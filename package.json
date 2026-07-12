@@ -1,7 +1,7 @@
 {
-  "name": "rts-trading-platform",
-  "version": "1.0.0",
-  "description": "Real Trading System - OANDA integration",
+  "name": "rts-platform",
+  "version": "2.0.0",
+  "description": "RTS Trading Platform – Modular, AI-ready, multi-broker",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
