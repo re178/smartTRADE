@@ -1,10 +1,22 @@
-// Public/JS config – change this if your backend is on a different URL
+// public/js/config.js – Frontend Configuration
+
 const CONFIG = {
-  // If dashboard is served from the same origin as the API, use relative path.
-  // Otherwise set full URL (e.g., 'https://your-backend.onrender.com')
+  // API base URL – uses current origin by default (works when served from same server)
+  // If frontend is served separately, change this to your backend URL.
   API_BASE: window.location.origin,
-  // Pairs to display prices
+
+  // Currency pairs to display live prices for
   PRICE_PAIRS: ['EUR_USD', 'GBP_USD', 'USD_JPY', 'AUD_USD'],
-  // Auto-refresh interval (ms)
-  PRICE_REFRESH_INTERVAL: 10000
+
+  // How often to refresh prices (milliseconds)
+  PRICE_REFRESH_INTERVAL: 10000,
+
+  // Default pair for signal and trade forms
+  DEFAULT_PAIR: 'EUR_USD',
+
+  // Default risk percentage for auto-trade
+  DEFAULT_RISK: 1,
+
+  // Default lot size for manual trades
+  DEFAULT_LOT: 0.01,
 };
