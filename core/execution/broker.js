@@ -5,7 +5,7 @@ const WebSocket = require('ws');
 const { EventEmitter } = require('events');
 const { sleep } = require('../../shared/helpers');
 const logger = require('../../infrastructure/logger') || console;
-const Order = require('../../../models/Order'); // persistent order store
+const Order = require('../../models/Order'); // persistent order store
 
 // ---------- Constants ----------
 const STATE = {
