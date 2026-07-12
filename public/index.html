@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>RTS Dashboard</title>
+  <!-- Bootstrap & Font Awesome (lightweight) -->
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet" />
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
   <style>
@@ -28,17 +29,20 @@
   <!-- Account & Prices -->
   <div class="row">
     <div class="col-md-4">
-      <div class="card"><div class="card-header"><i class="fas fa-user-circle"></i> Account</div>
+      <div class="card">
+        <div class="card-header"><i class="fas fa-user-circle"></i> Account</div>
         <div class="card-body" id="accountInfo"><p class="text-muted">Loading...</p></div>
       </div>
     </div>
     <div class="col-md-4">
-      <div class="card"><div class="card-header"><i class="fas fa-dollar-sign"></i> Balance & Equity</div>
+      <div class="card">
+        <div class="card-header"><i class="fas fa-dollar-sign"></i> Balance & Equity</div>
         <div class="card-body" id="balanceInfo"><p class="text-muted">Loading...</p></div>
       </div>
     </div>
     <div class="col-md-4">
-      <div class="card"><div class="card-header"><i class="fas fa-exchange-alt"></i> Prices</div>
+      <div class="card">
+        <div class="card-header"><i class="fas fa-exchange-alt"></i> Prices</div>
         <div class="card-body" id="priceInfo"><p class="text-muted">Loading...</p></div>
       </div>
     </div>
@@ -47,7 +51,8 @@
   <!-- Signal & Trading -->
   <div class="row">
     <div class="col-md-6">
-      <div class="card"><div class="card-header"><i class="fas fa-lightbulb"></i> Signal Generator</div>
+      <div class="card">
+        <div class="card-header"><i class="fas fa-lightbulb"></i> Signal Generator</div>
         <div class="card-body">
           <div class="input-group mb-3">
             <input type="text" id="signalPair" class="form-control" placeholder="Pair e.g. EUR_USD" value="EUR_USD" />
@@ -58,12 +63,18 @@
       </div>
     </div>
     <div class="col-md-6">
-      <div class="card"><div class="card-header"><i class="fas fa-rocket"></i> Execute Trade</div>
+      <div class="card">
+        <div class="card-header"><i class="fas fa-rocket"></i> Execute Trade</div>
         <div class="card-body">
           <form id="tradeForm">
             <div class="row">
               <div class="col-6"><label>Pair</label><input type="text" class="form-control" id="tradePair" value="EUR_USD" required /></div>
-              <div class="col-6"><label>Side</label><select class="form-select" id="tradeSide"><option value="BUY">BUY</option><option value="SELL">SELL</option></select></div>
+              <div class="col-6"><label>Side</label>
+                <select class="form-select" id="tradeSide">
+                  <option value="BUY">BUY</option>
+                  <option value="SELL">SELL</option>
+                </select>
+              </div>
               <div class="col-4 mt-2"><label>Lot Size</label><input type="number" step="0.01" class="form-control" id="tradeLot" value="0.01" required /></div>
               <div class="col-4 mt-2"><label>Stop Loss</label><input type="number" step="0.00001" class="form-control" id="tradeSL" placeholder="Optional" /></div>
               <div class="col-4 mt-2"><label>Take Profit</label><input type="number" step="0.00001" class="form-control" id="tradeTP" placeholder="Optional" /></div>
@@ -84,18 +95,24 @@
   </div>
 
   <!-- Open Trades -->
-  <div class="row"><div class="col-12">
-    <div class="card"><div class="card-header"><i class="fas fa-list-ul"></i> Open Trades <button class="btn btn-sm btn-outline-primary float-end" id="refreshTrades"><i class="fas fa-sync-alt"></i> Refresh</button></div>
-      <div class="card-body" id="openTradesContainer"><p class="text-muted">Loading...</p></div>
+  <div class="row">
+    <div class="col-12">
+      <div class="card">
+        <div class="card-header"><i class="fas fa-list-ul"></i> Open Trades <button class="btn btn-sm btn-outline-primary float-end" id="refreshTrades"><i class="fas fa-sync-alt"></i> Refresh</button></div>
+        <div class="card-body" id="openTradesContainer"><p class="text-muted">Loading...</p></div>
+      </div>
     </div>
-  </div></div>
+  </div>
 
   <!-- Trade History -->
-  <div class="row"><div class="col-12">
-    <div class="card"><div class="card-header"><i class="fas fa-history"></i> Trade History <button class="btn btn-sm btn-outline-secondary float-end" id="refreshHistory"><i class="fas fa-sync-alt"></i> Refresh</button></div>
-      <div class="card-body table-responsive" id="historyContainer"><p class="text-muted">Loading...</p></div>
+  <div class="row">
+    <div class="col-12">
+      <div class="card">
+        <div class="card-header"><i class="fas fa-history"></i> Trade History <button class="btn btn-sm btn-outline-secondary float-end" id="refreshHistory"><i class="fas fa-sync-alt"></i> Refresh</button></div>
+        <div class="card-body table-responsive" id="historyContainer"><p class="text-muted">Loading...</p></div>
+      </div>
     </div>
-  </div></div>
+  </div>
 </div>
 
 <script src="js/config.js"></script>
