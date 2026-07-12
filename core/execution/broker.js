@@ -1,5 +1,5 @@
 // src/core/execution/broker.js – Deriv WebSocket Driver (Enterprise Grade)
-// Rating: 10/10 – Live-Money Ready
+// Fixed: Moved DerivOrderBuilder, StreamingManager, RateLimiter outside the main class.
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -78,13 +78,13 @@ class RateLimiter {
   }
 }
 
-// ---------- Streaming Manager (encapsulated) ----------
+// ---------- Streaming Manager ----------
 class StreamingManager {
   constructor(broker) {
     this.broker = broker;
-    this._subscriptions = new Map();   // key -> { type, symbol, subscriptionId, callback }
+    this._subscriptions = new Map();
     this._subscriptionIdMap = new Map();
-    this._priceCache = new Map();      // symbol -> { bid, ask, mid, time }
+    this._priceCache = new Map();
   }
 
   async subscribe(type, symbol, callback) {
@@ -141,7 +141,6 @@ class StreamingManager {
     if (price) {
       this._priceCache.set(symbol, { bid, ask, mid: price, time: tick.epoch || Date.now() });
     }
-    // Route to callbacks
     for (const [key, sub] of this._subscriptions) {
       if (sub.symbol === symbol) {
         sub.callback(tick);
@@ -156,6 +155,30 @@ class StreamingManager {
 
   getAllPrices() {
     return Object.fromEntries(this._priceCache);
+  }
+}
+
+// ---------- Order Builder ----------
+class DerivOrderBuilder {
+  constructor(broker) {
+    this.broker = broker;
+  }
+
+  build(instrument, units, price, stopLoss, takeProfit, orderType, leverage, duration) {
+    const symbol = toDerivSymbol(instrument, this.broker.symbolMap);
+    const amount = Math.abs(units);
+    const payload = {
+      buy: symbol,
+      amount: amount,
+      price: orderType === 'market' ? 0 : price,
+    };
+    if (stopLoss !== null) payload.stop_loss = stopLoss;
+    if (takeProfit !== null) payload.take_profit = takeProfit;
+    if (this.broker.config.contractType === 'multiplier') {
+      payload.leverage = leverage || this.broker.config.leverage;
+      if (duration) payload.duration = duration;
+    }
+    return payload;
   }
 }
 
@@ -185,20 +208,20 @@ class DerivBroker extends EventEmitter {
       appId: config.appId || process.env.DERIV_APP_ID || '1089',
       wsUrl: config.wsUrl || process.env.DERIV_WS_URL || `wss://ws.deriv.com/websockets/v3?app_id=${this.appId}`,
       reconnectBaseDelay: parseInt(config.reconnectBaseDelay || process.env.DERIV_RECONNECT_DELAY || 2000),
-      maxReconnectDelay: parseInt(config.maxReconnectDelay || 30000),
+      maxReconnectDelay: parseInt(config.maxReconnectDelay || process.env.DERIV_MAX_RECONNECT_DELAY || 30000),
       maxRetries: parseInt(config.maxRetries || process.env.DERIV_MAX_RETRIES || 3),
-      maxQueueSize: parseInt(config.maxQueueSize || 1000),
-      circuitBreakerThreshold: parseInt(config.circuitBreakerThreshold || 5),
-      circuitBreakerTimeout: parseInt(config.circuitBreakerTimeout || 60000),
-      minOrderSize: parseFloat(config.minOrderSize || 0.01),
-      maxOrderSize: parseFloat(config.maxOrderSize || 100),
-      minStopDistance: parseFloat(config.minStopDistance || 0.0001),
-      rateLimit: parseFloat(config.rateLimit || 10),
-      rateCapacity: parseFloat(config.rateCapacity || 20),
-      contractType: config.contractType || 'cfd',
-      leverage: parseFloat(config.leverage || 1),
-      duration: config.duration || null,
-      riskValidator: config.riskValidator || null, // optional external risk check function
+      maxQueueSize: parseInt(config.maxQueueSize || process.env.DERIV_MAX_QUEUE_SIZE || 1000),
+      circuitBreakerThreshold: parseInt(config.circuitBreakerThreshold || process.env.DERIV_CIRCUIT_BREAKER_THRESHOLD || 5),
+      circuitBreakerTimeout: parseInt(config.circuitBreakerTimeout || process.env.DERIV_CIRCUIT_BREAKER_TIMEOUT || 60000),
+      minOrderSize: parseFloat(config.minOrderSize || process.env.DERIV_MIN_ORDER_SIZE || 0.01),
+      maxOrderSize: parseFloat(config.maxOrderSize || process.env.DERIV_MAX_ORDER_SIZE || 100),
+      minStopDistance: parseFloat(config.minStopDistance || process.env.DERIV_MIN_STOP_DISTANCE || 0.0001),
+      rateLimit: parseFloat(config.rateLimit || process.env.DERIV_RATE_LIMIT || 10),
+      rateCapacity: parseFloat(config.rateCapacity || process.env.DERIV_RATE_CAPACITY || 20),
+      contractType: config.contractType || process.env.DERIV_CONTRACT_TYPE || 'cfd',
+      leverage: parseFloat(config.leverage || process.env.DERIV_LEVERAGE || 1),
+      duration: config.duration || process.env.DERIV_DURATION || null,
+      riskValidator: config.riskValidator || null,
     };
 
     this.validateConfig();
@@ -225,9 +248,9 @@ class DerivBroker extends EventEmitter {
     this.reverseMap = {};
     this.spreadMap = {};
 
-    // Order tracking (in-memory cache, but DB is source of truth)
-    this._orders = new Map();      // clientOrderId -> order object (cached from DB)
-    this._orderMap = new Map();    // contractId -> clientOrderId
+    // Order tracking
+    this._orders = new Map();
+    this._orderMap = new Map();
 
     // Metrics
     this.metrics = {
@@ -247,10 +270,10 @@ class DerivBroker extends EventEmitter {
     // Capabilities
     this.capabilities = { ...BROKER_CAPABILITIES };
 
-    // Order builder placeholder (will be initialised after symbols loaded)
+    // Order builder placeholder
     this.orderBuilder = null;
 
-    // Trading session state
+    // Trading session
     this._session = {
       isOpen: true,
       accountEnabled: true,
@@ -258,7 +281,6 @@ class DerivBroker extends EventEmitter {
       lastCheck: null,
     };
 
-    // Metadata
     this.metadata = {
       name: 'Deriv',
       version: '1.0.0',
@@ -318,13 +340,10 @@ class DerivBroker extends EventEmitter {
                 this._setState(STATE.AUTHENTICATING);
                 await this._loadSymbols();
                 this._setState(STATE.READY);
-                // Restore subscriptions
                 this.streaming.restoreSubscriptions();
                 this._flushQueue();
                 this._resetCircuitBreaker();
-                // Reconciliation
                 await this._reconcilePositions();
-                // Load pending orders from DB
                 await this._loadPendingOrders();
                 this.emit('connected');
                 resolve();
@@ -377,7 +396,7 @@ class DerivBroker extends EventEmitter {
     return this._sendRawRequest({ authorize: this.config.apiToken }, 10000);
   }
 
-  // ---------- Reconnection & Backoff ----------
+  // ---------- Reconnection ----------
   _getReconnectDelay(attempt) {
     const base = this.config.reconnectBaseDelay;
     const max = this.config.maxReconnectDelay;
@@ -420,7 +439,7 @@ class DerivBroker extends EventEmitter {
 
   _isRequestAllowed() {
     if (this._cbState === CB_STATE.OPEN) return false;
-    return true; // HALF-OPEN allows test
+    return true;
   }
 
   // ---------- Heartbeat ----------
@@ -445,9 +464,8 @@ class DerivBroker extends EventEmitter {
   _handleMessage(rawData) {
     try {
       const msg = JSON.parse(rawData);
-      const start = Date.now();
 
-      // Request response
+      // Response to a request with req_id
       if (msg.req_id && this._pendingRequests.has(msg.req_id)) {
         const pending = this._pendingRequests.get(msg.req_id);
         clearTimeout(pending.timeout);
@@ -462,54 +480,45 @@ class DerivBroker extends EventEmitter {
         } else {
           this.metrics.requestsSent++;
           this._resetCircuitBreaker();
-          // If this is a buy/sell response, update order status
           this._handleOrderResponse(msg);
           pending.resolve(msg);
         }
         return;
       }
 
-      // Heartbeat response
       if (msg.pong) {
         this.metrics.lastHeartbeat = Date.now();
         return;
       }
 
-      // Tick updates (streaming)
       if (msg.msg_type === 'tick' && msg.tick) {
         this.streaming.handleTick(msg.tick);
         return;
       }
 
-      // Order responses (buy/sell) – we also handle via pending requests above, but additional fallback
       if (msg.buy || msg.sell) {
         this._handleOrderResponse(msg);
       }
 
-      // Subscription confirmations – handled by streaming manager
-      if (msg.subscription) {
-        // The streaming manager will catch this via req_id, but we can ignore.
-      }
+      // subscription confirmations are handled via req_id
     } catch (err) {
       logger.error('[DerivBroker] Error parsing WebSocket message:', err.message);
     }
   }
 
   _handleOrderResponse(msg) {
-    // If response contains client_order_id from echo_req, update order status
     if (msg.echo_req && msg.echo_req.client_order_id) {
       const clientOrderId = msg.echo_req.client_order_id;
       const tx = msg.buy || msg.sell;
       if (tx) {
         const contractId = tx.contract_id || tx.transaction_id;
         const status = tx.status || 'FILLED';
-        // Update in DB and cache
         this._updateOrderStatus(clientOrderId, status, contractId, tx);
       }
     }
   }
 
-  // ---------- Sending Messages ----------
+  // ---------- Sending ----------
   _sendRaw(payload) {
     if (this._state !== STATE.READY && this._state !== STATE.CONNECTED && this._state !== STATE.AUTHENTICATING) {
       if (this._messageQueue.length < this.config.maxQueueSize) {
@@ -535,7 +544,7 @@ class DerivBroker extends EventEmitter {
     }
     if (!this._isRequestAllowed()) throw new Error('Circuit breaker is OPEN');
 
-    // Idempotency: if client_order_id provided, check DB
+    // Idempotency check
     if (payload.client_order_id) {
       const existing = await Order.findOne({ clientOrderId: payload.client_order_id });
       if (existing && (existing.status === ORDER_STATUS.FILLED || existing.status === ORDER_STATUS.PENDING)) {
@@ -618,7 +627,6 @@ class DerivBroker extends EventEmitter {
       }
     }
     logger.info(`[DerivBroker] Loaded ${Object.keys(this.symbolMap).length} symbols.`);
-    // Init order builder
     this.orderBuilder = new DerivOrderBuilder(this);
   }
 
@@ -643,7 +651,6 @@ class DerivBroker extends EventEmitter {
       update.rejectReason = txData?.error?.message || 'Unknown';
     }
     await Order.findOneAndUpdate({ clientOrderId }, update, { upsert: true, new: true });
-    // Update cache
     const order = this._orders.get(clientOrderId);
     if (order) {
       Object.assign(order, update);
@@ -652,34 +659,8 @@ class DerivBroker extends EventEmitter {
     this.metrics.ordersPlaced++;
     if (status === ORDER_STATUS.FILLED) this.metrics.ordersFilled++;
     if (status === ORDER_STATUS.REJECTED) this.metrics.ordersRejected++;
-    // Audit log
     logger.info(`[Order] ${clientOrderId} → ${status}`, { clientOrderId, status, contractId });
     this.emit('orderUpdate', { clientOrderId, status, contractId });
-  }
-
-  // ---------- Order Builder ----------
-  class DerivOrderBuilder {
-    constructor(broker) {
-      this.broker = broker;
-    }
-
-    build(instrument, units, price, stopLoss, takeProfit, orderType, leverage, duration) {
-      const symbol = toDerivSymbol(instrument, this.broker.symbolMap);
-      const amount = Math.abs(units);
-      const payload = {
-        buy: symbol,
-        amount: amount,
-        price: orderType === 'market' ? 0 : price,
-      };
-      if (stopLoss !== null) payload.stop_loss = stopLoss;
-      if (takeProfit !== null) payload.take_profit = takeProfit;
-      // For multipliers/options, additional fields
-      if (this.broker.config.contractType === 'multiplier') {
-        payload.leverage = leverage || this.broker.config.leverage;
-        if (duration) payload.duration = duration;
-      }
-      return payload;
-    }
   }
 
   // ---------- Position Reconciliation ----------
@@ -692,11 +673,9 @@ class DerivBroker extends EventEmitter {
         if (ord.contractId) dbMap.set(ord.contractId, ord);
       }
 
-      // Check each broker position
       for (const pos of brokerPositions) {
         const existing = dbMap.get(pos.id);
         if (!existing) {
-          // Position not in DB – create it
           const newOrder = new Order({
             clientOrderId: generateClientOrderId(),
             instrument: pos.instrument,
@@ -712,17 +691,14 @@ class DerivBroker extends EventEmitter {
           this._orderMap.set(pos.id, newOrder.clientOrderId);
           logger.warn(`[Reconcile] Created order for position ${pos.id}`);
         } else {
-          // Update cached order
           this._orders.set(existing.clientOrderId, existing);
           this._orderMap.set(pos.id, existing.clientOrderId);
         }
       }
 
-      // Check for positions that exist in DB but not in broker (closed externally)
       for (const [contractId, clientOrderId] of this._orderMap) {
         const stillOpen = brokerPositions.some(p => p.id === contractId);
         if (!stillOpen) {
-          // Mark as closed
           await this._updateOrderStatus(clientOrderId, ORDER_STATUS.CLOSED);
           this._orderMap.delete(contractId);
         }
@@ -735,7 +711,6 @@ class DerivBroker extends EventEmitter {
 
   // ---------- Risk Validation ----------
   async _validateOrderRisk(instrument, side, units, stopLoss, takeProfit) {
-    // If external risk validator provided, call it
     if (this.config.riskValidator) {
       const result = await this.config.riskValidator({
         instrument,
@@ -749,18 +724,14 @@ class DerivBroker extends EventEmitter {
         throw new Error(`Risk validation failed: ${result.reason}`);
       }
     }
-    // Built-in checks: margin, exposure, etc.
     const account = await this.getAccount();
-    const balance = parseFloat(account.balance);
     const marginAvailable = parseFloat(account.marginAvailable);
     if (marginAvailable <= 0) {
       throw new Error('Insufficient margin');
     }
-    // Add more checks as needed.
   }
 
-  // ---------- Public API (Broker Interface) ----------
-
+  // ---------- Public API ----------
   async getAccount() {
     await this._ensureReady();
     const response = await this._sendRequest({ account: 1 });
@@ -791,7 +762,6 @@ class DerivBroker extends EventEmitter {
         });
         continue;
       }
-      // Fallback request
       const response = await this._sendRequest({ ticks: symbol, subscribe: 0 });
       const tick = response.tick;
       let bid, ask;
@@ -840,12 +810,9 @@ class DerivBroker extends EventEmitter {
 
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null, clientOrderId = null) {
     await this._ensureReady();
-    // Risk validation
     await this._validateOrderRisk(instrument, units > 0 ? 'BUY' : 'SELL', units, stopLoss, takeProfit);
 
-    const symbol = toDerivSymbol(instrument, this.symbolMap);
     const orderId = clientOrderId || generateClientOrderId();
-    // Create pending order in DB
     const orderDoc = new Order({
       clientOrderId: orderId,
       instrument,
@@ -966,7 +933,7 @@ class DerivBroker extends EventEmitter {
     return this.getOpenTrades();
   }
 
-  // ---------- Health Monitoring ----------
+  // ---------- Health & Kill ----------
   getHealth() {
     const avgLatency = this.metrics.latencyCount > 0 ? this.metrics.totalLatency / this.metrics.latencyCount : 0;
     return {
@@ -989,10 +956,8 @@ class DerivBroker extends EventEmitter {
     };
   }
 
-  // ---------- Emergency Kill Switch ----------
   async killSwitch() {
     logger.warn('🚨 EMERGENCY KILL SWITCH ACTIVATED 🚨');
-    // 1. Close all open positions
     const positions = await this.getOpenTrades();
     for (const pos of positions) {
       try {
@@ -1002,13 +967,11 @@ class DerivBroker extends EventEmitter {
         logger.error(`[Kill] Failed to close ${pos.id}:`, err.message);
       }
     }
-    // 2. Cancel all pending orders (we don't have a direct cancel, but we can mark them)
     const pending = await Order.find({ status: ORDER_STATUS.PENDING });
     for (const order of pending) {
       await this._updateOrderStatus(order.clientOrderId, ORDER_STATUS.CANCELLED);
       logger.info(`[Kill] Cancelled order ${order.clientOrderId}`);
     }
-    // 3. Disconnect
     await this.disconnect();
     logger.warn('🚨 Kill switch complete.');
   }
@@ -1018,7 +981,6 @@ class DerivBroker extends EventEmitter {
     logger.info('[DerivBroker] Disconnecting gracefully...');
     this._stopHeartbeat();
 
-    // Unsubscribe all
     const subs = Array.from(this.streaming._subscriptions.keys());
     for (const key of subs) {
       const sub = this.streaming._subscriptions.get(key);
@@ -1028,7 +990,6 @@ class DerivBroker extends EventEmitter {
       this.streaming._subscriptions.delete(key);
     }
 
-    // Reject pending
     for (const [id, pending] of this._pendingRequests) {
       clearTimeout(pending.timeout);
       pending.reject(new Error('Disconnected'));
@@ -1069,5 +1030,5 @@ class DerivBroker extends EventEmitter {
   }
 }
 
-// Export the class
+// ---------- Export ----------
 module.exports = DerivBroker;
