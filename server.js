@@ -10,7 +10,7 @@ const path = require('path');
 const connectDB = require('./config/db');
 
 // Import API routes (new modular structure)
-const apiRoutes = require('./src/api/routes');
+const apiRoutes = require('./api/routes');
 
 // Initialize Express
 const app = express();
