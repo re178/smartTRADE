@@ -1,3 +1,5 @@
+// public/js/app.js – Dashboard Logic
+
 // ---- API helper ----
 async function fetchJson(url, options = {}) {
   const res = await fetch(url, {
@@ -11,7 +13,9 @@ async function fetchJson(url, options = {}) {
   return res.json();
 }
 
-function formatPrice(p) { return parseFloat(p).toFixed(5); }
+function formatPrice(p) {
+  return parseFloat(p).toFixed(5);
+}
 
 // ---- Load Account ----
 async function loadAccount() {
@@ -79,11 +83,10 @@ document.getElementById('getSignalBtn').addEventListener('click', async function
   }
 });
 
-// Expose to global for inline onclick
 window.fillTradeForm = function(pair, side, entry, sl, tp) {
   document.getElementById('tradePair').value = pair;
   document.getElementById('tradeSide').value = side;
-  document.getElementById('tradeLot').value = 0.01;
+  document.getElementById('tradeLot').value = CONFIG.DEFAULT_LOT;
   document.getElementById('tradeSL').value = sl;
   document.getElementById('tradeTP').value = tp;
   document.querySelector('#tradeForm').scrollIntoView({ behavior: 'smooth' });
