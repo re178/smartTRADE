@@ -1,6 +1,6 @@
 // src/core/portfolio/logger.js – Trade Logging Service
 
-const Trade = require('../../../models/Trade');
+const Trade = require('../../models/Trade');
 const eventBus = require('../../infrastructure/eventBus');
 
 /**
