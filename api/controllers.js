@@ -1,6 +1,6 @@
 // src/api/controllers.js – Request Handlers
 
-const Trade = require('../../models/Trade');
+const Trade = require('../models/Trade');
 
 // Core modules
 const marketProvider = require('../core/market/provider');
