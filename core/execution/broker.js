@@ -1,5 +1,5 @@
 // src/core/execution/broker.js – Deriv WebSocket Driver (Enterprise Grade)
-// Fixed: Moved DerivOrderBuilder, StreamingManager, RateLimiter outside the main class.
+// Singleton export for easy use in controllers.
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -54,7 +54,7 @@ function fromDerivSymbol(symbol, reverseMap) {
   return symbol;
 }
 
-// ---------- Rate Limiter (Token Bucket) ----------
+// ---------- Rate Limiter ----------
 class RateLimiter {
   constructor(rate, capacity) {
     this.rate = rate;
@@ -1030,5 +1030,26 @@ class DerivBroker extends EventEmitter {
   }
 }
 
-// ---------- Export ----------
-module.exports = DerivBroker;
+// ---------- Singleton Export ----------
+// Create a single instance using environment variables
+const brokerInstance = new DerivBroker({
+  apiToken: process.env.DERIV_API_TOKEN,
+  appId: process.env.DERIV_APP_ID,
+  wsUrl: process.env.DERIV_WS_URL,
+  reconnectBaseDelay: parseInt(process.env.DERIV_RECONNECT_DELAY) || 2000,
+  maxReconnectDelay: parseInt(process.env.DERIV_MAX_RECONNECT_DELAY) || 30000,
+  maxRetries: parseInt(process.env.DERIV_MAX_RETRIES) || 3,
+  maxQueueSize: parseInt(process.env.DERIV_MAX_QUEUE_SIZE) || 1000,
+  circuitBreakerThreshold: parseInt(process.env.DERIV_CIRCUIT_BREAKER_THRESHOLD) || 5,
+  circuitBreakerTimeout: parseInt(process.env.DERIV_CIRCUIT_BREAKER_TIMEOUT) || 60000,
+  minOrderSize: parseFloat(process.env.DERIV_MIN_ORDER_SIZE) || 0.01,
+  maxOrderSize: parseFloat(process.env.DERIV_MAX_ORDER_SIZE) || 100,
+  minStopDistance: parseFloat(process.env.DERIV_MIN_STOP_DISTANCE) || 0.0001,
+  rateLimit: parseFloat(process.env.DERIV_RATE_LIMIT) || 10,
+  rateCapacity: parseFloat(process.env.DERIV_RATE_CAPACITY) || 20,
+  contractType: process.env.DERIV_CONTRACT_TYPE || 'cfd',
+  leverage: parseFloat(process.env.DERIV_LEVERAGE) || 1,
+  duration: process.env.DERIV_DURATION || null,
+});
+
+module.exports = brokerInstance;
