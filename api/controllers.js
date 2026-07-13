@@ -1,6 +1,6 @@
 // src/api/controllers.js – Complete Request Handlers (with Portfolio Manager & Notifications)
 
-const Trade = require('../../models/Trade');
+const Trade = require('../models/Trade');
 const marketProvider = require('../core/market/provider');
 const broker = require('../core/execution/broker');
 const orderService = require('../core/execution/orderService');
