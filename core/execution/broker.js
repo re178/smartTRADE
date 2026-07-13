@@ -1,13 +1,10 @@
-// src/core/execution/broker.js – with debug logging and skipReqId for authorize
+// src/core/execution/broker.js – Optimised for Render Free Tier
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
 const { sleep } = require('../../shared/helpers');
 const logger = require('../../infrastructure/logger') || console;
-const Order = require('../../models/Order');
-
-// Set log level to debug temporarily (or set LOG_LEVEL=debug in env)
-// If your logger supports levels, you can enable debug output.
+const Order = require('../../../models/Order');
 
 EventEmitter.defaultMaxListeners = 20;
 
@@ -38,7 +35,7 @@ const CB_STATE = { CLOSED: 'CLOSED', OPEN: 'OPEN', HALF_OPEN: 'HALF_OPEN' };
 let _requestCounter = 0;
 
 function generateRequestId() {
-  return ++_requestCounter; // integer: 1, 2, 3, ...
+  return ++_requestCounter;
 }
 
 function generateClientOrderId() {
@@ -60,7 +57,7 @@ function fromDerivSymbol(symbol, reverseMap) {
   return symbol;
 }
 
-// ---------- Rate Limiter ----------
+// ---------- Rate Limiter (kept minimal) ----------
 class RateLimiter {
   constructor(rate, capacity) {
     this.rate = rate;
@@ -84,7 +81,7 @@ class RateLimiter {
   }
 }
 
-// ---------- Streaming Manager ----------
+// ---------- Streaming Manager (simplified) ----------
 class StreamingManager {
   constructor(broker) {
     this.broker = broker;
@@ -215,23 +212,23 @@ class DerivBroker extends EventEmitter {
       apiToken: config.apiToken || process.env.DERIV_API_TOKEN,
       appId: appId,
       wsUrl: config.wsUrl || process.env.DERIV_WS_URL || `wss://ws.derivws.com/websockets/v3?app_id=${appId}`,
-      connectionTimeout: parseInt(config.connectionTimeout || process.env.DERIV_CONNECTION_TIMEOUT || 30000),
+      connectionTimeout: parseInt(config.connectionTimeout || process.env.DERIV_CONNECTION_TIMEOUT || 10000),
       reconnectBaseDelay: parseInt(config.reconnectBaseDelay || process.env.DERIV_RECONNECT_DELAY || 2000),
-      maxReconnectDelay: parseInt(config.maxReconnectDelay || process.env.DERIV_MAX_RECONNECT_DELAY || 30000),
-      maxRetries: parseInt(config.maxRetries || process.env.DERIV_MAX_RETRIES || 3),
-      maxQueueSize: parseInt(config.maxQueueSize || process.env.DERIV_MAX_QUEUE_SIZE || 1000),
-      circuitBreakerThreshold: parseInt(config.circuitBreakerThreshold || process.env.DERIV_CIRCUIT_BREAKER_THRESHOLD || 5),
-      circuitBreakerTimeout: parseInt(config.circuitBreakerTimeout || process.env.DERIV_CIRCUIT_BREAKER_TIMEOUT || 60000),
-      minOrderSize: parseFloat(config.minOrderSize || process.env.DERIV_MIN_ORDER_SIZE || 0.01),
-      maxOrderSize: parseFloat(config.maxOrderSize || process.env.DERIV_MAX_ORDER_SIZE || 100),
-      minStopDistance: parseFloat(config.minStopDistance || process.env.DERIV_MIN_STOP_DISTANCE || 0.0001),
-      rateLimit: parseFloat(config.rateLimit || process.env.DERIV_RATE_LIMIT || 10),
-      rateCapacity: parseFloat(config.rateCapacity || process.env.DERIV_RATE_CAPACITY || 20),
-      contractType: config.contractType || process.env.DERIV_CONTRACT_TYPE || 'cfd',
-      leverage: parseFloat(config.leverage || process.env.DERIV_LEVERAGE || 1),
-      duration: config.duration || process.env.DERIV_DURATION || null,
+      maxReconnectDelay: parseInt(config.maxReconnectDelay || process.env.DERIV_MAX_RECONNECT_DELAY || 10000),
+      maxRetries: parseInt(config.maxRetries || process.env.DERIV_MAX_RETRIES || 2),
+      maxQueueSize: parseInt(config.maxQueueSize || process.env.DERIV_MAX_QUEUE_SIZE || 100),
+      circuitBreakerThreshold: parseInt(config.circuitBreakerThreshold || 3),
+      circuitBreakerTimeout: parseInt(config.circuitBreakerTimeout || 30000),
+      minOrderSize: parseFloat(config.minOrderSize || 0.01),
+      maxOrderSize: parseFloat(config.maxOrderSize || 100),
+      minStopDistance: parseFloat(config.minStopDistance || 0.0001),
+      rateLimit: parseFloat(config.rateLimit || 5),
+      rateCapacity: parseFloat(config.rateCapacity || 10),
+      contractType: config.contractType || 'cfd',
+      leverage: parseFloat(config.leverage || 1),
+      duration: config.duration || null,
       riskValidator: config.riskValidator || null,
-      fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || process.env.DERIV_FATAL_AFTER_AUTH_FAILURES || 3),
+      fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || 3),
     };
 
     this.validateConfig();
@@ -291,7 +288,7 @@ class DerivBroker extends EventEmitter {
   async connect() {
     if (this._state === STATE.READY) return;
     if (this._state === STATE.FATAL) {
-      throw new Error('Broker in FATAL state – check credentials and network.');
+      throw new Error('Broker in FATAL state – check credentials.');
     }
     if (this._connectionPromise) return this._connectionPromise;
     this._connectionPromise = this._doConnect();
@@ -308,18 +305,25 @@ class DerivBroker extends EventEmitter {
     logger.info(`[DerivBroker] Connecting to ${this.config.wsUrl}`);
 
     return new Promise((resolve, reject) => {
-      const attemptConnect = async (attempt = 0) => {
+      let attempts = 0;
+      const attemptConnect = async () => {
         if (this._state === STATE.FATAL) {
-          reject(new Error('FATAL: Broker stopped due to repeated auth failures.'));
+          reject(new Error('FATAL: Broker stopped.'));
           return;
         }
-        if (this._state === STATE.RECONNECTING) {
-          await sleep(this._getReconnectDelay(attempt));
-          return attemptConnect(attempt + 1);
+        if (this._state === STATE.READY) {
+          resolve();
+          return;
+        }
+        attempts++;
+        if (attempts > 3) {
+          this._setState(STATE.FATAL);
+          reject(new Error('Connection failed after 3 attempts.'));
+          return;
         }
 
         this._setState(STATE.CONNECTING);
-        logger.info(`[DerivBroker] Connection attempt ${attempt + 1}`);
+        logger.info(`[DerivBroker] Connection attempt ${attempts}`);
 
         try {
           this._socket = new WebSocket(this.config.wsUrl);
@@ -329,10 +333,9 @@ class DerivBroker extends EventEmitter {
             logger.info('[DerivBroker] WebSocket connected.');
             this._setState(STATE.CONNECTED);
             this.metrics.connectedSince = Date.now();
-            if (attempt > 0) this.metrics.reconnections++;
             this._startHeartbeat();
 
-            // Authorize – we try WITHOUT req_id (some endpoints don't accept it)
+            // Send authorize WITHOUT req_id (to avoid validation issues)
             this._authorize()
               .then(async () => {
                 logger.info('[DerivBroker] Authorized.');
@@ -352,26 +355,20 @@ class DerivBroker extends EventEmitter {
                 logger.error('[DerivBroker] Authorization failed:', err.message);
                 this._authFailCount++;
                 if (this._authFailCount >= this.config.fatalAfterAuthFailures) {
-                  logger.error(`[DerivBroker] Too many auth failures (${this._authFailCount}). Entering FATAL state.`);
+                  logger.error(`[DerivBroker] Too many auth failures (${this._authFailCount}). FATAL.`);
                   this._setState(STATE.FATAL);
                   this._closeSocket();
-                  reject(new Error(`Authorization failed ${this._authFailCount} times – check API token.`));
+                  reject(new Error(`Authorization failed ${this._authFailCount} times.`));
                   return;
                 }
                 this._setState(STATE.FAILED);
                 this._closeSocket();
-                this._scheduleReconnect(attempt + 1);
-                reject(err);
+                // Retry after delay
+                setTimeout(() => attemptConnect(), this.config.reconnectBaseDelay);
               });
           });
 
-          // **NEW: log every incoming message raw**
-          socket.on('message', (data) => {
-            const raw = data.toString();
-            logger.debug(`[DerivBroker] RAW INCOMING: ${raw}`);
-            this._handleMessage(data);
-          });
-
+          socket.on('message', (data) => this._handleMessage(data));
           socket.on('error', (err) => {
             logger.error('[DerivBroker] WebSocket error:', err.message);
           });
@@ -379,15 +376,16 @@ class DerivBroker extends EventEmitter {
             logger.info(`[DerivBroker] WebSocket closed. Code: ${code}, Reason: ${reason || 'No reason'}`);
             if (this._state === STATE.READY || this._state === STATE.CONNECTED) {
               this._setState(STATE.RECONNECTING);
-              this._scheduleReconnect(0);
+              setTimeout(() => attemptConnect(), this.config.reconnectBaseDelay);
             }
           });
 
+          // Timeout for this connection attempt
           const timeout = setTimeout(() => {
-            if (!this._socket || this._socket.readyState !== WebSocket.OPEN) {
-              logger.error(`[DerivBroker] Connection timeout after ${this.config.connectionTimeout}ms`);
+            if (this._state !== STATE.READY && this._state !== STATE.CONNECTED) {
+              logger.error('[DerivBroker] Connection attempt timed out.');
               this._closeSocket();
-              reject(new Error(`Connection timeout (${this.config.connectionTimeout}ms)`));
+              reject(new Error('Connection attempt timed out'));
             }
           }, this.config.connectionTimeout);
           this.once('connected', () => clearTimeout(timeout));
@@ -396,7 +394,8 @@ class DerivBroker extends EventEmitter {
           reject(err);
         }
       };
-      attemptConnect(0);
+
+      attemptConnect();
     });
   }
 
@@ -407,30 +406,49 @@ class DerivBroker extends EventEmitter {
     this.emit('stateChange', { from: old, to: newState });
   }
 
-  // **MODIFIED: authorize WITHOUT req_id**
+  // Authorize WITHOUT req_id
   _authorize() {
-    // Send { authorize: token } – no req_id
-    return this._sendRawRequest({ authorize: this.config.apiToken }, 10000, null, true);
+    return new Promise((resolve, reject) => {
+      const payload = { authorize: this.config.apiToken };
+      const timeout = setTimeout(() => {
+        reject(new Error('Authorize timeout'));
+      }, 10000);
+
+      const handler = (data) => {
+        try {
+          const msg = JSON.parse(data);
+          if (msg.error) {
+            clearTimeout(timeout);
+            reject(new Error(`Deriv API error: ${msg.error.code} - ${msg.error.message}`));
+          } else if (msg.authorize !== undefined) {
+            clearTimeout(timeout);
+            resolve(msg);
+          }
+          // If it's not an authorize response, ignore.
+        } catch (err) {
+          // ignore
+        }
+      };
+
+      this._socket.once('message', handler);
+      // Send the message
+      this._sendRaw(payload);
+      // Also handle timeout
+      const timeoutHandler = setTimeout(() => {
+        this._socket.removeListener('message', handler);
+        reject(new Error('Authorize timeout'));
+      }, 10000);
+      this._pendingRequests.set('_auth', { timeout: timeoutHandler });
+    });
   }
 
-  // ---------- Reconnection ----------
+  // ---------- Reconnection (simplified) ----------
   _getReconnectDelay(attempt) {
     const base = this.config.reconnectBaseDelay;
     const max = this.config.maxReconnectDelay;
     const delay = Math.min(base * Math.pow(2, attempt), max);
     const jitter = delay * (0.8 + 0.4 * Math.random());
     return Math.round(jitter);
-  }
-
-  _scheduleReconnect(attempt = 0) {
-    if (this._state === STATE.RECONNECTING || this._state === STATE.FATAL) return;
-    this._setState(STATE.RECONNECTING);
-    const delay = this._getReconnectDelay(attempt);
-    logger.info(`[DerivBroker] Scheduling reconnect in ${delay}ms`);
-    setTimeout(() => {
-      this._setState(STATE.CONNECTING);
-      this.connect().catch((err) => logger.error('[DerivBroker] Reconnect failed:', err.message));
-    }, delay);
   }
 
   // ---------- Circuit Breaker ----------
@@ -481,9 +499,8 @@ class DerivBroker extends EventEmitter {
   _handleMessage(rawData) {
     try {
       const msg = JSON.parse(rawData);
-      logger.debug(`[DerivBroker] Parsed message: ${JSON.stringify(msg)}`);
 
-      // Check if this is a response to a pending request
+      // Check for response to a pending request (with req_id integer)
       if (msg.req_id && this._pendingRequests.has(msg.req_id)) {
         const pending = this._pendingRequests.get(msg.req_id);
         clearTimeout(pending.timeout);
@@ -500,24 +517,6 @@ class DerivBroker extends EventEmitter {
           this._resetCircuitBreaker();
           this._handleOrderResponse(msg);
           pending.resolve(msg);
-        }
-        return;
-      }
-
-      // If we have no req_id, it might be the authorize response (since we sent without req_id)
-      // Check if it has 'authorize' or 'error' fields
-      if (msg.authorize !== undefined || msg.error) {
-        // This is the authorize response – we need to resolve the promise stored in the pending map
-        // We stored a special key '_authorize' in the pending map
-        const pending = this._pendingRequests.get('_authorize');
-        if (pending) {
-          clearTimeout(pending.timeout);
-          this._pendingRequests.delete('_authorize');
-          if (msg.error) {
-            pending.reject(new Error(`Deriv API error: ${msg.error.code} - ${msg.error.message}`));
-          } else {
-            pending.resolve(msg);
-          }
         }
         return;
       }
@@ -539,7 +538,7 @@ class DerivBroker extends EventEmitter {
         this._handleOrderResponse(msg);
       }
 
-      // Other subscription confirmations are handled via req_id
+      // Other messages (subscription confirmations, etc.) are handled via req_id
     } catch (err) {
       logger.error('[DerivBroker] Error parsing WebSocket message:', err.message);
     }
@@ -568,23 +567,23 @@ class DerivBroker extends EventEmitter {
       return;
     }
     try {
-      const msgString = JSON.stringify(payload);
-      logger.debug(`[DerivBroker] Sending raw: ${msgString}`);
-      this._socket.send(msgString);
+      this._socket.send(JSON.stringify(payload));
     } catch (err) {
       logger.error('[DerivBroker] Send error:', err.message);
-      this._scheduleReconnect(0);
     }
   }
 
   async _sendRequest(payload, timeoutMs = 15000, signal = null) {
     await this._rateLimiter.acquire();
     if (this._state === STATE.FATAL) {
-      throw new Error('Broker in FATAL state – cannot send request.');
+      throw new Error('Broker in FATAL state.');
     }
     if (this._state !== STATE.READY) {
-      await this.connect();
-      if (this._state !== STATE.READY) throw new Error('Not ready');
+      try {
+        await this._ensureReady();
+      } catch (err) {
+        throw new Error(`Broker not ready: ${err.message}`);
+      }
     }
     if (!this._isRequestAllowed()) throw new Error('Circuit breaker is OPEN');
 
@@ -604,7 +603,7 @@ class DerivBroker extends EventEmitter {
         return result;
       } catch (err) {
         lastError = err;
-        logger.warn(`[DerivBroker] Request failed (attempt ${attempt}/${this.config.maxRetries}):`, err.message);
+        logger.warn(`[DerivBroker] Request failed (attempt ${attempt}):`, err.message);
         if (attempt < this.config.maxRetries) {
           await sleep(this._getReconnectDelay(attempt));
           if (signal && signal.aborted) throw new Error('Request cancelled');
@@ -616,64 +615,32 @@ class DerivBroker extends EventEmitter {
     throw lastError;
   }
 
-  /**
-   * Send raw request with optional skipReqId flag.
-   * If skipReqId is true, no req_id is added; the response is handled via a special '_authorize' key.
-   */
-  _sendRawRequest(payload, timeoutMs = 15000, signal = null, skipReqId = false) {
+  _sendRawRequest(payload, timeoutMs = 15000, signal = null) {
     return new Promise((resolve, reject) => {
-      let reqId = null;
-      let msg = payload;
-
-      if (!skipReqId) {
-        reqId = generateRequestId(); // integer
-        msg = { ...payload, req_id: reqId };
-      }
-
+      const reqId = generateRequestId();
+      const msg = { ...payload, req_id: reqId };
       const timeout = setTimeout(() => {
-        if (reqId && this._pendingRequests.has(reqId)) {
+        if (this._pendingRequests.has(reqId)) {
           this._pendingRequests.delete(reqId);
-          reject(new Error(`Request timed out (${timeoutMs}ms)`));
-        } else if (skipReqId && this._pendingRequests.has('_authorize')) {
-          this._pendingRequests.delete('_authorize');
           reject(new Error(`Request timed out (${timeoutMs}ms)`));
         }
       }, timeoutMs);
-
       const onCancel = () => {
         clearTimeout(timeout);
-        if (reqId && this._pendingRequests.has(reqId)) {
+        if (this._pendingRequests.has(reqId)) {
           this._pendingRequests.delete(reqId);
-          reject(new Error('Request cancelled'));
-        } else if (skipReqId && this._pendingRequests.has('_authorize')) {
-          this._pendingRequests.delete('_authorize');
           reject(new Error('Request cancelled'));
         }
       };
-
       if (signal) signal.addEventListener('abort', onCancel, { once: true });
-
-      if (reqId) {
-        this._pendingRequests.set(reqId, {
-          resolve,
-          reject,
-          timeout,
-          sentAt: Date.now(),
-          cancel: onCancel,
-          signal,
-        });
-      } else {
-        // For skipReqId, store under '_authorize'
-        this._pendingRequests.set('_authorize', {
-          resolve,
-          reject,
-          timeout,
-          sentAt: Date.now(),
-          cancel: onCancel,
-          signal,
-        });
-      }
-
+      this._pendingRequests.set(reqId, {
+        resolve,
+        reject,
+        timeout,
+        sentAt: Date.now(),
+        cancel: onCancel,
+        signal,
+      });
       logger.debug(`[DerivBroker] Sending: ${JSON.stringify(msg)}`);
       this._sendRaw(msg);
     });
@@ -1105,9 +1072,13 @@ class DerivBroker extends EventEmitter {
   _ensureReady() {
     if (this._state === STATE.READY) return Promise.resolve();
     if (this._state === STATE.FATAL) {
-      return Promise.reject(new Error('Broker in FATAL state – cannot proceed.'));
+      return Promise.reject(new Error('Broker in FATAL state.'));
     }
-    return this.connect();
+    // Fast fail if not ready within 2 seconds
+    return Promise.race([
+      this.connect(),
+      sleep(2000).then(() => { throw new Error('Broker connect timeout (2s)'); })
+    ]);
   }
 }
 
@@ -1116,18 +1087,18 @@ const brokerInstance = new DerivBroker({
   apiToken: process.env.DERIV_API_TOKEN,
   appId: process.env.DERIV_APP_ID,
   wsUrl: process.env.DERIV_WS_URL,
-  connectionTimeout: parseInt(process.env.DERIV_CONNECTION_TIMEOUT) || 30000,
+  connectionTimeout: parseInt(process.env.DERIV_CONNECTION_TIMEOUT) || 10000,
   reconnectBaseDelay: parseInt(process.env.DERIV_RECONNECT_DELAY) || 2000,
-  maxReconnectDelay: parseInt(process.env.DERIV_MAX_RECONNECT_DELAY) || 30000,
-  maxRetries: parseInt(process.env.DERIV_MAX_RETRIES) || 3,
-  maxQueueSize: parseInt(process.env.DERIV_MAX_QUEUE_SIZE) || 1000,
-  circuitBreakerThreshold: parseInt(process.env.DERIV_CIRCUIT_BREAKER_THRESHOLD) || 5,
-  circuitBreakerTimeout: parseInt(process.env.DERIV_CIRCUIT_BREAKER_TIMEOUT) || 60000,
+  maxReconnectDelay: parseInt(process.env.DERIV_MAX_RECONNECT_DELAY) || 10000,
+  maxRetries: parseInt(process.env.DERIV_MAX_RETRIES) || 2,
+  maxQueueSize: parseInt(process.env.DERIV_MAX_QUEUE_SIZE) || 100,
+  circuitBreakerThreshold: parseInt(process.env.DERIV_CIRCUIT_BREAKER_THRESHOLD) || 3,
+  circuitBreakerTimeout: parseInt(process.env.DERIV_CIRCUIT_BREAKER_TIMEOUT) || 30000,
   minOrderSize: parseFloat(process.env.DERIV_MIN_ORDER_SIZE) || 0.01,
   maxOrderSize: parseFloat(process.env.DERIV_MAX_ORDER_SIZE) || 100,
   minStopDistance: parseFloat(process.env.DERIV_MIN_STOP_DISTANCE) || 0.0001,
-  rateLimit: parseFloat(process.env.DERIV_RATE_LIMIT) || 10,
-  rateCapacity: parseFloat(process.env.DERIV_RATE_CAPACITY) || 20,
+  rateLimit: parseFloat(process.env.DERIV_RATE_LIMIT) || 5,
+  rateCapacity: parseFloat(process.env.DERIV_RATE_CAPACITY) || 10,
   contractType: process.env.DERIV_CONTRACT_TYPE || 'cfd',
   leverage: parseFloat(process.env.DERIV_LEVERAGE) || 1,
   duration: process.env.DERIV_DURATION || null,
