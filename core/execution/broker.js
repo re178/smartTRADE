@@ -1,11 +1,10 @@
-// src/core/execution/broker.js – Deriv WebSocket Driver (Enterprise Grade)
-// Singleton export for easy use in controllers.
+// src/core/execution/broker.js – Deriv WebSocket Driver (with extended timeout and debug logs)
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
 const { sleep } = require('../../shared/helpers');
 const logger = require('../../infrastructure/logger') || console;
-const Order = require('../../models/Order'); // persistent order store
+const Order = require('../../../models/Order');
 
 // ---------- Constants ----------
 const STATE = {
@@ -207,6 +206,7 @@ class DerivBroker extends EventEmitter {
       apiToken: config.apiToken || process.env.DERIV_API_TOKEN,
       appId: config.appId || process.env.DERIV_APP_ID || '1089',
       wsUrl: config.wsUrl || process.env.DERIV_WS_URL || `wss://ws.deriv.com/websockets/v3?app_id=${this.appId}`,
+      connectionTimeout: parseInt(config.connectionTimeout || process.env.DERIV_CONNECTION_TIMEOUT || 30000),
       reconnectBaseDelay: parseInt(config.reconnectBaseDelay || process.env.DERIV_RECONNECT_DELAY || 2000),
       maxReconnectDelay: parseInt(config.maxReconnectDelay || process.env.DERIV_MAX_RECONNECT_DELAY || 30000),
       maxRetries: parseInt(config.maxRetries || process.env.DERIV_MAX_RETRIES || 3),
@@ -314,6 +314,8 @@ class DerivBroker extends EventEmitter {
     this._setState(STATE.CONNECTING);
     this._closeSocket();
 
+    logger.info(`[DerivBroker] Connecting to ${this.config.wsUrl}`);
+
     return new Promise((resolve, reject) => {
       const attemptConnect = async (attempt = 0) => {
         if (this._state === STATE.RECONNECTING) {
@@ -358,23 +360,26 @@ class DerivBroker extends EventEmitter {
           });
 
           socket.on('message', (data) => this._handleMessage(data));
-          socket.on('error', (err) => logger.error('[DerivBroker] WebSocket error:', err.message));
-          socket.on('close', () => {
-            logger.info('[DerivBroker] WebSocket closed.');
+          socket.on('error', (err) => {
+            logger.error('[DerivBroker] WebSocket error:', err.message);
+            // Don't immediately reconnect; let 'close' handle it.
+          });
+          socket.on('close', (code, reason) => {
+            logger.info(`[DerivBroker] WebSocket closed. Code: ${code}, Reason: ${reason || 'No reason'}`);
             if (this._state === STATE.READY || this._state === STATE.CONNECTED) {
               this._setState(STATE.RECONNECTING);
               this._scheduleReconnect(0);
             }
           });
 
-          // Timeout
+          // Connection timeout - now configurable
           const timeout = setTimeout(() => {
             if (this._state !== STATE.CONNECTED) {
-              logger.error('[DerivBroker] Connection timeout.');
+              logger.error(`[DerivBroker] Connection timeout after ${this.config.connectionTimeout}ms`);
               this._closeSocket();
-              reject(new Error('Connection timeout'));
+              reject(new Error(`Connection timeout (${this.config.connectionTimeout}ms)`));
             }
-          }, 10000);
+          }, this.config.connectionTimeout);
           this.once('connected', () => clearTimeout(timeout));
         } catch (err) {
           this._setState(STATE.FAILED);
@@ -1031,11 +1036,11 @@ class DerivBroker extends EventEmitter {
 }
 
 // ---------- Singleton Export ----------
-// Create a single instance using environment variables
 const brokerInstance = new DerivBroker({
   apiToken: process.env.DERIV_API_TOKEN,
   appId: process.env.DERIV_APP_ID,
   wsUrl: process.env.DERIV_WS_URL,
+  connectionTimeout: parseInt(process.env.DERIV_CONNECTION_TIMEOUT) || 30000,
   reconnectBaseDelay: parseInt(process.env.DERIV_RECONNECT_DELAY) || 2000,
   maxReconnectDelay: parseInt(process.env.DERIV_MAX_RECONNECT_DELAY) || 30000,
   maxRetries: parseInt(process.env.DERIV_MAX_RETRIES) || 3,
