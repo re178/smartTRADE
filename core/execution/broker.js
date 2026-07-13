@@ -1,10 +1,10 @@
-// src/core/execution/broker.js – Final fixed version (no subscribe in getPrices)
+// src/core/execution/broker.js – Full production version with getAccount fixed
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
 const { sleep } = require('../../shared/helpers');
 const logger = require('../../infrastructure/logger') || console;
-const Order = require('../../models/Order');
+const Order = require('../../../models/Order');
 
 EventEmitter.defaultMaxListeners = 20;
 
@@ -788,7 +788,7 @@ class DerivBroker extends EventEmitter {
     this.emit('orderUpdate', { clientOrderId, status, contractId });
   }
 
-  // ---------- Position Reconciliation (fixed) ----------
+  // ---------- Position Reconciliation ----------
   async _reconcilePositions() {
     logger.info('[DerivBroker] Reconciling positions...');
     try {
@@ -866,8 +866,9 @@ class DerivBroker extends EventEmitter {
   // ---------- Public API ----------
   async getAccount() {
     await this._ensureReady();
-    const response = await this._sendRequest({ account: 1 });
-    const acc = response.account;
+    // FIXED: use "get_account" instead of "account"
+    const response = await this._sendRequest({ get_account: 1 });
+    const acc = response.get_account;
     return {
       id: acc.account_id || acc.loginid,
       balance: acc.balance || '0',
@@ -879,7 +880,6 @@ class DerivBroker extends EventEmitter {
     };
   }
 
-  // ** FIX: Removed "subscribe: 0" **
   async getPrices(instruments) {
     await this._ensureReady();
     const results = [];
@@ -895,7 +895,7 @@ class DerivBroker extends EventEmitter {
         });
         continue;
       }
-      // Removed subscribe parameter to avoid validation error
+      // No "subscribe" parameter to avoid validation error
       const response = await this._sendRequest({ ticks: symbol });
       const tick = response.tick;
       let bid, ask;
