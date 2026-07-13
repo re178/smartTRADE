@@ -1,4 +1,4 @@
-// src/core/execution/broker.js – Debug version with logging around startup steps
+// src/core/execution/broker.js – Fixed: symbol loading with timeout and fallback
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -56,6 +56,31 @@ function fromDerivSymbol(symbol, reverseMap) {
   }
   return symbol;
 }
+
+// ---------- Hardcoded fallback symbols (if API fails) ----------
+const FALLBACK_SYMBOLS = {
+  'EUR_USD': 'frxEURUSD',
+  'GBP_USD': 'frxGBPUSD',
+  'USD_JPY': 'frxUSDJPY',
+  'AUD_USD': 'frxAUDUSD',
+  'USD_CAD': 'frxUSDCAD',
+  'USD_CHF': 'frxUSDCHF',
+  'NZD_USD': 'frxNZDUSD',
+  'EUR_GBP': 'frxEURGBP',
+  'EUR_JPY': 'frxEURJPY',
+  'GBP_JPY': 'frxGBPJPY',
+  'AUD_JPY': 'frxAUDJPY',
+  'CAD_JPY': 'frxCADJPY',
+  'CHF_JPY': 'frxCHFJPY',
+  'EUR_AUD': 'frxEURAUD',
+  'EUR_CAD': 'frxEURCAD',
+  'GBP_AUD': 'frxGBPAUD',
+  'GBP_CAD': 'frxGBPCAD',
+  'NZD_JPY': 'frxNZDJPY',
+  'AUD_CAD': 'frxAUDCAD',
+  'AUD_CHF': 'frxAUDCHF',
+  'CAD_CHF': 'frxCADCHF',
+};
 
 // ---------- Rate Limiter ----------
 class RateLimiter {
@@ -214,7 +239,7 @@ class DerivBroker extends EventEmitter {
       apiToken: config.apiToken || process.env.DERIV_API_TOKEN,
       appId: appId,
       wsUrl: config.wsUrl || process.env.DERIV_WS_URL || `wss://ws.derivws.com/websockets/v3?app_id=${appId}`,
-      connectionTimeout: parseInt(config.connectionTimeout || process.env.DERIV_CONNECTION_TIMEOUT || 15000),
+      connectionTimeout: parseInt(config.connectionTimeout || process.env.DERIV_CONNECTION_TIMEOUT || 30000),
       reconnectBaseDelay: parseInt(config.reconnectBaseDelay || process.env.DERIV_RECONNECT_DELAY || 2000),
       maxReconnectDelay: parseInt(config.maxReconnectDelay || process.env.DERIV_MAX_RECONNECT_DELAY || 10000),
       maxRetries: parseInt(config.maxRetries || process.env.DERIV_MAX_RETRIES || 2),
@@ -231,7 +256,8 @@ class DerivBroker extends EventEmitter {
       duration: config.duration || null,
       riskValidator: config.riskValidator || null,
       fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || 3),
-      readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 15000),
+      readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 30000),
+      symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 10000),
     };
 
     this.validateConfig();
@@ -250,9 +276,17 @@ class DerivBroker extends EventEmitter {
     this._cbFailureCount = 0;
     this._cbOpenedAt = null;
 
-    this.symbolMap = {};
+    // Initialize with fallback symbols
+    this.symbolMap = { ...FALLBACK_SYMBOLS };
     this.reverseMap = {};
+    for (const [key, val] of Object.entries(FALLBACK_SYMBOLS)) {
+      this.reverseMap[val] = key;
+    }
     this.spreadMap = {};
+    for (const key of Object.keys(FALLBACK_SYMBOLS)) {
+      this.spreadMap[FALLBACK_SYMBOLS[key]] = 0.0001; // default spread
+    }
+    logger.info(`[DerivBroker] Using fallback symbols (${Object.keys(this.symbolMap).length} pairs).`);
 
     this._orders = new Map();
     this._orderMap = new Map();
@@ -272,7 +306,7 @@ class DerivBroker extends EventEmitter {
     };
 
     this.capabilities = { ...BROKER_CAPABILITIES };
-    this.orderBuilder = null;
+    this.orderBuilder = new DerivOrderBuilder(this);
     this._session = { isOpen: true, accountEnabled: true, marginSufficient: true, lastCheck: null };
     this.metadata = { name: 'Deriv', version: '1.0.0' };
     this._authFailCount = 0;
@@ -338,28 +372,26 @@ class DerivBroker extends EventEmitter {
             this.metrics.connectedSince = Date.now();
             this._startHeartbeat();
 
-            // Send authorize WITHOUT req_id
             this._authorize()
               .then(async () => {
                 logger.info('[DerivBroker] Authorized.');
                 this._authFailCount = 0;
                 this._setState(STATE.AUTHENTICATING);
 
-                // ---- Debug logs for each step ----
-                logger.info('[DerivBroker] Startup: Loading symbols...');
+                logger.info('[DerivBroker] Startup: Loading symbols (with timeout)...');
                 try {
-                  await this._loadSymbols();
+                  await this._loadSymbolsWithTimeout();
                   logger.info('[DerivBroker] Startup: Symbols loaded.');
                 } catch (err) {
-                  logger.error('[DerivBroker] Startup: Symbols loading failed:', err.message);
-                  throw err;
+                  logger.warn('[DerivBroker] Startup: Symbol loading failed, using fallback:', err.message);
+                  // Use fallback already set in constructor
                 }
 
-                // Set READY early so dashboard can start
+                // Mark READY immediately after symbols (or fallback)
                 this._setState(STATE.READY);
                 logger.info('[DerivBroker] Startup: Broker READY (early).');
 
-                // Fire and forget background tasks (do not await)
+                // Background tasks
                 setImmediate(() => {
                   logger.info('[DerivBroker] Startup: Restoring subscriptions (background)...');
                   this.streaming.restoreSubscriptions();
@@ -408,7 +440,6 @@ class DerivBroker extends EventEmitter {
             }
           });
 
-          // Timeout for this connection attempt
           const timeout = setTimeout(() => {
             if (this._state !== STATE.READY && this._state !== STATE.CONNECTED) {
               logger.error('[DerivBroker] Connection attempt timed out.');
@@ -434,7 +465,6 @@ class DerivBroker extends EventEmitter {
     this.emit('stateChange', { from: old, to: newState });
   }
 
-  // Authorize WITHOUT req_id
   _authorize() {
     return new Promise((resolve, reject) => {
       const payload = { authorize: this.config.apiToken };
@@ -459,7 +489,6 @@ class DerivBroker extends EventEmitter {
 
       this._socket.once('message', handler);
       this._sendRaw(payload);
-      // also handle timeout
       const timeoutHandler = setTimeout(() => {
         this._socket.removeListener('message', handler);
         reject(new Error('Authorize timeout'));
@@ -468,7 +497,7 @@ class DerivBroker extends EventEmitter {
     });
   }
 
-  // ---------- Reconnection (simplified) ----------
+  // ---------- Reconnection ----------
   _getReconnectDelay(attempt) {
     const base = this.config.reconnectBaseDelay;
     const max = this.config.maxReconnectDelay;
@@ -599,7 +628,7 @@ class DerivBroker extends EventEmitter {
       throw new Error('Broker in FATAL state.');
     }
     if (this._state !== STATE.READY) {
-      await this._ensureReady(); // wait for READY (with timeout)
+      await this._ensureReady();
     }
     if (!this._isRequestAllowed()) throw new Error('Circuit breaker is OPEN');
 
@@ -669,26 +698,47 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // ---------- Symbol Loading (with extra logging) ----------
+  // ---------- Symbol Loading with Timeout ----------
+  async _loadSymbolsWithTimeout() {
+    // Try with a timeout
+    return Promise.race([
+      this._loadSymbols(),
+      sleep(this.config.symbolTimeout).then(() => {
+        throw new Error(`Symbol loading timed out after ${this.config.symbolTimeout}ms`);
+      })
+    ]);
+  }
+
   async _loadSymbols() {
     logger.info('[DerivBroker] Fetching active symbols...');
-    // Try with "brief" as per API docs
-    const response = await this._sendRequest({ active_symbols: 'brief' }, 15000);
-    logger.info('[DerivBroker] Symbols response received:', Object.keys(response));
-    const symbols = response.active_symbols || [];
-    if (symbols.length === 0) {
-      logger.warn('[DerivBroker] No symbols returned. Trying "all" ...');
-      const fallback = await this._sendRequest({ active_symbols: 'all' }, 15000);
-      const fallbackSymbols = fallback.active_symbols || [];
-      if (fallbackSymbols.length === 0) {
-        throw new Error('No symbols returned from Deriv.');
+    try {
+      // Try 'brief' first
+      const response = await this._sendRequest({ active_symbols: 'brief' }, 10000);
+      const symbols = response.active_symbols || [];
+      if (symbols.length > 0) {
+        this._buildSymbolMaps(symbols);
+        logger.info(`[DerivBroker] Loaded ${symbols.length} symbols (brief).`);
+        return;
       }
-      logger.info(`[DerivBroker] Loaded ${fallbackSymbols.length} symbols (fallback).`);
-      this._buildSymbolMaps(fallbackSymbols);
-      return;
+    } catch (err) {
+      logger.warn('[DerivBroker] Brief symbol request failed:', err.message);
     }
-    logger.info(`[DerivBroker] Loaded ${symbols.length} symbols.`);
-    this._buildSymbolMaps(symbols);
+
+    // Fallback to 'all'
+    try {
+      const response = await this._sendRequest({ active_symbols: 'all' }, 10000);
+      const symbols = response.active_symbols || [];
+      if (symbols.length > 0) {
+        this._buildSymbolMaps(symbols);
+        logger.info(`[DerivBroker] Loaded ${symbols.length} symbols (all).`);
+        return;
+      }
+    } catch (err) {
+      logger.warn('[DerivBroker] All symbol request failed:', err.message);
+    }
+
+    // If we reach here, keep the fallback already set in constructor
+    logger.warn('[DerivBroker] Using fallback symbols.');
   }
 
   _buildSymbolMaps(symbols) {
@@ -705,7 +755,6 @@ class DerivBroker extends EventEmitter {
       }
     }
     logger.info(`[DerivBroker] Symbol map built: ${Object.keys(this.symbolMap).length} forex pairs.`);
-    this.orderBuilder = new DerivOrderBuilder(this);
   }
 
   // ---------- Order Persistence ----------
@@ -1074,7 +1123,7 @@ class DerivBroker extends EventEmitter {
 
     for (const [id, pending] of this._pendingRequests) {
       clearTimeout(pending.timeout);
-      pending.reject(new Error('Disconnected'));
+      if (pending.reject) pending.reject(new Error('Disconnected'));
       this._pendingRequests.delete(id);
     }
 
@@ -1100,7 +1149,7 @@ class DerivBroker extends EventEmitter {
     }
     for (const [id, pending] of this._pendingRequests) {
       clearTimeout(pending.timeout);
-      pending.reject(new Error('Connection closed'));
+      if (pending.reject) pending.reject(new Error('Connection closed'));
       this._pendingRequests.delete(id);
     }
     if (this._state !== STATE.DISCONNECTED && this._state !== STATE.FATAL) {
@@ -1108,7 +1157,6 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // ---------- Readiness Wait ----------
   _ensureReady() {
     if (this._state === STATE.READY) return Promise.resolve();
     if (this._state === STATE.FATAL) {
@@ -1144,7 +1192,7 @@ const brokerInstance = new DerivBroker({
   apiToken: process.env.DERIV_API_TOKEN,
   appId: process.env.DERIV_APP_ID,
   wsUrl: process.env.DERIV_WS_URL,
-  connectionTimeout: parseInt(process.env.DERIV_CONNECTION_TIMEOUT) || 15000,
+  connectionTimeout: parseInt(process.env.DERIV_CONNECTION_TIMEOUT) || 30000,
   reconnectBaseDelay: parseInt(process.env.DERIV_RECONNECT_DELAY) || 2000,
   maxReconnectDelay: parseInt(process.env.DERIV_MAX_RECONNECT_DELAY) || 10000,
   maxRetries: parseInt(process.env.DERIV_MAX_RETRIES) || 2,
@@ -1160,7 +1208,8 @@ const brokerInstance = new DerivBroker({
   leverage: parseFloat(process.env.DERIV_LEVERAGE) || 1,
   duration: process.env.DERIV_DURATION || null,
   fatalAfterAuthFailures: parseInt(process.env.DERIV_FATAL_AFTER_AUTH_FAILURES) || 3,
-  readinessTimeout: parseInt(process.env.DERIV_READINESS_TIMEOUT) || 15000,
+  readinessTimeout: parseInt(process.env.DERIV_READINESS_TIMEOUT) || 30000,
+  symbolTimeout: parseInt(process.env.DERIV_SYMBOL_TIMEOUT) || 10000,
 });
 
 module.exports = brokerInstance;
