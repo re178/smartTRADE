@@ -1,10 +1,10 @@
-// src/core/execution/broker.js – Optimised for Render Free Tier
+// src/core/execution/broker.js – Proper readiness waiting (no short timeout)
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
 const { sleep } = require('../../shared/helpers');
 const logger = require('../../infrastructure/logger') || console;
-const Order = require('../../models/Order');
+const Order = require('../../../models/Order');
 
 EventEmitter.defaultMaxListeners = 20;
 
@@ -212,7 +212,7 @@ class DerivBroker extends EventEmitter {
       apiToken: config.apiToken || process.env.DERIV_API_TOKEN,
       appId: appId,
       wsUrl: config.wsUrl || process.env.DERIV_WS_URL || `wss://ws.derivws.com/websockets/v3?app_id=${appId}`,
-      connectionTimeout: parseInt(config.connectionTimeout || process.env.DERIV_CONNECTION_TIMEOUT || 10000),
+      connectionTimeout: parseInt(config.connectionTimeout || process.env.DERIV_CONNECTION_TIMEOUT || 15000),
       reconnectBaseDelay: parseInt(config.reconnectBaseDelay || process.env.DERIV_RECONNECT_DELAY || 2000),
       maxReconnectDelay: parseInt(config.maxReconnectDelay || process.env.DERIV_MAX_RECONNECT_DELAY || 10000),
       maxRetries: parseInt(config.maxRetries || process.env.DERIV_MAX_RETRIES || 2),
@@ -229,6 +229,7 @@ class DerivBroker extends EventEmitter {
       duration: config.duration || null,
       riskValidator: config.riskValidator || null,
       fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || 3),
+      readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 15000),
     };
 
     this.validateConfig();
@@ -335,7 +336,7 @@ class DerivBroker extends EventEmitter {
             this.metrics.connectedSince = Date.now();
             this._startHeartbeat();
 
-            // Send authorize WITHOUT req_id (to avoid validation issues)
+            // Send authorize WITHOUT req_id
             this._authorize()
               .then(async () => {
                 logger.info('[DerivBroker] Authorized.');
@@ -348,6 +349,7 @@ class DerivBroker extends EventEmitter {
                 this._resetCircuitBreaker();
                 await this._reconcilePositions();
                 await this._loadPendingOrders();
+                this.emit('ready'); // Emit ready event
                 this.emit('connected');
                 resolve();
               })
@@ -363,7 +365,6 @@ class DerivBroker extends EventEmitter {
                 }
                 this._setState(STATE.FAILED);
                 this._closeSocket();
-                // Retry after delay
                 setTimeout(() => attemptConnect(), this.config.reconnectBaseDelay);
               });
           });
@@ -424,16 +425,14 @@ class DerivBroker extends EventEmitter {
             clearTimeout(timeout);
             resolve(msg);
           }
-          // If it's not an authorize response, ignore.
         } catch (err) {
           // ignore
         }
       };
 
       this._socket.once('message', handler);
-      // Send the message
       this._sendRaw(payload);
-      // Also handle timeout
+      // also handle timeout
       const timeoutHandler = setTimeout(() => {
         this._socket.removeListener('message', handler);
         reject(new Error('Authorize timeout'));
@@ -500,7 +499,6 @@ class DerivBroker extends EventEmitter {
     try {
       const msg = JSON.parse(rawData);
 
-      // Check for response to a pending request (with req_id integer)
       if (msg.req_id && this._pendingRequests.has(msg.req_id)) {
         const pending = this._pendingRequests.get(msg.req_id);
         clearTimeout(pending.timeout);
@@ -521,24 +519,19 @@ class DerivBroker extends EventEmitter {
         return;
       }
 
-      // Heartbeat response
       if (msg.pong) {
         this.metrics.lastHeartbeat = Date.now();
         return;
       }
 
-      // Tick updates
       if (msg.msg_type === 'tick' && msg.tick) {
         this.streaming.handleTick(msg.tick);
         return;
       }
 
-      // Order responses
       if (msg.buy || msg.sell) {
         this._handleOrderResponse(msg);
       }
-
-      // Other messages (subscription confirmations, etc.) are handled via req_id
     } catch (err) {
       logger.error('[DerivBroker] Error parsing WebSocket message:', err.message);
     }
@@ -579,11 +572,7 @@ class DerivBroker extends EventEmitter {
       throw new Error('Broker in FATAL state.');
     }
     if (this._state !== STATE.READY) {
-      try {
-        await this._ensureReady();
-      } catch (err) {
-        throw new Error(`Broker not ready: ${err.message}`);
-      }
+      await this._ensureReady(); // this will wait for READY with proper timeout
     }
     if (!this._isRequestAllowed()) throw new Error('Circuit breaker is OPEN');
 
@@ -1069,16 +1058,36 @@ class DerivBroker extends EventEmitter {
     }
   }
 
+  // ---------- Readiness Wait (fixed) ----------
   _ensureReady() {
     if (this._state === STATE.READY) return Promise.resolve();
     if (this._state === STATE.FATAL) {
       return Promise.reject(new Error('Broker in FATAL state.'));
     }
-    // Fast fail if not ready within 2 seconds
-    return Promise.race([
-      this.connect(),
-      sleep(2000).then(() => { throw new Error('Broker connect timeout (2s)'); })
-    ]);
+
+    // Wait for the 'ready' event or timeout
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.removeListener('ready', onReady);
+        reject(new Error(`Broker did not become ready within ${this.config.readinessTimeout}ms`));
+      }, this.config.readinessTimeout);
+
+      const onReady = () => {
+        clearTimeout(timeout);
+        resolve();
+      };
+
+      this.once('ready', onReady);
+
+      // If connection hasn't started, start it
+      if (this._state === STATE.DISCONNECTED || this._state === STATE.CONNECTING) {
+        this.connect().catch((err) => {
+          clearTimeout(timeout);
+          this.removeListener('ready', onReady);
+          reject(err);
+        });
+      }
+    });
   }
 }
 
@@ -1087,7 +1096,7 @@ const brokerInstance = new DerivBroker({
   apiToken: process.env.DERIV_API_TOKEN,
   appId: process.env.DERIV_APP_ID,
   wsUrl: process.env.DERIV_WS_URL,
-  connectionTimeout: parseInt(process.env.DERIV_CONNECTION_TIMEOUT) || 10000,
+  connectionTimeout: parseInt(process.env.DERIV_CONNECTION_TIMEOUT) || 15000,
   reconnectBaseDelay: parseInt(process.env.DERIV_RECONNECT_DELAY) || 2000,
   maxReconnectDelay: parseInt(process.env.DERIV_MAX_RECONNECT_DELAY) || 10000,
   maxRetries: parseInt(process.env.DERIV_MAX_RETRIES) || 2,
@@ -1103,6 +1112,7 @@ const brokerInstance = new DerivBroker({
   leverage: parseFloat(process.env.DERIV_LEVERAGE) || 1,
   duration: process.env.DERIV_DURATION || null,
   fatalAfterAuthFailures: parseInt(process.env.DERIV_FATAL_AFTER_AUTH_FAILURES) || 3,
+  readinessTimeout: parseInt(process.env.DERIV_READINESS_TIMEOUT) || 15000,
 });
 
 module.exports = brokerInstance;
