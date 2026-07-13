@@ -1,10 +1,10 @@
-// src/core/execution/broker.js – Deriv WebSocket Driver (with extended timeout and debug logs)
+// src/core/execution/broker.js – Deriv WebSocket Driver (with corrected URL)
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
 const { sleep } = require('../../shared/helpers');
 const logger = require('../../infrastructure/logger') || console;
-const Order = require('../../models/Order');
+const Order = require('../../../models/Order');
 
 // ---------- Constants ----------
 const STATE = {
@@ -201,11 +201,11 @@ const BROKER_CAPABILITIES = {
 class DerivBroker extends EventEmitter {
   constructor(config = {}) {
     super();
-    // Configuration
+    // Configuration – default WebSocket URL now uses ws.derivws.com
     this.config = {
       apiToken: config.apiToken || process.env.DERIV_API_TOKEN,
       appId: config.appId || process.env.DERIV_APP_ID || '1089',
-      wsUrl: config.wsUrl || process.env.DERIV_WS_URL || `wss://ws.deriv.com/websockets/v3?app_id=${this.appId}`,
+      wsUrl: config.wsUrl || process.env.DERIV_WS_URL || `wss://ws.derivws.com/websockets/v3?app_id=${this.config.appId || '1089'}`,
       connectionTimeout: parseInt(config.connectionTimeout || process.env.DERIV_CONNECTION_TIMEOUT || 30000),
       reconnectBaseDelay: parseInt(config.reconnectBaseDelay || process.env.DERIV_RECONNECT_DELAY || 2000),
       maxReconnectDelay: parseInt(config.maxReconnectDelay || process.env.DERIV_MAX_RECONNECT_DELAY || 30000),
@@ -372,7 +372,7 @@ class DerivBroker extends EventEmitter {
             }
           });
 
-          // Connection timeout - now configurable
+          // Connection timeout
           const timeout = setTimeout(() => {
             if (this._state !== STATE.CONNECTED) {
               logger.error(`[DerivBroker] Connection timeout after ${this.config.connectionTimeout}ms`);
@@ -1039,7 +1039,7 @@ class DerivBroker extends EventEmitter {
 const brokerInstance = new DerivBroker({
   apiToken: process.env.DERIV_API_TOKEN,
   appId: process.env.DERIV_APP_ID,
-  wsUrl: process.env.DERIV_WS_URL,
+  wsUrl: process.env.DERIV_WS_URL, // allow override
   connectionTimeout: parseInt(process.env.DERIV_CONNECTION_TIMEOUT) || 30000,
   reconnectBaseDelay: parseInt(process.env.DERIV_RECONNECT_DELAY) || 2000,
   maxReconnectDelay: parseInt(process.env.DERIV_MAX_RECONNECT_DELAY) || 30000,
