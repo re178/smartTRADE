@@ -1,10 +1,13 @@
-// src/core/execution/broker.js – Deriv WebSocket Driver (Final, req_id as integer)
+// src/core/execution/broker.js – with debug logging and skipReqId for authorize
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
 const { sleep } = require('../../shared/helpers');
 const logger = require('../../infrastructure/logger') || console;
-const Order = require('../../models/Order');
+const Order = require('../../../models/Order');
+
+// Set log level to debug temporarily (or set LOG_LEVEL=debug in env)
+// If your logger supports levels, you can enable debug output.
 
 EventEmitter.defaultMaxListeners = 20;
 
@@ -34,9 +37,8 @@ const CB_STATE = { CLOSED: 'CLOSED', OPEN: 'OPEN', HALF_OPEN: 'HALF_OPEN' };
 // --- Helpers ---
 let _requestCounter = 0;
 
-// DERIV EXPECTS req_id AS AN INTEGER – NOT A STRING
 function generateRequestId() {
-  return ++_requestCounter; // returns 1, 2, 3, ...
+  return ++_requestCounter; // integer: 1, 2, 3, ...
 }
 
 function generateClientOrderId() {
@@ -207,10 +209,8 @@ class DerivBroker extends EventEmitter {
   constructor(config = {}) {
     super();
 
-    // Safely extract appId before using it in wsUrl
     const appId = config.appId || process.env.DERIV_APP_ID || '1089';
 
-    // Now build config
     this.config = {
       apiToken: config.apiToken || process.env.DERIV_API_TOKEN,
       appId: appId,
@@ -331,7 +331,8 @@ class DerivBroker extends EventEmitter {
             this.metrics.connectedSince = Date.now();
             if (attempt > 0) this.metrics.reconnections++;
             this._startHeartbeat();
-            // Authorize with integer req_id
+
+            // Authorize – we try WITHOUT req_id (some endpoints don't accept it)
             this._authorize()
               .then(async () => {
                 logger.info('[DerivBroker] Authorized.');
@@ -364,7 +365,13 @@ class DerivBroker extends EventEmitter {
               });
           });
 
-          socket.on('message', (data) => this._handleMessage(data));
+          // **NEW: log every incoming message raw**
+          socket.on('message', (data) => {
+            const raw = data.toString();
+            logger.debug(`[DerivBroker] RAW INCOMING: ${raw}`);
+            this._handleMessage(data);
+          });
+
           socket.on('error', (err) => {
             logger.error('[DerivBroker] WebSocket error:', err.message);
           });
@@ -376,7 +383,6 @@ class DerivBroker extends EventEmitter {
             }
           });
 
-          // Timeout – check socket readyState instead of state
           const timeout = setTimeout(() => {
             if (!this._socket || this._socket.readyState !== WebSocket.OPEN) {
               logger.error(`[DerivBroker] Connection timeout after ${this.config.connectionTimeout}ms`);
@@ -401,9 +407,10 @@ class DerivBroker extends EventEmitter {
     this.emit('stateChange', { from: old, to: newState });
   }
 
+  // **MODIFIED: authorize WITHOUT req_id**
   _authorize() {
-    // Uses normal _sendRequest with integer req_id
-    return this._sendRequest({ authorize: this.config.apiToken }, 10000);
+    // Send { authorize: token } – no req_id
+    return this._sendRawRequest({ authorize: this.config.apiToken }, 10000, null, true);
   }
 
   // ---------- Reconnection ----------
@@ -474,8 +481,9 @@ class DerivBroker extends EventEmitter {
   _handleMessage(rawData) {
     try {
       const msg = JSON.parse(rawData);
+      logger.debug(`[DerivBroker] Parsed message: ${JSON.stringify(msg)}`);
 
-      // Response to a request with req_id (integer)
+      // Check if this is a response to a pending request
       if (msg.req_id && this._pendingRequests.has(msg.req_id)) {
         const pending = this._pendingRequests.get(msg.req_id);
         clearTimeout(pending.timeout);
@@ -496,21 +504,42 @@ class DerivBroker extends EventEmitter {
         return;
       }
 
+      // If we have no req_id, it might be the authorize response (since we sent without req_id)
+      // Check if it has 'authorize' or 'error' fields
+      if (msg.authorize !== undefined || msg.error) {
+        // This is the authorize response – we need to resolve the promise stored in the pending map
+        // We stored a special key '_authorize' in the pending map
+        const pending = this._pendingRequests.get('_authorize');
+        if (pending) {
+          clearTimeout(pending.timeout);
+          this._pendingRequests.delete('_authorize');
+          if (msg.error) {
+            pending.reject(new Error(`Deriv API error: ${msg.error.code} - ${msg.error.message}`));
+          } else {
+            pending.resolve(msg);
+          }
+        }
+        return;
+      }
+
+      // Heartbeat response
       if (msg.pong) {
         this.metrics.lastHeartbeat = Date.now();
         return;
       }
 
+      // Tick updates
       if (msg.msg_type === 'tick' && msg.tick) {
         this.streaming.handleTick(msg.tick);
         return;
       }
 
+      // Order responses
       if (msg.buy || msg.sell) {
         this._handleOrderResponse(msg);
       }
 
-      // Other messages (e.g., subscription confirmations) are handled via req_id
+      // Other subscription confirmations are handled via req_id
     } catch (err) {
       logger.error('[DerivBroker] Error parsing WebSocket message:', err.message);
     }
@@ -539,7 +568,9 @@ class DerivBroker extends EventEmitter {
       return;
     }
     try {
-      this._socket.send(JSON.stringify(payload));
+      const msgString = JSON.stringify(payload);
+      logger.debug(`[DerivBroker] Sending raw: ${msgString}`);
+      this._socket.send(msgString);
     } catch (err) {
       logger.error('[DerivBroker] Send error:', err.message);
       this._scheduleReconnect(0);
@@ -585,32 +616,64 @@ class DerivBroker extends EventEmitter {
     throw lastError;
   }
 
-  _sendRawRequest(payload, timeoutMs = 15000, signal = null) {
+  /**
+   * Send raw request with optional skipReqId flag.
+   * If skipReqId is true, no req_id is added; the response is handled via a special '_authorize' key.
+   */
+  _sendRawRequest(payload, timeoutMs = 15000, signal = null, skipReqId = false) {
     return new Promise((resolve, reject) => {
-      const reqId = generateRequestId(); // now returns an integer
-      const msg = { ...payload, req_id: reqId };
+      let reqId = null;
+      let msg = payload;
+
+      if (!skipReqId) {
+        reqId = generateRequestId(); // integer
+        msg = { ...payload, req_id: reqId };
+      }
+
       const timeout = setTimeout(() => {
-        if (this._pendingRequests.has(reqId)) {
+        if (reqId && this._pendingRequests.has(reqId)) {
           this._pendingRequests.delete(reqId);
+          reject(new Error(`Request timed out (${timeoutMs}ms)`));
+        } else if (skipReqId && this._pendingRequests.has('_authorize')) {
+          this._pendingRequests.delete('_authorize');
           reject(new Error(`Request timed out (${timeoutMs}ms)`));
         }
       }, timeoutMs);
+
       const onCancel = () => {
         clearTimeout(timeout);
-        if (this._pendingRequests.has(reqId)) {
+        if (reqId && this._pendingRequests.has(reqId)) {
           this._pendingRequests.delete(reqId);
+          reject(new Error('Request cancelled'));
+        } else if (skipReqId && this._pendingRequests.has('_authorize')) {
+          this._pendingRequests.delete('_authorize');
           reject(new Error('Request cancelled'));
         }
       };
+
       if (signal) signal.addEventListener('abort', onCancel, { once: true });
-      this._pendingRequests.set(reqId, {
-        resolve,
-        reject,
-        timeout,
-        sentAt: Date.now(),
-        cancel: onCancel,
-        signal,
-      });
+
+      if (reqId) {
+        this._pendingRequests.set(reqId, {
+          resolve,
+          reject,
+          timeout,
+          sentAt: Date.now(),
+          cancel: onCancel,
+          signal,
+        });
+      } else {
+        // For skipReqId, store under '_authorize'
+        this._pendingRequests.set('_authorize', {
+          resolve,
+          reject,
+          timeout,
+          sentAt: Date.now(),
+          cancel: onCancel,
+          signal,
+        });
+      }
+
       logger.debug(`[DerivBroker] Sending: ${JSON.stringify(msg)}`);
       this._sendRaw(msg);
     });
