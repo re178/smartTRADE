@@ -1,4 +1,4 @@
-// src/core/execution/broker.js – Proper readiness waiting (no short timeout)
+// src/core/execution/broker.js – Debug version with logging around startup steps
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -57,7 +57,7 @@ function fromDerivSymbol(symbol, reverseMap) {
   return symbol;
 }
 
-// ---------- Rate Limiter (kept minimal) ----------
+// ---------- Rate Limiter ----------
 class RateLimiter {
   constructor(rate, capacity) {
     this.rate = rate;
@@ -81,7 +81,7 @@ class RateLimiter {
   }
 }
 
-// ---------- Streaming Manager (simplified) ----------
+// ---------- Streaming Manager ----------
 class StreamingManager {
   constructor(broker) {
     this.broker = broker;
@@ -120,6 +120,7 @@ class StreamingManager {
   }
 
   restoreSubscriptions() {
+    logger.info('[Streaming] Restoring subscriptions...');
     for (const [key, sub] of this._subscriptions) {
       this.broker._sendRequest({ [sub.type]: sub.symbol, subscribe: 1 })
         .then((response) => {
@@ -133,6 +134,7 @@ class StreamingManager {
         })
         .catch((err) => logger.error(`[Streaming] Failed to restore ${key}:`, err.message));
     }
+    logger.info('[Streaming] Subscriptions restored.');
   }
 
   handleTick(tick) {
@@ -342,14 +344,39 @@ class DerivBroker extends EventEmitter {
                 logger.info('[DerivBroker] Authorized.');
                 this._authFailCount = 0;
                 this._setState(STATE.AUTHENTICATING);
-                await this._loadSymbols();
+
+                // ---- Debug logs for each step ----
+                logger.info('[DerivBroker] Startup: Loading symbols...');
+                try {
+                  await this._loadSymbols();
+                  logger.info('[DerivBroker] Startup: Symbols loaded.');
+                } catch (err) {
+                  logger.error('[DerivBroker] Startup: Symbols loading failed:', err.message);
+                  throw err;
+                }
+
+                // Set READY early so dashboard can start
                 this._setState(STATE.READY);
-                this.streaming.restoreSubscriptions();
-                this._flushQueue();
-                this._resetCircuitBreaker();
-                await this._reconcilePositions();
-                await this._loadPendingOrders();
-                this.emit('ready'); // Emit ready event
+                logger.info('[DerivBroker] Startup: Broker READY (early).');
+
+                // Fire and forget background tasks (do not await)
+                setImmediate(() => {
+                  logger.info('[DerivBroker] Startup: Restoring subscriptions (background)...');
+                  this.streaming.restoreSubscriptions();
+                  logger.info('[DerivBroker] Startup: Subscriptions restored.');
+
+                  logger.info('[DerivBroker] Startup: Reconciling positions (background)...');
+                  this._reconcilePositions()
+                    .then(() => logger.info('[DerivBroker] Startup: Positions reconciled.'))
+                    .catch((err) => logger.error('[DerivBroker] Startup: Position reconciliation error:', err.message));
+
+                  logger.info('[DerivBroker] Startup: Loading pending orders (background)...');
+                  this._loadPendingOrders()
+                    .then(() => logger.info('[DerivBroker] Startup: Pending orders loaded.'))
+                    .catch((err) => logger.error('[DerivBroker] Startup: Pending orders loading error:', err.message));
+                });
+
+                this.emit('ready');
                 this.emit('connected');
                 resolve();
               })
@@ -572,7 +599,7 @@ class DerivBroker extends EventEmitter {
       throw new Error('Broker in FATAL state.');
     }
     if (this._state !== STATE.READY) {
-      await this._ensureReady(); // this will wait for READY with proper timeout
+      await this._ensureReady(); // wait for READY (with timeout)
     }
     if (!this._isRequestAllowed()) throw new Error('Circuit breaker is OPEN');
 
@@ -642,10 +669,29 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // ---------- Symbol Loading ----------
+  // ---------- Symbol Loading (with extra logging) ----------
   async _loadSymbols() {
-    const response = await this._sendRequest({ active_symbols: 'all' }, 15000);
+    logger.info('[DerivBroker] Fetching active symbols...');
+    // Try with "brief" as per API docs
+    const response = await this._sendRequest({ active_symbols: 'brief' }, 15000);
+    logger.info('[DerivBroker] Symbols response received:', Object.keys(response));
     const symbols = response.active_symbols || [];
+    if (symbols.length === 0) {
+      logger.warn('[DerivBroker] No symbols returned. Trying "all" ...');
+      const fallback = await this._sendRequest({ active_symbols: 'all' }, 15000);
+      const fallbackSymbols = fallback.active_symbols || [];
+      if (fallbackSymbols.length === 0) {
+        throw new Error('No symbols returned from Deriv.');
+      }
+      logger.info(`[DerivBroker] Loaded ${fallbackSymbols.length} symbols (fallback).`);
+      this._buildSymbolMaps(fallbackSymbols);
+      return;
+    }
+    logger.info(`[DerivBroker] Loaded ${symbols.length} symbols.`);
+    this._buildSymbolMaps(symbols);
+  }
+
+  _buildSymbolMaps(symbols) {
     for (const sym of symbols) {
       const derivSymbol = sym.symbol;
       const display = sym.display_name || '';
@@ -658,12 +704,13 @@ class DerivBroker extends EventEmitter {
         this.spreadMap[derivSymbol] = pip * 0.5;
       }
     }
-    logger.info(`[DerivBroker] Loaded ${Object.keys(this.symbolMap).length} symbols.`);
+    logger.info(`[DerivBroker] Symbol map built: ${Object.keys(this.symbolMap).length} forex pairs.`);
     this.orderBuilder = new DerivOrderBuilder(this);
   }
 
   // ---------- Order Persistence ----------
   async _loadPendingOrders() {
+    logger.info('[DerivBroker] Loading pending orders from MongoDB...');
     const pendingOrders = await Order.find({ status: { $in: ['PENDING', 'ACCEPTED', 'EXECUTING'] } });
     for (const order of pendingOrders) {
       this._orders.set(order.clientOrderId, order);
@@ -672,6 +719,7 @@ class DerivBroker extends EventEmitter {
       }
       logger.info(`[DerivBroker] Loaded pending order ${order.clientOrderId} (${order.status})`);
     }
+    logger.info(`[DerivBroker] Loaded ${pendingOrders.length} pending orders.`);
   }
 
   async _updateOrderStatus(clientOrderId, status, contractId = null, txData = null) {
@@ -697,6 +745,7 @@ class DerivBroker extends EventEmitter {
 
   // ---------- Position Reconciliation ----------
   async _reconcilePositions() {
+    logger.info('[DerivBroker] Reconciling positions...');
     try {
       const brokerPositions = await this.getOpenTrades();
       const dbOrders = await Order.find({ status: ORDER_STATUS.FILLED });
@@ -738,6 +787,7 @@ class DerivBroker extends EventEmitter {
       logger.info('[Reconcile] Position reconciliation complete.');
     } catch (err) {
       logger.error('[Reconcile] Failed:', err.message);
+      throw err;
     }
   }
 
@@ -1058,14 +1108,13 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // ---------- Readiness Wait (fixed) ----------
+  // ---------- Readiness Wait ----------
   _ensureReady() {
     if (this._state === STATE.READY) return Promise.resolve();
     if (this._state === STATE.FATAL) {
       return Promise.reject(new Error('Broker in FATAL state.'));
     }
 
-    // Wait for the 'ready' event or timeout
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.removeListener('ready', onReady);
@@ -1079,7 +1128,6 @@ class DerivBroker extends EventEmitter {
 
       this.once('ready', onReady);
 
-      // If connection hasn't started, start it
       if (this._state === STATE.DISCONNECTED || this._state === STATE.CONNECTING) {
         this.connect().catch((err) => {
           clearTimeout(timeout);
