@@ -1,4 +1,4 @@
-// src/core/execution/broker.js – Fully patched, ready for production
+// src/core/execution/broker.js – Full production version with circuit breaker relaxed
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -248,8 +248,8 @@ class DerivBroker extends EventEmitter {
       maxReconnectDelay: parseInt(config.maxReconnectDelay || process.env.DERIV_MAX_RECONNECT_DELAY || 10000),
       maxRetries: parseInt(config.maxRetries || process.env.DERIV_MAX_RETRIES || 2),
       maxQueueSize: parseInt(config.maxQueueSize || process.env.DERIV_MAX_QUEUE_SIZE || 100),
-      circuitBreakerThreshold: parseInt(config.circuitBreakerThreshold || 3),
-      circuitBreakerTimeout: parseInt(config.circuitBreakerTimeout || 30000),
+      circuitBreakerThreshold: parseInt(config.circuitBreakerThreshold || process.env.DERIV_CIRCUIT_BREAKER_THRESHOLD || 20),
+      circuitBreakerTimeout: parseInt(config.circuitBreakerTimeout || process.env.DERIV_CIRCUIT_BREAKER_TIMEOUT || 60000),
       minOrderSize: parseFloat(config.minOrderSize || 0.01),
       maxOrderSize: parseFloat(config.maxOrderSize || 100),
       minStopDistance: parseFloat(config.minStopDistance || 0.0001),
@@ -793,7 +793,6 @@ class DerivBroker extends EventEmitter {
     logger.info('[DerivBroker] Reconciling positions...');
     try {
       const response = await this._sendRequest({ portfolio: 1 });
-      // The response contains a 'portfolio' array
       const brokerPositions = response.portfolio || [];
       if (!Array.isArray(brokerPositions)) {
         logger.warn('[Reconcile] Unexpected response format, expected array.');
@@ -1203,8 +1202,8 @@ const brokerInstance = new DerivBroker({
   maxReconnectDelay: parseInt(process.env.DERIV_MAX_RECONNECT_DELAY) || 10000,
   maxRetries: parseInt(process.env.DERIV_MAX_RETRIES) || 2,
   maxQueueSize: parseInt(process.env.DERIV_MAX_QUEUE_SIZE) || 100,
-  circuitBreakerThreshold: parseInt(process.env.DERIV_CIRCUIT_BREAKER_THRESHOLD) || 3,
-  circuitBreakerTimeout: parseInt(process.env.DERIV_CIRCUIT_BREAKER_TIMEOUT) || 30000,
+  circuitBreakerThreshold: parseInt(process.env.DERIV_CIRCUIT_BREAKER_THRESHOLD) || 20,
+  circuitBreakerTimeout: parseInt(process.env.DERIV_CIRCUIT_BREAKER_TIMEOUT) || 60000,
   minOrderSize: parseFloat(process.env.DERIV_MIN_ORDER_SIZE) || 0.01,
   maxOrderSize: parseFloat(process.env.DERIV_MAX_ORDER_SIZE) || 100,
   minStopDistance: parseFloat(process.env.DERIV_MIN_STOP_DISTANCE) || 0.0001,
