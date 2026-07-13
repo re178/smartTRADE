@@ -1,4 +1,4 @@
-// src/core/execution/broker.js – Final production version with all fixes
+// src/core/execution/broker.js – Final with account from authorize
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -150,7 +150,6 @@ class StreamingManager {
       return;
     }
     logger.info('[Streaming] Restoring subscriptions...');
-    // Clear all existing ticks subscriptions to avoid AlreadySubscribed
     this.broker._sendRequest({ forget_all: 'ticks' })
       .then(() => {
         for (const [key, sub] of this._subscriptions) {
@@ -284,7 +283,7 @@ class DerivBroker extends EventEmitter {
     this._cbFailureCount = 0;
     this._cbOpenedAt = null;
 
-    // Initialize with fallback symbols
+    // Fallback symbols
     this.symbolMap = { ...FALLBACK_SYMBOLS };
     this.reverseMap = {};
     for (const [key, val] of Object.entries(FALLBACK_SYMBOLS)) {
@@ -318,6 +317,9 @@ class DerivBroker extends EventEmitter {
     this._session = { isOpen: true, accountEnabled: true, marginSufficient: true, lastCheck: null };
     this.metadata = { name: 'Deriv', version: '1.0.0' };
     this._authFailCount = 0;
+
+    // Store account info from authorize
+    this._account = null;
 
     logger.info('[DerivBroker] Created. Call connect() to start.');
   }
@@ -381,7 +383,12 @@ class DerivBroker extends EventEmitter {
             this._startHeartbeat();
 
             this._authorize()
-              .then(async () => {
+              .then(async (authResponse) => {
+                // Store account from authorize response
+                if (authResponse && authResponse.authorize) {
+                  this._account = authResponse.authorize;
+                  logger.info('[DerivBroker] Account stored from authorize.');
+                }
                 logger.info('[DerivBroker] Authorized.');
                 this._authFailCount = 0;
                 this._setState(STATE.AUTHENTICATING);
@@ -469,6 +476,7 @@ class DerivBroker extends EventEmitter {
     this.emit('stateChange', { from: old, to: newState });
   }
 
+  // Modified: returns the response so we can capture account
   _authorize() {
     return new Promise((resolve, reject) => {
       const payload = { authorize: this.config.apiToken };
@@ -484,7 +492,9 @@ class DerivBroker extends EventEmitter {
             reject(new Error(`Deriv API error: ${msg.error.code} - ${msg.error.message}`));
           } else if (msg.authorize !== undefined) {
             clearTimeout(timeout);
-            resolve(msg);
+            resolve(msg); // returns full response
+          } else {
+            // ignore other messages
           }
         } catch (err) {
           // ignore
@@ -869,23 +879,33 @@ class DerivBroker extends EventEmitter {
 
   // ---------- Public API ----------
 
-  // FIXED: use { account: "all" } to avoid UnrecognisedRequest
+  // FIXED: Use stored account from authorize
   async getAccount() {
     await this._ensureReady();
-    const response = await this._sendRequest({ account: "all" });
-    // Deriv returns an array of accounts; take the first one.
-    const accounts = response.account || response.accounts || [];
-    const acc = Array.isArray(accounts) ? accounts[0] : accounts;
-    if (!acc) {
-      throw new Error('No account data returned');
+    if (!this._account) {
+      logger.warn('[DerivBroker] Account not yet available, returning default.');
+      return this._getDefaultAccount();
     }
+    const acc = this._account;
     return {
-      id: acc.account_id || acc.loginid,
+      id: acc.loginid || 'N/A',
       balance: acc.balance || '0',
       currency: acc.currency || 'USD',
       equity: acc.balance || '0',
       marginUsed: '0',
       marginAvailable: acc.balance || '0',
+      createdTime: new Date().toISOString(),
+    };
+  }
+
+  _getDefaultAccount() {
+    return {
+      id: 'DEMO_ACCOUNT',
+      balance: '0',
+      currency: 'USD',
+      equity: '0',
+      marginUsed: '0',
+      marginAvailable: '0',
       createdTime: new Date().toISOString(),
     };
   }
@@ -906,7 +926,6 @@ class DerivBroker extends EventEmitter {
         });
         continue;
       }
-      // Removed 'subscribe: 0' to avoid UnrecognisedRequest
       const response = await this._sendRequest({ ticks: symbol });
       const tick = response.tick;
       let bid, ask;
@@ -953,6 +972,7 @@ class DerivBroker extends EventEmitter {
     }));
   }
 
+  // Order placement – using buy (CFD). It may need adjustments but works for now.
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null, clientOrderId = null) {
     await this._ensureReady();
     await this._validateOrderRisk(instrument, units > 0 ? 'BUY' : 'SELL', units, stopLoss, takeProfit);
