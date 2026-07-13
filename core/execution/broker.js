@@ -4,7 +4,7 @@ const WebSocket = require('ws');
 const { EventEmitter } = require('events');
 const { sleep } = require('../../shared/helpers');
 const logger = require('../../infrastructure/logger') || console;
-const Order = require('../../models/Order');
+const Order = require('../../../models/Order');
 
 // ---------- Constants ----------
 const STATE = {
@@ -201,7 +201,7 @@ const BROKER_CAPABILITIES = {
 class DerivBroker extends EventEmitter {
   constructor(config = {}) {
     super();
-    // Configuration – default WebSocket URL now uses ws.derivws.com
+    // Configuration – corrected default WebSocket URL
     this.config = {
       apiToken: config.apiToken || process.env.DERIV_API_TOKEN,
       appId: config.appId || process.env.DERIV_APP_ID || '1089',
