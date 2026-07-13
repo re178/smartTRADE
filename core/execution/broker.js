@@ -1,4 +1,4 @@
-// src/core/execution/broker.js – Full production version with getAccount fixed
+// src/core/execution/broker.js – Final production version with all fixes
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -150,20 +150,24 @@ class StreamingManager {
       return;
     }
     logger.info('[Streaming] Restoring subscriptions...');
-    for (const [key, sub] of this._subscriptions) {
-      this.broker._sendRequest({ [sub.type]: sub.symbol, subscribe: 1 })
-        .then((response) => {
-          const newId = response.subscription?.id;
-          if (newId) {
-            this._subscriptionIdMap.delete(sub.subscriptionId);
-            sub.subscriptionId = newId;
-            this._subscriptionIdMap.set(newId, key);
-            logger.info(`[Streaming] Restored ${key} (new ID: ${newId})`);
-          }
-        })
-        .catch((err) => logger.error(`[Streaming] Failed to restore ${key}:`, err.message));
-    }
-    logger.info('[Streaming] Subscriptions restored.');
+    // Clear all existing ticks subscriptions to avoid AlreadySubscribed
+    this.broker._sendRequest({ forget_all: 'ticks' })
+      .then(() => {
+        for (const [key, sub] of this._subscriptions) {
+          this.broker._sendRequest({ [sub.type]: sub.symbol, subscribe: 1 })
+            .then((response) => {
+              const newId = response.subscription?.id;
+              if (newId) {
+                this._subscriptionIdMap.delete(sub.subscriptionId);
+                sub.subscriptionId = newId;
+                this._subscriptionIdMap.set(newId, key);
+                logger.info(`[Streaming] Restored ${key} (new ID: ${newId})`);
+              }
+            })
+            .catch((err) => logger.error(`[Streaming] Failed to restore ${key}:`, err.message));
+        }
+      })
+      .catch((err) => logger.error('[Streaming] Failed to clear old subscriptions:', err.message));
   }
 
   handleTick(tick) {
@@ -864,11 +868,17 @@ class DerivBroker extends EventEmitter {
   }
 
   // ---------- Public API ----------
+
+  // FIXED: use { account: "all" } to avoid UnrecognisedRequest
   async getAccount() {
     await this._ensureReady();
-    // FIXED: use "get_account" instead of "account"
-    const response = await this._sendRequest({ get_account: 1 });
-    const acc = response.get_account;
+    const response = await this._sendRequest({ account: "all" });
+    // Deriv returns an array of accounts; take the first one.
+    const accounts = response.account || response.accounts || [];
+    const acc = Array.isArray(accounts) ? accounts[0] : accounts;
+    if (!acc) {
+      throw new Error('No account data returned');
+    }
     return {
       id: acc.account_id || acc.loginid,
       balance: acc.balance || '0',
@@ -880,6 +890,7 @@ class DerivBroker extends EventEmitter {
     };
   }
 
+  // FIXED: removed subscribe:0
   async getPrices(instruments) {
     await this._ensureReady();
     const results = [];
@@ -895,7 +906,7 @@ class DerivBroker extends EventEmitter {
         });
         continue;
       }
-      // No "subscribe" parameter to avoid validation error
+      // Removed 'subscribe: 0' to avoid UnrecognisedRequest
       const response = await this._sendRequest({ ticks: symbol });
       const tick = response.tick;
       let bid, ask;
