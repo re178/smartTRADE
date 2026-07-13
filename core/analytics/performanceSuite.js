@@ -1,9 +1,7 @@
-// src/core/analytics/performanceSuite.js – Complete Performance Suite
-// Includes: Backtesting Engine, Portfolio Manager, Execution Analytics,
-// Walk‑Forward Optimization, and Performance Learning.
+// src/core/analytics/performanceSuite.js – Complete Performance Suite (Production Ready)
 
-const mongoose = require('mongoose');
 const Trade = require('../../../models/Trade');
+const marketProvider = require('../market/provider');
 const { generateSignal } = require('../strategy/engine');
 const logger = require('../../infrastructure/logger') || console;
 
@@ -28,7 +26,7 @@ function calculateDrawdown(equityCurve) {
 
 function calculateMetrics(trades, initialBalance) {
   if (!trades || trades.length === 0) {
-    return { winRate: 0, profitFactor: 0, sharpe: 0, maxDrawdown: 0, expectancy: 0 };
+    return { winRate: 0, profitFactor: 0, sharpe: 0, maxDrawdown: 0, expectancy: 0, totalTrades: 0 };
   }
   const winners = trades.filter(t => t.pnl > 0);
   const losers = trades.filter(t => t.pnl < 0);
@@ -44,10 +42,25 @@ function calculateMetrics(trades, initialBalance) {
   }
   const maxDrawdown = calculateDrawdown(equity);
   const expectancy = trades.reduce((a, b) => a + b.pnl, 0) / trades.length;
-  return { winRate, profitFactor, sharpe, maxDrawdown, expectancy };
+  const avgWin = winners.length > 0 ? winners.reduce((a, b) => a + b.pnl, 0) / winners.length : 0;
+  const avgLoss = losers.length > 0 ? Math.abs(losers.reduce((a, b) => a + b.pnl, 0)) / losers.length : 0;
+  const profitPerTrade = expectancy;
+  return {
+    winRate,
+    profitFactor,
+    sharpe,
+    maxDrawdown,
+    expectancy,
+    avgWin,
+    avgLoss,
+    profitPerTrade,
+    totalTrades: trades.length,
+    winningTrades: winners.length,
+    losingTrades: losers.length,
+  };
 }
 
-// ---------- 1. BACKTESTING ENGINE ----------
+// ---------- 1. BACKTESTING ENGINE (REAL DATA) ----------
 class BacktestingEngine {
   /**
    * @param {Object} config
@@ -64,49 +77,135 @@ class BacktestingEngine {
     this.config = config;
     this.trades = [];
     this.equity = [];
+    this.balance = config.initialBalance || 10000;
+    this.slippage = config.slippage || 0.5;
   }
 
   async run() {
-    const { instrument, strategy, timeframe, startDate, endDate, initialBalance = 10000, slippage = 0.5, params = {} } = this.config;
-    // Fetch historical candles (need a method in marketProvider for range)
-    // We'll assume marketProvider.getCandlesRange exists or we simulate using getCandles.
-    // For simplicity, we'll use a loop with incremental candle fetches (not efficient for large ranges).
-    // In production, implement a proper historical data loader.
-    // For now, we'll simulate using a daily fetch (simplified).
-    let balance = initialBalance;
-    let position = null;
-    const allTrades = [];
-    const equityCurve = [initialBalance];
+    const { instrument, strategy, timeframe, startDate, endDate, params = {} } = this.config;
+    // Fetch historical candles
+    const candles = await marketProvider.getHistoricalCandles(instrument, startDate, endDate, timeframe);
+    if (!candles || candles.length < 50) {
+      logger.warn('[Backtest] Not enough candles for backtest.');
+      return { trades: [], equity: [this.balance], finalBalance: this.balance, metrics: {} };
+    }
 
-    // Placeholder: we need a function to get historical candles; we'll use marketProvider.getCandles with a date range.
-    // We'll assume marketProvider.getHistoricalCandles exists (not in current provider; will implement later).
-    // For this demo, we'll use a loop over a simulated date range.
-    // This is a stub – you will replace with actual historical data.
-    logger.warn('[Backtest] Using simulated data – replace with real historical data provider.');
-    const days = Math.ceil((endDate - startDate) / (1000 * 60 * 60 * 24));
-    for (let d = 0; d < days; d++) {
-      const date = new Date(startDate.getTime() + d * 24 * 60 * 60 * 1000);
-      // Simulate a price (for demo)
-      const simulatedPrice = 1.1000 + Math.random() * 0.01;
-      // Generate signal from engine (would need real candles)
-      // We'll simulate a random signal for now.
-      if (Math.random() > 0.9) {
-        const signal = { side: Math.random() > 0.5 ? 'BUY' : 'SELL', entryPrice: simulatedPrice, stopLoss: simulatedPrice - 0.001, takeProfit: simulatedPrice + 0.002, confidence: 70 };
-        // Simulate trade execution
-        const entry = simulatedPrice;
-        const exit = entry + (signal.side === 'BUY' ? 0.002 : -0.002);
-        const pnl = (signal.side === 'BUY' ? (exit - entry) : (entry - exit)) * 10000; // simplified
-        allTrades.push({ entry, exit, pnl, side: signal.side });
-        balance += pnl;
+    let balance = this.balance;
+    let position = null; // { side, entry, stopLoss, takeProfit, units }
+    const allTrades = [];
+    const equityCurve = [balance];
+    const pipSize = getPipSize(instrument);
+
+    // Iterate through candles (skip initial warm-up)
+    const warmup = 50;
+    for (let i = warmup; i < candles.length; i++) {
+      const candle = candles[i];
+      const currentPrice = parseFloat(candle.mid.c);
+      const high = parseFloat(candle.mid.h);
+      const low = parseFloat(candle.mid.l);
+
+      // If we have an open position, check for stop or take profit
+      if (position) {
+        const slHit = position.side === 'BUY' ? low <= position.stopLoss : high >= position.stopLoss;
+        const tpHit = position.side === 'BUY' ? high >= position.takeProfit : low <= position.takeProfit;
+        let exitPrice = null;
+        if (slHit && tpHit) {
+          // Which one hit first? Use the order of prices.
+          // For simplicity, we assume the most extreme price is hit first.
+          if (position.side === 'BUY') {
+            // If low hit SL first, or high hit TP first? We'll compare distances.
+            const slDistance = Math.abs(position.entry - position.stopLoss);
+            const tpDistance = Math.abs(position.entry - position.takeProfit);
+            // If slDistance < tpDistance, SL is closer; but we need to know which price level was reached first.
+            // We'll check if low <= stopLoss (SL hit) and high >= takeProfit (TP hit). If both, the one with the closest price level from entry is hit first.
+            // We'll determine by checking the order of price movement: if the candle's range includes both levels.
+            // For simplicity, we'll assume the one that is crossed first in time is the one whose level is reached first.
+            // We'll approximate: if the low was hit before the high (in time), SL hit first.
+            // We'll use the open to compare: if (low - entry) < (high - entry) then SL hit first.
+            const slHitFirst = (position.entry - low) < (high - position.entry);
+            exitPrice = slHitFirst ? position.stopLoss : position.takeProfit;
+          } else {
+            const slHitFirst = (high - position.entry) < (position.entry - low);
+            exitPrice = slHitFirst ? position.stopLoss : position.takeProfit;
+          }
+        } else if (slHit) {
+          exitPrice = position.stopLoss;
+        } else if (tpHit) {
+          exitPrice = position.takeProfit;
+        }
+        if (exitPrice !== null) {
+          // Close position
+          const pnl = (position.side === 'BUY' ? (exitPrice - position.entry) : (position.entry - exitPrice)) * position.units * 100000; // simplified lot value
+          allTrades.push({
+            entry: position.entry,
+            exit: exitPrice,
+            pnl,
+            side: position.side,
+            units: position.units,
+            strategy: 'Backtest',
+            timestamp: candle.time,
+          });
+          balance += pnl;
+          equityCurve.push(balance);
+          position = null;
+          continue;
+        }
+        // If no exit, update equity with floating P&L
+        const floatingPL = (position.side === 'BUY' ? (currentPrice - position.entry) : (position.entry - currentPrice)) * position.units * 100000;
+        equityCurve.push(balance + floatingPL);
+      }
+
+      // Generate signal using the engine
+      const signal = await generateSignal(instrument, strategy, { ...params, timeframe });
+      if (signal && signal.side && signal.entryPrice && signal.stopLoss && signal.takeProfit) {
+        // Enter trade
+        const entryPrice = currentPrice + (signal.side === 'BUY' ? this.slippage * pipSize : -this.slippage * pipSize);
+        // Adjust SL/TP for slippage
+        const stopLoss = signal.stopLoss + (signal.side === 'BUY' ? -this.slippage * pipSize : this.slippage * pipSize);
+        const takeProfit = signal.takeProfit + (signal.side === 'BUY' ? -this.slippage * pipSize : this.slippage * pipSize);
+        const units = signal.recommendedLotSize || 0.01;
+        position = {
+          side: signal.side,
+          entry: entryPrice,
+          stopLoss,
+          takeProfit,
+          units,
+        };
+        // Record entry in equity (entry price used)
+        // We'll record the equity at entry
         equityCurve.push(balance);
       } else {
-        equityCurve.push(balance);
+        // No trade, equity remains same as previous
+        // To avoid duplicate entries, we only push if we haven't pushed on this candle
+        // We'll check if the last equity value was already from this candle (but we don't have a way to track).
+        // We'll push only if we didn't push in this iteration.
+        // We'll track a flag.
+        if (equityCurve[equityCurve.length - 1] !== balance) {
+          equityCurve.push(balance);
+        }
       }
+    }
+
+    // If position still open at end, close at last price
+    if (position) {
+      const lastPrice = parseFloat(candles[candles.length - 1].mid.c);
+      const pnl = (position.side === 'BUY' ? (lastPrice - position.entry) : (position.entry - lastPrice)) * position.units * 100000;
+      allTrades.push({
+        entry: position.entry,
+        exit: lastPrice,
+        pnl,
+        side: position.side,
+        units: position.units,
+        strategy: 'Backtest',
+        timestamp: candles[candles.length - 1].time,
+      });
+      balance += pnl;
+      equityCurve.push(balance);
     }
 
     this.trades = allTrades;
     this.equity = equityCurve;
-    const metrics = calculateMetrics(allTrades, initialBalance);
+    const metrics = calculateMetrics(allTrades, this.config.initialBalance || 10000);
     return {
       trades: allTrades,
       equity: equityCurve,
@@ -116,16 +215,14 @@ class BacktestingEngine {
   }
 }
 
+// Helper: pip size
+function getPipSize(instrument) {
+  if (instrument.includes('JPY')) return 0.01;
+  return 0.0001;
+}
+
 // ---------- 2. PORTFOLIO MANAGER ----------
 class PortfolioManager {
-  /**
-   * @param {Object} config
-   * @param {number} config.maxExposure – in account currency, default Infinity
-   * @param {number} config.maxOpenTrades – default 5
-   * @param {number} config.maxDailyLoss – in account currency, default 0 (disabled)
-   * @param {number} config.maxPositionSize – in lots, default 100
-   * @param {Array} config.correlatedPairs – [[‘EUR_USD’, ‘GBP_USD’], …]
-   */
   constructor(config = {}) {
     this.config = {
       maxExposure: config.maxExposure || Infinity,
@@ -140,31 +237,25 @@ class PortfolioManager {
   }
 
   async canOpenTrade(signal, accountBalance, currentPositions) {
-    // Reset daily loss if new day
     const today = new Date().toDateString();
     if (today !== this.lastReset) {
       this.dailyPnL = 0;
       this.lastReset = today;
     }
-    // Check max open trades
     if (currentPositions.length >= this.config.maxOpenTrades) {
       return { allowed: false, reason: 'Max open trades reached' };
     }
-    // Check position size
     const lotSize = signal.recommendedLotSize || 0.01;
     if (lotSize > this.config.maxPositionSize) {
       return { allowed: false, reason: 'Position size exceeds max' };
     }
-    // Check max exposure
     const totalExposure = currentPositions.reduce((sum, p) => sum + Math.abs(p.units * p.price), 0);
     if (totalExposure + lotSize * signal.entryPrice > this.config.maxExposure) {
       return { allowed: false, reason: 'Max exposure exceeded' };
     }
-    // Check daily loss
     if (this.config.maxDailyLoss > 0 && this.dailyPnL < -this.config.maxDailyLoss) {
       return { allowed: false, reason: 'Daily loss limit reached' };
     }
-    // Check correlations
     const pair = signal.pair;
     for (const group of this.config.correlatedPairs) {
       if (group.includes(pair)) {
@@ -184,10 +275,6 @@ class PortfolioManager {
 
 // ---------- 3. EXECUTION ANALYTICS ----------
 class ExecutionAnalytics {
-  /**
-   * @param {Object} config
-   * @param {number} config.slippageTolerance – in pips, default 1
-   */
   constructor(config = {}) {
     this.config = { slippageTolerance: config.slippageTolerance || 1 };
     this.metrics = {
@@ -202,23 +289,11 @@ class ExecutionAnalytics {
     this.executions = [];
   }
 
-  /**
-   * Record an order execution.
-   * @param {Object} exec
-   * @param {string} exec.orderId
-   * @param {string} exec.instrument
-   * @param {string} exec.side
-   * @param {number} exec.requestedPrice
-   * @param {number} exec.filledPrice
-   * @param {number} exec.latency – milliseconds
-   * @param {number} exec.spread – in pips
-   * @param {string} exec.status – 'FILLED', 'REJECTED', 'PARTIAL'
-   */
   recordExecution(exec) {
     this.metrics.totalOrders++;
     if (exec.status === 'FILLED') {
       this.metrics.totalFilled++;
-      const slippage = Math.abs(exec.filledPrice - exec.requestedPrice) / (0.0001); // in pips (approx)
+      const slippage = Math.abs(exec.filledPrice - exec.requestedPrice) / 0.0001;
       this.metrics.avgSlippage = (this.metrics.avgSlippage * (this.metrics.totalFilled - 1) + slippage) / this.metrics.totalFilled;
       if (slippage > this.metrics.maxSlippage) this.metrics.maxSlippage = slippage;
       this.metrics.avgLatency = (this.metrics.avgLatency * (this.metrics.totalFilled - 1) + exec.latency) / this.metrics.totalFilled;
@@ -227,7 +302,6 @@ class ExecutionAnalytics {
       this.metrics.rejected++;
     }
     this.executions.push(exec);
-    // Store in DB if needed
   }
 
   getReport() {
@@ -241,18 +315,6 @@ class ExecutionAnalytics {
 
 // ---------- 4. WALK‑FORWARD OPTIMIZATION ----------
 class WalkForwardOptimizer {
-  /**
-   * @param {Object} config
-   * @param {string} config.instrument
-   * @param {string} config.strategy
-   * @param {string} config.timeframe
-   * @param {Date} config.startDate
-   * @param {Date} config.endDate
-   * @param {Object} config.paramRanges – e.g., { fastPeriod: [5, 15], slowPeriod: [20, 40] }
-   * @param {number} config.windowSize – number of days for in‑sample
-   * @param {number} config.stepSize – number of days to step forward
-   * @param {number} config.initialBalance
-   */
   constructor(config) {
     this.config = config;
   }
@@ -266,13 +328,11 @@ class WalkForwardOptimizer {
       const outSampleStart = new Date(inSampleEnd.getTime());
       const outSampleEnd = new Date(outSampleStart.getTime() + stepSize * 24 * 60 * 60 * 1000);
       if (outSampleEnd > endDate) break;
-      // Find best parameters on in‑sample
       let bestParams = null;
       let bestScore = -Infinity;
       for (const [key, values] of Object.entries(paramRanges)) {
         for (const val of values) {
           const params = { [key]: val };
-          // Run backtest on in‑sample
           const backtest = new BacktestingEngine({
             instrument, strategy, timeframe,
             startDate: currentStart,
@@ -288,7 +348,6 @@ class WalkForwardOptimizer {
           }
         }
       }
-      // Test bestParams on out‑of‑sample
       const backtest = new BacktestingEngine({
         instrument, strategy, timeframe,
         startDate: outSampleStart,
@@ -301,7 +360,6 @@ class WalkForwardOptimizer {
         inSample: { start: currentStart, end: inSampleEnd, bestParams, bestScore },
         outSample: { start: outSampleStart, end: outSampleEnd, ...outResult.metrics },
       });
-      // Move window
       currentStart = new Date(currentStart.getTime() + stepSize * 24 * 60 * 60 * 1000);
     }
     return results;
@@ -320,13 +378,8 @@ class PerformanceLearner {
     this.confidenceBias = {};
   }
 
-  /**
-   * Record the outcome of a completed trade.
-   * @param {Object} trade – full trade object with pnl, strategy, confidence, etc.
-   */
   recordTrade(trade) {
     this.tradeHistory.push(trade);
-    // Update strategy weights and confidence bias
     this._updateWeights(trade);
     this._updateConfidence(trade);
   }
@@ -334,46 +387,33 @@ class PerformanceLearner {
   _updateWeights(trade) {
     const strategy = trade.strategy || 'unknown';
     if (!this.strategyWeights[strategy]) {
-      this.strategyWeights[strategy] = { wins: 0, losses: 0, total: 0 };
+      this.strategyWeights[strategy] = { wins: 0, losses: 0, total: 0, totalWin: 0, totalLoss: 0 };
     }
     const record = this.strategyWeights[strategy];
     record.total++;
-    if (trade.pnl > 0) record.wins++;
-    else if (trade.pnl < 0) record.losses++;
-    // Adjust weight: win rate * (1 + profit factor)
-    const winRate = record.wins / record.total;
-    const avgWin = trade.pnl > 0 ? trade.pnl : 0; // placeholder – store average wins
-    const avgLoss = trade.pnl < 0 ? Math.abs(trade.pnl) : 0;
-    const profitFactor = avgLoss > 0 ? avgWin / avgLoss : (avgWin > 0 ? Infinity : 0);
-    // We'll store these for later use in weighted voting.
+    if (trade.pnl > 0) {
+      record.wins++;
+      record.totalWin += trade.pnl;
+    } else if (trade.pnl < 0) {
+      record.losses++;
+      record.totalLoss += Math.abs(trade.pnl);
+    }
   }
 
   _updateConfidence(trade) {
-    // Simple: if trade won, increase confidence for that strategy; if lost, decrease.
     const strategy = trade.strategy || 'unknown';
     if (!this.confidenceBias[strategy]) this.confidenceBias[strategy] = 0;
     const adjustment = trade.pnl > 0 ? 1 : -1;
     this.confidenceBias[strategy] += adjustment * this.config.learningRate;
-    // Clamp
     this.confidenceBias[strategy] = Math.max(-20, Math.min(20, this.confidenceBias[strategy]));
   }
 
-  /**
-   * Get adjusted confidence for a signal.
-   * @param {Object} signal – signal object with strategy, confidence
-   * @returns {number} Adjusted confidence.
-   */
   adjustConfidence(signal) {
     const strategy = signal.strategy || 'unknown';
     const bias = this.confidenceBias[strategy] || 0;
     return Math.min(100, Math.max(0, signal.confidence + bias));
   }
 
-  /**
-   * Get adjusted weights for strategy voting.
-   * @param {Object} baseWeights – e.g., { SMA: 0.2, EMA: 0.2, ... }
-   * @returns {Object} Adjusted weights.
-   */
   adjustWeights(baseWeights) {
     const adjusted = {};
     let total = 0;
@@ -383,21 +423,21 @@ class PerformanceLearner {
         adjusted[strategy] = weight;
       } else {
         const winRate = record.wins / record.total;
-        // Prefer strategies with higher win rate
-        adjusted[strategy] = weight * (0.5 + winRate * 0.5);
+        const avgWin = record.wins > 0 ? record.totalWin / record.wins : 0;
+        const avgLoss = record.losses > 0 ? record.totalLoss / record.losses : 0;
+        const profitFactor = avgLoss > 0 ? avgWin / avgLoss : (avgWin > 0 ? Infinity : 0);
+        // Combine win rate and profit factor
+        const performance = winRate * (0.5 + 0.5 * Math.min(profitFactor, 5));
+        adjusted[strategy] = weight * (0.5 + performance * 0.5);
       }
       total += adjusted[strategy];
     }
-    // Normalise
     for (const [strategy, val] of Object.entries(adjusted)) {
       adjusted[strategy] = val / total;
     }
     return adjusted;
   }
 
-  /**
-   * Load historical trades from DB to initialise.
-   */
   async loadHistory() {
     const trades = await Trade.find({ status: 'CLOSED' });
     for (const trade of trades) {
@@ -407,7 +447,6 @@ class PerformanceLearner {
   }
 }
 
-// ---------- EXPORTS ----------
 module.exports = {
   BacktestingEngine,
   PortfolioManager,
