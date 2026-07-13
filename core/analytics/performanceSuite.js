@@ -1,6 +1,6 @@
 // src/core/analytics/performanceSuite.js – Complete Performance Suite (Production Ready)
 
-const Trade = require('../../../models/Trade');
+const Trade = require('../../models/Trade');
 const marketProvider = require('../market/provider');
 const { generateSignal } = require('../strategy/engine');
 const logger = require('../../infrastructure/logger') || console;
