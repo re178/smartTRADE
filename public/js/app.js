@@ -1,4 +1,4 @@
-// public/js/app.js – Dashboard Logic
+// public/js/app.js – Complete Dashboard Logic (with notifications, strategy selector)
 
 // ---- API helper ----
 async function fetchJson(url, options = {}) {
@@ -56,37 +56,59 @@ async function loadPrices() {
   }
 }
 
-// ---- Signal ----
+// ---- Load Notification Status ----
+async function loadNotificationStatus() {
+  try {
+    const status = await fetchJson(`${CONFIG.API_BASE}/api/notifications/status`);
+    document.getElementById('emailStatus').textContent = status.emailEnabled ? 'Enabled' : 'Disabled';
+    document.getElementById('emailStatus').className = `badge bg-${status.emailEnabled ? 'success' : 'danger'}`;
+    document.getElementById('instagramStatus').textContent = status.instagramEnabled ? 'Enabled' : 'Disabled';
+    document.getElementById('instagramStatus').className = `badge bg-${status.instagramEnabled ? 'success' : 'danger'}`;
+    document.getElementById('emailAddress').textContent = status.email || 'Not set';
+  } catch (e) {
+    document.getElementById('emailStatus').textContent = 'Error';
+    document.getElementById('instagramStatus').textContent = 'Error';
+  }
+}
+
+// ---- Signal Generation (with strategy selector) ----
 document.getElementById('getSignalBtn').addEventListener('click', async function() {
   const pair = document.getElementById('signalPair').value.trim();
+  const strategy = document.getElementById('signalStrategy')?.value || 'sma';
   if (!pair) return;
   const resultDiv = document.getElementById('signalResult');
   resultDiv.innerHTML = '<p class="text-muted">Fetching signal...</p>';
   try {
-    const signal = await fetchJson(`${CONFIG.API_BASE}/api/signal?pair=${pair}`);
+    const signal = await fetchJson(`${CONFIG.API_BASE}/api/signal?pair=${pair}&strategy=${strategy}`);
     if (!signal || !signal.side) {
       resultDiv.innerHTML = `<p class="text-warning">No signal for ${pair} at this time.</p>`;
       return;
     }
-    resultDiv.innerHTML = `
-      <div class="alert alert-${signal.side === 'BUY' ? 'success' : 'danger'}">
-        <h5><strong>${signal.side}</strong> ${signal.pair}</h5>
-        <p>Entry: ${formatPrice(signal.entryPrice)} | SL: ${formatPrice(signal.stopLoss)} | TP: ${formatPrice(signal.takeProfit)}</p>
-        <p>Confidence: ${signal.confidence || 75}%</p>
-      </div>
-      <button class="btn btn-sm btn-outline-primary" onclick="window.fillTradeForm('${signal.pair}','${signal.side}','${signal.entryPrice}','${signal.stopLoss}','${signal.takeProfit}')">
+    // Build signal display
+    let details = `<div class="alert alert-${signal.side === 'BUY' ? 'success' : 'danger'}">
+      <h5><strong>${signal.side}</strong> ${signal.pair}</h5>
+      <p>Entry: ${formatPrice(signal.entryPrice)} | SL: ${formatPrice(signal.stopLoss)} | TP: ${formatPrice(signal.takeProfit)}</p>
+      <p>Confidence: ${signal.confidence || 75}%</p>`;
+    if (signal.strategy) details += `<p>Strategy: ${signal.strategy}</p>`;
+    if (signal.reason) details += `<p>Reason: ${signal.reason}</p>`;
+    if (signal.riskRating) details += `<p>Risk: ${signal.riskRating}</p>`;
+    if (signal.recommendedLotSize) details += `<p>Recommended Lot: ${signal.recommendedLotSize}</p>`;
+    details += `</div>
+      <button class="btn btn-sm btn-outline-primary" onclick="window.fillTradeForm('${signal.pair}','${signal.side}','${signal.entryPrice}','${signal.stopLoss}','${signal.takeProfit}','${signal.recommendedLotSize || CONFIG.DEFAULT_LOT}')">
         <i class="fas fa-arrow-right"></i> Use for Trade
       </button>
     `;
+    resultDiv.innerHTML = details;
   } catch (e) {
     resultDiv.innerHTML = `<p class="text-danger">Error: ${e.message}</p>`;
   }
 });
 
-window.fillTradeForm = function(pair, side, entry, sl, tp) {
+// ---- Fill Trade Form from Signal ----
+window.fillTradeForm = function(pair, side, entry, sl, tp, lotSize) {
   document.getElementById('tradePair').value = pair;
   document.getElementById('tradeSide').value = side;
-  document.getElementById('tradeLot').value = CONFIG.DEFAULT_LOT;
+  document.getElementById('tradeLot').value = lotSize || CONFIG.DEFAULT_LOT;
   document.getElementById('tradeSL').value = sl;
   document.getElementById('tradeTP').value = tp;
   document.querySelector('#tradeForm').scrollIntoView({ behavior: 'smooth' });
@@ -123,11 +145,12 @@ document.getElementById('tradeForm').addEventListener('submit', async function(e
   }
 });
 
-// ---- Auto-Trade ----
+// ---- Auto-Trade (with strategy selector) ----
 document.getElementById('autoTradeForm').addEventListener('submit', async function(e) {
   e.preventDefault();
   const pair = document.getElementById('autoPair').value.trim();
   const risk = parseFloat(document.getElementById('autoRisk').value);
+  const strategy = document.getElementById('autoStrategy')?.value || 'sma';
   if (!pair || isNaN(risk) || risk <= 0) {
     alert('Please enter valid pair and risk percentage.');
     return;
@@ -138,7 +161,7 @@ document.getElementById('autoTradeForm').addEventListener('submit', async functi
   try {
     const result = await fetchJson(`${CONFIG.API_BASE}/api/auto-trade`, {
       method: 'POST',
-      body: JSON.stringify({ pair, riskPercent: risk })
+      body: JSON.stringify({ pair, riskPercent: risk, strategy })
     });
     if (result.success) {
       alert(`Auto-trade executed! Trade opened.`);
@@ -155,7 +178,7 @@ document.getElementById('autoTradeForm').addEventListener('submit', async functi
   }
 });
 
-// ---- Open Trades ----
+// ---- Load Open Trades ----
 async function loadOpenTrades() {
   const container = document.getElementById('openTradesContainer');
   container.innerHTML = '<p class="text-muted">Loading open trades...</p>';
@@ -187,6 +210,7 @@ async function loadOpenTrades() {
   }
 }
 
+// ---- Close Trade ----
 window.closeTrade = async function(tradeId) {
   if (!confirm(`Close trade ${tradeId}?`)) return;
   try {
@@ -199,7 +223,7 @@ window.closeTrade = async function(tradeId) {
   }
 };
 
-// ---- Trade History ----
+// ---- Load Trade History ----
 async function loadTradeHistory() {
   const container = document.getElementById('historyContainer');
   container.innerHTML = '<p class="text-muted">Loading history...</p>';
@@ -231,15 +255,26 @@ async function loadTradeHistory() {
   }
 }
 
+// ---- Test Notification ----
+document.getElementById('testNotificationBtn')?.addEventListener('click', async function() {
+  try {
+    const result = await fetchJson(`${CONFIG.API_BASE}/api/test-email`, { method: 'POST' });
+    alert('Test email sent! Check your inbox.');
+  } catch (e) {
+    alert('Error sending test email: ' + e.message);
+  }
+});
+
 // ---- Refresh buttons ----
-document.getElementById('refreshTrades').addEventListener('click', loadOpenTrades);
-document.getElementById('refreshHistory').addEventListener('click', loadTradeHistory);
+document.getElementById('refreshTrades')?.addEventListener('click', loadOpenTrades);
+document.getElementById('refreshHistory')?.addEventListener('click', loadTradeHistory);
 
 // ---- Initialise ----
 loadAccount();
 loadPrices();
 loadOpenTrades();
 loadTradeHistory();
+loadNotificationStatus();
 
 // Auto-refresh prices
 setInterval(loadPrices, CONFIG.PRICE_REFRESH_INTERVAL);
