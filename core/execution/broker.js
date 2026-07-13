@@ -1,10 +1,10 @@
-// src/core/execution/broker.js – Full production version with circuit breaker relaxed
+// src/core/execution/broker.js – Final fixed version (no subscribe in getPrices)
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
 const { sleep } = require('../../shared/helpers');
 const logger = require('../../infrastructure/logger') || console;
-const Order = require('../../models/Order');
+const Order = require('../../../models/Order');
 
 EventEmitter.defaultMaxListeners = 20;
 
@@ -879,6 +879,7 @@ class DerivBroker extends EventEmitter {
     };
   }
 
+  // ** FIX: Removed "subscribe: 0" **
   async getPrices(instruments) {
     await this._ensureReady();
     const results = [];
@@ -894,7 +895,8 @@ class DerivBroker extends EventEmitter {
         });
         continue;
       }
-      const response = await this._sendRequest({ ticks: symbol, subscribe: 0 });
+      // Removed subscribe parameter to avoid validation error
+      const response = await this._sendRequest({ ticks: symbol });
       const tick = response.tick;
       let bid, ask;
       if (tick.bid !== undefined && tick.ask !== undefined) {
