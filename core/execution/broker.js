@@ -1,4 +1,4 @@
-// core/execution/broker.js – Correct Deriv WebSocket Driver (Proposal + Buy)
+// core/execution/broker.js – Correct Proposal/Buy Workflow with valid multiplier and min stake
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -201,37 +201,28 @@ class DerivProposalBuilder {
   buildProposal(instrument, units, stopLoss, takeProfit, orderType, limitPrice = 0) {
     const symbol = toDerivSymbol(instrument, this.broker.symbolMap);
     if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
-    const amount = Math.abs(units);
+    let amount = Math.abs(units);
     if (amount <= 0) throw new Error('Order amount must be greater than zero.');
-    const side = units > 0 ? 'BUY' : 'SELL';
-
-    // Determine contract type based on account type
-    const accountType = this.broker._account?.account_type || 'cfd';
-    let contractType = 'MULTUP'; // default for multipliers
-    let productType = 'basic';
-    let basis = 'stake';
-
-    if (accountType === 'cfd' || accountType === 'standard' || accountType === 'financial') {
-      // For CFDs, we use a different contract type (e.g., 'CALL' or 'PUT'?)
-      // Actually, for spot forex CFDs, Deriv's API uses 'CALL'/'PUT' for binary options, but for CFDs via MT5 it's different.
-      // Since you are using the WebSocket API, you likely want Multipliers or Options.
-      // We'll default to Multipliers (MULTUP) as a safe choice.
-      contractType = 'MULTUP';
-    } else if (accountType === 'multiplier') {
-      contractType = 'MULTUP';
-    } else {
-      contractType = 'MULTUP';
+    
+    // For MULTUP contracts, minimum stake is 1 USD (assuming USD account)
+    if (amount < 1) {
+      amount = 1;
+      logger.warn(`[ProposalBuilder] Amount increased to minimum 1.00 (was ${units})`);
     }
+
+    // Valid multipliers for MULTUP: 100, 200, 300, 500, 800
+    // We'll use 100 as default (minimum)
+    const multiplier = 100;
 
     const proposalPayload = {
       proposal: 1,
       amount,
-      basis,
-      contract_type: contractType,
+      basis: 'stake',
+      contract_type: 'MULTUP',
       currency: 'USD',
       symbol,
-      product_type: productType,
-      multiplier: this.broker.config.leverage || 1,
+      product_type: 'basic',
+      multiplier: multiplier,
     };
 
     // Add limit order for stop loss and take profit
@@ -245,9 +236,6 @@ class DerivProposalBuilder {
     if (Object.keys(limitOrder).length > 0) {
       proposalPayload.limit_order = limitOrder;
     }
-
-    // For limit orders, we'd need to specify the entry price in the proposal? Actually, for limit orders, we set the price in the buy request.
-    // For market, price is 0 in the buy request.
 
     return proposalPayload;
   }
