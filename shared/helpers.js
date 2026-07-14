@@ -1,4 +1,4 @@
-// src/shared/helpers.js – Utility Functions
+// shared/helpers.js – Utility Functions (with fixed pair validation)
 
 /**
  * Format a number as a price with fixed decimals.
@@ -31,7 +31,7 @@ function getPipSize(instrument) {
   const upper = instrument.toUpperCase();
   // JPY pairs have pip at 0.01
   if (upper.includes('JPY')) return 0.01;
-  // XAU (gold) has pip at 0.1?
+  // XAU (gold) has pip at 0.01
   if (upper.includes('XAU')) return 0.01;
   // Default for most pairs
   return 0.0001;
@@ -44,8 +44,8 @@ function getPipSize(instrument) {
  */
 function isValidPair(pair) {
   if (!pair || typeof pair !== 'string') return false;
-  // Must contain an underscore and be at least 7 characters (e.g., EUR_USD)
-  return /^[A-Z]{6}$/.test(pair) && pair.includes('_');
+  // Must be 3 letters, underscore, 3 letters (e.g., EUR_USD)
+  return /^[A-Z]{3}_[A-Z]{3}$/.test(pair.toUpperCase().trim());
 }
 
 /**
@@ -101,6 +101,47 @@ function envBool(key, defaultValue = false) {
   return val.toLowerCase() === 'true' || val === '1';
 }
 
+/**
+ * Check if a string is empty or whitespace.
+ * @param {string} str - String to check.
+ * @returns {boolean}
+ */
+function isEmpty(str) {
+  return !str || typeof str !== 'string' || str.trim().length === 0;
+}
+
+/**
+ * Truncate a string to a maximum length.
+ * @param {string} str - String to truncate.
+ * @param {number} maxLength - Maximum length.
+ * @param {string} suffix - Suffix to add (default '...').
+ * @returns {string}
+ */
+function truncate(str, maxLength = 100, suffix = '...') {
+  if (!str || typeof str !== 'string') return '';
+  if (str.length <= maxLength) return str;
+  return str.substring(0, maxLength - suffix.length) + suffix;
+}
+
+/**
+ * Convert a date to ISO string or return null.
+ * @param {Date|string|number} date - Date input.
+ * @returns {string|null} ISO string or null.
+ */
+function toISOString(date) {
+  if (!date) return null;
+  const d = new Date(date);
+  return isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+/**
+ * Get the current timestamp in seconds (Unix).
+ * @returns {number}
+ */
+function timestampNow() {
+  return Math.floor(Date.now() / 1000);
+}
+
 module.exports = {
   formatPrice,
   sleep,
@@ -111,4 +152,8 @@ module.exports = {
   envInt,
   envFloat,
   envBool,
+  isEmpty,
+  truncate,
+  toISOString,
+  timestampNow,
 };
