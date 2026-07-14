@@ -1,4 +1,4 @@
-// core/execution/broker.js – Production Deriv WebSocket Driver (All Fixes)
+// core/execution/broker.js – Production Deriv WebSocket Driver (Final Fix)
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -35,7 +35,7 @@ const CB_STATE = { CLOSED: 'CLOSED', OPEN: 'OPEN', HALF_OPEN: 'HALF_OPEN' };
 let _requestCounter = 0;
 
 function generateRequestId() {
-  return ++_requestCounter; // integer
+  return ++_requestCounter;
 }
 
 function generateClientOrderId() {
@@ -152,7 +152,6 @@ class StreamingManager {
       return;
     }
     logger.info('[Streaming] Restoring subscriptions...');
-    // First, forget all ticks subscriptions on the server to avoid AlreadySubscribed
     this.broker._sendRequest({ forget_all: 'ticks' })
       .then(() => {
         for (const [key, sub] of this._subscriptions) {
@@ -198,7 +197,7 @@ class StreamingManager {
   }
 }
 
-// ---------- Order Builder ----------
+// ---------- Order Builder (FIXED) ----------
 class DerivOrderBuilder {
   constructor(broker) {
     this.broker = broker;
@@ -213,8 +212,14 @@ class DerivOrderBuilder {
       amount: amount,
       price: orderType === 'market' ? 0 : price,
     };
-    if (stopLoss !== null) payload.stop_loss = stopLoss;
-    if (takeProfit !== null) payload.take_profit = takeProfit;
+    // Only add stop_loss and take_profit if they are provided
+    if (stopLoss !== null && stopLoss !== undefined) {
+      payload.stop_loss = stopLoss;
+    }
+    if (takeProfit !== null && takeProfit !== undefined) {
+      payload.take_profit = takeProfit;
+    }
+    // For multiplier contracts (if applicable)
     if (this.broker.config.contractType === 'multiplier') {
       payload.leverage = leverage || this.broker.config.leverage;
       if (duration) payload.duration = duration;
@@ -321,8 +326,6 @@ class DerivBroker extends EventEmitter {
     this._session = { isOpen: true, accountEnabled: true, marginSufficient: true, lastCheck: null };
     this.metadata = { name: 'Deriv', version: '1.0.0' };
     this._authFailCount = 0;
-
-    // Store account from authorize
     this._account = null;
 
     logger.info('[DerivBroker] Created. Call connect() to start.');
@@ -479,7 +482,6 @@ class DerivBroker extends EventEmitter {
     this.emit('stateChange', { from: old, to: newState });
   }
 
-  // Modified: returns the full response to capture account
   _authorize() {
     return new Promise((resolve, reject) => {
       const payload = { authorize: this.config.apiToken };
@@ -512,7 +514,6 @@ class DerivBroker extends EventEmitter {
     });
   }
 
-  // ---------- Reconnection ----------
   _getReconnectDelay(attempt) {
     const base = this.config.reconnectBaseDelay;
     const max = this.config.maxReconnectDelay;
@@ -521,7 +522,6 @@ class DerivBroker extends EventEmitter {
     return Math.round(jitter);
   }
 
-  // ---------- Circuit Breaker ----------
   _recordFailure() {
     if (this._cbState === CB_STATE.OPEN) return;
     this._cbFailureCount++;
@@ -547,7 +547,6 @@ class DerivBroker extends EventEmitter {
     return true;
   }
 
-  // ---------- Heartbeat ----------
   _startHeartbeat() {
     this._stopHeartbeat();
     this._heartbeatInterval = setInterval(() => {
@@ -565,7 +564,6 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // ---------- Message Handling ----------
   _handleMessage(rawData) {
     try {
       const msg = JSON.parse(rawData);
@@ -620,7 +618,6 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // ---------- Sending ----------
   _sendRaw(payload) {
     if (this._state !== STATE.READY && this._state !== STATE.CONNECTED && this._state !== STATE.AUTHENTICATING) {
       if (this._messageQueue.length < this.config.maxQueueSize) {
@@ -637,7 +634,6 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // ---------- REMOVED IDEMPOTENCY CHECK ----------
   async _sendRequest(payload, timeoutMs = 15000, signal = null) {
     await this._rateLimiter.acquire();
     if (this._state === STATE.FATAL) {
@@ -707,7 +703,6 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // ---------- Symbol Loading with Timeout ----------
   async _loadSymbolsWithTimeout() {
     return Promise.race([
       this._loadSymbols(),
@@ -762,7 +757,6 @@ class DerivBroker extends EventEmitter {
     logger.info(`[DerivBroker] Symbol map built: ${Object.keys(this.symbolMap).length} forex pairs.`);
   }
 
-  // ---------- Order Persistence ----------
   async _loadPendingOrders() {
     logger.info('[DerivBroker] Loading pending orders from MongoDB...');
     const pendingOrders = await Order.find({ status: { $in: ['PENDING', 'ACCEPTED', 'EXECUTING'] } });
@@ -814,18 +808,23 @@ class DerivBroker extends EventEmitter {
       }
 
       for (const pos of brokerPositions) {
-        // pos fields: contract_id, buy (boolean), sell (boolean), amount, buy_price, entry_spot, profit_loss, current_spot, symbol
         const contractId = pos.contract_id;
         if (!contractId) continue;
         const existing = dbMap.get(contractId);
         if (!existing) {
           const side = pos.buy ? 'BUY' : 'SELL';
-          const instrument = fromDerivSymbol(pos.symbol, this.reverseMap);
-          const units = Math.abs(pos.amount || 0);
+          const instrument = fromDerivSymbol(pos.symbol, this.reverseMap) || 'UNKNOWN';
+          const amount = pos.amount || 0;
+          const units = Math.abs(amount) || 0.01;
           const entryPrice = pos.buy_price || pos.entry_spot || 0;
+          // Skip if any required field is missing or NaN
+          if (isNaN(units) || units <= 0 || !instrument || !side) {
+            logger.warn(`[Reconcile] Skipping position with invalid data: ${JSON.stringify(pos)}`);
+            continue;
+          }
           const newOrder = new Order({
             clientOrderId: generateClientOrderId(),
-            instrument: instrument || 'UNKNOWN',
+            instrument,
             side,
             units,
             entryPrice,
@@ -857,7 +856,6 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // ---------- Risk Validation ----------
   async _validateOrderRisk(instrument, side, units, stopLoss, takeProfit) {
     if (this.config.riskValidator) {
       const result = await this.config.riskValidator({
@@ -880,7 +878,6 @@ class DerivBroker extends EventEmitter {
   }
 
   // ---------- Public API ----------
-
   async getAccount() {
     await this._ensureReady();
     if (!this._account) {
@@ -978,11 +975,17 @@ class DerivBroker extends EventEmitter {
     }));
   }
 
+  // ---------- ORDER PLACEMENT (FIXED) ----------
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null) {
     await this._ensureReady();
     await this._validateOrderRisk(instrument, units > 0 ? 'BUY' : 'SELL', units, stopLoss, takeProfit);
 
-    const payload = this.orderBuilder.build(instrument, units, 0, stopLoss, takeProfit, 'market');
+    // Validate stopLoss and takeProfit – if they are too small, Deriv rejects them.
+    // We'll set them to null if they are not valid numbers > 0.
+    const sl = (stopLoss && !isNaN(stopLoss) && stopLoss > 0) ? stopLoss : null;
+    const tp = (takeProfit && !isNaN(takeProfit) && takeProfit > 0) ? takeProfit : null;
+
+    const payload = this.orderBuilder.build(instrument, units, 0, sl, tp, 'market');
     try {
       const response = await this._sendRequest(payload);
       const tx = response.buy;
@@ -1005,7 +1008,10 @@ class DerivBroker extends EventEmitter {
     await this._ensureReady();
     await this._validateOrderRisk(instrument, units > 0 ? 'BUY' : 'SELL', units, stopLoss, takeProfit);
 
-    const payload = this.orderBuilder.build(instrument, units, price, stopLoss, takeProfit, 'limit');
+    const sl = (stopLoss && !isNaN(stopLoss) && stopLoss > 0) ? stopLoss : null;
+    const tp = (takeProfit && !isNaN(takeProfit) && takeProfit > 0) ? takeProfit : null;
+
+    const payload = this.orderBuilder.build(instrument, units, price, sl, tp, 'limit');
     try {
       const response = await this._sendRequest(payload);
       const tx = response.buy;
@@ -1036,7 +1042,7 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // FIXED: robust parsing with conversion of object to array and safe field mapping
+  // ---------- GET OPEN TRADES (FIXED) ----------
   async getOpenTrades() {
     await this._ensureReady();
     const response = await this._sendRequest({ portfolio: 1 });
@@ -1049,15 +1055,17 @@ class DerivBroker extends EventEmitter {
     if (!Array.isArray(contracts) || contracts.length === 0) {
       return [];
     }
-    return contracts.map(c => ({
-      id: c.contract_id,
-      instrument: fromDerivSymbol(c.symbol, this.reverseMap) || 'UNKNOWN',
-      side: c.buy ? 'BUY' : 'SELL',
-      price: c.buy_price || c.entry_spot || 0,
-      units: c.buy ? (c.amount || 0) : -(c.amount || 0),
-      unrealizedPL: c.profit_loss || 0,
-      currentPrice: c.current_spot || c.entry_spot || 0,
-    }));
+    return contracts
+      .filter(c => c.contract_id) // filter out invalid entries
+      .map(c => ({
+        id: c.contract_id,
+        instrument: fromDerivSymbol(c.symbol, this.reverseMap) || 'UNKNOWN',
+        side: c.buy ? 'BUY' : 'SELL',
+        price: c.buy_price || c.entry_spot || 0,
+        units: c.buy ? (c.amount || 0) : -(c.amount || 0),
+        unrealizedPL: c.profit_loss || 0,
+        currentPrice: c.current_spot || c.entry_spot || 0,
+      }));
   }
 
   async getPositions() {
@@ -1107,7 +1115,6 @@ class DerivBroker extends EventEmitter {
     logger.warn('🚨 Kill switch complete.');
   }
 
-  // ---------- Disconnect ----------
   async disconnect() {
     logger.info('[DerivBroker] Disconnecting gracefully...');
     this._stopHeartbeat();
