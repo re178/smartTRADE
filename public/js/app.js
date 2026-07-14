@@ -1,4 +1,9 @@
-// public/js/app.js – Complete Dashboard Logic (with notifications, strategy selector)
+// public/js/app.js – Dashboard Logic (with debounce & live P&L updates)
+
+// ---- Configuration ----
+const REFRESH_INTERVAL = 10000; // 10 seconds
+let isSubmitting = false;
+let isAutoSubmitting = false;
 
 // ---- API helper ----
 async function fetchJson(url, options = {}) {
@@ -71,7 +76,7 @@ async function loadNotificationStatus() {
   }
 }
 
-// ---- Signal Generation (with strategy selector) ----
+// ---- Signal Generation ----
 document.getElementById('getSignalBtn').addEventListener('click', async function() {
   const pair = document.getElementById('signalPair').value.trim();
   const strategy = document.getElementById('signalStrategy')?.value || 'sma';
@@ -84,7 +89,6 @@ document.getElementById('getSignalBtn').addEventListener('click', async function
       resultDiv.innerHTML = `<p class="text-warning">No signal for ${pair} at this time.</p>`;
       return;
     }
-    // Build signal display
     let details = `<div class="alert alert-${signal.side === 'BUY' ? 'success' : 'danger'}">
       <h5><strong>${signal.side}</strong> ${signal.pair}</h5>
       <p>Entry: ${formatPrice(signal.entryPrice)} | SL: ${formatPrice(signal.stopLoss)} | TP: ${formatPrice(signal.takeProfit)}</p>
@@ -104,7 +108,6 @@ document.getElementById('getSignalBtn').addEventListener('click', async function
   }
 });
 
-// ---- Fill Trade Form from Signal ----
 window.fillTradeForm = function(pair, side, entry, sl, tp, lotSize) {
   document.getElementById('tradePair').value = pair;
   document.getElementById('tradeSide').value = side;
@@ -114,22 +117,28 @@ window.fillTradeForm = function(pair, side, entry, sl, tp, lotSize) {
   document.querySelector('#tradeForm').scrollIntoView({ behavior: 'smooth' });
 };
 
-// ---- Manual Trade ----
+// ---- Manual Trade (with debounce) ----
 document.getElementById('tradeForm').addEventListener('submit', async function(e) {
   e.preventDefault();
-  const pair = document.getElementById('tradePair').value.trim();
-  const side = document.getElementById('tradeSide').value;
-  const lotSize = parseFloat(document.getElementById('tradeLot').value);
-  const sl = document.getElementById('tradeSL').value ? parseFloat(document.getElementById('tradeSL').value) : null;
-  const tp = document.getElementById('tradeTP').value ? parseFloat(document.getElementById('tradeTP').value) : null;
-  if (!pair || !side || isNaN(lotSize) || lotSize <= 0) {
-    alert('Please fill all required fields correctly.');
+  if (isSubmitting) {
+    alert('Please wait, order is being processed...');
     return;
   }
+  isSubmitting = true;
   const btn = this.querySelector('button[type="submit"]');
   btn.disabled = true;
   btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Placing...';
+
   try {
+    const pair = document.getElementById('tradePair').value.trim();
+    const side = document.getElementById('tradeSide').value;
+    const lotSize = parseFloat(document.getElementById('tradeLot').value);
+    const sl = document.getElementById('tradeSL').value ? parseFloat(document.getElementById('tradeSL').value) : null;
+    const tp = document.getElementById('tradeTP').value ? parseFloat(document.getElementById('tradeTP').value) : null;
+    if (!pair || !side || isNaN(lotSize) || lotSize <= 0) {
+      alert('Please fill all required fields correctly.');
+      return;
+    }
     const result = await fetchJson(`${CONFIG.API_BASE}/api/order`, {
       method: 'POST',
       body: JSON.stringify({ pair, side, lotSize, stopLoss: sl, takeProfit: tp })
@@ -137,28 +146,36 @@ document.getElementById('tradeForm').addEventListener('submit', async function(e
     alert('Order placed successfully! Trade ID: ' + (result.trade?.oandaTradeId || 'N/A'));
     loadOpenTrades();
     loadTradeHistory();
+    loadAccount(); // refresh balance
   } catch (e) {
     alert('Error placing order: ' + e.message);
   } finally {
+    isSubmitting = false;
     btn.disabled = false;
     btn.innerHTML = '<i class="fas fa-paper-plane"></i> Place Order';
   }
 });
 
-// ---- Auto-Trade (with strategy selector) ----
+// ---- Auto-Trade (with debounce) ----
 document.getElementById('autoTradeForm').addEventListener('submit', async function(e) {
   e.preventDefault();
-  const pair = document.getElementById('autoPair').value.trim();
-  const risk = parseFloat(document.getElementById('autoRisk').value);
-  const strategy = document.getElementById('autoStrategy')?.value || 'sma';
-  if (!pair || isNaN(risk) || risk <= 0) {
-    alert('Please enter valid pair and risk percentage.');
+  if (isAutoSubmitting) {
+    alert('Please wait, auto-trade is being processed...');
     return;
   }
+  isAutoSubmitting = true;
   const btn = this.querySelector('button[type="submit"]');
   btn.disabled = true;
   btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Auto-trading...';
+
   try {
+    const pair = document.getElementById('autoPair').value.trim();
+    const risk = parseFloat(document.getElementById('autoRisk').value);
+    const strategy = document.getElementById('autoStrategy')?.value || 'sma';
+    if (!pair || isNaN(risk) || risk <= 0) {
+      alert('Please enter valid pair and risk percentage.');
+      return;
+    }
     const result = await fetchJson(`${CONFIG.API_BASE}/api/auto-trade`, {
       method: 'POST',
       body: JSON.stringify({ pair, riskPercent: risk, strategy })
@@ -167,18 +184,22 @@ document.getElementById('autoTradeForm').addEventListener('submit', async functi
       alert(`Auto-trade executed! Trade opened.`);
       loadOpenTrades();
       loadTradeHistory();
+      loadAccount();
     } else {
       alert('Auto-trade: ' + (result.message || 'No signal'));
     }
   } catch (e) {
     alert('Error auto-trading: ' + e.message);
   } finally {
+    isAutoSubmitting = false;
     btn.disabled = false;
     btn.innerHTML = '<i class="fas fa-robot"></i> Auto-Trade';
   }
 });
 
-// ---- Load Open Trades ----
+// ---- Load Open Trades (live P&L) ----
+let openTradesInterval = null;
+
 async function loadOpenTrades() {
   const container = document.getElementById('openTradesContainer');
   container.innerHTML = '<p class="text-muted">Loading open trades...</p>';
@@ -189,9 +210,11 @@ async function loadOpenTrades() {
       return;
     }
     let html = `<table class="table table-striped"><thead><tr><th>ID</th><th>Pair</th><th>Side</th><th>Open Price</th><th>Current Price</th><th>Units</th><th>P/L</th><th>Action</th></tr></thead><tbody>`;
+    let totalPL = 0;
     for (const t of trades) {
       const pl = t.unrealizedPL ? parseFloat(t.unrealizedPL).toFixed(2) : '0.00';
       const currentPrice = t.currentPrice || t.price || 'N/A';
+      totalPL += parseFloat(pl) || 0;
       html += `<tr>
         <td>${t.id}</td>
         <td>${t.instrument}</td>
@@ -203,6 +226,7 @@ async function loadOpenTrades() {
         <td><button class="btn btn-sm btn-danger" onclick="window.closeTrade('${t.id}')"><i class="fas fa-times"></i> Close</button></td>
       </tr>`;
     }
+    html += `<tr><td colspan="6"><strong>Total Unrealized P&L</strong></td><td class="${totalPL >= 0 ? 'text-success' : 'text-danger'}"><strong>${totalPL.toFixed(2)}</strong></td><td></td></tr>`;
     html += '</tbody></table>';
     container.innerHTML = html;
   } catch (e) {
@@ -218,6 +242,7 @@ window.closeTrade = async function(tradeId) {
     alert('Trade closed successfully.');
     loadOpenTrades();
     loadTradeHistory();
+    loadAccount();
   } catch (e) {
     alert('Error closing trade: ' + e.message);
   }
@@ -269,6 +294,14 @@ document.getElementById('testNotificationBtn')?.addEventListener('click', async 
 document.getElementById('refreshTrades')?.addEventListener('click', loadOpenTrades);
 document.getElementById('refreshHistory')?.addEventListener('click', loadTradeHistory);
 
+// ---- Start Live Updates ----
+function startLiveUpdates() {
+  // Prices already update via setInterval
+  // Open trades refresh every 10 seconds for live P&L
+  if (openTradesInterval) clearInterval(openTradesInterval);
+  openTradesInterval = setInterval(loadOpenTrades, REFRESH_INTERVAL);
+}
+
 // ---- Initialise ----
 loadAccount();
 loadPrices();
@@ -276,5 +309,13 @@ loadOpenTrades();
 loadTradeHistory();
 loadNotificationStatus();
 
-// Auto-refresh prices
+// Start live updates
+startLiveUpdates();
+
+// Auto-refresh prices (already in config)
 setInterval(loadPrices, CONFIG.PRICE_REFRESH_INTERVAL);
+
+// ---- Cleanup on page unload (optional) ----
+window.addEventListener('beforeunload', function() {
+  if (openTradesInterval) clearInterval(openTradesInterval);
+});
