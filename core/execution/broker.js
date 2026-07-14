@@ -1,4 +1,4 @@
-// src/core/execution/broker.js – Final with account from authorize
+// core/execution/broker.js – Production Deriv WebSocket Driver (All Fixes)
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -35,7 +35,7 @@ const CB_STATE = { CLOSED: 'CLOSED', OPEN: 'OPEN', HALF_OPEN: 'HALF_OPEN' };
 let _requestCounter = 0;
 
 function generateRequestId() {
-  return ++_requestCounter;
+  return ++_requestCounter; // integer
 }
 
 function generateClientOrderId() {
@@ -144,12 +144,14 @@ class StreamingManager {
     logger.info(`[Streaming] Unsubscribed from ${key}`);
   }
 
+  // FIXED: clear server subscriptions before restoring
   restoreSubscriptions() {
     if (this._subscriptions.size === 0) {
       logger.info('[Streaming] No subscriptions to restore.');
       return;
     }
     logger.info('[Streaming] Restoring subscriptions...');
+    // First, forget all ticks subscriptions on the server to avoid AlreadySubscribed
     this.broker._sendRequest({ forget_all: 'ticks' })
       .then(() => {
         for (const [key, sub] of this._subscriptions) {
@@ -248,8 +250,8 @@ class DerivBroker extends EventEmitter {
       wsUrl: config.wsUrl || process.env.DERIV_WS_URL || `wss://ws.derivws.com/websockets/v3?app_id=${appId}`,
       connectionTimeout: parseInt(config.connectionTimeout || process.env.DERIV_CONNECTION_TIMEOUT || 30000),
       reconnectBaseDelay: parseInt(config.reconnectBaseDelay || process.env.DERIV_RECONNECT_DELAY || 2000),
-      maxReconnectDelay: parseInt(config.maxReconnectDelay || process.env.DERIV_MAX_RECONNECT_DELAY || 10000),
-      maxRetries: parseInt(config.maxRetries || process.env.DERIV_MAX_RETRIES || 2),
+      maxReconnectDelay: parseInt(config.maxReconnectDelay || process.env.DERIV_MAX_RECONNECT_DELAY || 30000),
+      maxRetries: parseInt(config.maxRetries || process.env.DERIV_MAX_RETRIES || 3),
       maxQueueSize: parseInt(config.maxQueueSize || process.env.DERIV_MAX_QUEUE_SIZE || 100),
       circuitBreakerThreshold: parseInt(config.circuitBreakerThreshold || process.env.DERIV_CIRCUIT_BREAKER_THRESHOLD || 20),
       circuitBreakerTimeout: parseInt(config.circuitBreakerTimeout || process.env.DERIV_CIRCUIT_BREAKER_TIMEOUT || 60000),
@@ -318,7 +320,7 @@ class DerivBroker extends EventEmitter {
     this.metadata = { name: 'Deriv', version: '1.0.0' };
     this._authFailCount = 0;
 
-    // Store account info from authorize
+    // Store account from authorize
     this._account = null;
 
     logger.info('[DerivBroker] Created. Call connect() to start.');
@@ -384,7 +386,6 @@ class DerivBroker extends EventEmitter {
 
             this._authorize()
               .then(async (authResponse) => {
-                // Store account from authorize response
                 if (authResponse && authResponse.authorize) {
                   this._account = authResponse.authorize;
                   logger.info('[DerivBroker] Account stored from authorize.');
@@ -476,7 +477,7 @@ class DerivBroker extends EventEmitter {
     this.emit('stateChange', { from: old, to: newState });
   }
 
-  // Modified: returns the response so we can capture account
+  // Modified: returns the full response to capture account
   _authorize() {
     return new Promise((resolve, reject) => {
       const payload = { authorize: this.config.apiToken };
@@ -492,9 +493,7 @@ class DerivBroker extends EventEmitter {
             reject(new Error(`Deriv API error: ${msg.error.code} - ${msg.error.message}`));
           } else if (msg.authorize !== undefined) {
             clearTimeout(timeout);
-            resolve(msg); // returns full response
-          } else {
-            // ignore other messages
+            resolve(msg);
           }
         } catch (err) {
           // ignore
@@ -802,14 +801,16 @@ class DerivBroker extends EventEmitter {
     this.emit('orderUpdate', { clientOrderId, status, contractId });
   }
 
-  // ---------- Position Reconciliation ----------
+  // ---------- Position Reconciliation (FIXED) ----------
   async _reconcilePositions() {
     logger.info('[DerivBroker] Reconciling positions...');
     try {
       const response = await this._sendRequest({ portfolio: 1 });
+      // Log the response for debugging (only in debug mode)
+      logger.debug('[Reconcile] Response:', JSON.stringify(response));
       const brokerPositions = response.portfolio || [];
       if (!Array.isArray(brokerPositions)) {
-        logger.warn('[Reconcile] Unexpected response format, expected array.');
+        logger.warn('[Reconcile] Unexpected response format, expected array. Got:', typeof brokerPositions);
         return;
       }
       const dbOrders = await Order.find({ status: ORDER_STATUS.FILLED });
@@ -879,7 +880,7 @@ class DerivBroker extends EventEmitter {
 
   // ---------- Public API ----------
 
-  // FIXED: Use stored account from authorize
+  // FIXED: use stored account from authorize
   async getAccount() {
     await this._ensureReady();
     if (!this._account) {
@@ -910,7 +911,7 @@ class DerivBroker extends EventEmitter {
     };
   }
 
-  // FIXED: removed subscribe:0
+  // FIXED: removed subscribe:0 and added end parameter for candles
   async getPrices(instruments) {
     await this._ensureReady();
     const results = [];
@@ -926,6 +927,7 @@ class DerivBroker extends EventEmitter {
         });
         continue;
       }
+      // Removed 'subscribe: 0' to avoid UnrecognisedRequest
       const response = await this._sendRequest({ ticks: symbol });
       const tick = response.tick;
       let bid, ask;
@@ -948,6 +950,7 @@ class DerivBroker extends EventEmitter {
     return results;
   }
 
+  // FIXED: added 'end' parameter to ohlc request
   async getCandles(instrument, count = 100, granularity = 'M5') {
     await this._ensureReady();
     const symbol = toDerivSymbol(instrument, this.symbolMap);
@@ -958,10 +961,12 @@ class DerivBroker extends EventEmitter {
     const seconds = intervalMap[granularity] || 300;
     const end = Math.floor(Date.now() / 1000);
     const start = end - (count * seconds + 10);
+    // Add 'end' parameter to fix UnrecognisedRequest
     const response = await this._sendRequest({
       ohlc: symbol,
       interval: seconds,
       start: start,
+      end: end,
     });
     const candles = response.candles || [];
     const sorted = candles.slice(-count);
@@ -972,7 +977,6 @@ class DerivBroker extends EventEmitter {
     }));
   }
 
-  // Order placement – using buy (CFD). It may need adjustments but works for now.
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null, clientOrderId = null) {
     await this._ensureReady();
     await this._validateOrderRisk(instrument, units > 0 ? 'BUY' : 'SELL', units, stopLoss, takeProfit);
@@ -1079,12 +1083,15 @@ class DerivBroker extends EventEmitter {
     }
   }
 
+  // FIXED: robust parsing with logging
   async getOpenTrades() {
     await this._ensureReady();
     const response = await this._sendRequest({ portfolio: 1 });
+    // Log the raw response for debugging
+    logger.debug('[getOpenTrades] Response:', JSON.stringify(response));
     const contracts = response.portfolio || [];
     if (!Array.isArray(contracts)) {
-      logger.warn('[getOpenTrades] Unexpected response format.');
+      logger.warn('[getOpenTrades] Unexpected response format. Expected array, got:', typeof contracts);
       return [];
     }
     return contracts.map(c => ({
@@ -1232,8 +1239,8 @@ const brokerInstance = new DerivBroker({
   wsUrl: process.env.DERIV_WS_URL,
   connectionTimeout: parseInt(process.env.DERIV_CONNECTION_TIMEOUT) || 30000,
   reconnectBaseDelay: parseInt(process.env.DERIV_RECONNECT_DELAY) || 2000,
-  maxReconnectDelay: parseInt(process.env.DERIV_MAX_RECONNECT_DELAY) || 10000,
-  maxRetries: parseInt(process.env.DERIV_MAX_RETRIES) || 2,
+  maxReconnectDelay: parseInt(process.env.DERIV_MAX_RECONNECT_DELAY) || 30000,
+  maxRetries: parseInt(process.env.DERIV_MAX_RETRIES) || 3,
   maxQueueSize: parseInt(process.env.DERIV_MAX_QUEUE_SIZE) || 100,
   circuitBreakerThreshold: parseInt(process.env.DERIV_CIRCUIT_BREAKER_THRESHOLD) || 20,
   circuitBreakerTimeout: parseInt(process.env.DERIV_CIRCUIT_BREAKER_TIMEOUT) || 60000,
