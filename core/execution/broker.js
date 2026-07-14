@@ -43,12 +43,14 @@ function generateClientOrderId() {
 }
 
 function toDerivSymbol(pair, symbolMap) {
+  if (!pair) return null;
   const upper = pair.toUpperCase();
   if (symbolMap[upper]) return symbolMap[upper];
   return upper;
 }
 
 function fromDerivSymbol(symbol, reverseMap) {
+  if (!symbol) return 'UNKNOWN';
   if (reverseMap[symbol]) return reverseMap[symbol];
   const clean = symbol.replace(/^frx/, '');
   if (clean.length === 6) {
@@ -118,7 +120,7 @@ class StreamingManager {
   async subscribe(type, symbol, callback) {
     const key = `${type}:${symbol}`;
     if (this._subscriptions.has(key)) {
-      logger.warn(`[Streaming] Subscription ${key} already exists.`);
+      logger.warn(`[Streaming] Subscription ${key} already exists locally.`);
       return;
     }
     await this.broker._ensureReady();
@@ -204,6 +206,7 @@ class DerivOrderBuilder {
 
   build(instrument, units, price, stopLoss, takeProfit, orderType, leverage, duration) {
     const symbol = toDerivSymbol(instrument, this.broker.symbolMap);
+    if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
     const amount = Math.abs(units);
     const payload = {
       buy: symbol,
@@ -645,8 +648,6 @@ class DerivBroker extends EventEmitter {
     }
     if (!this._isRequestAllowed()) throw new Error('Circuit breaker is OPEN');
 
-    // Idempotency check removed – frontend debounce prevents duplicates
-
     let lastError = null;
     for (let attempt = 1; attempt <= this.config.maxRetries; attempt++) {
       try {
@@ -801,7 +802,6 @@ class DerivBroker extends EventEmitter {
     logger.info('[DerivBroker] Reconciling positions...');
     try {
       const response = await this._sendRequest({ portfolio: 1 });
-      // FIX: if portfolio is an object, wrap it in an array
       let brokerPositions = response.portfolio || [];
       if (!Array.isArray(brokerPositions)) {
         logger.warn('[Reconcile] portfolio is not an array, converting object to array');
@@ -814,30 +814,37 @@ class DerivBroker extends EventEmitter {
       }
 
       for (const pos of brokerPositions) {
-        const existing = dbMap.get(pos.id);
+        // pos fields: contract_id, buy (boolean), sell (boolean), amount, buy_price, entry_spot, profit_loss, current_spot, symbol
+        const contractId = pos.contract_id;
+        if (!contractId) continue;
+        const existing = dbMap.get(contractId);
         if (!existing) {
+          const side = pos.buy ? 'BUY' : 'SELL';
+          const instrument = fromDerivSymbol(pos.symbol, this.reverseMap);
+          const units = Math.abs(pos.amount || 0);
+          const entryPrice = pos.buy_price || pos.entry_spot || 0;
           const newOrder = new Order({
             clientOrderId: generateClientOrderId(),
-            instrument: pos.instrument,
-            side: pos.side,
-            units: Math.abs(pos.units),
-            entryPrice: pos.price,
+            instrument: instrument || 'UNKNOWN',
+            side,
+            units,
+            entryPrice,
             status: ORDER_STATUS.FILLED,
-            contractId: pos.id,
+            contractId: contractId,
             filledAt: new Date(),
           });
           await newOrder.save();
           this._orders.set(newOrder.clientOrderId, newOrder);
-          this._orderMap.set(pos.id, newOrder.clientOrderId);
-          logger.warn(`[Reconcile] Created order for position ${pos.id}`);
+          this._orderMap.set(contractId, newOrder.clientOrderId);
+          logger.warn(`[Reconcile] Created order for position ${contractId}`);
         } else {
           this._orders.set(existing.clientOrderId, existing);
-          this._orderMap.set(pos.id, existing.clientOrderId);
+          this._orderMap.set(contractId, existing.clientOrderId);
         }
       }
 
       for (const [contractId, clientOrderId] of this._orderMap) {
-        const stillOpen = brokerPositions.some(p => p.id === contractId);
+        const stillOpen = brokerPositions.some(p => p.contract_id === contractId);
         if (!stillOpen) {
           await this._updateOrderStatus(clientOrderId, ORDER_STATUS.CLOSED);
           this._orderMap.delete(contractId);
@@ -909,6 +916,10 @@ class DerivBroker extends EventEmitter {
     const results = [];
     for (const pair of instruments) {
       const symbol = toDerivSymbol(pair, this.symbolMap);
+      if (!symbol) {
+        logger.warn(`[getPrices] Unknown pair: ${pair}`);
+        continue;
+      }
       const cached = this.streaming.getPrice(symbol);
       if (cached) {
         results.push({
@@ -944,6 +955,7 @@ class DerivBroker extends EventEmitter {
   async getCandles(instrument, count = 100, granularity = 'M5') {
     await this._ensureReady();
     const symbol = toDerivSymbol(instrument, this.symbolMap);
+    if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
     const intervalMap = {
       'M1': 60, 'M5': 300, 'M15': 900, 'M30': 1800,
       'H1': 3600, 'H4': 14400, 'D': 86400,
@@ -966,24 +978,16 @@ class DerivBroker extends EventEmitter {
     }));
   }
 
-  async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null, clientOrderId = null) {
+  async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null) {
     await this._ensureReady();
     await this._validateOrderRisk(instrument, units > 0 ? 'BUY' : 'SELL', units, stopLoss, takeProfit);
 
-    // Generate clientOrderId only for logging, not for idempotency
-    const orderId = clientOrderId || generateClientOrderId();
-    // We don't save the order here; it will be saved by the controller after success
-
     const payload = this.orderBuilder.build(instrument, units, 0, stopLoss, takeProfit, 'market');
-    // Do NOT add client_order_id to payload to avoid idempotency check
-
     try {
       const response = await this._sendRequest(payload);
       const tx = response.buy;
       const contractId = tx.contract_id || tx.transaction_id;
       const executedPrice = tx.buy_price || 0;
-      // Update order status (if it was saved in controller, we would update)
-      // But we will not save here; controller will handle.
       return {
         tradeID: contractId,
         id: contractId,
@@ -997,12 +1001,10 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  async placeLimitOrder(instrument, units, price, stopLoss = null, takeProfit = null, clientOrderId = null) {
+  async placeLimitOrder(instrument, units, price, stopLoss = null, takeProfit = null) {
     await this._ensureReady();
     await this._validateOrderRisk(instrument, units > 0 ? 'BUY' : 'SELL', units, stopLoss, takeProfit);
 
-    const orderId = clientOrderId || generateClientOrderId();
-    // Do not use client_order_id in payload
     const payload = this.orderBuilder.build(instrument, units, price, stopLoss, takeProfit, 'limit');
     try {
       const response = await this._sendRequest(payload);
@@ -1034,13 +1036,12 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // FIXED: robust parsing with conversion of object to array
+  // FIXED: robust parsing with conversion of object to array and safe field mapping
   async getOpenTrades() {
     await this._ensureReady();
     const response = await this._sendRequest({ portfolio: 1 });
     logger.debug('[getOpenTrades] Response:', JSON.stringify(response));
     let contracts = response.portfolio || [];
-    // If portfolio is an object, convert to array of values
     if (!Array.isArray(contracts)) {
       logger.warn('[getOpenTrades] portfolio is not an array, converting object to array');
       contracts = Object.values(contracts);
@@ -1050,12 +1051,12 @@ class DerivBroker extends EventEmitter {
     }
     return contracts.map(c => ({
       id: c.contract_id,
-      instrument: fromDerivSymbol(c.symbol, this.reverseMap),
+      instrument: fromDerivSymbol(c.symbol, this.reverseMap) || 'UNKNOWN',
       side: c.buy ? 'BUY' : 'SELL',
-      price: c.buy_price || c.entry_spot,
-      units: c.buy ? c.amount : -c.amount,
+      price: c.buy_price || c.entry_spot || 0,
+      units: c.buy ? (c.amount || 0) : -(c.amount || 0),
       unrealizedPL: c.profit_loss || 0,
-      currentPrice: c.current_spot || c.entry_spot,
+      currentPrice: c.current_spot || c.entry_spot || 0,
     }));
   }
 
