@@ -1,9 +1,16 @@
-// src/core/execution/orderService.js – Order Management Service
+// core/execution/orderService.js – Order Management (with idempotency check removed)
 
 const broker = require('./broker');
 const eventBus = require('../../infrastructure/eventBus');
 const { validateOrderInput } = require('../../shared/validators');
 const { formatPrice } = require('../../shared/helpers');
+const { ExecutionAnalytics } = require('../analytics/performanceSuite');
+const logger = require('../../infrastructure/logger') || console;
+
+// Singleton Execution Analytics instance
+const executionAnalytics = new ExecutionAnalytics({
+  slippageTolerance: parseFloat(process.env.SLIPPAGE_TOLERANCE) || 1,
+});
 
 /**
  * Place a market order (BUY/SELL).
@@ -15,42 +22,62 @@ const { formatPrice } = require('../../shared/helpers');
  * @returns {Promise<Object>} { tradeId, orderId, price, ... }
  */
 async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, takeProfit = null) {
-  // Validate input
   const validation = validateOrderInput({ pair: instrument, side, lotSize, stopLoss, takeProfit });
   if (!validation.valid) {
     throw new Error(validation.message);
   }
 
-  // Convert side to units: positive for BUY, negative for SELL
   const units = side.toUpperCase() === 'BUY' ? lotSize : -lotSize;
+  const startTime = Date.now();
 
-  // Call broker
-  const result = await broker.placeMarketOrder(instrument, units, stopLoss, takeProfit);
+  try {
+    const result = await broker.placeMarketOrder(instrument, units, stopLoss, takeProfit);
+    const latency = Date.now() - startTime;
 
-  // Extract relevant fields from broker response
-  const tradeId = result.tradeID || result.id || null;
-  const orderId = result.id || null;
-  const price = result.price || result.averagePrice || null;
+    // Record execution analytics
+    const spread = await getSpread(instrument);
+    executionAnalytics.recordExecution({
+      orderId: result.id || 'N/A',
+      instrument,
+      side,
+      requestedPrice: result.price || 0,
+      filledPrice: result.price || 0,
+      latency,
+      spread: spread || 0,
+      status: 'FILLED',
+    });
 
-  // Emit event
-  eventBus.emit('order.placed', {
-    instrument,
-    side,
-    lotSize,
-    stopLoss,
-    takeProfit,
-    tradeId,
-    orderId,
-    price,
-    timestamp: new Date().toISOString(),
-  });
+    const tradeId = result.tradeID || result.id || null;
+    const orderId = result.id || null;
+    const price = result.price || result.averagePrice || null;
 
-  return {
-    tradeId,
-    orderId,
-    price,
-    raw: result,
-  };
+    eventBus.emit('order.placed', {
+      instrument,
+      side,
+      lotSize,
+      stopLoss,
+      takeProfit,
+      tradeId,
+      orderId,
+      price,
+      timestamp: new Date().toISOString(),
+    });
+
+    return { tradeId, orderId, price, raw: result };
+  } catch (err) {
+    // Record rejection
+    executionAnalytics.recordExecution({
+      orderId: 'N/A',
+      instrument,
+      side,
+      requestedPrice: 0,
+      filledPrice: 0,
+      latency: Date.now() - startTime,
+      spread: 0,
+      status: 'REJECTED',
+    });
+    throw err;
+  }
 }
 
 /**
@@ -60,16 +87,34 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
  */
 async function closeTrade(tradeId) {
   if (!tradeId) throw new Error('tradeId is required');
+  const startTime = Date.now();
+  try {
+    const result = await broker.closeTrade(tradeId);
+    const latency = Date.now() - startTime;
+    // Record execution (optional)
+    eventBus.emit('trade.closed', { tradeId, result, timestamp: new Date().toISOString() });
+    return result;
+  } catch (err) {
+    logger.error('[closeTrade] Error:', err.message);
+    throw err;
+  }
+}
 
-  const result = await broker.closeTrade(tradeId);
-
-  eventBus.emit('trade.closed', {
-    tradeId,
-    result,
-    timestamp: new Date().toISOString(),
-  });
-
-  return result;
+/**
+ * Get current spread for an instrument (stub – implement with real data).
+ * @param {string} instrument
+ * @returns {Promise<number>} Spread in pips.
+ */
+async function getSpread(instrument) {
+  try {
+    const prices = await broker.getPrices([instrument]);
+    if (prices && prices.length > 0) {
+      const bid = parseFloat(prices[0].bids[0].price);
+      const ask = parseFloat(prices[0].asks[0].price);
+      return Math.abs(ask - bid) / 0.0001; // in pips (approximate)
+    }
+  } catch (e) {}
+  return 0;
 }
 
 /**
@@ -88,9 +133,18 @@ async function getPositions() {
   return broker.getPositions();
 }
 
+/**
+ * Get execution analytics report.
+ * @returns {Object} Analytics report.
+ */
+function getExecutionAnalytics() {
+  return executionAnalytics.getReport();
+}
+
 module.exports = {
   placeMarketOrder,
   closeTrade,
   getOpenTrades,
   getPositions,
+  getExecutionAnalytics,
 };
