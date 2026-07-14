@@ -1,4 +1,4 @@
-// src/core/risk/manager.js – Risk Management Engine
+// core/risk/manager.js – Risk Management Engine (with lot size cap)
 
 const accountService = require('../portfolio/accountService');
 const orderService = require('../execution/orderService');
@@ -12,9 +12,10 @@ const { getPipSize, formatPrice } = require('../../shared/helpers');
  * @param {number} entryPrice - Entry price.
  * @param {number} stopLoss - Stop loss price.
  * @param {number} riskPercent - Percentage of account to risk (e.g., 1 for 1%).
+ * @param {number} maxLot - Maximum allowed lot size (default 1000).
  * @returns {Promise<number>} Lot size (units, positive).
  */
-async function calculateLotSize(instrument, entryPrice, stopLoss, riskPercent = 1) {
+async function calculateLotSize(instrument, entryPrice, stopLoss, riskPercent = 1, maxLot = 1000) {
   try {
     // Get account balance
     const account = await accountService.getAccount();
@@ -36,8 +37,6 @@ async function calculateLotSize(instrument, entryPrice, stopLoss, riskPercent = 
     const pipSize = getPipSize(instrument);
 
     // Calculate pip value (approximate: for USD pairs, 1 lot = 100,000 units, pip value ~ $10 per pip)
-    // For more accurate, we could use broker's instrument details.
-    // This is a simplification; in production, use proper pip value calculation.
     const pipValue = 10; // approx for most USD pairs
 
     // Calculate lot size: riskAmount / (pipDistance * pipValue)
@@ -46,11 +45,11 @@ async function calculateLotSize(instrument, entryPrice, stopLoss, riskPercent = 
     // Round to 2 decimal places (0.01 lot minimum)
     lotSize = Math.max(0.01, Math.round(lotSize * 100) / 100);
 
-    // Cap at maximum lot size (optional)
-    const maxLot = 100; // arbitrary cap
-    if (lotSize > maxLot) {
-      lotSize = maxLot;
-      console.warn(`Lot size capped at ${maxLot} (calculated ${lotSize})`);
+    // Cap at maxLot (default 1000, configurable via env)
+    const maxAllowed = parseInt(process.env.MAX_POSITION_SIZE) || maxLot;
+    if (lotSize > maxAllowed) {
+      lotSize = maxAllowed;
+      console.warn(`[RiskManager] Lot size capped at ${maxAllowed} (calculated ${lotSize})`);
     }
 
     return lotSize;
@@ -73,11 +72,7 @@ async function calculateLotSize(instrument, entryPrice, stopLoss, riskPercent = 
  * @returns {Promise<Object>} { approved: boolean, reason: string }
  */
 async function validateTrade(instrument, side, lotSize) {
-  const validation = {
-    approved: true,
-    reason: '',
-  };
-
+  const validation = { approved: true, reason: '' };
   try {
     // 1. Check maximum open positions (configurable)
     const maxPositions = parseInt(process.env.MAX_OPEN_POSITIONS) || 5;
@@ -91,31 +86,12 @@ async function validateTrade(instrument, side, lotSize) {
     // 2. Check daily loss limit (optional)
     const dailyLossLimit = parseFloat(process.env.DAILY_LOSS_LIMIT) || 0; // 0 means disabled
     if (dailyLossLimit > 0) {
-      // Calculate today's P&L from closed trades (would need to fetch from DB)
-      // For now, placeholder – we could query Trade model.
-      // We'll implement a stub: assume we have a function getTodayPnL()
-      // const todayPnL = await getTodayPnL();
-      // if (todayPnL <= -dailyLossLimit) {
-      //   validation.approved = false;
-      //   validation.reason = `Daily loss limit (${dailyLossLimit}) reached`;
-      //   return validation;
-      // }
+      // Placeholder – implement with DB query
     }
 
     // 3. Minimum spread check (optional)
-    // Fetch current spread and compare to max allowed
-    // const spread = await getSpread(instrument);
-    // const maxSpread = parseFloat(process.env.MAX_SPREAD) || 0;
-    // if (maxSpread > 0 && spread > maxSpread) {
-    //   validation.approved = false;
-    //   validation.reason = `Spread ${spread} exceeds limit ${maxSpread}`;
-    //   return validation;
-    // }
-
     // 4. Instrument availability / trading hours (placeholder)
-    // Could check if market is open for this instrument.
 
-    // If all checks pass
     return validation;
   } catch (error) {
     console.error('Trade validation error:', error.message);
@@ -127,7 +103,6 @@ async function validateTrade(instrument, side, lotSize) {
 
 /**
  * Get today's realized P&L from MongoDB (placeholder).
- * In production, this would sum closed trades for today.
  * @returns {Promise<number>} Total P&L for today.
  */
 async function getTodayPnL() {
@@ -141,8 +116,6 @@ async function getTodayPnL() {
  * @returns {Promise<number>} Spread in pips.
  */
 async function getSpread(instrument) {
-  // In real implementation, fetch bid/ask and compute difference
-  // For now, return a default.
   return 1.0;
 }
 
