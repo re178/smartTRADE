@@ -1,4 +1,4 @@
-// src/api/controllers.js – Complete Request Handlers (with Portfolio Manager & Notifications)
+// api/controllers.js – Complete Request Handlers (with order saving after broker)
 
 const Trade = require('../models/Trade');
 const marketProvider = require('../core/market/provider');
@@ -98,7 +98,7 @@ exports.getTradeHistory = async (req, res) => {
   }
 };
 
-// ---------- Manual Order (with Portfolio Manager & Notifications) ----------
+// ---------- Manual Order (save after broker) ----------
 exports.placeOrder = async (req, res) => {
   const { pair, side, lotSize, stopLoss, takeProfit } = req.body;
 
@@ -131,7 +131,7 @@ exports.placeOrder = async (req, res) => {
       return res.status(400).json({ error: approval.reason });
     }
 
-    // Place the order
+    // Place the order FIRST (no client_order_id)
     const orderResult = await orderService.placeMarketOrder(
       instrument,
       side,
@@ -140,7 +140,7 @@ exports.placeOrder = async (req, res) => {
       takeProfit || null
     );
 
-    // Save to database
+    // Save to database AFTER broker confirms
     const trade = await portfolioLogger.logTrade({
       pair: instrument,
       side,
@@ -221,7 +221,7 @@ exports.getSignal = async (req, res) => {
   }
 };
 
-// ---------- Auto Trade (with Portfolio Manager & Notifications) ----------
+// ---------- Auto Trade (save after broker) ----------
 exports.autoTrade = async (req, res) => {
   const { pair, riskPercent = 1, strategy = 'sma', ...params } = req.body;
   if (!pair) return res.status(400).json({ error: 'pair required' });
@@ -252,7 +252,7 @@ exports.autoTrade = async (req, res) => {
       riskPercent
     );
 
-    // Place order
+    // Place order FIRST
     const orderResult = await orderService.placeMarketOrder(
       instrument,
       signal.side,
@@ -261,7 +261,7 @@ exports.autoTrade = async (req, res) => {
       signal.takeProfit
     );
 
-    // Log to DB
+    // Log to DB AFTER broker confirms
     const trade = await portfolioLogger.logTrade({
       pair: instrument,
       side: signal.side,
