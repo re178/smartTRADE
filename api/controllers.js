@@ -1,4 +1,4 @@
-// api/controllers.js – Complete Request Handlers (with order saving after broker)
+// api/controllers.js – with safe order handling
 
 const Trade = require('../models/Trade');
 const marketProvider = require('../core/market/provider');
@@ -10,7 +10,6 @@ const portfolioLogger = require('../core/portfolio/logger');
 const accountService = require('../core/portfolio/accountService');
 const { PortfolioManager, PerformanceLearner } = require('../core/analytics/performanceSuite');
 const { notifyTrade } = require('../core/notifications/notificationService');
-const { formatPrice, validatePair } = require('../shared/helpers');
 const { validateOrderInput } = require('../shared/validators');
 const logger = require('../infrastructure/logger') || console;
 
@@ -98,7 +97,7 @@ exports.getTradeHistory = async (req, res) => {
   }
 };
 
-// ---------- Manual Order (save after broker) ----------
+// ---------- Manual Order ----------
 exports.placeOrder = async (req, res) => {
   const { pair, side, lotSize, stopLoss, takeProfit } = req.body;
 
@@ -131,7 +130,7 @@ exports.placeOrder = async (req, res) => {
       return res.status(400).json({ error: approval.reason });
     }
 
-    // Place the order FIRST (no client_order_id)
+    // Place the order
     const orderResult = await orderService.placeMarketOrder(
       instrument,
       side,
@@ -140,7 +139,7 @@ exports.placeOrder = async (req, res) => {
       takeProfit || null
     );
 
-    // Save to database AFTER broker confirms
+    // Save to database
     const trade = await portfolioLogger.logTrade({
       pair: instrument,
       side,
@@ -221,7 +220,7 @@ exports.getSignal = async (req, res) => {
   }
 };
 
-// ---------- Auto Trade (save after broker) ----------
+// ---------- Auto Trade ----------
 exports.autoTrade = async (req, res) => {
   const { pair, riskPercent = 1, strategy = 'sma', ...params } = req.body;
   if (!pair) return res.status(400).json({ error: 'pair required' });
@@ -252,7 +251,7 @@ exports.autoTrade = async (req, res) => {
       riskPercent
     );
 
-    // Place order FIRST
+    // Place order
     const orderResult = await orderService.placeMarketOrder(
       instrument,
       signal.side,
@@ -261,7 +260,7 @@ exports.autoTrade = async (req, res) => {
       signal.takeProfit
     );
 
-    // Log to DB AFTER broker confirms
+    // Log to DB
     const trade = await portfolioLogger.logTrade({
       pair: instrument,
       side: signal.side,
