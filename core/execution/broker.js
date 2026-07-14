@@ -1,4 +1,4 @@
-// core/execution/broker.js – Production Deriv WebSocket Driver (Final Fix)
+// core/execution/broker.js – Final Corrected Version (CFD uses 'units', not 'amount')
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -31,7 +31,6 @@ const ORDER_STATUS = {
 
 const CB_STATE = { CLOSED: 'CLOSED', OPEN: 'OPEN', HALF_OPEN: 'HALF_OPEN' };
 
-// --- Helpers ---
 let _requestCounter = 0;
 
 function generateRequestId() {
@@ -59,7 +58,6 @@ function fromDerivSymbol(symbol, reverseMap) {
   return symbol;
 }
 
-// ---------- Hardcoded fallback symbols ----------
 const FALLBACK_SYMBOLS = {
   'EUR_USD': 'frxEURUSD',
   'GBP_USD': 'frxGBPUSD',
@@ -71,20 +69,8 @@ const FALLBACK_SYMBOLS = {
   'EUR_GBP': 'frxEURGBP',
   'EUR_JPY': 'frxEURJPY',
   'GBP_JPY': 'frxGBPJPY',
-  'AUD_JPY': 'frxAUDJPY',
-  'CAD_JPY': 'frxCADJPY',
-  'CHF_JPY': 'frxCHFJPY',
-  'EUR_AUD': 'frxEURAUD',
-  'EUR_CAD': 'frxEURCAD',
-  'GBP_AUD': 'frxGBPAUD',
-  'GBP_CAD': 'frxGBPCAD',
-  'NZD_JPY': 'frxNZDJPY',
-  'AUD_CAD': 'frxAUDCAD',
-  'AUD_CHF': 'frxAUDCHF',
-  'CAD_CHF': 'frxCADCHF',
 };
 
-// ---------- Rate Limiter ----------
 class RateLimiter {
   constructor(rate, capacity) {
     this.rate = rate;
@@ -108,7 +94,6 @@ class RateLimiter {
   }
 }
 
-// ---------- Streaming Manager ----------
 class StreamingManager {
   constructor(broker) {
     this.broker = broker;
@@ -120,7 +105,7 @@ class StreamingManager {
   async subscribe(type, symbol, callback) {
     const key = `${type}:${symbol}`;
     if (this._subscriptions.has(key)) {
-      logger.warn(`[Streaming] Subscription ${key} already exists locally.`);
+      logger.warn(`[Streaming] Subscription ${key} already exists.`);
       return;
     }
     await this.broker._ensureReady();
@@ -197,38 +182,30 @@ class StreamingManager {
   }
 }
 
-// ---------- Order Builder (FIXED) ----------
+// ---------- ORDER BUILDER – CFD uses 'units' ----------
 class DerivOrderBuilder {
   constructor(broker) {
     this.broker = broker;
   }
 
-  build(instrument, units, price, stopLoss, takeProfit, orderType, leverage, duration) {
+  build(instrument, units, price, stopLoss, takeProfit, orderType) {
     const symbol = toDerivSymbol(instrument, this.broker.symbolMap);
     if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
-    const amount = Math.abs(units);
     const payload = {
       buy: symbol,
-      amount: amount,
+      units: Math.abs(units), // CFD uses 'units', NOT 'amount'
       price: orderType === 'market' ? 0 : price,
     };
-    // Only add stop_loss and take_profit if they are provided
-    if (stopLoss !== null && stopLoss !== undefined) {
+    if (stopLoss !== null && stopLoss !== undefined && !isNaN(stopLoss) && stopLoss > 0) {
       payload.stop_loss = stopLoss;
     }
-    if (takeProfit !== null && takeProfit !== undefined) {
+    if (takeProfit !== null && takeProfit !== undefined && !isNaN(takeProfit) && takeProfit > 0) {
       payload.take_profit = takeProfit;
-    }
-    // For multiplier contracts (if applicable)
-    if (this.broker.config.contractType === 'multiplier') {
-      payload.leverage = leverage || this.broker.config.leverage;
-      if (duration) payload.duration = duration;
     }
     return payload;
   }
 }
 
-// ---------- Broker Capabilities ----------
 const BROKER_CAPABILITIES = {
   supportsTrailingStop: false,
   supportsHedging: false,
@@ -244,7 +221,6 @@ const BROKER_CAPABILITIES = {
   supportedMarkets: ['Forex', 'Indices', 'Commodities', 'Cryptocurrencies'],
 };
 
-// ---------- Main Broker Class ----------
 class DerivBroker extends EventEmitter {
   constructor(config = {}) {
     super();
@@ -292,7 +268,6 @@ class DerivBroker extends EventEmitter {
     this._cbFailureCount = 0;
     this._cbOpenedAt = null;
 
-    // Fallback symbols
     this.symbolMap = { ...FALLBACK_SYMBOLS };
     this.reverseMap = {};
     for (const [key, val] of Object.entries(FALLBACK_SYMBOLS)) {
@@ -791,7 +766,6 @@ class DerivBroker extends EventEmitter {
     this.emit('orderUpdate', { clientOrderId, status, contractId });
   }
 
-  // ---------- Position Reconciliation (FIXED) ----------
   async _reconcilePositions() {
     logger.info('[DerivBroker] Reconciling positions...');
     try {
@@ -817,7 +791,6 @@ class DerivBroker extends EventEmitter {
           const amount = pos.amount || 0;
           const units = Math.abs(amount) || 0.01;
           const entryPrice = pos.buy_price || pos.entry_spot || 0;
-          // Skip if any required field is missing or NaN
           if (isNaN(units) || units <= 0 || !instrument || !side) {
             logger.warn(`[Reconcile] Skipping position with invalid data: ${JSON.stringify(pos)}`);
             continue;
@@ -877,7 +850,6 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // ---------- Public API ----------
   async getAccount() {
     await this._ensureReady();
     if (!this._account) {
@@ -975,15 +947,15 @@ class DerivBroker extends EventEmitter {
     }));
   }
 
-  // ---------- ORDER PLACEMENT (FIXED) ----------
+  // ---------- ORDER PLACEMENT (CFD uses 'units') ----------
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null) {
     await this._ensureReady();
-    await this._validateOrderRisk(instrument, units > 0 ? 'BUY' : 'SELL', units, stopLoss, takeProfit);
+    const amount = Math.abs(units);
+    if (amount <= 0) throw new Error('Order units must be greater than zero.');
+    await this._validateOrderRisk(instrument, units > 0 ? 'BUY' : 'SELL', amount, stopLoss, takeProfit);
 
-    // Validate stopLoss and takeProfit – if they are too small, Deriv rejects them.
-    // We'll set them to null if they are not valid numbers > 0.
-    const sl = (stopLoss && !isNaN(stopLoss) && stopLoss > 0) ? stopLoss : null;
-    const tp = (takeProfit && !isNaN(takeProfit) && takeProfit > 0) ? takeProfit : null;
+    const sl = (stopLoss !== null && stopLoss !== undefined && !isNaN(stopLoss) && stopLoss > 0) ? stopLoss : null;
+    const tp = (takeProfit !== null && takeProfit !== undefined && !isNaN(takeProfit) && takeProfit > 0) ? takeProfit : null;
 
     const payload = this.orderBuilder.build(instrument, units, 0, sl, tp, 'market');
     try {
@@ -1006,10 +978,12 @@ class DerivBroker extends EventEmitter {
 
   async placeLimitOrder(instrument, units, price, stopLoss = null, takeProfit = null) {
     await this._ensureReady();
-    await this._validateOrderRisk(instrument, units > 0 ? 'BUY' : 'SELL', units, stopLoss, takeProfit);
+    const amount = Math.abs(units);
+    if (amount <= 0) throw new Error('Order units must be greater than zero.');
+    await this._validateOrderRisk(instrument, units > 0 ? 'BUY' : 'SELL', amount, stopLoss, takeProfit);
 
-    const sl = (stopLoss && !isNaN(stopLoss) && stopLoss > 0) ? stopLoss : null;
-    const tp = (takeProfit && !isNaN(takeProfit) && takeProfit > 0) ? takeProfit : null;
+    const sl = (stopLoss !== null && stopLoss !== undefined && !isNaN(stopLoss) && stopLoss > 0) ? stopLoss : null;
+    const tp = (takeProfit !== null && takeProfit !== undefined && !isNaN(takeProfit) && takeProfit > 0) ? takeProfit : null;
 
     const payload = this.orderBuilder.build(instrument, units, price, sl, tp, 'limit');
     try {
@@ -1032,6 +1006,7 @@ class DerivBroker extends EventEmitter {
 
   async closeTrade(tradeId) {
     await this._ensureReady();
+    if (!tradeId) throw new Error('tradeId is required');
     const payload = { sell: tradeId, price: 0 };
     try {
       const response = await this._sendRequest(payload);
@@ -1042,11 +1017,9 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // ---------- GET OPEN TRADES (FIXED) ----------
   async getOpenTrades() {
     await this._ensureReady();
     const response = await this._sendRequest({ portfolio: 1 });
-    logger.debug('[getOpenTrades] Response:', JSON.stringify(response));
     let contracts = response.portfolio || [];
     if (!Array.isArray(contracts)) {
       logger.warn('[getOpenTrades] portfolio is not an array, converting object to array');
@@ -1056,7 +1029,7 @@ class DerivBroker extends EventEmitter {
       return [];
     }
     return contracts
-      .filter(c => c.contract_id) // filter out invalid entries
+      .filter(c => c.contract_id)
       .map(c => ({
         id: c.contract_id,
         instrument: fromDerivSymbol(c.symbol, this.reverseMap) || 'UNKNOWN',
@@ -1072,7 +1045,6 @@ class DerivBroker extends EventEmitter {
     return this.getOpenTrades();
   }
 
-  // ---------- Health & Kill ----------
   getHealth() {
     const avgLatency = this.metrics.latencyCount > 0 ? this.metrics.totalLatency / this.metrics.latencyCount : 0;
     return {
