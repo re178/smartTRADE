@@ -1,4 +1,4 @@
-// api/controllers.js – with safe order handling
+// api/controllers.js – Complete Request Handlers (with increased max position size)
 
 const Trade = require('../models/Trade');
 const marketProvider = require('../core/market/provider');
@@ -18,7 +18,7 @@ const portfolioManager = new PortfolioManager({
   maxOpenTrades: parseInt(process.env.MAX_OPEN_TRADES) || 5,
   maxDailyLoss: parseFloat(process.env.MAX_DAILY_LOSS) || 0,
   maxExposure: parseFloat(process.env.MAX_EXPOSURE) || Infinity,
-  maxPositionSize: parseFloat(process.env.MAX_POSITION_SIZE) || 100,
+  maxPositionSize: parseFloat(process.env.MAX_POSITION_SIZE) || 1000, // Increased from 100 to 1000
   correlatedPairs: process.env.CORRELATED_PAIRS ? JSON.parse(process.env.CORRELATED_PAIRS) : [],
 });
 
@@ -244,12 +244,15 @@ exports.autoTrade = async (req, res) => {
     }
 
     // Calculate lot size (use recommended if provided, else risk manager)
-    const lotSize = signal.recommendedLotSize || await riskManager.calculateLotSize(
-      instrument,
-      signal.entryPrice,
-      signal.stopLoss,
-      riskPercent
-    );
+    let lotSize = signal.recommendedLotSize;
+    if (!lotSize) {
+      lotSize = await riskManager.calculateLotSize(
+        instrument,
+        signal.entryPrice,
+        signal.stopLoss,
+        riskPercent
+      );
+    }
 
     // Place order
     const orderResult = await orderService.placeMarketOrder(
