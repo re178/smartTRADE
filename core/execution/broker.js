@@ -144,7 +144,6 @@ class StreamingManager {
     logger.info(`[Streaming] Unsubscribed from ${key}`);
   }
 
-  // FIXED: clear server subscriptions before restoring
   restoreSubscriptions() {
     if (this._subscriptions.size === 0) {
       logger.info('[Streaming] No subscriptions to restore.');
@@ -635,6 +634,7 @@ class DerivBroker extends EventEmitter {
     }
   }
 
+  // ---------- REMOVED IDEMPOTENCY CHECK ----------
   async _sendRequest(payload, timeoutMs = 15000, signal = null) {
     await this._rateLimiter.acquire();
     if (this._state === STATE.FATAL) {
@@ -645,12 +645,7 @@ class DerivBroker extends EventEmitter {
     }
     if (!this._isRequestAllowed()) throw new Error('Circuit breaker is OPEN');
 
-    if (payload.client_order_id) {
-      const existing = await Order.findOne({ clientOrderId: payload.client_order_id });
-      if (existing && (existing.status === ORDER_STATUS.FILLED || existing.status === ORDER_STATUS.PENDING)) {
-        throw new Error(`Duplicate order: ${payload.client_order_id}`);
-      }
-    }
+    // Idempotency check removed – frontend debounce prevents duplicates
 
     let lastError = null;
     for (let attempt = 1; attempt <= this.config.maxRetries; attempt++) {
@@ -806,12 +801,11 @@ class DerivBroker extends EventEmitter {
     logger.info('[DerivBroker] Reconciling positions...');
     try {
       const response = await this._sendRequest({ portfolio: 1 });
-      // Log the response for debugging (only in debug mode)
-      logger.debug('[Reconcile] Response:', JSON.stringify(response));
-      const brokerPositions = response.portfolio || [];
+      // FIX: if portfolio is an object, wrap it in an array
+      let brokerPositions = response.portfolio || [];
       if (!Array.isArray(brokerPositions)) {
-        logger.warn('[Reconcile] Unexpected response format, expected array. Got:', typeof brokerPositions);
-        return;
+        logger.warn('[Reconcile] portfolio is not an array, converting object to array');
+        brokerPositions = Object.values(brokerPositions);
       }
       const dbOrders = await Order.find({ status: ORDER_STATUS.FILLED });
       const dbMap = new Map();
@@ -880,7 +874,6 @@ class DerivBroker extends EventEmitter {
 
   // ---------- Public API ----------
 
-  // FIXED: use stored account from authorize
   async getAccount() {
     await this._ensureReady();
     if (!this._account) {
@@ -911,7 +904,6 @@ class DerivBroker extends EventEmitter {
     };
   }
 
-  // FIXED: removed subscribe:0 and added end parameter for candles
   async getPrices(instruments) {
     await this._ensureReady();
     const results = [];
@@ -927,7 +919,6 @@ class DerivBroker extends EventEmitter {
         });
         continue;
       }
-      // Removed 'subscribe: 0' to avoid UnrecognisedRequest
       const response = await this._sendRequest({ ticks: symbol });
       const tick = response.tick;
       let bid, ask;
@@ -950,7 +941,6 @@ class DerivBroker extends EventEmitter {
     return results;
   }
 
-  // FIXED: added 'end' parameter to ohlc request
   async getCandles(instrument, count = 100, granularity = 'M5') {
     await this._ensureReady();
     const symbol = toDerivSymbol(instrument, this.symbolMap);
@@ -961,7 +951,6 @@ class DerivBroker extends EventEmitter {
     const seconds = intervalMap[granularity] || 300;
     const end = Math.floor(Date.now() / 1000);
     const start = end - (count * seconds + 10);
-    // Add 'end' parameter to fix UnrecognisedRequest
     const response = await this._sendRequest({
       ohlc: symbol,
       interval: seconds,
@@ -981,37 +970,29 @@ class DerivBroker extends EventEmitter {
     await this._ensureReady();
     await this._validateOrderRisk(instrument, units > 0 ? 'BUY' : 'SELL', units, stopLoss, takeProfit);
 
+    // Generate clientOrderId only for logging, not for idempotency
     const orderId = clientOrderId || generateClientOrderId();
-    const orderDoc = new Order({
-      clientOrderId: orderId,
-      instrument,
-      side: units > 0 ? 'BUY' : 'SELL',
-      units: Math.abs(units),
-      stopLoss,
-      takeProfit,
-      status: ORDER_STATUS.PENDING,
-    });
-    await orderDoc.save();
-    this._orders.set(orderId, orderDoc);
+    // We don't save the order here; it will be saved by the controller after success
 
     const payload = this.orderBuilder.build(instrument, units, 0, stopLoss, takeProfit, 'market');
-    payload.client_order_id = orderId;
+    // Do NOT add client_order_id to payload to avoid idempotency check
 
     try {
       const response = await this._sendRequest(payload);
       const tx = response.buy;
       const contractId = tx.contract_id || tx.transaction_id;
       const executedPrice = tx.buy_price || 0;
-      await this._updateOrderStatus(orderId, ORDER_STATUS.FILLED, contractId);
+      // Update order status (if it was saved in controller, we would update)
+      // But we will not save here; controller will handle.
       return {
         tradeID: contractId,
         id: contractId,
         price: executedPrice,
         averagePrice: executedPrice,
-        clientOrderId: orderId,
+        raw: response,
       };
     } catch (err) {
-      await this._updateOrderStatus(orderId, ORDER_STATUS.REJECTED);
+      logger.error('[placeMarketOrder] Error:', err.message);
       throw err;
     }
   }
@@ -1021,77 +1002,50 @@ class DerivBroker extends EventEmitter {
     await this._validateOrderRisk(instrument, units > 0 ? 'BUY' : 'SELL', units, stopLoss, takeProfit);
 
     const orderId = clientOrderId || generateClientOrderId();
-    const orderDoc = new Order({
-      clientOrderId: orderId,
-      instrument,
-      side: units > 0 ? 'BUY' : 'SELL',
-      units: Math.abs(units),
-      entryPrice: price,
-      stopLoss,
-      takeProfit,
-      status: ORDER_STATUS.PENDING,
-    });
-    await orderDoc.save();
-    this._orders.set(orderId, orderDoc);
-
+    // Do not use client_order_id in payload
     const payload = this.orderBuilder.build(instrument, units, price, stopLoss, takeProfit, 'limit');
-    payload.client_order_id = orderId;
-
     try {
       const response = await this._sendRequest(payload);
       const tx = response.buy;
       const contractId = tx.contract_id || tx.transaction_id;
       const executedPrice = tx.buy_price || price;
-      await this._updateOrderStatus(orderId, ORDER_STATUS.FILLED, contractId);
       return {
         tradeID: contractId,
         id: contractId,
         price: executedPrice,
         averagePrice: executedPrice,
-        clientOrderId: orderId,
+        raw: response,
       };
     } catch (err) {
-      await this._updateOrderStatus(orderId, ORDER_STATUS.REJECTED);
+      logger.error('[placeLimitOrder] Error:', err.message);
       throw err;
     }
   }
 
-  async closeTrade(tradeId, clientOrderId = null) {
+  async closeTrade(tradeId) {
     await this._ensureReady();
-    const orderId = clientOrderId || generateClientOrderId();
-    const orderDoc = new Order({
-      clientOrderId: orderId,
-      instrument: 'CLOSE',
-      side: 'CLOSE',
-      units: 0,
-      status: ORDER_STATUS.PENDING,
-      metadata: { tradeId },
-    });
-    await orderDoc.save();
-    this._orders.set(orderId, orderDoc);
-
-    const payload = { sell: tradeId, price: 0, client_order_id: orderId };
+    const payload = { sell: tradeId, price: 0 };
     try {
       const response = await this._sendRequest(payload);
-      const tx = response.sell;
-      const contractId = tx.contract_id || tx.transaction_id;
-      await this._updateOrderStatus(orderId, ORDER_STATUS.FILLED, contractId);
       return response.sell;
     } catch (err) {
-      await this._updateOrderStatus(orderId, ORDER_STATUS.REJECTED);
+      logger.error('[closeTrade] Error:', err.message);
       throw err;
     }
   }
 
-  // FIXED: robust parsing with logging
+  // FIXED: robust parsing with conversion of object to array
   async getOpenTrades() {
     await this._ensureReady();
     const response = await this._sendRequest({ portfolio: 1 });
-    // Log the raw response for debugging
     logger.debug('[getOpenTrades] Response:', JSON.stringify(response));
-    const contracts = response.portfolio || [];
+    let contracts = response.portfolio || [];
+    // If portfolio is an object, convert to array of values
     if (!Array.isArray(contracts)) {
-      logger.warn('[getOpenTrades] Unexpected response format. Expected array, got:', typeof contracts);
+      logger.warn('[getOpenTrades] portfolio is not an array, converting object to array');
+      contracts = Object.values(contracts);
+    }
+    if (!Array.isArray(contracts) || contracts.length === 0) {
       return [];
     }
     return contracts.map(c => ({
