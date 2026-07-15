@@ -1,4 +1,6 @@
-// core/execution/broker.js – Singleton instance with all methods (ARCHITECTURE FIXED)
+// core/execution/broker.js – Singleton instance with all methods (FINAL)
+// Supports: 'cfd' (forex options), 'multiplier' (leverage), 'basic' (vanilla options)
+// All product types are driven by the environment variable TRADING_PRODUCT.
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -100,8 +102,7 @@ class StreamingManager {
     this._subscriptions = new Map();
     this._subscriptionIdMap = new Map();
     this._priceCache = new Map();
-    // FIX: Track active subscription keys to prevent duplicates
-    this._activeKeys = new Set();
+    this._activeKeys = new Set(); // prevent duplicate subscriptions
   }
 
   async subscribe(type, symbol, callback) {
@@ -139,7 +140,6 @@ class StreamingManager {
     logger.info(`[Streaming] Unsubscribed from ${key}`);
   }
 
-  // FIX: Wait for forget_all to complete before restoring
   async restoreSubscriptions() {
     if (this._subscriptions.size === 0) {
       logger.info('[Streaming] No subscriptions to restore.');
@@ -147,15 +147,14 @@ class StreamingManager {
     }
     logger.info('[Streaming] Restoring subscriptions...');
     try {
-      // Clear all old subscriptions on the server
+      // Clear old subscriptions on the server
       await this.broker._sendRequest({ forget_all: 'ticks' });
       logger.info('[Streaming] Cleared old subscriptions.');
     } catch (err) {
       logger.warn('[Streaming] Failed to clear old subscriptions:', err.message);
-      // Continue anyway – we'll try to subscribe individually
     }
 
-    // Now restore each subscription
+    // Re‑subscribe each
     for (const [key, sub] of this._subscriptions) {
       try {
         const response = await this.broker._sendRequest({ [sub.type]: sub.symbol, subscribe: 1 });
@@ -198,6 +197,9 @@ class StreamingManager {
   }
 }
 
+// ------------------------------------------------------------
+// PROPOSAL BUILDER – Correctly handles all three product types
+// ------------------------------------------------------------
 class DerivProposalBuilder {
   constructor(broker) {
     this.broker = broker;
@@ -210,8 +212,7 @@ class DerivProposalBuilder {
     if (amount <= 0) throw new Error('Order amount must be greater than zero.');
     const side = units > 0 ? 'BUY' : 'SELL';
 
-    // FIX: Use the broker's single product type
-    const productType = this.broker.productType; // 'cfd' or 'multiplier'
+    const productType = this.broker.productType; // one of 'cfd', 'multiplier', 'basic'
 
     // Base proposal
     const proposalPayload = {
@@ -220,38 +221,39 @@ class DerivProposalBuilder {
       basis: 'stake',
       currency: 'USD',
       symbol,
-      product_type: productType === 'cfd' ? 'basic' : 'multiplier',
     };
 
-    if (productType === 'cfd') {
-      // === CFD (CALL/PUT with duration) ===
-      proposalPayload.contract_type = side === 'BUY' ? 'CALL' : 'PUT';
-      proposalPayload.duration_unit = 's';
-      proposalPayload.duration = this.broker.config.duration || 60; // seconds
-      // CFD does NOT support stop_loss / take_profit
-      if (stopLoss || takeProfit) {
-        logger.warn('[DerivProposalBuilder] stop_loss/take_profit ignored for CFD.');
-      }
-    } else {
-      // === Multiplier (MULTUP/MULTIDOWN with leverage) ===
+    // Determine product_type and contract_type based on productType
+    if (productType === 'multiplier') {
+      // Multiplier contracts
+      proposalPayload.product_type = 'multiplier';
       proposalPayload.contract_type = side === 'BUY' ? 'MULTUP' : 'MULTIDOWN';
-      let multiplier = this.broker.config.leverage || 100;
-      const validMultipliers = [100, 200, 300, 500, 800];
-      if (!validMultipliers.includes(multiplier)) {
-        multiplier = 100;
-        logger.warn(`[DerivBroker] Invalid multiplier, using default 100`);
-      }
-      proposalPayload.multiplier = multiplier;
-      // Support stop_loss / take_profit for multiplier
+      proposalPayload.multiplier = this.broker.config.leverage || 100;
+      // Multiplier supports stop_loss / take_profit via limit_order
       const limitOrder = {};
-      if (stopLoss !== null && stopLoss !== undefined && !isNaN(stopLoss) && stopLoss > 0) {
-        limitOrder.stop_loss = stopLoss;
-      }
-      if (takeProfit !== null && takeProfit !== undefined && !isNaN(takeProfit) && takeProfit > 0) {
-        limitOrder.take_profit = takeProfit;
-      }
+      if (stopLoss && !isNaN(stopLoss) && stopLoss > 0) limitOrder.stop_loss = stopLoss;
+      if (takeProfit && !isNaN(takeProfit) && takeProfit > 0) limitOrder.take_profit = takeProfit;
       if (Object.keys(limitOrder).length > 0) {
         proposalPayload.limit_order = limitOrder;
+      }
+      // Multiplier can also have duration (optional)
+      if (this.broker.config.duration) {
+        proposalPayload.duration = this.broker.config.duration;
+        proposalPayload.duration_unit = 's';
+      }
+    } else {
+      // Basic product (options / CFD‑style options)
+      proposalPayload.product_type = 'basic';
+      // For both 'cfd' and 'basic', we use CALL/PUT contracts.
+      // The difference is in the naming only; the API treats them as options.
+      proposalPayload.contract_type = side === 'BUY' ? 'CALL' : 'PUT';
+      // Duration is mandatory for options
+      const duration = this.broker.config.duration || 60;
+      proposalPayload.duration = duration;
+      proposalPayload.duration_unit = 's';
+      // Options do NOT support stop_loss / take_profit – warn if provided
+      if (stopLoss || takeProfit) {
+        logger.warn('[DerivProposalBuilder] stop_loss/take_profit ignored for basic/CFD options.');
       }
     }
 
@@ -259,6 +261,9 @@ class DerivProposalBuilder {
   }
 }
 
+// ------------------------------------------------------------
+// MAIN BROKER CLASS
+// ------------------------------------------------------------
 const BROKER_CAPABILITIES = {
   supportsTrailingStop: false,
   supportsHedging: false,
@@ -296,20 +301,23 @@ class DerivBroker extends EventEmitter {
       minStopDistance: parseFloat(config.minStopDistance || 0.0001),
       rateLimit: parseFloat(config.rateLimit || 5),
       rateCapacity: parseFloat(config.rateCapacity || 10),
-      contractType: config.contractType || 'cfd',
+      contractType: config.contractType || 'cfd', // legacy, not used
       leverage: parseFloat(config.leverage || 100),
-      duration: config.duration ? parseInt(config.duration) : 60, // default 60s
+      duration: config.duration ? parseInt(config.duration) : 60, // seconds for options
       riskValidator: config.riskValidator || null,
       fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || 3),
       readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 30000),
       symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 30000),
     };
 
-    // FIX: Single product type – no mixing
-    this.productType = (config.productType || process.env.TRADING_PRODUCT || 'cfd').toLowerCase();
-    if (!['cfd', 'multiplier'].includes(this.productType)) {
-      logger.warn(`[DerivBroker] Invalid productType '${this.productType}', defaulting to 'cfd'`);
+    // Product type validation
+    const rawProduct = (config.productType || process.env.TRADING_PRODUCT || 'cfd').toLowerCase();
+    const validProducts = ['cfd', 'multiplier', 'basic'];
+    if (!validProducts.includes(rawProduct)) {
+      logger.warn(`[DerivBroker] Invalid productType '${rawProduct}', defaulting to 'cfd'`);
       this.productType = 'cfd';
+    } else {
+      this.productType = rawProduct;
     }
 
     this.validateConfig();
@@ -362,6 +370,7 @@ class DerivBroker extends EventEmitter {
     this.metadata = { name: 'Deriv', version: '1.0.0' };
     this._authFailCount = 0;
     this._account = null;
+    this._portfolioLogged = false;
 
     logger.info(`[DerivBroker] Created with product type: ${this.productType}`);
   }
@@ -434,10 +443,7 @@ class DerivBroker extends EventEmitter {
             this.metrics.connectedSince = Date.now();
             this._startHeartbeat();
 
-            // Authorization via the standard request pipeline
-            this._sendRaw({ authorize: this.config.apiToken, req_id: generateRequestId() });
-            // The response will be handled by _handleMessage and resolved via the pending request map
-            // We'll wait for the authorize response using a dedicated promise
+            // Authorize via the standard request pipeline
             this._authorize()
               .then(async (authResponse) => {
                 if (authResponse && authResponse.authorize) {
@@ -448,7 +454,7 @@ class DerivBroker extends EventEmitter {
                 this._authFailCount = 0;
                 this._setState(STATE.AUTHENTICATING);
 
-                // --- LOAD SYMBOLS (bypass _ensureReady) ---
+                // Load symbols – bypasses _ensureReady to avoid deadlock
                 logger.info('[DerivBroker] Startup: Loading symbols (with timeout)...');
                 try {
                   await this._loadSymbolsWithTimeout();
@@ -459,10 +465,9 @@ class DerivBroker extends EventEmitter {
 
                 // Now READY
                 this._setState(STATE.READY);
-                // FIX: Flush queued messages
-                this._flushQueue();
+                this._flushQueue(); // send queued messages
 
-                // Background tasks (run only if still ready)
+                // Background tasks (only if still connected)
                 setImmediate(() => {
                   if (this._state === STATE.READY && this._socket && this._socket.readyState === WebSocket.OPEN) {
                     logger.info('[DerivBroker] Startup: Restoring subscriptions (background)...');
@@ -552,7 +557,7 @@ class DerivBroker extends EventEmitter {
     this.emit('stateChange', { from: old, to: newState });
   }
 
-  // FIX: Authorization using the standard request pipeline
+  // ----- AUTHORIZATION via request pipeline -----
   _authorize() {
     return new Promise((resolve, reject) => {
       const reqId = generateRequestId();
@@ -564,7 +569,6 @@ class DerivBroker extends EventEmitter {
         }
       }, 10000);
 
-      // Register a one-off resolver for this req_id
       this._pendingRequests.set(reqId, {
         resolve: (msg) => {
           clearTimeout(timeout);
@@ -784,7 +788,7 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // FIX: Separate symbol loading – it bypasses _ensureReady
+  // ----- SYMBOL LOADING (bypasses _ensureReady) -----
   async _loadSymbolsWithTimeout() {
     return Promise.race([
       this._loadSymbolsInternal(),
@@ -842,6 +846,7 @@ class DerivBroker extends EventEmitter {
     logger.info(`[DerivBroker] Symbol map built: ${Object.keys(this.symbolMap).length} forex pairs.`);
   }
 
+  // ----- ORDER PERSISTENCE -----
   async _loadPendingOrders() {
     logger.info('[DerivBroker] Loading pending orders from MongoDB...');
     const pendingOrders = await Order.find({ status: { $in: ['PENDING', 'ACCEPTED', 'EXECUTING'] } });
@@ -876,20 +881,18 @@ class DerivBroker extends EventEmitter {
     this.emit('orderUpdate', { clientOrderId, status, contractId });
   }
 
-  // FIX: Improved portfolio parsing – log the structure once and handle multiple formats
+  // ----- POSITION RECONCILIATION (robust parser) -----
   async _reconcilePositions() {
     logger.info('[DerivBroker] Reconciling positions...');
     try {
       const response = await this._sendRequest({ portfolio: 1 });
       let rawPortfolio = response.portfolio || response.contracts || [];
       if (!Array.isArray(rawPortfolio)) {
-        // If it's an object with numeric keys, convert to array
         if (typeof rawPortfolio === 'object' && rawPortfolio !== null) {
           const keys = Object.keys(rawPortfolio);
           if (keys.length > 0 && !isNaN(keys[0])) {
             rawPortfolio = Object.values(rawPortfolio);
           } else {
-            // Try to find an array inside
             const maybeArray = Object.values(rawPortfolio).find(v => Array.isArray(v));
             if (maybeArray) rawPortfolio = maybeArray;
           }
@@ -899,9 +902,8 @@ class DerivBroker extends EventEmitter {
         rawPortfolio = [];
         logger.warn('[Reconcile] Unable to parse portfolio response; defaulting to empty array.');
       }
-      // Log structure once for debugging
       if (!this._portfolioLogged) {
-        logger.info('[Reconcile] Portfolio structure:', JSON.stringify(rawPortfolio.slice(0, 2), null, 2));
+        logger.info('[Reconcile] Portfolio structure (first 2 items):', JSON.stringify(rawPortfolio.slice(0, 2), null, 2));
         this._portfolioLogged = true;
       }
 
@@ -981,7 +983,7 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // ---------- Public API ----------
+  // ---------- PUBLIC API ----------
   async getAccount() {
     await this._ensureReady();
     if (!this._account) {
