@@ -1233,4 +1233,4 @@ const brokerInstance = new DerivBroker({
   productType: process.env.TRADING_PRODUCT || 'multiplier',
 });
 
-module.exports = brokerInstance;
+module.exports = DerivBroker;
