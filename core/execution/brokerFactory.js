@@ -1,7 +1,6 @@
-// core/execution/brokerFactory.js – Broker Factory (Multipliers or CFDs)
+// core/execution/brokerFactory.js – Broker Factory (Single DerivBroker with product support)
 
-const DerivBroker = require('./broker');   // Multipliers (legacy WS)
-const MT5Broker = require('./mt5Broker'); // CFDs (MT5 WS)
+const DerivBroker = require('./broker');
 const logger = require('../../infrastructure/logger') || console;
 
 let instance = null;
@@ -9,17 +8,12 @@ let instance = null;
 function getBroker() {
   if (instance) return instance;
 
-  const product = process.env.TRADING_PRODUCT || 'multiplier';
+  // DerivBroker now handles both Multipliers and CFDs
+  instance = new DerivBroker({
+    productType: process.env.TRADING_PRODUCT || 'multiplier',
+  });
+  logger.info(`[BrokerFactory] Using DerivBroker (${instance.productType})`);
 
-  if (product === 'cfd') {
-    instance = new MT5Broker();
-    logger.info('[BrokerFactory] Using MT5Broker (CFDs)');
-  } else {
-    instance = new DerivBroker();
-    logger.info('[BrokerFactory] Using DerivBroker (Multipliers)');
-  }
-
-  // The caller should connect explicitly.
   return instance;
 }
 
