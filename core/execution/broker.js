@@ -1,4 +1,4 @@
-// core/execution/broker.js – Full file with singleton export
+// core/execution/broker.js – Singleton instance with all methods
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -1232,4 +1232,4 @@ const brokerInstance = new DerivBroker({
   productType: process.env.TRADING_PRODUCT || 'multiplier',
 });
 
-module.exports = DerivBroker;
+module.exports = brokerInstance;
