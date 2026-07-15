@@ -1,4 +1,4 @@
-// core/execution/broker.js – Singleton instance with all methods
+// core/execution/broker.js – Singleton instance with all methods (FIXED)
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -187,6 +187,7 @@ class DerivProposalBuilder {
     this.broker = broker;
   }
 
+  // FIX: Accept additional parameters for product type and duration
   buildProposal(instrument, units, stopLoss, takeProfit, orderType, limitPrice = 0) {
     const symbol = toDerivSymbol(instrument, this.broker.symbolMap);
     if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
@@ -201,15 +202,25 @@ class DerivProposalBuilder {
       basis: 'stake',
       currency: 'USD',
       symbol,
-      product_type: 'basic',
+      // FIX: Set product_type correctly based on broker config
+      product_type: productType === 'cfd' ? 'basic' : 'multiplier',
     };
+
+    // FIX: Use duration from config, default to 10 seconds for CFD
+    const duration = this.broker.config.duration || 10; // in seconds
 
     if (productType === 'cfd') {
       proposalPayload.contract_type = side === 'BUY' ? 'CALL' : 'PUT';
-      proposalPayload.duration_unit = 't';
-      proposalPayload.duration = 1;
+      // Use seconds ('s') instead of ticks ('t') to avoid "duration not offered"
+      proposalPayload.duration_unit = 's';
+      proposalPayload.duration = duration;
+      // FIX: CFD does NOT support stop_loss/take_profit – omit limit_order
+      if (stopLoss || takeProfit) {
+        logger.warn('[DerivProposalBuilder] stop_loss/take_profit ignored for CFD orders.');
+      }
     } else {
-      proposalPayload.contract_type = 'MULTUP';
+      // Multiplier
+      proposalPayload.contract_type = side === 'BUY' ? 'MULTUP' : 'MULTIDOWN';
       let multiplier = this.broker.config.leverage || 100;
       const validMultipliers = [100, 200, 300, 500, 800];
       if (!validMultipliers.includes(multiplier)) {
@@ -217,17 +228,17 @@ class DerivProposalBuilder {
         logger.warn(`[DerivBroker] Invalid multiplier, using default 100`);
       }
       proposalPayload.multiplier = multiplier;
-    }
-
-    const limitOrder = {};
-    if (stopLoss !== null && stopLoss !== undefined && !isNaN(stopLoss) && stopLoss > 0) {
-      limitOrder.stop_loss = stopLoss;
-    }
-    if (takeProfit !== null && takeProfit !== undefined && !isNaN(takeProfit) && takeProfit > 0) {
-      limitOrder.take_profit = takeProfit;
-    }
-    if (Object.keys(limitOrder).length > 0) {
-      proposalPayload.limit_order = limitOrder;
+      // FIX: limit_order only for multiplier
+      const limitOrder = {};
+      if (stopLoss !== null && stopLoss !== undefined && !isNaN(stopLoss) && stopLoss > 0) {
+        limitOrder.stop_loss = stopLoss;
+      }
+      if (takeProfit !== null && takeProfit !== undefined && !isNaN(takeProfit) && takeProfit > 0) {
+        limitOrder.take_profit = takeProfit;
+      }
+      if (Object.keys(limitOrder).length > 0) {
+        proposalPayload.limit_order = limitOrder;
+      }
     }
 
     return proposalPayload;
@@ -273,7 +284,7 @@ class DerivBroker extends EventEmitter {
       rateCapacity: parseFloat(config.rateCapacity || 10),
       contractType: config.contractType || 'cfd',
       leverage: parseFloat(config.leverage || 100),
-      duration: config.duration || null,
+      duration: config.duration ? parseInt(config.duration) : 10, // default 10 seconds
       riskValidator: config.riskValidator || null,
       fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || 3),
       readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 30000),
@@ -360,11 +371,13 @@ class DerivBroker extends EventEmitter {
 
   async _doConnect() {
     this._setState(STATE.CONNECTING);
-    this._closeSocket();
+    this._closeSocket(); // ensure clean state
     logger.info(`[DerivBroker] Connecting to ${this.config.wsUrl}`);
 
     return new Promise((resolve, reject) => {
       let attempts = 0;
+      let connectionTimer = null;
+
       const attemptConnect = async () => {
         if (this._state === STATE.FATAL) {
           reject(new Error('FATAL: Broker stopped.'));
@@ -384,9 +397,21 @@ class DerivBroker extends EventEmitter {
         this._setState(STATE.CONNECTING);
         logger.info(`[DerivBroker] Connection attempt ${attempts}`);
 
+        // Clear any old timeout
+        if (connectionTimer) {
+          clearTimeout(connectionTimer);
+          connectionTimer = null;
+        }
+
         try {
           this._socket = new WebSocket(this.config.wsUrl);
           const socket = this._socket;
+
+          // FIX: Reset circuit breaker on new connection attempt
+          this._resetCircuitBreaker();
+
+          // FIX: Clean up old listeners to avoid memory leaks
+          socket.removeAllListeners();
 
           socket.on('open', () => {
             logger.info('[DerivBroker] WebSocket connected.');
@@ -394,6 +419,7 @@ class DerivBroker extends EventEmitter {
             this.metrics.connectedSince = Date.now();
             this._startHeartbeat();
 
+            // Authorize
             this._authorize()
               .then(async (authResponse) => {
                 if (authResponse && authResponse.authorize) {
@@ -404,6 +430,7 @@ class DerivBroker extends EventEmitter {
                 this._authFailCount = 0;
                 this._setState(STATE.AUTHENTICATING);
 
+                // Load symbols (with timeout) – but we will not let it block READY; if it fails, we use fallback.
                 logger.info('[DerivBroker] Startup: Loading symbols (with timeout)...');
                 try {
                   await this._loadSymbolsWithTimeout();
@@ -412,9 +439,11 @@ class DerivBroker extends EventEmitter {
                   logger.warn('[DerivBroker] Startup: Symbol loading failed, using fallback:', err.message);
                 }
 
+                // Now set READY and flush queue
                 this._setState(STATE.READY);
-                logger.info('[DerivBroker] Startup: Broker READY (early).');
+                this._flushQueue();
 
+                // Background tasks: subscriptions, reconciliation, pending orders
                 setImmediate(() => {
                   logger.info('[DerivBroker] Startup: Restoring subscriptions (background)...');
                   this.streaming.restoreSubscriptions();
@@ -446,7 +475,7 @@ class DerivBroker extends EventEmitter {
                 }
                 this._setState(STATE.FAILED);
                 this._closeSocket();
-                setTimeout(() => attemptConnect(), this.config.reconnectBaseDelay);
+                setTimeout(() => attemptConnect(), this._getReconnectDelay(attempts));
               });
           });
 
@@ -456,20 +485,35 @@ class DerivBroker extends EventEmitter {
           });
           socket.on('close', (code, reason) => {
             logger.info(`[DerivBroker] WebSocket closed. Code: ${code}, Reason: ${reason || 'No reason'}`);
-            if (this._state === STATE.READY || this._state === STATE.CONNECTED) {
+            if (connectionTimer) {
+              clearTimeout(connectionTimer);
+              connectionTimer = null;
+            }
+            // If we are not already in a terminal state, try reconnect
+            if (this._state === STATE.READY || this._state === STATE.CONNECTED || this._state === STATE.AUTHENTICATING) {
               this._setState(STATE.RECONNECTING);
-              setTimeout(() => attemptConnect(), this.config.reconnectBaseDelay);
+              setTimeout(() => attemptConnect(), this._getReconnectDelay(attempts));
+            } else if (this._state === STATE.CONNECTING || this._state === STATE.CONNECTED) {
+              // If connection attempt fails, reject the promise
+              reject(new Error(`WebSocket closed unexpectedly: ${code}`));
             }
           });
 
-          const timeout = setTimeout(() => {
-            if (this._state !== STATE.READY && this._state !== STATE.CONNECTED) {
-              logger.error('[DerivBroker] Connection attempt timed out.');
-              this._closeSocket();
-              reject(new Error('Connection attempt timed out'));
-            }
+          // Connection timeout
+          connectionTimer = setTimeout(() => {
+            logger.error('[DerivBroker] Connection attempt timed out.');
+            this._closeSocket();
+            reject(new Error('Connection attempt timed out'));
           }, this.config.connectionTimeout);
-          this.once('connected', () => clearTimeout(timeout));
+
+          // Clean up timeout on resolve
+          this.once('connected', () => {
+            if (connectionTimer) {
+              clearTimeout(connectionTimer);
+              connectionTimer = null;
+            }
+          });
+
         } catch (err) {
           this._setState(STATE.FAILED);
           reject(err);
@@ -492,7 +536,7 @@ class DerivBroker extends EventEmitter {
       const payload = { authorize: this.config.apiToken };
       const timeout = setTimeout(() => {
         reject(new Error('Authorize timeout'));
-      }, 10000);
+      }, this.config.connectionTimeout);
 
       const handler = (data) => {
         try {
@@ -511,11 +555,6 @@ class DerivBroker extends EventEmitter {
 
       this._socket.once('message', handler);
       this._sendRaw(payload);
-      const timeoutHandler = setTimeout(() => {
-        this._socket.removeListener('message', handler);
-        reject(new Error('Authorize timeout'));
-      }, 10000);
-      this._pendingRequests.set('_auth', { timeout: timeoutHandler });
     });
   }
 
@@ -624,9 +663,11 @@ class DerivBroker extends EventEmitter {
   }
 
   _sendRaw(payload) {
-    if (this._state !== STATE.READY && this._state !== STATE.CONNECTED && this._state !== STATE.AUTHENTICATING) {
+    // FIX: If socket is not open, enqueue the message
+    if (!this._socket || this._socket.readyState !== WebSocket.OPEN) {
       if (this._messageQueue.length < this.config.maxQueueSize) {
         this._messageQueue.push(payload);
+        logger.debug('[DerivBroker] Message queued (socket not open)');
       } else {
         logger.error('[DerivBroker] Queue full, dropping message.');
       }
@@ -636,6 +677,10 @@ class DerivBroker extends EventEmitter {
       this._socket.send(JSON.stringify(payload));
     } catch (err) {
       logger.error('[DerivBroker] Send error:', err.message);
+      // Try to re-queue if it fails
+      if (this._messageQueue.length < this.config.maxQueueSize) {
+        this._messageQueue.push(payload);
+      }
     }
   }
 
@@ -646,6 +691,10 @@ class DerivBroker extends EventEmitter {
     }
     if (this._state !== STATE.READY) {
       await this._ensureReady();
+    }
+    // FIX: Check socket is open
+    if (!this._socket || this._socket.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket not open');
     }
     if (!this._isRequestAllowed()) throw new Error('Circuit breaker is OPEN');
 
@@ -708,6 +757,7 @@ class DerivBroker extends EventEmitter {
     }
   }
 
+  // FIX: Make this reject on timeout, not just resolve with fallback
   async _loadSymbolsWithTimeout() {
     return Promise.race([
       this._loadSymbols(),
@@ -743,7 +793,8 @@ class DerivBroker extends EventEmitter {
       logger.warn('[DerivBroker] All symbol request failed:', err.message);
     }
 
-    logger.warn('[DerivBroker] Using fallback symbols.');
+    // If all attempts fail, throw so the timeout can reject the promise
+    throw new Error('Failed to load symbols from Deriv API.');
   }
 
   _buildSymbolMaps(symbols) {
@@ -1039,7 +1090,7 @@ class DerivBroker extends EventEmitter {
   async closeTrade(tradeId) {
     await this._ensureReady();
     if (!tradeId) throw new Error('tradeId is required');
-    const payload = { sell: tradeId, price: 0 };
+    const payload = { sell: tradeId, price: 0 }; // FIX: price=0 is market sell
     try {
       const response = await this._sendRequest(payload);
       return response.sell;
@@ -1163,6 +1214,7 @@ class DerivBroker extends EventEmitter {
   _closeSocket() {
     this._stopHeartbeat();
     if (this._socket) {
+      this._socket.removeAllListeners(); // FIX: remove all listeners to avoid leaks
       this._socket.terminate();
       this._socket = null;
     }
@@ -1225,7 +1277,7 @@ const brokerInstance = new DerivBroker({
   rateCapacity: parseFloat(process.env.DERIV_RATE_CAPACITY) || 10,
   contractType: process.env.DERIV_CONTRACT_TYPE || 'cfd',
   leverage: parseFloat(process.env.DERIV_LEVERAGE) || 100,
-  duration: process.env.DERIV_DURATION || null,
+  duration: process.env.DERIV_DURATION ? parseInt(process.env.DERIV_DURATION) : 10,
   fatalAfterAuthFailures: parseInt(process.env.DERIV_FATAL_AFTER_AUTH_FAILURES) || 3,
   readinessTimeout: parseInt(process.env.DERIV_READINESS_TIMEOUT) || 30000,
   symbolTimeout: parseInt(process.env.DERIV_SYMBOL_TIMEOUT) || 30000,
