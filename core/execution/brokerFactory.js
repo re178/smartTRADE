@@ -1,4 +1,4 @@
-// core/execution/brokerFactory.js – ALWAYS returns DerivBroker
+// core/execution/brokerFactory.js – Always returns DerivBroker
 
 const DerivBroker = require('./broker');
 const logger = require('../../infrastructure/logger') || console;
