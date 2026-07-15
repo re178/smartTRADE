@@ -1,4 +1,4 @@
-// core/execution/broker.js – Singleton Instance (Multipliers + CFDs)
+// core/execution/broker.js – Full file with singleton export
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -1077,12 +1077,20 @@ class DerivBroker extends EventEmitter {
     return this.getOpenTrades();
   }
 
+  isConnected() {
+    return this._state === STATE.READY || this._state === STATE.CONNECTED;
+  }
+
+  isAuthorized() {
+    return this._state === STATE.READY || this._state === STATE.AUTHENTICATING;
+  }
+
   getHealth() {
     const avgLatency = this.metrics.latencyCount > 0 ? this.metrics.totalLatency / this.metrics.latencyCount : 0;
     return {
       state: this._state,
-      connected: this._state === STATE.READY || this._state === STATE.CONNECTED,
-      authorized: this._state === STATE.READY || this._state === STATE.AUTHENTICATING,
+      connected: this.isConnected(),
+      authorized: this.isAuthorized(),
       circuitBreaker: this._cbState,
       reconnectCount: this.metrics.reconnections,
       queueSize: this._messageQueue.length,
@@ -1097,14 +1105,6 @@ class DerivBroker extends EventEmitter {
       },
       subscriptions: this.streaming._subscriptions.size,
     };
-  }
-
-  isConnected() {
-    return this._connected;
-  }
-
-  isAuthorized() {
-    return this._authorized;
   }
 
   async killSwitch() {
@@ -1206,8 +1206,7 @@ class DerivBroker extends EventEmitter {
   }
 }
 
-// ---------- Singleton Export ----------
-// Create a single instance using environment variables
+// ---------- Export the singleton instance ----------
 const brokerInstance = new DerivBroker({
   apiToken: process.env.DERIV_API_TOKEN,
   appId: process.env.DERIV_APP_ID,
@@ -1233,4 +1232,4 @@ const brokerInstance = new DerivBroker({
   productType: process.env.TRADING_PRODUCT || 'multiplier',
 });
 
-module.exports = DerivBroker;
+module.exports = brokerInstance;
