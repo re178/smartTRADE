@@ -1,4 +1,4 @@
-// core/execution/broker.js – Complete (Multipliers + CFDs)
+// core/execution/broker.js – Corrected (no syntax errors)
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -182,7 +182,6 @@ class StreamingManager {
   }
 }
 
-// ---------- PROPOSAL BUILDER (Extended for CFDs) ----------
 class DerivProposalBuilder {
   constructor(broker) {
     this.broker = broker;
@@ -235,7 +234,6 @@ class DerivProposalBuilder {
   }
 }
 
-// ---------- Broker Capabilities ----------
 const BROKER_CAPABILITIES = {
   supportsTrailingStop: false,
   supportsHedging: false,
@@ -251,7 +249,6 @@ const BROKER_CAPABILITIES = {
   supportedMarkets: ['Forex', 'Indices', 'Commodities', 'Cryptocurrencies'],
 };
 
-// ---------- Main Broker Class ----------
 class DerivBroker extends EventEmitter {
   constructor(config = {}) {
     super();
@@ -280,7 +277,7 @@ class DerivBroker extends EventEmitter {
       riskValidator: config.riskValidator || null,
       fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || 3),
       readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 30000),
-      symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 10000),
+      symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 30000),
     };
 
     this.productType = config.productType || process.env.TRADING_PRODUCT || 'multiplier';
@@ -1200,42 +1197,6 @@ class DerivBroker extends EventEmitter {
   }
 }
 
-// ---------- Singleton Export ----------
-const brokerInstance = new DerivBroker({
-  apiToken: process.env.DERIV_API_TOKEN,
-  appId: process.env.DERIV_APP_ID,
-  wsUrl: process.env.DERIV_WS_URL,
-  connectionTimeout: parseInt(process.env.DERIV_CONNECTION_TIMEOUT) || 30000,
-  reconnectBaseDelay: parseInt(process.env.DERIV_RECONNECT_DELAY) || 2000,
-  maxReconnectDelay: parseInt(process._state === STATE.FATAL) {
-      return Promise.reject(new Error('Broker in FATAL state.'));
-    }
-
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.removeListener('ready', onReady);
-        reject(new Error(`Broker did not become ready within ${this.config.readinessTimeout}ms`));
-      }, this.config.readinessTimeout);
-
-      const onReady = () => {
-        clearTimeout(timeout);
-        resolve();
-      };
-
-      this.once('ready', onReady);
-
-      if (this._state === STATE.DISCONNECTED || this._state === STATE.CONNECTING) {
-        this.connect().catch((err) => {
-          clearTimeout(timeout);
-          this.removeListener('ready', onReady);
-          reject(err);
-        });
-      }
-    });
-  }
-}
-
-// ---------- Singleton Export ----------
 const brokerInstance = new DerivBroker({
   apiToken: process.env.DERIV_API_TOKEN,
   appId: process.env.DERIV_APP_ID,
@@ -1243,16 +1204,6 @@ const brokerInstance = new DerivBroker({
   connectionTimeout: parseInt(process.env.DERIV_CONNECTION_TIMEOUT) || 30000,
   reconnectBaseDelay: parseInt(process.env.DERIV_RECONNECT_DELAY) || 2000,
   maxReconnectDelay: parseInt(process.env.DERIV_MAX_RECONNECT_DELAY) || 30000,
-  maxRetries: parseInt(process.env.DERIV_MAX_RETRIES) || 3,
-  maxQueueSize: parseInt(process.env.DERIV_MAX_QUEUE_SIZE) || 100,
-  circuitBreakerThreshold: parseInt(process.env.DERIV_CIRCUIT_BREAKER_THRESHOLD) || 20,
-  circuitBreakerTimeout: parseInt(process.env.DERIV_CIRCUIT_BREAKER_TIMEOUT) || 60000,
-  minOrderSize: parseFloat(process.env.DERIV_MIN_ORDER_SIZE) || 0.01,
-  maxOrderSize: parseFloat(process.env.DERIV_MAX_ORDER_SIZE) || 100,
-  minStopDistance: parseFloat(process.env.DERIV_MIN_STOP_DISTANCE) || 0.0001,
-  rateLimit: parseFloat(process.env.DERIV_RATE_LIMIT) || 5,
-  rateCapacity: parseFloat(process.env.DERIV_RATE_CAPACITY) || 10,
- .env.DERIV_MAX_RECONNECT_DELAY) || 30000,
   maxRetries: parseInt(process.env.DERIV_MAX_RETRIES) || 3,
   maxQueueSize: parseInt(process.env.DERIV_MAX_QUEUE_SIZE) || 100,
   circuitBreakerThreshold: parseInt(process.env.DERIV_CIRCUIT_BREAKER_THRESHOLD) || 20,
