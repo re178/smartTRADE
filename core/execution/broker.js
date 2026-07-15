@@ -1,4 +1,4 @@
-// core/execution/broker.js – Full-featured Deriv broker with true CFD, Multiplier, and Options support
+// core/execution/broker.js – Deriv broker with separated product executors
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -47,7 +47,6 @@ function generateRequestId() {
 }
 
 function generateClientOrderId() {
-  // Use crypto.randomUUID() if available, else fallback
   if (typeof crypto !== 'undefined' && crypto.randomUUID) {
     return `ord_${crypto.randomUUID()}`;
   }
@@ -71,7 +70,6 @@ function fromDerivSymbol(symbol, reverseMap) {
   return symbol;
 }
 
-// Fallback symbols (enriched by active_symbols)
 const FALLBACK_SYMBOLS = {
   'EUR_USD': 'frxEURUSD',
   'GBP_USD': 'frxGBPUSD',
@@ -86,7 +84,7 @@ const FALLBACK_SYMBOLS = {
 };
 
 // ============================================================
-// RATE LIMITER (loop instead of recursion)
+// RATE LIMITER
 // ============================================================
 class RateLimiter {
   constructor(rate, capacity) {
@@ -113,13 +111,12 @@ class RateLimiter {
 }
 
 // ============================================================
-// STREAMING MANAGER (supports multiple callbacks per symbol)
+// STREAMING MANAGER
 // ============================================================
 class StreamingManager {
   constructor(broker) {
     this.broker = broker;
-    // Map: key -> { type, symbol, subscriptionId, callbacks: [] }
-    this._subscriptions = new Map();
+    this._subscriptions = new Map(); // key -> { type, symbol, subscriptionId, callbacks: [] }
     this._subscriptionIdMap = new Map();
     this._priceCache = new Map();
   }
@@ -127,7 +124,6 @@ class StreamingManager {
   async subscribe(type, symbol, callback) {
     const key = `${type}:${symbol}`;
     if (this._subscriptions.has(key)) {
-      // Add callback to existing subscription
       const sub = this._subscriptions.get(key);
       if (!sub.callbacks.includes(callback)) {
         sub.callbacks.push(callback);
@@ -152,11 +148,9 @@ class StreamingManager {
     const sub = this._subscriptions.get(key);
     if (!sub) return;
     if (callback) {
-      // Remove specific callback
       sub.callbacks = sub.callbacks.filter(cb => cb !== callback);
-      if (sub.callbacks.length > 0) return; // still have listeners
+      if (sub.callbacks.length > 0) return;
     }
-    // No callbacks left – unsubscribe from server
     await this.broker._sendRequest({ forget: sub.subscriptionId });
     this._subscriptions.delete(key);
     this._subscriptionIdMap.delete(sub.subscriptionId);
@@ -165,10 +159,7 @@ class StreamingManager {
   }
 
   async restoreSubscriptions() {
-    if (this._subscriptions.size === 0) {
-      logger.info('[Streaming] No subscriptions to restore.');
-      return;
-    }
+    if (this._subscriptions.size === 0) return;
     logger.info('[Streaming] Restoring subscriptions...');
     try {
       await this.broker._sendRequest({ forget_all: 'ticks' });
@@ -201,7 +192,6 @@ class StreamingManager {
     if (price) {
       this._priceCache.set(symbol, { bid, ask, mid: price, time: tick.epoch || Date.now() });
     }
-    // Find all subscriptions for this symbol and call all callbacks
     for (const [key, sub] of this._subscriptions) {
       if (sub.symbol === symbol) {
         for (const cb of sub.callbacks) {
@@ -212,114 +202,20 @@ class StreamingManager {
     }
   }
 
-  getPrice(symbol) {
-    return this._priceCache.get(symbol) || null;
-  }
-
-  getAllPrices() {
-    return Object.fromEntries(this._priceCache);
-  }
+  getPrice(symbol) { return this._priceCache.get(symbol) || null; }
+  getAllPrices() { return Object.fromEntries(this._priceCache); }
 }
 
 // ============================================================
-// PROPOSAL BUILDER – unified for all three products
-// ============================================================
-class DerivProposalBuilder {
-  constructor(broker) {
-    this.broker = broker;
-  }
-
-  /**
-   * Build a proposal request for the current product type.
-   * For CFD, this includes stop_loss and take_profit.
-   * For Multiplier, stop_loss/take_profit go inside limit_order.
-   * For Basic Options, stop_loss/take_profit are ignored.
-   */
-  buildProposal(instrument, units, stopLoss, takeProfit, orderType, limitPrice = 0) {
-    const symbol = toDerivSymbol(instrument, this.broker.symbolMap);
-    if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
-    let amount = Math.abs(units);
-    if (amount <= 0) throw new Error('Order amount must be greater than zero.');
-    const side = units > 0 ? 'BUY' : 'SELL';
-
-    const productType = this.broker.productType; // 'cfd', 'multiplier', 'basic'
-
-    // Base proposal (common to all)
-    const proposalPayload = {
-      proposal: 1,
-      amount,
-      basis: 'stake',
-      currency: this.broker.accountCurrency || 'USD',
-      symbol,
-    };
-
-    // ---- CFD ----
-    if (productType === 'cfd') {
-      proposalPayload.product_type = 'basic';
-      proposalPayload.contract_type = 'CFD';
-      // stop_loss and take_profit are allowed directly in CFD proposal
-      if (stopLoss && !isNaN(stopLoss) && stopLoss > 0) {
-        proposalPayload.stop_loss = stopLoss;
-      }
-      if (takeProfit && !isNaN(takeProfit) && takeProfit > 0) {
-        proposalPayload.take_profit = takeProfit;
-      }
-      // No duration, no multiplier
-    }
-
-    // ---- Multiplier ----
-    else if (productType === 'multiplier') {
-      proposalPayload.product_type = 'multiplier';
-      proposalPayload.contract_type = side === 'BUY' ? 'MULTUP' : 'MULTIDOWN';
-      proposalPayload.multiplier = this.broker.getLeverage(symbol) || 100;
-      // Multiplier uses limit_order for SL/TP
-      const limitOrder = {};
-      if (stopLoss && !isNaN(stopLoss) && stopLoss > 0) limitOrder.stop_loss = stopLoss;
-      if (takeProfit && !isNaN(takeProfit) && takeProfit > 0) limitOrder.take_profit = takeProfit;
-      if (Object.keys(limitOrder).length > 0) {
-        proposalPayload.limit_order = limitOrder;
-      }
-      // Optional duration
-      if (this.broker.config.duration) {
-        proposalPayload.duration = this.broker.config.duration;
-        proposalPayload.duration_unit = 's';
-      }
-    }
-
-    // ---- Basic Options ----
-    else {
-      proposalPayload.product_type = 'basic';
-      proposalPayload.contract_type = side === 'BUY' ? 'CALL' : 'PUT';
-      const duration = this.broker.config.duration || 60;
-      proposalPayload.duration = duration;
-      proposalPayload.duration_unit = 's';
-      // Options do NOT support stop_loss/take_profit
-      if (stopLoss || takeProfit) {
-        logger.warn('[DerivProposalBuilder] stop_loss/take_profit ignored for basic options.');
-      }
-    }
-
-    return proposalPayload;
-  }
-}
-
-// ============================================================
-// SYMBOL MANAGER – provides leverage, pip, etc.
+// SYMBOL MANAGER
 // ============================================================
 class SymbolManager {
   constructor() {
     this._symbols = new Map();
-    // Default leverage map (will be enriched)
     this._leverageMap = {
-      'frxEURUSD': 100,
-      'frxGBPUSD': 100,
-      'frxUSDJPY': 100,
-      'frxAUDUSD': 100,
-      'frxUSDCAD': 100,
-      'frxUSDCHF': 100,
-      'frxNZDUSD': 100,
-      'frxEURGBP': 100,
-      'frxEURJPY': 100,
+      'frxEURUSD': 100, 'frxGBPUSD': 100, 'frxUSDJPY': 100,
+      'frxAUDUSD': 100, 'frxUSDCAD': 100, 'frxUSDCHF': 100,
+      'frxNZDUSD': 100, 'frxEURGBP': 100, 'frxEURJPY': 100,
       'frxGBPJPY': 100,
     };
   }
@@ -327,23 +223,259 @@ class SymbolManager {
   setSymbols(symbols) {
     for (const sym of symbols) {
       this._symbols.set(sym.symbol, sym);
-      if (sym.leverage) {
-        this._leverageMap[sym.symbol] = sym.leverage;
-      }
+      if (sym.leverage) this._leverageMap[sym.symbol] = sym.leverage;
     }
   }
 
-  getLeverage(derivSymbol) {
-    return this._leverageMap[derivSymbol] || 100;
+  getLeverage(derivSymbol) { return this._leverageMap[derivSymbol] || 100; }
+  getPip(derivSymbol) { return this._symbols.get(derivSymbol)?.pip || 0.0001; }
+  getSymbolInfo(derivSymbol) { return this._symbols.get(derivSymbol) || null; }
+}
+
+// ============================================================
+// PRODUCT EXECUTORS
+// ============================================================
+
+// Base executor – each product implements the same interface
+class BaseExecutor {
+  constructor(broker) { this.broker = broker; }
+  async placeMarket(instrument, units, stopLoss, takeProfit) { throw new Error('Not implemented'); }
+  async placeLimit(instrument, units, price, stopLoss, takeProfit) { throw new Error('Not implemented'); }
+  async close(tradeId) { throw new Error('Not implemented'); }
+  async modifySLTP(tradeId, stopLoss, takeProfit) { throw new Error('Not implemented'); }
+  async partialClose(tradeId, units) { throw new Error('Not implemented'); }
+}
+
+// ---- CFD Executor ----
+class CFDExecutor extends BaseExecutor {
+  async placeMarket(instrument, units, stopLoss, takeProfit) {
+    const { symbol, amount } = this._prepare(instrument, units);
+    const proposalPayload = {
+      proposal: 1,
+      amount,
+      basis: 'stake',
+      currency: this.broker.accountCurrency || 'USD',
+      symbol,
+      product_type: 'basic',
+      contract_type: 'CFD',
+    };
+    if (stopLoss) proposalPayload.stop_loss = stopLoss;
+    if (takeProfit) proposalPayload.take_profit = takeProfit;
+    const proposalResponse = await this.broker._sendRequest(proposalPayload);
+    if (!proposalResponse.proposal?.id) throw new Error('CFD proposal failed');
+    const buyPayload = { buy: proposalResponse.proposal.id, price: 0 };
+    const buyResponse = await this.broker._sendRequest(buyPayload);
+    return this._formatResponse(buyResponse);
   }
 
-  getPip(derivSymbol) {
-    const sym = this._symbols.get(derivSymbol);
-    return sym?.pip || 0.0001;
+  async placeLimit(instrument, units, price, stopLoss, takeProfit) {
+    const { symbol, amount } = this._prepare(instrument, units);
+    const proposalPayload = {
+      proposal: 1,
+      amount,
+      basis: 'stake',
+      currency: this.broker.accountCurrency || 'USD',
+      symbol,
+      product_type: 'basic',
+      contract_type: 'CFD',
+    };
+    if (stopLoss) proposalPayload.stop_loss = stopLoss;
+    if (takeProfit) proposalPayload.take_profit = takeProfit;
+    const proposalResponse = await this.broker._sendRequest(proposalPayload);
+    if (!proposalResponse.proposal?.id) throw new Error('CFD proposal failed');
+    const buyPayload = { buy: proposalResponse.proposal.id, price: price };
+    const buyResponse = await this.broker._sendRequest(buyPayload);
+    return this._formatResponse(buyResponse);
   }
 
-  getSymbolInfo(derivSymbol) {
-    return this._symbols.get(derivSymbol) || null;
+  async close(tradeId) {
+    const response = await this.broker._sendRequest({ sell: tradeId, price: 0 });
+    return response.sell;
+  }
+
+  async modifySLTP(tradeId, stopLoss, takeProfit) {
+    // For CFDs, modification is done via proposal_open_contract with update parameters
+    // This is a placeholder – needs proper implementation
+    throw new Error('Modify SL/TP not yet implemented for CFDs');
+  }
+
+  async partialClose(tradeId, units) {
+    throw new Error('Partial close not yet implemented for CFDs');
+  }
+
+  _prepare(instrument, units) {
+    const symbol = toDerivSymbol(instrument, this.broker.symbolMap);
+    if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
+    const amount = Math.abs(units);
+    if (amount <= 0) throw new Error('Units must be positive');
+    return { symbol, amount };
+  }
+
+  _formatResponse(response) {
+    const tx = response.buy;
+    const contractId = tx.contract_id || tx.transaction_id;
+    return {
+      tradeID: contractId,
+      id: contractId,
+      price: tx.buy_price || tx.price || 0,
+      averagePrice: tx.buy_price || tx.price || 0,
+      raw: response,
+    };
+  }
+}
+
+// ---- Multiplier Executor ----
+class MultiplierExecutor extends BaseExecutor {
+  async placeMarket(instrument, units, stopLoss, takeProfit) {
+    const { symbol, amount, side } = this._prepare(instrument, units);
+    const leverage = this.broker.getLeverage(symbol);
+    const proposalPayload = {
+      proposal: 1,
+      amount,
+      basis: 'stake',
+      currency: this.broker.accountCurrency || 'USD',
+      symbol,
+      product_type: 'multiplier',
+      contract_type: side === 'BUY' ? 'MULTUP' : 'MULTIDOWN',
+      multiplier: leverage,
+    };
+    const limitOrder = {};
+    if (stopLoss) limitOrder.stop_loss = stopLoss;
+    if (takeProfit) limitOrder.take_profit = takeProfit;
+    if (Object.keys(limitOrder).length) proposalPayload.limit_order = limitOrder;
+    if (this.broker.config.duration) {
+      proposalPayload.duration = this.broker.config.duration;
+      proposalPayload.duration_unit = 's';
+    }
+    const proposalResponse = await this.broker._sendRequest(proposalPayload);
+    if (!proposalResponse.proposal?.id) throw new Error('Multiplier proposal failed');
+    const buyPayload = { buy: proposalResponse.proposal.id, price: 0 };
+    const buyResponse = await this.broker._sendRequest(buyPayload);
+    return this._formatResponse(buyResponse);
+  }
+
+  async placeLimit(instrument, units, price, stopLoss, takeProfit) {
+    // Multipliers may not support traditional limit orders; use the same as market with price
+    const { symbol, amount, side } = this._prepare(instrument, units);
+    const leverage = this.broker.getLeverage(symbol);
+    const proposalPayload = {
+      proposal: 1,
+      amount,
+      basis: 'stake',
+      currency: this.broker.accountCurrency || 'USD',
+      symbol,
+      product_type: 'multiplier',
+      contract_type: side === 'BUY' ? 'MULTUP' : 'MULTIDOWN',
+      multiplier: leverage,
+    };
+    const limitOrder = {};
+    if (stopLoss) limitOrder.stop_loss = stopLoss;
+    if (takeProfit) limitOrder.take_profit = takeProfit;
+    if (Object.keys(limitOrder).length) proposalPayload.limit_order = limitOrder;
+    if (this.broker.config.duration) {
+      proposalPayload.duration = this.broker.config.duration;
+      proposalPayload.duration_unit = 's';
+    }
+    const proposalResponse = await this.broker._sendRequest(proposalPayload);
+    if (!proposalResponse.proposal?.id) throw new Error('Multiplier proposal failed');
+    const buyPayload = { buy: proposalResponse.proposal.id, price: price };
+    const buyResponse = await this.broker._sendRequest(buyPayload);
+    return this._formatResponse(buyResponse);
+  }
+
+  async close(tradeId) {
+    const response = await this.broker._sendRequest({ sell: tradeId, price: 0 });
+    return response.sell;
+  }
+
+  async modifySLTP(tradeId, stopLoss, takeProfit) {
+    // Similar to CFD – needs proper implementation
+    throw new Error('Modify SL/TP not yet implemented for Multipliers');
+  }
+
+  async partialClose(tradeId, units) {
+    throw new Error('Partial close not yet implemented for Multipliers');
+  }
+
+  _prepare(instrument, units) {
+    const symbol = toDerivSymbol(instrument, this.broker.symbolMap);
+    if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
+    const amount = Math.abs(units);
+    if (amount <= 0) throw new Error('Units must be positive');
+    const side = units > 0 ? 'BUY' : 'SELL';
+    return { symbol, amount, side };
+  }
+
+  _formatResponse(response) {
+    const tx = response.buy;
+    const contractId = tx.contract_id || tx.transaction_id;
+    return {
+      tradeID: contractId,
+      id: contractId,
+      price: tx.buy_price || tx.price || 0,
+      averagePrice: tx.buy_price || tx.price || 0,
+      raw: response,
+    };
+  }
+}
+
+// ---- Basic Options Executor ----
+class OptionsExecutor extends BaseExecutor {
+  async placeMarket(instrument, units, stopLoss, takeProfit) {
+    const { symbol, amount, side } = this._prepare(instrument, units);
+    if (stopLoss || takeProfit) logger.warn('[Options] SL/TP ignored');
+    const duration = this.broker.config.duration || 60;
+    const proposalPayload = {
+      proposal: 1,
+      amount,
+      basis: 'stake',
+      currency: this.broker.accountCurrency || 'USD',
+      symbol,
+      product_type: 'basic',
+      contract_type: side === 'BUY' ? 'CALL' : 'PUT',
+      duration,
+      duration_unit: 's',
+    };
+    const proposalResponse = await this.broker._sendRequest(proposalPayload);
+    if (!proposalResponse.proposal?.id) throw new Error('Options proposal failed');
+    const buyPayload = { buy: proposalResponse.proposal.id, price: 0 };
+    const buyResponse = await this.broker._sendRequest(buyPayload);
+    return this._formatResponse(buyResponse);
+  }
+
+  async placeLimit(instrument, units, price, stopLoss, takeProfit) {
+    // Options may not support limit orders; fallback to market with price
+    return this.placeMarket(instrument, units, stopLoss, takeProfit);
+  }
+
+  async close(tradeId) {
+    // Options can be sold before expiry
+    const response = await this.broker._sendRequest({ sell: tradeId, price: 0 });
+    return response.sell;
+  }
+
+  async modifySLTP() { throw new Error('Options do not support SL/TP modification'); }
+  async partialClose() { throw new Error('Options do not support partial close'); }
+
+  _prepare(instrument, units) {
+    const symbol = toDerivSymbol(instrument, this.broker.symbolMap);
+    if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
+    const amount = Math.abs(units);
+    if (amount <= 0) throw new Error('Units must be positive');
+    const side = units > 0 ? 'BUY' : 'SELL';
+    return { symbol, amount, side };
+  }
+
+  _formatResponse(response) {
+    const tx = response.buy;
+    const contractId = tx.contract_id || tx.transaction_id;
+    return {
+      tradeID: contractId,
+      id: contractId,
+      price: tx.buy_price || tx.price || 0,
+      averagePrice: tx.buy_price || tx.price || 0,
+      raw: response,
+    };
   }
 }
 
@@ -387,18 +519,16 @@ class DerivBroker extends EventEmitter {
       minStopDistance: parseFloat(config.minStopDistance || 0.0001),
       rateLimit: parseFloat(config.rateLimit || 5),
       rateCapacity: parseFloat(config.rateCapacity || 10),
-      contractType: config.contractType || 'cfd', // legacy
-      leverage: parseFloat(config.leverage || 100), // default, overridden by symbol
+      contractType: config.contractType || 'cfd',
+      leverage: parseFloat(config.leverage || 100),
       duration: config.duration ? parseInt(config.duration) : 60,
       riskValidator: config.riskValidator || null,
       fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || 3),
       readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 30000),
       symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 30000),
-      // Heartbeat timeout: if no pong within this time, reconnect
       heartbeatTimeout: parseInt(config.heartbeatTimeout || process.env.DERIV_HEARTBEAT_TIMEOUT || 60000),
     };
 
-    // Product type validation
     const rawProduct = (config.productType || process.env.TRADING_PRODUCT || 'cfd').toLowerCase();
     const validProducts = ['cfd', 'multiplier', 'basic'];
     if (!validProducts.includes(rawProduct)) {
@@ -410,13 +540,13 @@ class DerivBroker extends EventEmitter {
 
     this.validateConfig();
 
-    // ----- Core components -----
+    // ---------- Core components ----------
     this._state = STATE.DISCONNECTED;
     this._socket = null;
     this._pendingRequests = new Map();
     this._messageQueue = [];
     this._heartbeatInterval = null;
-    this._heartbeatTimeout = null; // for pong monitoring
+    this._heartbeatTimeout = null;
     this._lastPong = Date.now();
     this._connectionPromise = null;
     this._rateLimiter = new RateLimiter(this.config.rateLimit, this.config.rateCapacity);
@@ -424,12 +554,12 @@ class DerivBroker extends EventEmitter {
     this.streaming = new StreamingManager(this);
     this.symbolManager = new SymbolManager();
 
-    // ----- Circuit breaker -----
+    // ---------- Circuit breaker ----------
     this._cbState = CB_STATE.CLOSED;
     this._cbFailureCount = 0;
     this._cbOpenedAt = null;
 
-    // ----- Symbol maps -----
+    // ---------- Symbol maps ----------
     this.symbolMap = { ...FALLBACK_SYMBOLS };
     this.reverseMap = {};
     for (const [key, val] of Object.entries(FALLBACK_SYMBOLS)) {
@@ -441,12 +571,12 @@ class DerivBroker extends EventEmitter {
     }
     logger.info(`[DerivBroker] Using fallback symbols (${Object.keys(this.symbolMap).length} pairs).`);
 
-    // ----- Order tracking -----
+    // ---------- Order tracking ----------
     this._orders = new Map();
     this._orderMap = new Map();
-    this.accountCurrency = 'USD'; // will be updated from account
+    this.accountCurrency = 'USD';
 
-    // ----- Metrics -----
+    // ---------- Metrics ----------
     this.metrics = {
       connectedSince: null,
       requestsSent: 0,
@@ -463,14 +593,26 @@ class DerivBroker extends EventEmitter {
     };
 
     this.capabilities = { ...BROKER_CAPABILITIES };
-    this.proposalBuilder = new DerivProposalBuilder(this);
-    this._session = { isOpen: true, accountEnabled: true, marginSufficient: true, lastCheck: null };
-    this.metadata = { name: 'Deriv', version: '1.0.0' };
     this._authFailCount = 0;
     this._account = null;
     this._portfolioLogged = false;
 
-    logger.info(`[DerivBroker] Created with product type: ${this.productType}`);
+    // ---------- Instantiate the appropriate executor ----------
+    switch (this.productType) {
+      case 'cfd':
+        this.executor = new CFDExecutor(this);
+        break;
+      case 'multiplier':
+        this.executor = new MultiplierExecutor(this);
+        break;
+      case 'basic':
+        this.executor = new OptionsExecutor(this);
+        break;
+      default:
+        this.executor = new CFDExecutor(this); // fallback
+    }
+
+    logger.info(`[DerivBroker] Created with product type: ${this.productType}, using ${this.executor.constructor.name}`);
   }
 
   validateConfig() {
@@ -490,9 +632,7 @@ class DerivBroker extends EventEmitter {
   // ---------- CONNECTION ----------
   async connect() {
     if (this._state === STATE.READY) return;
-    if (this._state === STATE.FATAL) {
-      throw new Error('Broker in FATAL state – check credentials.');
-    }
+    if (this._state === STATE.FATAL) throw new Error('Broker in FATAL state.');
     if (this._connectionPromise) return this._connectionPromise;
     this._connectionPromise = this._doConnect();
     try {
@@ -521,7 +661,7 @@ class DerivBroker extends EventEmitter {
           return;
         }
         attempts++;
-        this.metrics.reconnections++; // increment reconnect count
+        this.metrics.reconnections++;
         if (attempts > 3) {
           this._setState(STATE.FATAL);
           reject(new Error('Connection failed after 3 attempts.'));
@@ -560,7 +700,7 @@ class DerivBroker extends EventEmitter {
                 this._authFailCount = 0;
                 this._setState(STATE.AUTHENTICATING);
 
-                logger.info('[DerivBroker] Startup: Loading symbols (with timeout)...');
+                logger.info('[DerivBroker] Startup: Loading symbols...');
                 try {
                   await this._loadSymbolsWithTimeout();
                   logger.info('[DerivBroker] Startup: Symbols loaded.');
@@ -573,16 +713,16 @@ class DerivBroker extends EventEmitter {
 
                 setImmediate(() => {
                   if (this._state === STATE.READY && this._socket && this._socket.readyState === WebSocket.OPEN) {
-                    logger.info('[DerivBroker] Startup: Restoring subscriptions (background)...');
+                    logger.info('[DerivBroker] Startup: Restoring subscriptions...');
                     this.streaming.restoreSubscriptions()
                       .catch(err => logger.error('[DerivBroker] Subscription restore error:', err.message));
 
-                    logger.info('[DerivBroker] Startup: Reconciling positions (background)...');
+                    logger.info('[DerivBroker] Startup: Reconciling positions...');
                     this._reconcilePositions()
                       .then(() => logger.info('[DerivBroker] Startup: Positions reconciled.'))
                       .catch((err) => logger.error('[DerivBroker] Startup: Position reconciliation error:', err.message));
 
-                    logger.info('[DerivBroker] Startup: Loading pending orders (background)...');
+                    logger.info('[DerivBroker] Startup: Loading pending orders...');
                     this._loadPendingOrders()
                       .then(() => logger.info('[DerivBroker] Startup: Pending orders loaded.'))
                       .catch((err) => logger.error('[DerivBroker] Startup: Pending orders loading error:', err.message));
@@ -612,9 +752,7 @@ class DerivBroker extends EventEmitter {
           });
 
           socket.on('message', (data) => this._handleMessage(data));
-          socket.on('error', (err) => {
-            logger.error('[DerivBroker] WebSocket error:', err.message);
-          });
+          socket.on('error', (err) => logger.error('[DerivBroker] WebSocket error:', err.message));
           socket.on('close', (code, reason) => {
             logger.info(`[DerivBroker] WebSocket closed. Code: ${code}, Reason: ${reason || 'No reason'}`);
             if (connectionTimer) {
@@ -659,7 +797,7 @@ class DerivBroker extends EventEmitter {
     this.emit('stateChange', { from: old, to: newState });
   }
 
-  // ---------- AUTHORIZATION via request pipeline ----------
+  // ---------- AUTHORIZATION ----------
   _authorize() {
     return new Promise((resolve, reject) => {
       const reqId = generateRequestId();
@@ -672,14 +810,8 @@ class DerivBroker extends EventEmitter {
       }, 10000);
 
       this._pendingRequests.set(reqId, {
-        resolve: (msg) => {
-          clearTimeout(timeout);
-          resolve(msg);
-        },
-        reject: (err) => {
-          clearTimeout(timeout);
-          reject(err);
-        },
+        resolve: (msg) => { clearTimeout(timeout); resolve(msg); },
+        reject: (err) => { clearTimeout(timeout); reject(err); },
         timeout,
         sentAt: Date.now(),
         cancel: () => {},
@@ -724,11 +856,10 @@ class DerivBroker extends EventEmitter {
     return true;
   }
 
-  // ---------- HEARTBEAT with pong timeout ----------
+  // ---------- HEARTBEAT ----------
   _startHeartbeat() {
     this._stopHeartbeat();
     this._lastPong = Date.now();
-    // Send ping every 30s
     this._heartbeatInterval = setInterval(() => {
       if (this._state === STATE.READY || this._state === STATE.CONNECTED) {
         this._sendRaw({ ping: 1 });
@@ -736,7 +867,6 @@ class DerivBroker extends EventEmitter {
       }
     }, 30000);
 
-    // Check pong timeout every 10s
     this._heartbeatTimeout = setInterval(() => {
       const now = Date.now();
       if (now - this._lastPong > this.config.heartbeatTimeout) {
@@ -763,15 +893,11 @@ class DerivBroker extends EventEmitter {
   _handleMessage(rawData) {
     try {
       const msg = JSON.parse(rawData);
-
-      // Update last pong time
       if (msg.pong) {
         this._lastPong = Date.now();
         this.metrics.lastPong = this._lastPong;
         return;
       }
-
-      // Standard request-response
       if (msg.req_id && this._pendingRequests.has(msg.req_id)) {
         const pending = this._pendingRequests.get(msg.req_id);
         clearTimeout(pending.timeout);
@@ -791,22 +917,12 @@ class DerivBroker extends EventEmitter {
         }
         return;
       }
-
-      // Tick
       if (msg.msg_type === 'tick' && msg.tick) {
         this.streaming.handleTick(msg.tick);
         return;
       }
-
-      // Order response (no req_id)
       if (msg.buy || msg.sell) {
         this._handleOrderResponse(msg);
-      }
-
-      // Portfolio updates (if subscribed)
-      if (msg.msg_type === 'portfolio') {
-        // This could be used for live position updates; for now we ignore
-        // but we could trigger reconciliation
       }
     } catch (err) {
       logger.error('[DerivBroker] Error parsing WebSocket message:', err.message);
@@ -820,7 +936,6 @@ class DerivBroker extends EventEmitter {
       if (tx) {
         const contractId = tx.contract_id || tx.transaction_id;
         const status = tx.status || 'FILLED';
-        // Map Deriv status to our ORDER_STATUS
         let mappedStatus = ORDER_STATUS.FILLED;
         if (status === 'PENDING') mappedStatus = ORDER_STATUS.PENDING;
         else if (status === 'ACCEPTED') mappedStatus = ORDER_STATUS.ACCEPTED;
@@ -856,15 +971,9 @@ class DerivBroker extends EventEmitter {
 
   async _sendRequest(payload, timeoutMs = 15000, signal = null) {
     await this._rateLimiter.acquire();
-    if (this._state === STATE.FATAL) {
-      throw new Error('Broker in FATAL state.');
-    }
-    if (this._state !== STATE.READY) {
-      await this._ensureReady();
-    }
-    if (!this._socket || this._socket.readyState !== WebSocket.OPEN) {
-      throw new Error('WebSocket not open');
-    }
+    if (this._state === STATE.FATAL) throw new Error('Broker in FATAL state.');
+    if (this._state !== STATE.READY) await this._ensureReady();
+    if (!this._socket || this._socket.readyState !== WebSocket.OPEN) throw new Error('WebSocket not open');
     if (!this._isRequestAllowed()) throw new Error('Circuit breaker is OPEN');
 
     let lastError = null;
@@ -907,12 +1016,7 @@ class DerivBroker extends EventEmitter {
       };
       if (signal) signal.addEventListener('abort', onCancel, { once: true });
       this._pendingRequests.set(reqId, {
-        resolve,
-        reject,
-        timeout,
-        sentAt: Date.now(),
-        cancel: onCancel,
-        signal,
+        resolve, reject, timeout, sentAt: Date.now(), cancel: onCancel, signal,
       });
       logger.debug(`[DerivBroker] Sending: ${JSON.stringify(msg)}`);
       this._sendRaw(msg);
@@ -921,11 +1025,10 @@ class DerivBroker extends EventEmitter {
 
   _flushQueue() {
     const now = Date.now();
-    const maxAge = 300000; // 5 minutes
+    const maxAge = 300000;
     while (this._messageQueue.length > 0) {
       const item = this._messageQueue[0];
       if (now - item.timestamp > maxAge) {
-        // Expired – discard
         this._messageQueue.shift();
         logger.warn('[DerivBroker] Discarded expired queued message');
         continue;
@@ -935,7 +1038,7 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // ---------- SYMBOL LOADING (bypasses _ensureReady) ----------
+  // ---------- SYMBOL LOADING ----------
   async _loadSymbolsWithTimeout() {
     return Promise.race([
       this._loadSymbolsInternal(),
@@ -999,9 +1102,7 @@ class DerivBroker extends EventEmitter {
     const pendingOrders = await Order.find({ status: { $in: ['PENDING', 'ACCEPTED', 'EXECUTING'] } });
     for (const order of pendingOrders) {
       this._orders.set(order.clientOrderId, order);
-      if (order.contractId) {
-        this._orderMap.set(order.contractId, order.clientOrderId);
-      }
+      if (order.contractId) this._orderMap.set(order.contractId, order.clientOrderId);
       logger.info(`[DerivBroker] Loaded pending order ${order.clientOrderId} (${order.status})`);
     }
     logger.info(`[DerivBroker] Loaded ${pendingOrders.length} pending orders.`);
@@ -1120,21 +1221,15 @@ class DerivBroker extends EventEmitter {
         takeProfit,
         account: await this.getAccount(),
       });
-      if (!result.approved) {
-        throw new Error(`Risk validation failed: ${result.reason}`);
-      }
+      if (!result.approved) throw new Error(`Risk validation failed: ${result.reason}`);
     }
     const account = await this.getAccount();
     const marginAvailable = parseFloat(account.marginAvailable);
-    if (marginAvailable <= 0) {
-      throw new Error('Insufficient margin');
-    }
-    // Basic exposure check: ensure order size not too large
+    if (marginAvailable <= 0) throw new Error('Insufficient margin');
+    // Basic exposure check
     const balance = parseFloat(account.balance);
-    const exposure = units * 0.01; // rough estimate – replace with proper margin calculation
-    if (exposure > balance * 0.1) {
-      throw new Error(`Order size ${units} exceeds 10% of balance`);
-    }
+    const exposure = units * 0.01; // rough placeholder
+    if (exposure > balance * 0.1) throw new Error(`Order size ${units} exceeds 10% of balance`);
   }
 
   // ---------- PUBLIC API ----------
@@ -1235,86 +1330,41 @@ class DerivBroker extends EventEmitter {
     }));
   }
 
-  // ---------- ORDER PLACEMENT – BRANCHED BY PRODUCT TYPE ----------
+  // ---------- ORDER PLACEMENT (delegates to executor) ----------
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null) {
     await this._ensureReady();
     const amount = Math.abs(units);
-    if (amount <= 0) throw new Error('Order units must be greater than zero.');
+    if (amount <= 0) throw new Error('Order units must be positive.');
     await this._validateOrderRisk(instrument, units > 0 ? 'BUY' : 'SELL', amount, stopLoss, takeProfit);
-
-    const symbol = toDerivSymbol(instrument, this.symbolMap);
-    if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
-
-    // -------- For ALL products, we use proposal → buy (CFD proposal includes SL/TP) --------
-    const proposalPayload = this.proposalBuilder.buildProposal(instrument, units, stopLoss, takeProfit, 'market');
-    logger.info('[placeMarketOrder] Sending proposal:', JSON.stringify(proposalPayload));
-    const proposalResponse = await this._sendRequest(proposalPayload);
-    if (!proposalResponse.proposal || !proposalResponse.proposal.id) {
-      throw new Error('Proposal failed: no proposal ID returned');
-    }
-    const proposalId = proposalResponse.proposal.id;
-    const price = proposalResponse.proposal.price || proposalResponse.proposal.buy_price || 0;
-
-    const buyPayload = { buy: proposalId, price: price };
-    logger.info('[placeMarketOrder] Buying proposal:', JSON.stringify(buyPayload));
-    const buyResponse = await this._sendRequest(buyPayload);
-    const tx = buyResponse.buy;
-    const contractId = tx.contract_id || tx.transaction_id;
-    const executedPrice = tx.buy_price || tx.price || 0;
-
-    return {
-      tradeID: contractId,
-      id: contractId,
-      price: executedPrice,
-      averagePrice: executedPrice,
-      raw: buyResponse,
-    };
+    return this.executor.placeMarket(instrument, units, stopLoss, takeProfit);
   }
 
   async placeLimitOrder(instrument, units, price, stopLoss = null, takeProfit = null) {
     await this._ensureReady();
     const amount = Math.abs(units);
-    if (amount <= 0) throw new Error('Order units must be greater than zero.');
+    if (amount <= 0) throw new Error('Order units must be positive.');
+    if (price <= 0) throw new Error('Price must be positive.');
     await this._validateOrderRisk(instrument, units > 0 ? 'BUY' : 'SELL', amount, stopLoss, takeProfit);
-
-    const symbol = toDerivSymbol(instrument, this.symbolMap);
-    if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
-
-    // -------- For ALL products, we use proposal → buy --------
-    const proposalPayload = this.proposalBuilder.buildProposal(instrument, units, stopLoss, takeProfit, 'limit', price);
-    logger.info('[placeLimitOrder] Sending proposal:', JSON.stringify(proposalPayload));
-    const proposalResponse = await this._sendRequest(proposalPayload);
-    if (!proposalResponse.proposal || !proposalResponse.proposal.id) {
-      throw new Error('Proposal failed: no proposal ID returned');
-    }
-    const proposalId = proposalResponse.proposal.id;
-    const buyPayload = { buy: proposalId, price: price };
-    logger.info('[placeLimitOrder] Buying proposal with limit price:', JSON.stringify(buyPayload));
-    const buyResponse = await this._sendRequest(buyPayload);
-    const tx = buyResponse.buy;
-    const contractId = tx.contract_id || tx.transaction_id;
-    const executedPrice = tx.buy_price || tx.price || price;
-
-    return {
-      tradeID: contractId,
-      id: contractId,
-      price: executedPrice,
-      averagePrice: executedPrice,
-      raw: buyResponse,
-    };
+    return this.executor.placeLimit(instrument, units, price, stopLoss, takeProfit);
   }
 
   async closeTrade(tradeId) {
     await this._ensureReady();
     if (!tradeId) throw new Error('tradeId is required');
-    const payload = { sell: tradeId, price: 0 };
-    try {
-      const response = await this._sendRequest(payload);
-      return response.sell;
-    } catch (err) {
-      logger.error('[closeTrade] Error:', err.message);
-      throw err;
-    }
+    return this.executor.close(tradeId);
+  }
+
+  async modifySLTP(tradeId, stopLoss, takeProfit) {
+    await this._ensureReady();
+    if (!tradeId) throw new Error('tradeId is required');
+    return this.executor.modifySLTP(tradeId, stopLoss, takeProfit);
+  }
+
+  async partialClose(tradeId, units) {
+    await this._ensureReady();
+    if (!tradeId) throw new Error('tradeId is required');
+    if (units <= 0) throw new Error('Units must be positive');
+    return this.executor.partialClose(tradeId, units);
   }
 
   async getOpenTrades() {
@@ -1348,17 +1398,10 @@ class DerivBroker extends EventEmitter {
       }));
   }
 
-  async getPositions() {
-    return this.getOpenTrades();
-  }
+  async getPositions() { return this.getOpenTrades(); }
 
-  isConnected() {
-    return this._state === STATE.READY || this._state === STATE.CONNECTED;
-  }
-
-  isAuthorized() {
-    return this._state === STATE.READY || this._state === STATE.AUTHENTICATING;
-  }
+  isConnected() { return this._state === STATE.READY || this._state === STATE.CONNECTED; }
+  isAuthorized() { return this._state === STATE.READY || this._state === STATE.AUTHENTICATING; }
 
   getHealth() {
     const avgLatency = this.metrics.latencyCount > 0 ? this.metrics.totalLatency / this.metrics.latencyCount : 0;
@@ -1406,7 +1449,6 @@ class DerivBroker extends EventEmitter {
   async disconnect() {
     logger.info('[DerivBroker] Disconnecting gracefully...');
     this._stopHeartbeat();
-
     const subs = Array.from(this.streaming._subscriptions.keys());
     for (const key of subs) {
       const sub = this.streaming._subscriptions.get(key);
@@ -1415,13 +1457,11 @@ class DerivBroker extends EventEmitter {
       } catch (e) {}
       this.streaming._subscriptions.delete(key);
     }
-
     for (const [id, pending] of this._pendingRequests) {
       clearTimeout(pending.timeout);
       if (pending.reject) pending.reject(new Error('Disconnected'));
       this._pendingRequests.delete(id);
     }
-
     if (this._socket) {
       this._socket.close();
       await new Promise((resolve) => {
@@ -1430,7 +1470,6 @@ class DerivBroker extends EventEmitter {
       });
       this._socket = null;
     }
-
     this._setState(STATE.DISCONNECTED);
     this._messageQueue = [];
     logger.info('[DerivBroker] Disconnected.');
@@ -1455,23 +1494,17 @@ class DerivBroker extends EventEmitter {
 
   _ensureReady() {
     if (this._state === STATE.READY) return Promise.resolve();
-    if (this._state === STATE.FATAL) {
-      return Promise.reject(new Error('Broker in FATAL state.'));
-    }
-
+    if (this._state === STATE.FATAL) return Promise.reject(new Error('Broker in FATAL state.'));
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.removeListener('ready', onReady);
         reject(new Error(`Broker did not become ready within ${this.config.readinessTimeout}ms`));
       }, this.config.readinessTimeout);
-
       const onReady = () => {
         clearTimeout(timeout);
         resolve();
       };
-
       this.once('ready', onReady);
-
       if (this._state === STATE.DISCONNECTED || this._state === STATE.CONNECTING) {
         this.connect().catch((err) => {
           clearTimeout(timeout);
