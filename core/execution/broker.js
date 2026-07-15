@@ -1,4 +1,4 @@
-// core/execution/broker.js – Corrected (no syntax errors)
+// core/execution/broker.js – Singleton Instance (Multipliers + CFDs)
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -880,6 +880,7 @@ class DerivBroker extends EventEmitter {
     }
   }
 
+  // ---------- Public API ----------
   async getAccount() {
     await this._ensureReady();
     if (!this._account) {
@@ -1098,6 +1099,14 @@ class DerivBroker extends EventEmitter {
     };
   }
 
+  isConnected() {
+    return this._connected;
+  }
+
+  isAuthorized() {
+    return this._authorized;
+  }
+
   async killSwitch() {
     logger.warn('🚨 EMERGENCY KILL SWITCH ACTIVATED 🚨');
     const positions = await this.getOpenTrades();
@@ -1197,6 +1206,8 @@ class DerivBroker extends EventEmitter {
   }
 }
 
+// ---------- Singleton Export ----------
+// Create a single instance using environment variables
 const brokerInstance = new DerivBroker({
   apiToken: process.env.DERIV_API_TOKEN,
   appId: process.env.DERIV_APP_ID,
@@ -1222,5 +1233,4 @@ const brokerInstance = new DerivBroker({
   productType: process.env.TRADING_PRODUCT || 'multiplier',
 });
 
-// ---------- Export the class (NOT a singleton) ----------
-module.exports = DerivBroker;
+module.exports = brokerInstance;
