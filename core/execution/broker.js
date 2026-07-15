@@ -1,5 +1,4 @@
-// core/execution/broker.js – Singleton broker with full support for CFD, Multiplier, and Basic Options
-// All products use the standard proposal → buy flow, but each proposal is built according to its own rules.
+// core/execution/broker.js – Fully corrected, with true CFD support via direct buy
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -107,7 +106,7 @@ class StreamingManager {
     this._subscriptions = new Map();
     this._subscriptionIdMap = new Map();
     this._priceCache = new Map();
-    this._activeKeys = new Set(); // prevents duplicate subscriptions
+    this._activeKeys = new Set();
   }
 
   async subscribe(type, symbol, callback) {
@@ -152,14 +151,11 @@ class StreamingManager {
     }
     logger.info('[Streaming] Restoring subscriptions...');
     try {
-      // Clear old subscriptions on the server
       await this.broker._sendRequest({ forget_all: 'ticks' });
       logger.info('[Streaming] Cleared old subscriptions.');
     } catch (err) {
       logger.warn('[Streaming] Failed to clear old subscriptions:', err.message);
     }
-
-    // Re‑subscribe each
     for (const [key, sub] of this._subscriptions) {
       try {
         const response = await this.broker._sendRequest({ [sub.type]: sub.symbol, subscribe: 1 });
@@ -203,17 +199,14 @@ class StreamingManager {
 }
 
 // ------------------------------------------------------------
-// PROPOSAL BUILDER – Pure, product‑specific
+// PROPOSAL BUILDER – for Multiplier and Basic Options only
+// (CFD bypasses this entirely)
 // ------------------------------------------------------------
 class DerivProposalBuilder {
   constructor(broker) {
     this.broker = broker;
   }
 
-  /**
-   * Build a proposal request for the current product type.
-   * The broker’s productType determines the structure.
-   */
   buildProposal(instrument, units, stopLoss, takeProfit, orderType, limitPrice = 0) {
     const symbol = toDerivSymbol(instrument, this.broker.symbolMap);
     if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
@@ -221,9 +214,12 @@ class DerivProposalBuilder {
     if (amount <= 0) throw new Error('Order amount must be greater than zero.');
     const side = units > 0 ? 'BUY' : 'SELL';
 
-    const productType = this.broker.productType; // 'cfd', 'multiplier', or 'basic'
+    const productType = this.broker.productType;
+    // This builder is only for multiplier and basic; it should not be called for CFD.
+    if (productType === 'cfd') {
+      throw new Error('Proposal builder should not be used for CFD trades.');
+    }
 
-    // Base proposal (common to all)
     const proposalPayload = {
       proposal: 1,
       amount,
@@ -232,53 +228,27 @@ class DerivProposalBuilder {
       symbol,
     };
 
-    // --------------------------------------------------------------------
-    // 1. TRUE CFD – perpetual position, no expiry
-    // --------------------------------------------------------------------
-    if (productType === 'cfd') {
-      proposalPayload.product_type = 'basic';
-      proposalPayload.contract_type = 'CFD';
-      // CFD supports stop-loss and take-profit directly
-      if (stopLoss && !isNaN(stopLoss) && stopLoss > 0) {
-        proposalPayload.stop_loss = stopLoss;
-      }
-      if (takeProfit && !isNaN(takeProfit) && takeProfit > 0) {
-        proposalPayload.take_profit = takeProfit;
-      }
-      // No duration, no multiplier
-    }
-
-    // --------------------------------------------------------------------
-    // 2. MULTIPLIER – leveraged, optional duration
-    // --------------------------------------------------------------------
-    else if (productType === 'multiplier') {
+    if (productType === 'multiplier') {
       proposalPayload.product_type = 'multiplier';
       proposalPayload.contract_type = side === 'BUY' ? 'MULTUP' : 'MULTIDOWN';
       proposalPayload.multiplier = this.broker.config.leverage || 100;
-      // Multiplier supports stop_loss/take_profit via a limit_order sub‑object
       const limitOrder = {};
       if (stopLoss && !isNaN(stopLoss) && stopLoss > 0) limitOrder.stop_loss = stopLoss;
       if (takeProfit && !isNaN(takeProfit) && takeProfit > 0) limitOrder.take_profit = takeProfit;
       if (Object.keys(limitOrder).length > 0) {
         proposalPayload.limit_order = limitOrder;
       }
-      // Optional duration (if the user wants an expiry)
       if (this.broker.config.duration) {
         proposalPayload.duration = this.broker.config.duration;
         proposalPayload.duration_unit = 's';
       }
-    }
-
-    // --------------------------------------------------------------------
-    // 3. BASIC OPTIONS (CALL / PUT) – fixed duration, no SL/TP
-    // --------------------------------------------------------------------
-    else {
+    } else {
+      // basic options (CALL/PUT)
       proposalPayload.product_type = 'basic';
       proposalPayload.contract_type = side === 'BUY' ? 'CALL' : 'PUT';
       const duration = this.broker.config.duration || 60;
       proposalPayload.duration = duration;
       proposalPayload.duration_unit = 's';
-      // Basic options do not support stop_loss or take_profit
       if (stopLoss || takeProfit) {
         logger.warn('[DerivProposalBuilder] stop_loss/take_profit ignored for basic options.');
       }
@@ -330,14 +300,13 @@ class DerivBroker extends EventEmitter {
       rateCapacity: parseFloat(config.rateCapacity || 10),
       contractType: config.contractType || 'cfd',        // legacy, not used
       leverage: parseFloat(config.leverage || 100),
-      duration: config.duration ? parseInt(config.duration) : 60, // only for options
+      duration: config.duration ? parseInt(config.duration) : 60,
       riskValidator: config.riskValidator || null,
       fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || 3),
       readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 30000),
       symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 30000),
     };
 
-    // Validate and set the product type
     const rawProduct = (config.productType || process.env.TRADING_PRODUCT || 'cfd').toLowerCase();
     const validProducts = ['cfd', 'multiplier', 'basic'];
     if (!validProducts.includes(rawProduct)) {
@@ -403,7 +372,7 @@ class DerivBroker extends EventEmitter {
     this.metadata = { name: 'Deriv', version: '1.0.0' };
     this._authFailCount = 0;
     this._account = null;
-    this._portfolioLogged = false; // to log portfolio structure once
+    this._portfolioLogged = false;
 
     logger.info(`[DerivBroker] Created with product type: ${this.productType}`);
   }
@@ -477,7 +446,6 @@ class DerivBroker extends EventEmitter {
             this.metrics.connectedSince = Date.now();
             this._startHeartbeat();
 
-            // Authorize via the standard request pipeline
             this._authorize()
               .then(async (authResponse) => {
                 if (authResponse && authResponse.authorize) {
@@ -488,7 +456,6 @@ class DerivBroker extends EventEmitter {
                 this._authFailCount = 0;
                 this._setState(STATE.AUTHENTICATING);
 
-                // Load symbols – uses _sendRawRequest to avoid deadlock
                 logger.info('[DerivBroker] Startup: Loading symbols (with timeout)...');
                 try {
                   await this._loadSymbolsWithTimeout();
@@ -497,11 +464,9 @@ class DerivBroker extends EventEmitter {
                   logger.warn('[DerivBroker] Startup: Symbol loading failed, using fallback:', err.message);
                 }
 
-                // Now READY
                 this._setState(STATE.READY);
-                this._flushQueue(); // send any queued messages
+                this._flushQueue();
 
-                // Background tasks (only if still connected)
                 setImmediate(() => {
                   if (this._state === STATE.READY && this._socket && this._socket.readyState === WebSocket.OPEN) {
                     logger.info('[DerivBroker] Startup: Restoring subscriptions (background)...');
@@ -560,7 +525,6 @@ class DerivBroker extends EventEmitter {
             }
           });
 
-          // Overall connection timeout
           connectionTimer = setTimeout(() => {
             logger.error('[DerivBroker] Connection attempt timed out.');
             this._closeSocket();
@@ -679,7 +643,6 @@ class DerivBroker extends EventEmitter {
     try {
       const msg = JSON.parse(rawData);
 
-      // Standard request-response
       if (msg.req_id && this._pendingRequests.has(msg.req_id)) {
         const pending = this._pendingRequests.get(msg.req_id);
         clearTimeout(pending.timeout);
@@ -700,19 +663,16 @@ class DerivBroker extends EventEmitter {
         return;
       }
 
-      // Heartbeat
       if (msg.pong) {
         this.metrics.lastHeartbeat = Date.now();
         return;
       }
 
-      // Tick
       if (msg.msg_type === 'tick' && msg.tick) {
         this.streaming.handleTick(msg.tick);
         return;
       }
 
-      // Order response (no req_id)
       if (msg.buy || msg.sell) {
         this._handleOrderResponse(msg);
       }
@@ -1118,13 +1078,47 @@ class DerivBroker extends EventEmitter {
     }));
   }
 
-  // ---------- ORDER PLACEMENT (unified proposal → buy) ----------
+  // ---------- ORDER PLACEMENT – BRANCHED BY PRODUCT TYPE ----------
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null) {
     await this._ensureReady();
     const amount = Math.abs(units);
     if (amount <= 0) throw new Error('Order units must be greater than zero.');
     await this._validateOrderRisk(instrument, units > 0 ? 'BUY' : 'SELL', amount, stopLoss, takeProfit);
 
+    const symbol = toDerivSymbol(instrument, this.symbolMap);
+    if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
+
+    // -------- TRUE CFD PATH (direct buy, no proposal) --------
+    if (this.productType === 'cfd') {
+      const buyPayload = {
+        buy: 1,                     // 1 = market order
+        symbol,
+        amount,
+        product_type: 'basic',
+        contract_type: 'CFD',
+        price: 0,                   // market price
+      };
+      if (stopLoss && !isNaN(stopLoss) && stopLoss > 0) {
+        buyPayload.stop_loss = stopLoss;
+      }
+      if (takeProfit && !isNaN(takeProfit) && takeProfit > 0) {
+        buyPayload.take_profit = takeProfit;
+      }
+      logger.info('[placeMarketOrder] Opening CFD position:', JSON.stringify(buyPayload));
+      const response = await this._sendRequest(buyPayload);
+      const tx = response.buy;
+      const contractId = tx.contract_id || tx.transaction_id;
+      const executedPrice = tx.buy_price || tx.price || 0;
+      return {
+        tradeID: contractId,
+        id: contractId,
+        price: executedPrice,
+        averagePrice: executedPrice,
+        raw: response,
+      };
+    }
+
+    // -------- MULTIPLIER or BASIC OPTIONS (proposal flow) --------
     const proposalPayload = this.proposalBuilder.buildProposal(instrument, units, stopLoss, takeProfit, 'market');
     logger.info('[placeMarketOrder] Sending proposal:', JSON.stringify(proposalPayload));
     const proposalResponse = await this._sendRequest(proposalPayload);
@@ -1133,14 +1127,12 @@ class DerivBroker extends EventEmitter {
     }
     const proposalId = proposalResponse.proposal.id;
     const price = proposalResponse.proposal.price || proposalResponse.proposal.buy_price || 0;
-
     const buyPayload = { buy: proposalId, price: price };
     logger.info('[placeMarketOrder] Buying proposal:', JSON.stringify(buyPayload));
     const buyResponse = await this._sendRequest(buyPayload);
     const tx = buyResponse.buy;
     const contractId = tx.contract_id || tx.transaction_id;
     const executedPrice = tx.buy_price || tx.price || 0;
-
     return {
       tradeID: contractId,
       id: contractId,
@@ -1156,6 +1148,40 @@ class DerivBroker extends EventEmitter {
     if (amount <= 0) throw new Error('Order units must be greater than zero.');
     await this._validateOrderRisk(instrument, units > 0 ? 'BUY' : 'SELL', amount, stopLoss, takeProfit);
 
+    const symbol = toDerivSymbol(instrument, this.symbolMap);
+    if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
+
+    // -------- TRUE CFD PATH (direct buy with limit price) --------
+    if (this.productType === 'cfd') {
+      const buyPayload = {
+        buy: 1,                     // 1 = order; when price is specified it becomes a limit order
+        symbol,
+        amount,
+        product_type: 'basic',
+        contract_type: 'CFD',
+        price: price,               // limit price
+      };
+      if (stopLoss && !isNaN(stopLoss) && stopLoss > 0) {
+        buyPayload.stop_loss = stopLoss;
+      }
+      if (takeProfit && !isNaN(takeProfit) && takeProfit > 0) {
+        buyPayload.take_profit = takeProfit;
+      }
+      logger.info('[placeLimitOrder] Opening CFD limit order:', JSON.stringify(buyPayload));
+      const response = await this._sendRequest(buyPayload);
+      const tx = response.buy;
+      const contractId = tx.contract_id || tx.transaction_id;
+      const executedPrice = tx.buy_price || tx.price || price;
+      return {
+        tradeID: contractId,
+        id: contractId,
+        price: executedPrice,
+        averagePrice: executedPrice,
+        raw: response,
+      };
+    }
+
+    // -------- MULTIPLIER or BASIC OPTIONS (proposal flow) --------
     const proposalPayload = this.proposalBuilder.buildProposal(instrument, units, stopLoss, takeProfit, 'limit', price);
     logger.info('[placeLimitOrder] Sending proposal:', JSON.stringify(proposalPayload));
     const proposalResponse = await this._sendRequest(proposalPayload);
@@ -1169,7 +1195,6 @@ class DerivBroker extends EventEmitter {
     const tx = buyResponse.buy;
     const contractId = tx.contract_id || tx.transaction_id;
     const executedPrice = tx.buy_price || tx.price || price;
-
     return {
       tradeID: contractId,
       id: contractId,
@@ -1182,7 +1207,7 @@ class DerivBroker extends EventEmitter {
   async closeTrade(tradeId) {
     await this._ensureReady();
     if (!tradeId) throw new Error('tradeId is required');
-    const payload = { sell: tradeId, price: 0 }; // market close
+    const payload = { sell: tradeId, price: 0 };
     try {
       const response = await this._sendRequest(payload);
       return response.sell;
