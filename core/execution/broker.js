@@ -1,4 +1,4 @@
-// core/execution/broker.js – Singleton instance with all methods (FINAL FIXED)
+// core/execution/broker.js – Singleton instance with all methods (ARCHITECTURE FIXED)
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -100,10 +100,16 @@ class StreamingManager {
     this._subscriptions = new Map();
     this._subscriptionIdMap = new Map();
     this._priceCache = new Map();
+    // FIX: Track active subscription keys to prevent duplicates
+    this._activeKeys = new Set();
   }
 
   async subscribe(type, symbol, callback) {
     const key = `${type}:${symbol}`;
+    if (this._activeKeys.has(key)) {
+      logger.warn(`[Streaming] Already subscribed to ${key}, skipping.`);
+      return;
+    }
     if (this._subscriptions.has(key)) {
       logger.warn(`[Streaming] Subscription ${key} already exists.`);
       return;
@@ -117,6 +123,7 @@ class StreamingManager {
     }
     this._subscriptions.set(key, { type, symbol, subscriptionId, callback });
     this._subscriptionIdMap.set(subscriptionId, key);
+    this._activeKeys.add(key);
     logger.info(`[Streaming] Subscribed to ${key} (ID: ${subscriptionId})`);
   }
 
@@ -127,33 +134,42 @@ class StreamingManager {
     await this.broker._sendRequest({ forget: sub.subscriptionId });
     this._subscriptions.delete(key);
     this._subscriptionIdMap.delete(sub.subscriptionId);
+    this._activeKeys.delete(key);
     this._priceCache.delete(symbol);
     logger.info(`[Streaming] Unsubscribed from ${key}`);
   }
 
-  restoreSubscriptions() {
+  // FIX: Wait for forget_all to complete before restoring
+  async restoreSubscriptions() {
     if (this._subscriptions.size === 0) {
       logger.info('[Streaming] No subscriptions to restore.');
       return;
     }
     logger.info('[Streaming] Restoring subscriptions...');
-    this.broker._sendRequest({ forget_all: 'ticks' })
-      .then(() => {
-        for (const [key, sub] of this._subscriptions) {
-          this.broker._sendRequest({ [sub.type]: sub.symbol, subscribe: 1 })
-            .then((response) => {
-              const newId = response.subscription?.id;
-              if (newId) {
-                this._subscriptionIdMap.delete(sub.subscriptionId);
-                sub.subscriptionId = newId;
-                this._subscriptionIdMap.set(newId, key);
-                logger.info(`[Streaming] Restored ${key} (new ID: ${newId})`);
-              }
-            })
-            .catch((err) => logger.error(`[Streaming] Failed to restore ${key}:`, err.message));
+    try {
+      // Clear all old subscriptions on the server
+      await this.broker._sendRequest({ forget_all: 'ticks' });
+      logger.info('[Streaming] Cleared old subscriptions.');
+    } catch (err) {
+      logger.warn('[Streaming] Failed to clear old subscriptions:', err.message);
+      // Continue anyway – we'll try to subscribe individually
+    }
+
+    // Now restore each subscription
+    for (const [key, sub] of this._subscriptions) {
+      try {
+        const response = await this.broker._sendRequest({ [sub.type]: sub.symbol, subscribe: 1 });
+        const newId = response.subscription?.id;
+        if (newId) {
+          this._subscriptionIdMap.delete(sub.subscriptionId);
+          sub.subscriptionId = newId;
+          this._subscriptionIdMap.set(newId, key);
+          logger.info(`[Streaming] Restored ${key} (new ID: ${newId})`);
         }
-      })
-      .catch((err) => logger.error('[Streaming] Failed to clear old subscriptions:', err.message));
+      } catch (err) {
+        logger.error(`[Streaming] Failed to restore ${key}:`, err.message);
+      }
+    }
   }
 
   handleTick(tick) {
@@ -194,7 +210,10 @@ class DerivProposalBuilder {
     if (amount <= 0) throw new Error('Order amount must be greater than zero.');
     const side = units > 0 ? 'BUY' : 'SELL';
 
-    const productType = this.broker.productType || 'multiplier';
+    // FIX: Use the broker's single product type
+    const productType = this.broker.productType; // 'cfd' or 'multiplier'
+
+    // Base proposal
     const proposalPayload = {
       proposal: 1,
       amount,
@@ -204,17 +223,17 @@ class DerivProposalBuilder {
       product_type: productType === 'cfd' ? 'basic' : 'multiplier',
     };
 
-    const duration = this.broker.config.duration || 10; // seconds
-
     if (productType === 'cfd') {
+      // === CFD (CALL/PUT with duration) ===
       proposalPayload.contract_type = side === 'BUY' ? 'CALL' : 'PUT';
       proposalPayload.duration_unit = 's';
-      proposalPayload.duration = duration;
-      // CFD does NOT support stop_loss/take_profit
+      proposalPayload.duration = this.broker.config.duration || 60; // seconds
+      // CFD does NOT support stop_loss / take_profit
       if (stopLoss || takeProfit) {
-        logger.warn('[DerivProposalBuilder] stop_loss/take_profit ignored for CFD orders.');
+        logger.warn('[DerivProposalBuilder] stop_loss/take_profit ignored for CFD.');
       }
     } else {
+      // === Multiplier (MULTUP/MULTIDOWN with leverage) ===
       proposalPayload.contract_type = side === 'BUY' ? 'MULTUP' : 'MULTIDOWN';
       let multiplier = this.broker.config.leverage || 100;
       const validMultipliers = [100, 200, 300, 500, 800];
@@ -223,6 +242,7 @@ class DerivProposalBuilder {
         logger.warn(`[DerivBroker] Invalid multiplier, using default 100`);
       }
       proposalPayload.multiplier = multiplier;
+      // Support stop_loss / take_profit for multiplier
       const limitOrder = {};
       if (stopLoss !== null && stopLoss !== undefined && !isNaN(stopLoss) && stopLoss > 0) {
         limitOrder.stop_loss = stopLoss;
@@ -278,14 +298,19 @@ class DerivBroker extends EventEmitter {
       rateCapacity: parseFloat(config.rateCapacity || 10),
       contractType: config.contractType || 'cfd',
       leverage: parseFloat(config.leverage || 100),
-      duration: config.duration ? parseInt(config.duration) : 10,
+      duration: config.duration ? parseInt(config.duration) : 60, // default 60s
       riskValidator: config.riskValidator || null,
       fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || 3),
       readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 30000),
       symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 30000),
     };
 
-    this.productType = config.productType || process.env.TRADING_PRODUCT || 'multiplier';
+    // FIX: Single product type – no mixing
+    this.productType = (config.productType || process.env.TRADING_PRODUCT || 'cfd').toLowerCase();
+    if (!['cfd', 'multiplier'].includes(this.productType)) {
+      logger.warn(`[DerivBroker] Invalid productType '${this.productType}', defaulting to 'cfd'`);
+      this.productType = 'cfd';
+    }
 
     this.validateConfig();
 
@@ -365,7 +390,7 @@ class DerivBroker extends EventEmitter {
 
   async _doConnect() {
     this._setState(STATE.CONNECTING);
-    this._closeSocket(); // ensure clean state
+    this._closeSocket();
     logger.info(`[DerivBroker] Connecting to ${this.config.wsUrl}`);
 
     return new Promise((resolve, reject) => {
@@ -409,13 +434,10 @@ class DerivBroker extends EventEmitter {
             this.metrics.connectedSince = Date.now();
             this._startHeartbeat();
 
-            // Clear the overall connection timer – we are now connected and will handle auth separately.
-            if (connectionTimer) {
-              clearTimeout(connectionTimer);
-              connectionTimer = null;
-            }
-
-            // Authorize
+            // Authorization via the standard request pipeline
+            this._sendRaw({ authorize: this.config.apiToken, req_id: generateRequestId() });
+            // The response will be handled by _handleMessage and resolved via the pending request map
+            // We'll wait for the authorize response using a dedicated promise
             this._authorize()
               .then(async (authResponse) => {
                 if (authResponse && authResponse.authorize) {
@@ -426,7 +448,7 @@ class DerivBroker extends EventEmitter {
                 this._authFailCount = 0;
                 this._setState(STATE.AUTHENTICATING);
 
-                // Now load symbols (with its own timeout)
+                // --- LOAD SYMBOLS (bypass _ensureReady) ---
                 logger.info('[DerivBroker] Startup: Loading symbols (with timeout)...');
                 try {
                   await this._loadSymbolsWithTimeout();
@@ -435,15 +457,17 @@ class DerivBroker extends EventEmitter {
                   logger.warn('[DerivBroker] Startup: Symbol loading failed, using fallback:', err.message);
                 }
 
-                // Set READY and flush queue
+                // Now READY
                 this._setState(STATE.READY);
+                // FIX: Flush queued messages
                 this._flushQueue();
 
-                // Schedule background tasks only after READY
+                // Background tasks (run only if still ready)
                 setImmediate(() => {
                   if (this._state === STATE.READY && this._socket && this._socket.readyState === WebSocket.OPEN) {
                     logger.info('[DerivBroker] Startup: Restoring subscriptions (background)...');
-                    this.streaming.restoreSubscriptions();
+                    this.streaming.restoreSubscriptions()
+                      .catch(err => logger.error('[DerivBroker] Subscription restore error:', err.message));
 
                     logger.info('[DerivBroker] Startup: Reconciling positions (background)...');
                     this._reconcilePositions()
@@ -489,25 +513,21 @@ class DerivBroker extends EventEmitter {
               clearTimeout(connectionTimer);
               connectionTimer = null;
             }
-            // If we are in a state where we expected the connection to be alive, reconnect.
             if (this._state === STATE.READY || this._state === STATE.CONNECTED || this._state === STATE.AUTHENTICATING) {
               this._setState(STATE.RECONNECTING);
               setTimeout(() => attemptConnect(), this._getReconnectDelay(attempts));
             } else if (this._state === STATE.CONNECTING || this._state === STATE.CONNECTED) {
-              // Connection attempt failed – reject the promise
               reject(new Error(`WebSocket closed unexpectedly: ${code}`));
             }
           });
 
-          // Overall connection timeout – only for establishing the socket and authorization
+          // Overall connection timeout
           connectionTimer = setTimeout(() => {
-            logger.error('[DerivBroker] Connection attempt timed out (socket/auth).');
+            logger.error('[DerivBroker] Connection attempt timed out.');
             this._closeSocket();
             reject(new Error('Connection attempt timed out'));
           }, this.config.connectionTimeout);
 
-          // Once we are connected (socket open and auth done), clear timer.
-          // We'll clear it inside 'open' after auth, but also if we get 'connected' event.
           this.once('connected', () => {
             if (connectionTimer) {
               clearTimeout(connectionTimer);
@@ -532,29 +552,34 @@ class DerivBroker extends EventEmitter {
     this.emit('stateChange', { from: old, to: newState });
   }
 
+  // FIX: Authorization using the standard request pipeline
   _authorize() {
     return new Promise((resolve, reject) => {
-      const payload = { authorize: this.config.apiToken };
+      const reqId = generateRequestId();
+      const payload = { authorize: this.config.apiToken, req_id: reqId };
       const timeout = setTimeout(() => {
-        reject(new Error('Authorize timeout'));
-      }, 10000); // Use a fixed 10s timeout for auth
-
-      const handler = (data) => {
-        try {
-          const msg = JSON.parse(data);
-          if (msg.error) {
-            clearTimeout(timeout);
-            reject(new Error(`Deriv API error: ${msg.error.code} - ${msg.error.message}`));
-          } else if (msg.authorize !== undefined) {
-            clearTimeout(timeout);
-            resolve(msg);
-          }
-        } catch (err) {
-          // ignore
+        if (this._pendingRequests.has(reqId)) {
+          this._pendingRequests.delete(reqId);
+          reject(new Error('Authorize timeout'));
         }
-      };
+      }, 10000);
 
-      this._socket.once('message', handler);
+      // Register a one-off resolver for this req_id
+      this._pendingRequests.set(reqId, {
+        resolve: (msg) => {
+          clearTimeout(timeout);
+          resolve(msg);
+        },
+        reject: (err) => {
+          clearTimeout(timeout);
+          reject(err);
+        },
+        timeout,
+        sentAt: Date.now(),
+        cancel: () => {},
+        signal: null,
+      });
+
       this._sendRaw(payload);
     });
   }
@@ -613,6 +638,7 @@ class DerivBroker extends EventEmitter {
     try {
       const msg = JSON.parse(rawData);
 
+      // Standard request-response
       if (msg.req_id && this._pendingRequests.has(msg.req_id)) {
         const pending = this._pendingRequests.get(msg.req_id);
         clearTimeout(pending.timeout);
@@ -633,16 +659,19 @@ class DerivBroker extends EventEmitter {
         return;
       }
 
+      // Heartbeat
       if (msg.pong) {
         this.metrics.lastHeartbeat = Date.now();
         return;
       }
 
+      // Tick
       if (msg.msg_type === 'tick' && msg.tick) {
         this.streaming.handleTick(msg.tick);
         return;
       }
 
+      // Order response (no req_id)
       if (msg.buy || msg.sell) {
         this._handleOrderResponse(msg);
       }
@@ -664,7 +693,6 @@ class DerivBroker extends EventEmitter {
   }
 
   _sendRaw(payload) {
-    // If socket is not open, enqueue the message
     if (!this._socket || this._socket.readyState !== WebSocket.OPEN) {
       if (this._messageQueue.length < this.config.maxQueueSize) {
         this._messageQueue.push(payload);
@@ -678,7 +706,6 @@ class DerivBroker extends EventEmitter {
       this._socket.send(JSON.stringify(payload));
     } catch (err) {
       logger.error('[DerivBroker] Send error:', err.message);
-      // Attempt to re-queue
       if (this._messageQueue.length < this.config.maxQueueSize) {
         this._messageQueue.push(payload);
       }
@@ -757,19 +784,22 @@ class DerivBroker extends EventEmitter {
     }
   }
 
+  // FIX: Separate symbol loading – it bypasses _ensureReady
   async _loadSymbolsWithTimeout() {
     return Promise.race([
-      this._loadSymbols(),
+      this._loadSymbolsInternal(),
       sleep(this.config.symbolTimeout).then(() => {
         throw new Error(`Symbol loading timed out after ${this.config.symbolTimeout}ms`);
       })
     ]);
   }
 
-  async _loadSymbols() {
+  async _loadSymbolsInternal() {
     logger.info('[DerivBroker] Fetching active symbols...');
+    let lastError = null;
+    // Try brief
     try {
-      const response = await this._sendRequest({ active_symbols: 'brief' }, 10000);
+      const response = await this._sendRawRequest({ active_symbols: 'brief' }, 10000);
       const symbols = response.active_symbols || [];
       if (symbols.length > 0) {
         this._buildSymbolMaps(symbols);
@@ -777,11 +807,12 @@ class DerivBroker extends EventEmitter {
         return;
       }
     } catch (err) {
+      lastError = err;
       logger.warn('[DerivBroker] Brief symbol request failed:', err.message);
     }
-
+    // Try all
     try {
-      const response = await this._sendRequest({ active_symbols: 'all' }, 10000);
+      const response = await this._sendRawRequest({ active_symbols: 'all' }, 10000);
       const symbols = response.active_symbols || [];
       if (symbols.length > 0) {
         this._buildSymbolMaps(symbols);
@@ -789,10 +820,10 @@ class DerivBroker extends EventEmitter {
         return;
       }
     } catch (err) {
+      lastError = err;
       logger.warn('[DerivBroker] All symbol request failed:', err.message);
     }
-
-    throw new Error('Failed to load symbols from Deriv API.');
+    throw lastError || new Error('Failed to load symbols from Deriv API.');
   }
 
   _buildSymbolMaps(symbols) {
@@ -845,15 +876,36 @@ class DerivBroker extends EventEmitter {
     this.emit('orderUpdate', { clientOrderId, status, contractId });
   }
 
+  // FIX: Improved portfolio parsing – log the structure once and handle multiple formats
   async _reconcilePositions() {
     logger.info('[DerivBroker] Reconciling positions...');
     try {
       const response = await this._sendRequest({ portfolio: 1 });
-      let brokerPositions = response.portfolio || [];
-      if (!Array.isArray(brokerPositions)) {
-        logger.warn('[Reconcile] portfolio is not an array, converting object to array');
-        brokerPositions = Object.values(brokerPositions);
+      let rawPortfolio = response.portfolio || response.contracts || [];
+      if (!Array.isArray(rawPortfolio)) {
+        // If it's an object with numeric keys, convert to array
+        if (typeof rawPortfolio === 'object' && rawPortfolio !== null) {
+          const keys = Object.keys(rawPortfolio);
+          if (keys.length > 0 && !isNaN(keys[0])) {
+            rawPortfolio = Object.values(rawPortfolio);
+          } else {
+            // Try to find an array inside
+            const maybeArray = Object.values(rawPortfolio).find(v => Array.isArray(v));
+            if (maybeArray) rawPortfolio = maybeArray;
+          }
+        }
       }
+      if (!Array.isArray(rawPortfolio)) {
+        rawPortfolio = [];
+        logger.warn('[Reconcile] Unable to parse portfolio response; defaulting to empty array.');
+      }
+      // Log structure once for debugging
+      if (!this._portfolioLogged) {
+        logger.info('[Reconcile] Portfolio structure:', JSON.stringify(rawPortfolio.slice(0, 2), null, 2));
+        this._portfolioLogged = true;
+      }
+
+      const brokerPositions = rawPortfolio;
       const dbOrders = await Order.find({ status: ORDER_STATUS.FILLED });
       const dbMap = new Map();
       for (const ord of dbOrders) {
@@ -1101,13 +1153,20 @@ class DerivBroker extends EventEmitter {
   async getOpenTrades() {
     await this._ensureReady();
     const response = await this._sendRequest({ portfolio: 1 });
-    let contracts = response.portfolio || [];
+    let contracts = response.portfolio || response.contracts || [];
     if (!Array.isArray(contracts)) {
-      logger.warn('[getOpenTrades] portfolio is not an array, converting object to array');
-      contracts = Object.values(contracts);
-    }
-    if (!Array.isArray(contracts) || contracts.length === 0) {
-      return [];
+      if (typeof contracts === 'object' && contracts !== null) {
+        const keys = Object.keys(contracts);
+        if (keys.length > 0 && !isNaN(keys[0])) {
+          contracts = Object.values(contracts);
+        } else {
+          const maybeArray = Object.values(contracts).find(v => Array.isArray(v));
+          if (maybeArray) contracts = maybeArray;
+          else contracts = [];
+        }
+      } else {
+        contracts = [];
+      }
     }
     return contracts
       .filter(c => c.contract_id)
@@ -1275,11 +1334,11 @@ const brokerInstance = new DerivBroker({
   rateCapacity: parseFloat(process.env.DERIV_RATE_CAPACITY) || 10,
   contractType: process.env.DERIV_CONTRACT_TYPE || 'cfd',
   leverage: parseFloat(process.env.DERIV_LEVERAGE) || 100,
-  duration: process.env.DERIV_DURATION ? parseInt(process.env.DERIV_DURATION) : 10,
+  duration: process.env.DERIV_DURATION ? parseInt(process.env.DERIV_DURATION) : 60,
   fatalAfterAuthFailures: parseInt(process.env.DERIV_FATAL_AFTER_AUTH_FAILURES) || 3,
   readinessTimeout: parseInt(process.env.DERIV_READINESS_TIMEOUT) || 30000,
   symbolTimeout: parseInt(process.env.DERIV_SYMBOL_TIMEOUT) || 30000,
-  productType: process.env.TRADING_PRODUCT || 'multiplier',
+  productType: process.env.TRADING_PRODUCT || 'cfd',
 });
 
 module.exports = brokerInstance;
