@@ -1,4 +1,4 @@
-// core/execution/broker.js – Correct Proposal/Buy Workflow with valid multiplier and min stake
+// core/execution/broker.js – Production Deriv WebSocket Driver (Multipliers + CFDs)
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -31,6 +31,7 @@ const ORDER_STATUS = {
 
 const CB_STATE = { CLOSED: 'CLOSED', OPEN: 'OPEN', HALF_OPEN: 'HALF_OPEN' };
 
+// --- Helpers ---
 let _requestCounter = 0;
 
 function generateRequestId() {
@@ -58,6 +59,7 @@ function fromDerivSymbol(symbol, reverseMap) {
   return symbol;
 }
 
+// ---------- Hardcoded fallback symbols ----------
 const FALLBACK_SYMBOLS = {
   'EUR_USD': 'frxEURUSD',
   'GBP_USD': 'frxGBPUSD',
@@ -71,6 +73,7 @@ const FALLBACK_SYMBOLS = {
   'GBP_JPY': 'frxGBPJPY',
 };
 
+// ---------- Rate Limiter ----------
 class RateLimiter {
   constructor(rate, capacity) {
     this.rate = rate;
@@ -94,6 +97,7 @@ class RateLimiter {
   }
 }
 
+// ---------- Streaming Manager ----------
 class StreamingManager {
   constructor(broker) {
     this.broker = broker;
@@ -182,7 +186,7 @@ class StreamingManager {
   }
 }
 
-// ---------- PROPOSAL BUILDER (Stage 1) ----------
+// ---------- PROPOSAL BUILDER (Extended for CFDs) ----------
 class DerivProposalBuilder {
   constructor(broker) {
     this.broker = broker;
@@ -201,31 +205,45 @@ class DerivProposalBuilder {
   buildProposal(instrument, units, stopLoss, takeProfit, orderType, limitPrice = 0) {
     const symbol = toDerivSymbol(instrument, this.broker.symbolMap);
     if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
-    let amount = Math.abs(units);
+    const amount = Math.abs(units);
     if (amount <= 0) throw new Error('Order amount must be greater than zero.');
-    
-    // For MULTUP contracts, minimum stake is 1 USD (assuming USD account)
-    if (amount < 1) {
-      amount = 1;
-      logger.warn(`[ProposalBuilder] Amount increased to minimum 1.00 (was ${units})`);
-    }
+    const side = units > 0 ? 'BUY' : 'SELL';
 
-    // Valid multipliers for MULTUP: 100, 200, 300, 500, 800
-    // We'll use 100 as default (minimum)
-    const multiplier = 100;
+    // Get product type from broker config
+    const productType = this.broker.productType || 'multiplier';
 
+    // Base proposal payload
     const proposalPayload = {
       proposal: 1,
       amount,
       basis: 'stake',
-      contract_type: 'MULTUP',
       currency: 'USD',
       symbol,
       product_type: 'basic',
-      multiplier: multiplier,
     };
 
-    // Add limit order for stop loss and take profit
+    // Configure for product type
+    if (productType === 'cfd') {
+      // For CFDs, we use 'CALL' or 'PUT' contract type based on direction
+      // For spot CFDs, we use 'CALL' for BUY and 'PUT' for SELL
+      // with duration_unit: 'tick' (no expiry)
+      proposalPayload.contract_type = side === 'BUY' ? 'CALL' : 'PUT';
+      proposalPayload.duration_unit = 't';
+      proposalPayload.duration = 1; // 1 tick (no expiry)
+    } else {
+      // Multipliers
+      proposalPayload.contract_type = 'MULTUP';
+      // Ensure multiplier is valid
+      const validMultipliers = [100, 200, 300, 500, 800];
+      let multiplier = this.broker.config.leverage || 100;
+      if (!validMultipliers.includes(multiplier)) {
+        multiplier = 100;
+        logger.warn(`[DerivBroker] Invalid multiplier, using default 100`);
+      }
+      proposalPayload.multiplier = multiplier;
+    }
+
+    // Add limit order for stop loss and take profit (for both products)
     const limitOrder = {};
     if (stopLoss !== null && stopLoss !== undefined && !isNaN(stopLoss) && stopLoss > 0) {
       limitOrder.stop_loss = stopLoss;
@@ -241,7 +259,34 @@ class DerivProposalBuilder {
   }
 }
 
-// ---------- DERIV BROKER (Main) ----------
+// ---------- Order Builder (for legacy compatibility) ----------
+class DerivOrderBuilder {
+  constructor(broker) {
+    this.broker = broker;
+  }
+
+  build(instrument, units, price, stopLoss, takeProfit, orderType) {
+    // This is kept for compatibility with the existing proposal flow
+    const symbol = toDerivSymbol(instrument, this.broker.symbolMap);
+    if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
+    const amount = Math.abs(units);
+    if (amount <= 0) throw new Error('Order amount must be greater than zero.');
+    const payload = {
+      buy: symbol,
+      amount: amount,
+      price: orderType === 'market' ? 0 : price,
+    };
+    if (stopLoss !== null && stopLoss !== undefined && !isNaN(stopLoss) && stopLoss > 0) {
+      payload.stop_loss = stopLoss;
+    }
+    if (takeProfit !== null && takeProfit !== undefined && !isNaN(takeProfit) && takeProfit > 0) {
+      payload.take_profit = takeProfit;
+    }
+    return payload;
+  }
+}
+
+// ---------- Broker Capabilities ----------
 const BROKER_CAPABILITIES = {
   supportsTrailingStop: false,
   supportsHedging: false,
@@ -257,6 +302,7 @@ const BROKER_CAPABILITIES = {
   supportedMarkets: ['Forex', 'Indices', 'Commodities', 'Cryptocurrencies'],
 };
 
+// ---------- Main Broker Class ----------
 class DerivBroker extends EventEmitter {
   constructor(config = {}) {
     super();
@@ -280,13 +326,16 @@ class DerivBroker extends EventEmitter {
       rateLimit: parseFloat(config.rateLimit || 5),
       rateCapacity: parseFloat(config.rateCapacity || 10),
       contractType: config.contractType || 'cfd',
-      leverage: parseFloat(config.leverage || 1),
+      leverage: parseFloat(config.leverage || 100),
       duration: config.duration || null,
       riskValidator: config.riskValidator || null,
       fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || 3),
       readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 30000),
       symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 10000),
     };
+
+    // Product type (multiplier or cfd)
+    this.productType = config.productType || process.env.TRADING_PRODUCT || 'multiplier';
 
     this.validateConfig();
 
@@ -304,6 +353,7 @@ class DerivBroker extends EventEmitter {
     this._cbFailureCount = 0;
     this._cbOpenedAt = null;
 
+    // Fallback symbols
     this.symbolMap = { ...FALLBACK_SYMBOLS };
     this.reverseMap = {};
     for (const [key, val] of Object.entries(FALLBACK_SYMBOLS)) {
@@ -334,12 +384,13 @@ class DerivBroker extends EventEmitter {
 
     this.capabilities = { ...BROKER_CAPABILITIES };
     this.proposalBuilder = new DerivProposalBuilder(this);
+    this.orderBuilder = new DerivOrderBuilder(this);
     this._session = { isOpen: true, accountEnabled: true, marginSufficient: true, lastCheck: null };
     this.metadata = { name: 'Deriv', version: '1.0.0' };
     this._authFailCount = 0;
     this._account = null;
 
-    logger.info('[DerivBroker] Created. Call connect() to start.');
+    logger.info(`[DerivBroker] Created with product type: ${this.productType}`);
   }
 
   validateConfig() {
@@ -886,6 +937,7 @@ class DerivBroker extends EventEmitter {
     }
   }
 
+  // ---------- Public API ----------
   async getAccount() {
     await this._ensureReady();
     if (!this._account) {
@@ -1028,13 +1080,7 @@ class DerivBroker extends EventEmitter {
     if (amount <= 0) throw new Error('Order units must be greater than zero.');
     await this._validateOrderRisk(instrument, units > 0 ? 'BUY' : 'SELL', amount, stopLoss, takeProfit);
 
-    // For limit orders, we need to set the entry price in the proposal? 
-    // Actually, for Deriv, the price in the buy request is the entry price.
-    // The proposal should be for a market order at entry price? We'll treat limit as a market order at the limit price.
-    // We'll build proposal with the limit price as the price field? 
-    // In Deriv, a limit order is typically a limit order on the contract, not a market entry.
-    // But for simplicity, we can use the same proposal builder and set price in buy.
-    // We'll use the same proposal as market, but set price in buy.
+    // For limit orders, we use the same proposal flow with the limit price
     const proposalPayload = this.proposalBuilder.buildProposal(instrument, units, stopLoss, takeProfit, 'limit');
 
     const proposalResponse = await this._sendRequest(proposalPayload);
@@ -1042,10 +1088,9 @@ class DerivBroker extends EventEmitter {
       throw new Error('Proposal failed: no proposal ID returned');
     }
     const proposalId = proposalResponse.proposal.id;
-    // The proposal price might be different; we use the limit price for the buy.
     const buyPayload = {
       buy: proposalId,
-      price: price, // use the provided limit price
+      price: price,
     };
     const buyResponse = await this._sendRequest(buyPayload);
     const tx = buyResponse.buy;
@@ -1241,11 +1286,12 @@ const brokerInstance = new DerivBroker({
   rateLimit: parseFloat(process.env.DERIV_RATE_LIMIT) || 5,
   rateCapacity: parseFloat(process.env.DERIV_RATE_CAPACITY) || 10,
   contractType: process.env.DERIV_CONTRACT_TYPE || 'cfd',
-  leverage: parseFloat(process.env.DERIV_LEVERAGE) || 1,
+  leverage: parseFloat(process.env.DERIV_LEVERAGE) || 100,
   duration: process.env.DERIV_DURATION || null,
   fatalAfterAuthFailures: parseInt(process.env.DERIV_FATAL_AFTER_AUTH_FAILURES) || 3,
   readinessTimeout: parseInt(process.env.DERIV_READINESS_TIMEOUT) || 30000,
   symbolTimeout: parseInt(process.env.DERIV_SYMBOL_TIMEOUT) || 10000,
+  productType: process.env.TRADING_PRODUCT || 'multiplier',
 });
 
 module.exports = brokerInstance;
