@@ -47,6 +47,10 @@ function generateRequestId() {
 }
 
 function generateClientOrderId() {
+  // Use crypto.randomUUID() if available, else fallback
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return `ord_${crypto.randomUUID()}`;
+  }
   return `ord_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
 }
 
@@ -67,7 +71,7 @@ function fromDerivSymbol(symbol, reverseMap) {
   return symbol;
 }
 
-// Fallback symbols (will be enriched by active_symbols)
+// Fallback symbols (enriched by active_symbols)
 const FALLBACK_SYMBOLS = {
   'EUR_USD': 'frxEURUSD',
   'GBP_USD': 'frxGBPUSD',
@@ -82,7 +86,7 @@ const FALLBACK_SYMBOLS = {
 };
 
 // ============================================================
-// RATE LIMITER
+// RATE LIMITER (loop instead of recursion)
 // ============================================================
 class RateLimiter {
   constructor(rate, capacity) {
@@ -93,40 +97,42 @@ class RateLimiter {
   }
 
   async acquire() {
-    const now = Date.now();
-    const elapsed = (now - this.lastRefill) / 1000;
-    this.tokens = Math.min(this.capacity, this.tokens + elapsed * this.rate);
-    this.lastRefill = now;
-    if (this.tokens < 1) {
+    while (true) {
+      const now = Date.now();
+      const elapsed = (now - this.lastRefill) / 1000;
+      this.tokens = Math.min(this.capacity, this.tokens + elapsed * this.rate);
+      this.lastRefill = now;
+      if (this.tokens >= 1) {
+        this.tokens--;
+        return true;
+      }
       const waitTime = (1 - this.tokens) / this.rate * 1000;
       await sleep(Math.ceil(waitTime));
-      return this.acquire();
     }
-    this.tokens--;
-    return true;
   }
 }
 
 // ============================================================
-// STREAMING MANAGER (with duplicate prevention)
+// STREAMING MANAGER (supports multiple callbacks per symbol)
 // ============================================================
 class StreamingManager {
   constructor(broker) {
     this.broker = broker;
+    // Map: key -> { type, symbol, subscriptionId, callbacks: [] }
     this._subscriptions = new Map();
     this._subscriptionIdMap = new Map();
     this._priceCache = new Map();
-    this._activeKeys = new Set();
   }
 
   async subscribe(type, symbol, callback) {
     const key = `${type}:${symbol}`;
-    if (this._activeKeys.has(key)) {
-      logger.warn(`[Streaming] Already subscribed to ${key}, skipping.`);
-      return;
-    }
     if (this._subscriptions.has(key)) {
-      logger.warn(`[Streaming] Subscription ${key} already exists.`);
+      // Add callback to existing subscription
+      const sub = this._subscriptions.get(key);
+      if (!sub.callbacks.includes(callback)) {
+        sub.callbacks.push(callback);
+        logger.info(`[Streaming] Added callback to existing subscription ${key}`);
+      }
       return;
     }
     await this.broker._ensureReady();
@@ -136,20 +142,24 @@ class StreamingManager {
       logger.error(`[Streaming] No subscription ID for ${key}`);
       return;
     }
-    this._subscriptions.set(key, { type, symbol, subscriptionId, callback });
+    this._subscriptions.set(key, { type, symbol, subscriptionId, callbacks: [callback] });
     this._subscriptionIdMap.set(subscriptionId, key);
-    this._activeKeys.add(key);
     logger.info(`[Streaming] Subscribed to ${key} (ID: ${subscriptionId})`);
   }
 
-  async unsubscribe(type, symbol) {
+  async unsubscribe(type, symbol, callback = null) {
     const key = `${type}:${symbol}`;
     const sub = this._subscriptions.get(key);
     if (!sub) return;
+    if (callback) {
+      // Remove specific callback
+      sub.callbacks = sub.callbacks.filter(cb => cb !== callback);
+      if (sub.callbacks.length > 0) return; // still have listeners
+    }
+    // No callbacks left – unsubscribe from server
     await this.broker._sendRequest({ forget: sub.subscriptionId });
     this._subscriptions.delete(key);
     this._subscriptionIdMap.delete(sub.subscriptionId);
-    this._activeKeys.delete(key);
     this._priceCache.delete(symbol);
     logger.info(`[Streaming] Unsubscribed from ${key}`);
   }
@@ -191,9 +201,12 @@ class StreamingManager {
     if (price) {
       this._priceCache.set(symbol, { bid, ask, mid: price, time: tick.epoch || Date.now() });
     }
+    // Find all subscriptions for this symbol and call all callbacks
     for (const [key, sub] of this._subscriptions) {
       if (sub.symbol === symbol) {
-        sub.callback(tick);
+        for (const cb of sub.callbacks) {
+          try { cb(tick); } catch (err) { logger.error('[Streaming] Callback error:', err); }
+        }
         break;
       }
     }
@@ -314,7 +327,6 @@ class SymbolManager {
   setSymbols(symbols) {
     for (const sym of symbols) {
       this._symbols.set(sym.symbol, sym);
-      // Update leverage if available
       if (sym.leverage) {
         this._leverageMap[sym.symbol] = sym.leverage;
       }
@@ -382,6 +394,8 @@ class DerivBroker extends EventEmitter {
       fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || 3),
       readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 30000),
       symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 30000),
+      // Heartbeat timeout: if no pong within this time, reconnect
+      heartbeatTimeout: parseInt(config.heartbeatTimeout || process.env.DERIV_HEARTBEAT_TIMEOUT || 60000),
     };
 
     // Product type validation
@@ -402,6 +416,8 @@ class DerivBroker extends EventEmitter {
     this._pendingRequests = new Map();
     this._messageQueue = [];
     this._heartbeatInterval = null;
+    this._heartbeatTimeout = null; // for pong monitoring
+    this._lastPong = Date.now();
     this._connectionPromise = null;
     this._rateLimiter = new RateLimiter(this.config.rateLimit, this.config.rateCapacity);
 
@@ -443,6 +459,7 @@ class DerivBroker extends EventEmitter {
       ordersPlaced: 0,
       ordersFilled: 0,
       ordersRejected: 0,
+      lastPong: Date.now(),
     };
 
     this.capabilities = { ...BROKER_CAPABILITIES };
@@ -461,6 +478,8 @@ class DerivBroker extends EventEmitter {
     if (!this.config.appId) throw new Error('DERIV_APP_ID is required');
     if (!this.config.wsUrl || !this.config.wsUrl.startsWith('ws')) throw new Error('Invalid WebSocket URL');
     if (this.config.maxQueueSize < 1) throw new Error('maxQueueSize must be at least 1');
+    if (isNaN(this.config.leverage) || this.config.leverage <= 0) throw new Error('leverage must be positive');
+    if (isNaN(this.config.duration) || this.config.duration <= 0) throw new Error('duration must be positive');
     logger.info('[DerivBroker] Configuration validated.');
   }
 
@@ -502,6 +521,7 @@ class DerivBroker extends EventEmitter {
           return;
         }
         attempts++;
+        this.metrics.reconnections++; // increment reconnect count
         if (attempts > 3) {
           this._setState(STATE.FATAL);
           reject(new Error('Connection failed after 3 attempts.'));
@@ -704,21 +724,38 @@ class DerivBroker extends EventEmitter {
     return true;
   }
 
-  // ---------- HEARTBEAT ----------
+  // ---------- HEARTBEAT with pong timeout ----------
   _startHeartbeat() {
     this._stopHeartbeat();
+    this._lastPong = Date.now();
+    // Send ping every 30s
     this._heartbeatInterval = setInterval(() => {
       if (this._state === STATE.READY || this._state === STATE.CONNECTED) {
         this._sendRaw({ ping: 1 });
         this.metrics.lastHeartbeat = Date.now();
       }
     }, 30000);
+
+    // Check pong timeout every 10s
+    this._heartbeatTimeout = setInterval(() => {
+      const now = Date.now();
+      if (now - this._lastPong > this.config.heartbeatTimeout) {
+        logger.warn('[DerivBroker] Heartbeat timeout – no pong received. Reconnecting...');
+        this.metrics.heartbeatMisses++;
+        this._closeSocket();
+        this.connect().catch(err => logger.error('[DerivBroker] Reconnect after heartbeat timeout failed:', err));
+      }
+    }, 10000);
   }
 
   _stopHeartbeat() {
     if (this._heartbeatInterval) {
       clearInterval(this._heartbeatInterval);
       this._heartbeatInterval = null;
+    }
+    if (this._heartbeatTimeout) {
+      clearInterval(this._heartbeatTimeout);
+      this._heartbeatTimeout = null;
     }
   }
 
@@ -727,6 +764,14 @@ class DerivBroker extends EventEmitter {
     try {
       const msg = JSON.parse(rawData);
 
+      // Update last pong time
+      if (msg.pong) {
+        this._lastPong = Date.now();
+        this.metrics.lastPong = this._lastPong;
+        return;
+      }
+
+      // Standard request-response
       if (msg.req_id && this._pendingRequests.has(msg.req_id)) {
         const pending = this._pendingRequests.get(msg.req_id);
         clearTimeout(pending.timeout);
@@ -747,18 +792,21 @@ class DerivBroker extends EventEmitter {
         return;
       }
 
-      if (msg.pong) {
-        this.metrics.lastHeartbeat = Date.now();
-        return;
-      }
-
+      // Tick
       if (msg.msg_type === 'tick' && msg.tick) {
         this.streaming.handleTick(msg.tick);
         return;
       }
 
+      // Order response (no req_id)
       if (msg.buy || msg.sell) {
         this._handleOrderResponse(msg);
+      }
+
+      // Portfolio updates (if subscribed)
+      if (msg.msg_type === 'portfolio') {
+        // This could be used for live position updates; for now we ignore
+        // but we could trigger reconciliation
       }
     } catch (err) {
       logger.error('[DerivBroker] Error parsing WebSocket message:', err.message);
@@ -772,7 +820,15 @@ class DerivBroker extends EventEmitter {
       if (tx) {
         const contractId = tx.contract_id || tx.transaction_id;
         const status = tx.status || 'FILLED';
-        this._updateOrderStatus(clientOrderId, status, contractId, tx);
+        // Map Deriv status to our ORDER_STATUS
+        let mappedStatus = ORDER_STATUS.FILLED;
+        if (status === 'PENDING') mappedStatus = ORDER_STATUS.PENDING;
+        else if (status === 'ACCEPTED') mappedStatus = ORDER_STATUS.ACCEPTED;
+        else if (status === 'EXECUTING') mappedStatus = ORDER_STATUS.EXECUTING;
+        else if (status === 'REJECTED') mappedStatus = ORDER_STATUS.REJECTED;
+        else if (status === 'CANCELLED') mappedStatus = ORDER_STATUS.CANCELLED;
+        else if (status === 'CLOSED') mappedStatus = ORDER_STATUS.CLOSED;
+        this._updateOrderStatus(clientOrderId, mappedStatus, contractId, tx);
       }
     }
   }
@@ -781,7 +837,7 @@ class DerivBroker extends EventEmitter {
   _sendRaw(payload) {
     if (!this._socket || this._socket.readyState !== WebSocket.OPEN) {
       if (this._messageQueue.length < this.config.maxQueueSize) {
-        this._messageQueue.push(payload);
+        this._messageQueue.push({ payload, timestamp: Date.now() });
         logger.debug('[DerivBroker] Message queued (socket not open)');
       } else {
         logger.error('[DerivBroker] Queue full, dropping message.');
@@ -793,7 +849,7 @@ class DerivBroker extends EventEmitter {
     } catch (err) {
       logger.error('[DerivBroker] Send error:', err.message);
       if (this._messageQueue.length < this.config.maxQueueSize) {
-        this._messageQueue.push(payload);
+        this._messageQueue.push({ payload, timestamp: Date.now() });
       }
     }
   }
@@ -864,9 +920,18 @@ class DerivBroker extends EventEmitter {
   }
 
   _flushQueue() {
+    const now = Date.now();
+    const maxAge = 300000; // 5 minutes
     while (this._messageQueue.length > 0) {
-      const msg = this._messageQueue.shift();
-      this._sendRaw(msg);
+      const item = this._messageQueue[0];
+      if (now - item.timestamp > maxAge) {
+        // Expired – discard
+        this._messageQueue.shift();
+        logger.warn('[DerivBroker] Discarded expired queued message');
+        continue;
+      }
+      this._sendRaw(item.payload);
+      this._messageQueue.shift();
     }
   }
 
@@ -1044,7 +1109,7 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // ---------- RISK VALIDATION (basic) ----------
+  // ---------- RISK VALIDATION ----------
   async _validateOrderRisk(instrument, side, units, stopLoss, takeProfit) {
     if (this.config.riskValidator) {
       const result = await this.config.riskValidator({
@@ -1063,6 +1128,12 @@ class DerivBroker extends EventEmitter {
     const marginAvailable = parseFloat(account.marginAvailable);
     if (marginAvailable <= 0) {
       throw new Error('Insufficient margin');
+    }
+    // Basic exposure check: ensure order size not too large
+    const balance = parseFloat(account.balance);
+    const exposure = units * 0.01; // rough estimate – replace with proper margin calculation
+    if (exposure > balance * 0.1) {
+      throw new Error(`Order size ${units} exceeds 10% of balance`);
     }
   }
 
@@ -1300,6 +1371,7 @@ class DerivBroker extends EventEmitter {
       queueSize: this._messageQueue.length,
       pendingRequests: this._pendingRequests.size,
       lastHeartbeat: this.metrics.lastHeartbeat,
+      lastPong: this.metrics.lastPong,
       averageLatency: avgLatency,
       uptime: this.metrics.connectedSince ? Date.now() - this.metrics.connectedSince : 0,
       orders: {
@@ -1434,6 +1506,7 @@ const brokerInstance = new DerivBroker({
   fatalAfterAuthFailures: parseInt(process.env.DERIV_FATAL_AFTER_AUTH_FAILURES) || 3,
   readinessTimeout: parseInt(process.env.DERIV_READINESS_TIMEOUT) || 30000,
   symbolTimeout: parseInt(process.env.DERIV_SYMBOL_TIMEOUT) || 30000,
+  heartbeatTimeout: parseInt(process.env.DERIV_HEARTBEAT_TIMEOUT) || 60000,
   productType: process.env.TRADING_PRODUCT || 'cfd',
 });
 
