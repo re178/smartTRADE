@@ -1222,4 +1222,5 @@ const brokerInstance = new DerivBroker({
   productType: process.env.TRADING_PRODUCT || 'multiplier',
 });
 
-module.exports = brokerInstance;
+// ---------- Export the class (NOT a singleton) ----------
+module.exports = DerivBroker;
