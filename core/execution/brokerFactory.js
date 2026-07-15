@@ -1,4 +1,4 @@
-// core/execution/brokerFactory.js – Returns DerivBroker ONLY
+// core/execution/brokerFactory.js – ALWAYS returns DerivBroker
 
 const DerivBroker = require('./broker');
 const logger = require('../../infrastructure/logger') || console;
@@ -8,10 +8,8 @@ let instance = null;
 function getBroker() {
   if (instance) return instance;
 
-  // Read product type from environment
   const productType = process.env.TRADING_PRODUCT || 'multiplier';
 
-  // ALWAYS use DerivBroker – it handles both Multipliers and CFDs
   instance = new DerivBroker({
     productType: productType,
     apiToken: process.env.DERIV_API_TOKEN,
