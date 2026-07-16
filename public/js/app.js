@@ -1,4 +1,4 @@
-// public/js/app.js – Dashboard Logic (with debounce, live P&L updates, and product toggles)
+// public/js/app.js – Dashboard Logic (with debounce, live P&L updates, product toggles, pending orders)
 
 // ---- Configuration ----
 const REFRESH_INTERVAL = 10000; // 10 seconds
@@ -52,15 +52,18 @@ async function handleProductChange(e) {
       method: 'POST',
       body: JSON.stringify({ tradingProduct: value })
     });
-    // Optionally show a success message
     console.log('Product preference updated to:', value);
-    // Refresh account/prices to reflect new product? Not needed; backend uses new product for subsequent calls.
+    // Refresh account and trades to reflect new product
+    loadAccount();
+    loadOpenTrades();
+    loadPendingOrders();
   } catch (e) {
     alert('Failed to update product preference: ' + e.message);
-    // Revert UI to previous state – we can reload the preference
-    loadProductPreference();
+    loadProductPreference(); // revert UI
   }
 }
+// Make it globally accessible for HTML onchange
+window.handleProductChange = handleProductChange;
 
 // ---- Load Account ----
 async function loadAccount() {
@@ -186,7 +189,7 @@ document.getElementById('tradeForm').addEventListener('submit', async function(e
     alert('Order placed successfully! Trade ID: ' + (result.trade?.oandaTradeId || 'N/A'));
     loadOpenTrades();
     loadTradeHistory();
-    loadAccount(); // refresh balance
+    loadAccount();
   } catch (e) {
     alert('Error placing order: ' + e.message);
   } finally {
@@ -320,6 +323,63 @@ async function loadTradeHistory() {
   }
 }
 
+// ---- Load Pending Orders ----
+async function loadPendingOrders() {
+  const container = document.getElementById('pendingOrdersContainer');
+  if (!container) return;
+  container.innerHTML = '<p class="text-muted">Loading pending orders...</p>';
+  try {
+    const orders = await fetchJson(`${CONFIG.API_BASE}/api/pending-orders`);
+    if (!orders || orders.length === 0) {
+      container.innerHTML = '<p class="text-muted">No pending orders.</p>';
+      return;
+    }
+    let html = `<table class="table table-striped"><thead><tr>
+      <th>ID</th><th>Pair</th><th>Side</th><th>Entry Price</th><th>Lot</th><th>Status</th><th>Action</th>
+    </tr></thead><tbody>`;
+    orders.forEach(o => {
+      html += `<tr>
+        <td>${o.contractId || o.clientOrderId || 'N/A'}</td>
+        <td>${o.instrument}</td>
+        <td><span class="badge ${o.side === 'BUY' ? 'bg-success' : 'bg-danger'}">${o.side}</span></td>
+        <td>${o.entryPrice || '-'}</td>
+        <td>${o.units}</td>
+        <td><span class="badge bg-warning">${o.status}</span></td>
+        <td><button class="btn btn-sm btn-danger" onclick="window.cancelPending('${o.contractId || o.clientOrderId}')">Cancel</button></td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+    container.innerHTML = html;
+  } catch (e) {
+    container.innerHTML = `<p class="text-danger">Error loading pending orders: ${e.message}</p>`;
+  }
+}
+
+// ---- Cancel Pending Order ----
+window.cancelPending = async function(orderId) {
+  if (!confirm(`Cancel order ${orderId}?`)) return;
+  try {
+    await fetchJson(`${CONFIG.API_BASE}/api/order/${orderId}`, { method: 'DELETE' });
+    alert('Order cancelled successfully.');
+    loadPendingOrders();
+    loadOpenTrades();
+  } catch (e) {
+    alert('Error cancelling order: ' + e.message);
+  }
+};
+
+// ---- Delete History ----
+document.getElementById('deleteHistoryBtn')?.addEventListener('click', async function() {
+  if (!confirm('Delete all closed trades from history? This cannot be undone.')) return;
+  try {
+    const result = await fetchJson(`${CONFIG.API_BASE}/api/history`, { method: 'DELETE' });
+    alert(`Deleted ${result.deletedCount} closed trades.`);
+    loadTradeHistory();
+  } catch (e) {
+    alert('Error deleting history: ' + e.message);
+  }
+});
+
 // ---- Test Notification ----
 document.getElementById('testNotificationBtn')?.addEventListener('click', async function() {
   try {
@@ -333,11 +393,10 @@ document.getElementById('testNotificationBtn')?.addEventListener('click', async 
 // ---- Refresh buttons ----
 document.getElementById('refreshTrades')?.addEventListener('click', loadOpenTrades);
 document.getElementById('refreshHistory')?.addEventListener('click', loadTradeHistory);
+document.getElementById('refreshPending')?.addEventListener('click', loadPendingOrders);
 
 // ---- Start Live Updates ----
 function startLiveUpdates() {
-  // Prices already update via setInterval
-  // Open trades refresh every 10 seconds for live P&L
   if (openTradesInterval) clearInterval(openTradesInterval);
   openTradesInterval = setInterval(loadOpenTrades, REFRESH_INTERVAL);
 }
@@ -348,6 +407,7 @@ loadAccount();
 loadPrices();
 loadOpenTrades();
 loadTradeHistory();
+loadPendingOrders();
 loadNotificationStatus();
 
 // Start live updates
@@ -356,7 +416,7 @@ startLiveUpdates();
 // Auto-refresh prices (already in config)
 setInterval(loadPrices, CONFIG.PRICE_REFRESH_INTERVAL);
 
-// ---- Cleanup on page unload (optional) ----
+// ---- Cleanup on page unload ----
 window.addEventListener('beforeunload', function() {
   if (openTradesInterval) clearInterval(openTradesInterval);
 });
