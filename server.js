@@ -1,5 +1,4 @@
 // server.js – RTS Entry Point
-// Load environment variables
 require('dotenv').config();
 
 const express = require('express');
@@ -11,6 +10,9 @@ const connectDB = require('./config/db');
 
 // Import API routes (new modular structure)
 const apiRoutes = require('./api/routes');
+
+// ---------- Import broker factory middleware ----------
+const brokerFactory = require('./core/execution/brokerFactory');
 
 // Initialize Express
 const app = express();
@@ -24,8 +26,39 @@ app.use(cors());                         // Enable CORS
 app.use(express.json());                 // Parse JSON bodies
 app.use(express.static('public'));       // Serve frontend static files
 
+// ---------- (Optional) Authentication middleware ----------
+// Example: attach user to req (you may have your own)
+// app.use((req, res, next) => {
+//   // For demo, read from header or query
+//   const product = req.headers['x-product'] || req.query.product || 'deriv';
+//   req.user = { tradingProduct: product };
+//   next();
+// });
+
+// ---------- Broker Product Context Middleware ----------
+// This must run AFTER you have determined the user's preference.
+// It sets the product in AsyncLocalStorage so that getBroker() knows which one to return.
+app.use(brokerFactory.middleware((req) => {
+  // --- CUSTOMIZE THIS FUNCTION ---
+  // Read the product preference from the authenticated user, database, or session.
+  // For now, we use a header, query param, or fallback to environment variable.
+
+  // 1. From authenticated user (if you have a user object):
+  // return req.user?.tradingProduct || process.env.TRADING_PRODUCT || 'deriv';
+
+  // 2. From header (for testing):
+  const headerProduct = req.headers['x-product'];
+  if (headerProduct) return headerProduct;
+
+  // 3. From query parameter (for quick testing):
+  const queryProduct = req.query.product;
+  if (queryProduct) return queryProduct;
+
+  // 4. Environment variable (global default)
+  return process.env.TRADING_PRODUCT || 'deriv';
+}));
+
 // ---------- API Routes ----------
-// All API endpoints are prefixed with /api
 app.use('/api', apiRoutes);
 
 // ---------- Health Check ----------
@@ -34,7 +67,6 @@ app.get('/health', (req, res) => {
 });
 
 // ---------- SPA Fallback ----------
-// For any non-API request, serve the dashboard (index.html)
 app.get('*', (req, res) => {
   if (!req.path.startsWith('/api')) {
     res.sendFile('index.html', { root: 'public' });
