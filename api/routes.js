@@ -1,9 +1,9 @@
-// src/api/routes.js – Complete API Routes (with notifications, analytics, backtesting)
+// src/api/routes.js – Complete API Routes (with notifications, analytics, backtesting, pending orders, delete history)
 
 const express = require('express');
 const router = express.Router();
 const controllers = require('./controllers');
-const { getBroker } = require('../core/execution/brokerFactory'); // <-- use factory
+const { getBroker } = require('../core/execution/brokerFactory');
 const {
   BacktestingEngine,
   PortfolioManager,
@@ -14,119 +14,24 @@ const {
 const { sendTestEmail } = require('../core/notifications/emailService');
 const logger = require('../infrastructure/logger') || console;
 
-// ---------- Helper to get broker for current user ----------
-function getBrokerForRequest(req) {
-  const product = req.user?.tradingProduct || process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd';
-  return getBroker(product);
-}
-
 // ---------- Existing Endpoints ----------
-router.get('/account', async (req, res) => {
-  try {
-    const broker = getBrokerForRequest(req);
-    const account = await broker.getAccount();
-    res.json(account);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-router.get('/prices', async (req, res) => {
-  try {
-    const broker = getBrokerForRequest(req);
-    const { instruments } = req.query;
-    const prices = await broker.getPrices(instruments ? instruments.split(',') : ['EUR_USD']);
-    res.json(prices);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-router.get('/candles', async (req, res) => {
-  try {
-    const broker = getBrokerForRequest(req);
-    const { instrument, count, granularity } = req.query;
-    const candles = await broker.getCandles(instrument, parseInt(count) || 100, granularity || 'M5');
-    res.json(candles);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-router.get('/positions', async (req, res) => {
-  try {
-    const broker = getBrokerForRequest(req);
-    const positions = await broker.getPositions();
-    res.json(positions);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-router.get('/trades', async (req, res) => {
-  try {
-    const broker = getBrokerForRequest(req);
-    const trades = await broker.getOpenTrades();
-    res.json(trades);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-router.get('/trade-history', async (req, res) => {
-  try {
-    // Assuming you have a history method – if not, fallback to getOpenTrades
-    const broker = getBrokerForRequest(req);
-    // Placeholder: you might have a getTradeHistory method; if not, return open trades.
-    if (typeof broker.getTradeHistory === 'function') {
-      const history = await broker.getTradeHistory();
-      res.json(history);
-    } else {
-      const trades = await broker.getOpenTrades();
-      res.json(trades);
-    }
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-router.post('/order', async (req, res) => {
-  try {
-    const broker = getBrokerForRequest(req);
-    const { instrument, units, stopLoss, takeProfit, orderType, price } = req.body;
-    let result;
-    if (orderType === 'limit') {
-      result = await broker.placeLimitOrder(instrument, units, price, stopLoss, takeProfit);
-    } else {
-      result = await broker.placeMarketOrder(instrument, units, stopLoss, takeProfit);
-    }
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-router.put('/close/:tradeId', async (req, res) => {
-  try {
-    const broker = getBrokerForRequest(req);
-    const { tradeId } = req.params;
-    const result = await broker.closeTrade(tradeId);
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
+router.get('/account', controllers.getAccount);
+router.get('/prices', controllers.getPrices);
+router.get('/candles', controllers.getCandles);
+router.get('/positions', controllers.getPositions);
+router.get('/trades', controllers.getTrades);
+router.get('/trade-history', controllers.getTradeHistory);
+router.post('/order', controllers.placeOrder);
+router.put('/close/:tradeId', controllers.closeTrade);
 router.get('/signal', controllers.getSignal);
 router.post('/auto-trade', controllers.autoTrade);
-
 router.get('/health', (req, res) => res.json({ status: 'OK' }));
 
+// ---------- Broker Management ----------
 router.post('/broker/reset-circuit-breaker', (req, res) => {
-  // This is broker‑specific – we need to get the current broker and reset its circuit breaker.
-  // However, the factory may return a different broker per user; we cannot reset all.
-  // We'll either remove this or make it reset the active broker's internal breaker.
-  const broker = getBrokerForRequest(req);
+  // Get product from request (if available)
+  const product = req.user?.tradingProduct || process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd';
+  const broker = getBroker(product);
   if (broker._resetCircuitBreaker) {
     broker._resetCircuitBreaker();
     res.json({ status: 'Circuit breaker reset successfully' });
@@ -161,6 +66,13 @@ router.post('/test-email', async (req, res) => {
   }
 });
 
+// ---------- Pending Orders ----------
+router.get('/pending-orders', controllers.getPendingOrders);
+router.delete('/order/:orderId', controllers.cancelOrder);
+
+// ---------- Delete History ----------
+router.delete('/history', controllers.deleteHistory);
+
 // ---------- Performance Suite Endpoints ----------
 
 /**
@@ -185,7 +97,8 @@ router.post('/backtest', async (req, res) => {
  */
 router.get('/portfolio/status', async (req, res) => {
   try {
-    const broker = getBrokerForRequest(req);
+    const product = req.user?.tradingProduct || process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd';
+    const broker = getBroker(product);
     const account = await broker.getAccount();
     const trades = await broker.getOpenTrades();
     const totalExposure = trades.reduce((sum, t) => sum + Math.abs(t.units * t.price), 0);
@@ -210,7 +123,6 @@ router.get('/execution/analytics', (req, res) => {
     // For now, we return a placeholder – you can integrate with orderService.
     res.json({
       message: 'Execution analytics – integrate with orderService.getExecutionAnalytics()',
-      // You could store analytics in a database and return them here.
     });
   } catch (err) {
     logger.error('[execution/analytics] Error:', err.message);
