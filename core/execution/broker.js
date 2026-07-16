@@ -264,7 +264,7 @@ class CFDExecutor extends BaseExecutor {
       cfd_open_position: 1,
       symbol,
       amount,
-      direction,          // 'up' for BUY, 'down' for SELL
+      direction,
       leverage,
     };
     if (stopLoss && !isNaN(stopLoss) && stopLoss > 0) payload.stop_loss = stopLoss;
@@ -287,10 +287,6 @@ class CFDExecutor extends BaseExecutor {
     };
   }
 
-  // CFD limit orders are not supported via cfd_open_position; we use market with price as limit?
-  // Actually, you can set a limit price by using "limit_order" in the cfd_open_position request?
-  // The API does not have a limit order for CFD; you can use a pending order? 
-  // For simplicity, we'll just place a market order for limit orders and log a warning.
   async placeLimit(instrument, units, price, stopLoss, takeProfit) {
     logger.warn('[CFDExecutor] Limit orders not supported for CFDs; placing market order with price ignored.');
     return this.placeMarket(instrument, units, stopLoss, takeProfit);
@@ -320,9 +316,6 @@ class CFDExecutor extends BaseExecutor {
   }
 
   async partialClose(tradeId, units) {
-    // Deriv does not support partial close of CFD positions via a single API call.
-    // You would need to close a portion by opening a new opposite position with less size.
-    // For simplicity, we'll throw.
     throw new Error('Partial close not supported for CFDs via API');
   }
 
@@ -384,7 +377,6 @@ class MultiplierExecutor extends BaseExecutor {
   }
 
   async placeLimit(instrument, units, price, stopLoss, takeProfit) {
-    // Multipliers may support limit orders via the proposal -> buy with price
     const { symbol, amount, side } = this._prepare(instrument, units);
     const leverage = this.broker.getLeverage(symbol);
     const proposalPayload = {
@@ -426,7 +418,7 @@ class MultiplierExecutor extends BaseExecutor {
   }
 
   async getPositions() {
-    return this.broker.getOpenTrades(); // fallback to portfolio
+    return this.broker.getOpenTrades();
   }
 
   _prepare(instrument, units) {
@@ -476,7 +468,6 @@ class OptionsExecutor extends BaseExecutor {
   }
 
   async placeLimit(instrument, units, price, stopLoss, takeProfit) {
-    // Options do not support limit orders; fallback to market with price ignored
     logger.warn('[Options] Limit orders not supported; placing market order with price ignored.');
     return this.placeMarket(instrument, units, stopLoss, takeProfit);
   }
@@ -490,7 +481,7 @@ class OptionsExecutor extends BaseExecutor {
   async partialClose() { throw new Error('Options do not support partial close'); }
 
   async getPositions() {
-    return this.broker.getOpenTrades(); // fallback to portfolio
+    return this.broker.getOpenTrades();
   }
 
   _prepare(instrument, units) {
@@ -565,6 +556,7 @@ class DerivBroker extends EventEmitter {
       heartbeatTimeout: parseInt(config.heartbeatTimeout || process.env.DERIV_HEARTBEAT_TIMEOUT || 60000),
     };
 
+    // ---- CHANGE: use config.productType, fallback to environment ----
     const rawProduct = (config.productType || process.env.TRADING_PRODUCT || 'cfd').toLowerCase();
     const validProducts = ['cfd', 'multiplier', 'basic'];
     if (!validProducts.includes(rawProduct)) {
@@ -848,7 +840,6 @@ class DerivBroker extends EventEmitter {
       this._pendingRequests.set(reqId, {
         resolve: (msg) => {
           clearTimeout(timeout);
-          // --- Log authorization response ---
           const safeMsg = redactSensitive(msg);
           logger.info('[Auth] Authorization response:', JSON.stringify(safeMsg, null, 2));
           resolve(msg);
@@ -949,7 +940,6 @@ class DerivBroker extends EventEmitter {
         logger.error('[In] API Error:', JSON.stringify(msg.error, null, 2));
       }
 
-      // --- Handle pending requests by req_id ---
       if (msg.req_id && this._pendingRequests.has(msg.req_id)) {
         const pending = this._pendingRequests.get(msg.req_id);
         clearTimeout(pending.timeout);
@@ -970,31 +960,26 @@ class DerivBroker extends EventEmitter {
         handled = true;
       }
 
-      // --- Tick handling ---
       if (msg.msg_type === 'tick' && msg.tick) {
         this.streaming.handleTick(msg.tick);
         handled = true;
       }
 
-      // --- Order responses not tied to pending requests (async updates) ---
       if (msg.buy || msg.sell || msg.cfd_open_position) {
         this._handleOrderResponse(msg);
         handled = true;
       }
 
-      // --- LOG CFD responses at info level (even if already handled) ---
       if (msg.cfd_open_position || msg.cfd_close_position || msg.cfd_update_position || msg.cfd_get_positions) {
         logger.info('[In] CFD response:', JSON.stringify(redactSensitive(msg), null, 2));
       }
 
-      // --- LOG portfolio at info level ---
       if (msg.portfolio || msg.contracts) {
         const portfolio = msg.portfolio || msg.contracts;
         logger.info('[In] Portfolio response (first 2):', JSON.stringify(Array.isArray(portfolio) ? portfolio.slice(0, 2) : portfolio, null, 2));
         logger.debug('[In] Full portfolio:', JSON.stringify(portfolio, null, 2));
       }
 
-      // --- Unknown message ---
       if (!handled) {
         logger.warn('[In] Unknown message type:', JSON.stringify(redactSensitive(msg), null, 2));
       }
@@ -1004,18 +989,13 @@ class DerivBroker extends EventEmitter {
   }
 
   _handleOrderResponse(msg) {
-    // For CFD orders, response is in cfd_open_position
     if (msg.cfd_open_position) {
       const pos = msg.cfd_open_position;
       if (pos.position_id) {
-        // update order status
         logger.info('[DerivBroker] CFD position opened:', pos.position_id);
-        // We don't have a clientOrderId for CFD; we use position_id as tradeID
-        // The order will be saved in reconciliation later.
       }
       return;
     }
-    // For contract-based orders
     if (msg.echo_req && msg.echo_req.client_order_id) {
       const clientOrderId = msg.echo_req.client_order_id;
       const tx = msg.buy || msg.sell;
@@ -1046,7 +1026,6 @@ class DerivBroker extends EventEmitter {
       return;
     }
     try {
-      // --- Log outgoing messages ---
       const isImportant = payload.cfd_open_position || payload.cfd_close_position ||
                           payload.cfd_update_position || payload.cfd_get_positions ||
                           payload.buy || payload.sell || payload.proposal || payload.portfolio ||
@@ -1233,11 +1212,9 @@ class DerivBroker extends EventEmitter {
   async _reconcilePositions() {
     logger.info('[DerivBroker] Reconciling positions...');
     try {
-      // For CFD, we use cfd_get_positions
       if (this.productType === 'cfd') {
         const positions = await this.executor.getPositions();
         logger.info('[Reconcile] CFD positions from API:', JSON.stringify(positions, null, 2));
-        // Sync with DB
         const dbOrders = await Order.find({ status: ORDER_STATUS.FILLED });
         const dbMap = new Map();
         for (const ord of dbOrders) {
@@ -1263,7 +1240,6 @@ class DerivBroker extends EventEmitter {
             logger.warn(`[Reconcile] Created order for CFD position ${contractId}`);
           }
         }
-        // Check for positions closed on broker but still in DB
         for (const [contractId, clientOrderId] of this._orderMap) {
           const stillOpen = positions.some(p => p.id === contractId);
           if (!stillOpen) {
@@ -1275,7 +1251,6 @@ class DerivBroker extends EventEmitter {
         return;
       }
 
-      // For contract-based products, use portfolio
       const response = await this._sendRequest({ portfolio: 1 });
       let rawPortfolio = response.portfolio || response.contracts || [];
       if (!Array.isArray(rawPortfolio)) {
@@ -1370,7 +1345,7 @@ class DerivBroker extends EventEmitter {
     const marginAvailable = parseFloat(account.marginAvailable);
     if (marginAvailable <= 0) throw new Error('Insufficient margin');
     const balance = parseFloat(account.balance);
-    const exposure = units * 0.01; // rough placeholder
+    const exposure = units * 0.01;
     if (exposure > balance * 0.1) throw new Error(`Order size ${units} exceeds 10% of balance`);
   }
 
@@ -1479,9 +1454,7 @@ class DerivBroker extends EventEmitter {
     if (amount <= 0) throw new Error('Order units must be positive.');
     await this._validateOrderRisk(instrument, units > 0 ? 'BUY' : 'SELL', amount, stopLoss, takeProfit);
     const result = await this.executor.placeMarket(instrument, units, stopLoss, takeProfit);
-    // If it's CFD, save order manually?
     if (this.productType === 'cfd') {
-      // The executor returned tradeID, but we need to save order in DB
       const newOrder = new Order({
         clientOrderId: generateClientOrderId(),
         instrument,
@@ -1532,7 +1505,6 @@ class DerivBroker extends EventEmitter {
     if (this.productType === 'cfd') {
       return this.executor.getPositions();
     }
-    // For contract-based, use portfolio
     const response = await this._sendRequest({ portfolio: 1 });
     let contracts = response.portfolio || response.contracts || [];
     if (!Array.isArray(contracts)) {
@@ -1680,7 +1652,9 @@ class DerivBroker extends EventEmitter {
   }
 }
 
-// ---------- EXPORT SINGLETON ----------
+// ============================================================
+// EXPORT – singleton AND class
+// ============================================================
 const brokerInstance = new DerivBroker({
   apiToken: process.env.DERIV_API_TOKEN,
   appId: process.env.DERIV_APP_ID,
@@ -1697,14 +1671,15 @@ const brokerInstance = new DerivBroker({
   minStopDistance: parseFloat(process.env.DERIV_MIN_STOP_DISTANCE) || 0.0001,
   rateLimit: parseFloat(process.env.DERIV_RATE_LIMIT) || 5,
   rateCapacity: parseFloat(process.env.DERIV_RATE_CAPACITY) || 10,
-  contractType: process.env.DERIV_CONTRACT_TYPE || 'cfd',
   leverage: parseFloat(process.env.DERIV_LEVERAGE) || 100,
   duration: process.env.DERIV_DURATION ? parseInt(process.env.DERIV_DURATION) : 60,
   fatalAfterAuthFailures: parseInt(process.env.DERIV_FATAL_AFTER_AUTH_FAILURES) || 3,
   readinessTimeout: parseInt(process.env.DERIV_READINESS_TIMEOUT) || 30000,
   symbolTimeout: parseInt(process.env.DERIV_SYMBOL_TIMEOUT) || 30000,
   heartbeatTimeout: parseInt(process.env.DERIV_HEARTBEAT_TIMEOUT) || 60000,
-  productType: process.env.TRADING_PRODUCT || 'cfd',
+  productType: process.env.TRADING_PRODUCT || 'cfd', // backward compatibility
 });
 
+// Export both the singleton and the class
 module.exports = brokerInstance;
+module.exports.DerivBroker = DerivBroker;
