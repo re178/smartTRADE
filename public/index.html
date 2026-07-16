@@ -70,7 +70,7 @@
     </div>
   </div>
 
-  <!-- ========== NEW: Trading Product Toggle ========== -->
+  <!-- Trading Product Toggle -->
   <div class="row">
     <div class="col-12">
       <div class="card">
@@ -175,8 +175,24 @@
   <div class="row">
     <div class="col-12">
       <div class="card">
-        <div class="card-header"><i class="fas fa-list-ul"></i> Open Trades <button class="btn btn-sm btn-outline-primary float-end" id="refreshTrades"><i class="fas fa-sync-alt"></i> Refresh</button></div>
+        <div class="card-header">
+          <i class="fas fa-list-ul"></i> Open Trades
+          <button class="btn btn-sm btn-outline-primary float-end" id="refreshTrades"><i class="fas fa-sync-alt"></i> Refresh</button>
+        </div>
         <div class="card-body" id="openTradesContainer"><p class="text-muted">Loading...</p></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Pending Orders -->
+  <div class="row">
+    <div class="col-12">
+      <div class="card">
+        <div class="card-header">
+          <i class="fas fa-clock"></i> Pending Orders
+          <button class="btn btn-sm btn-outline-secondary float-end" id="refreshPending"><i class="fas fa-sync-alt"></i> Refresh</button>
+        </div>
+        <div class="card-body" id="pendingOrdersContainer"><p class="text-muted">Loading...</p></div>
       </div>
     </div>
   </div>
@@ -185,7 +201,11 @@
   <div class="row">
     <div class="col-12">
       <div class="card">
-        <div class="card-header"><i class="fas fa-history"></i> Trade History <button class="btn btn-sm btn-outline-secondary float-end" id="refreshHistory"><i class="fas fa-sync-alt"></i> Refresh</button></div>
+        <div class="card-header">
+          <i class="fas fa-history"></i> Trade History
+          <button class="btn btn-sm btn-outline-danger float-end ms-2" id="deleteHistoryBtn"><i class="fas fa-trash"></i> Clear History</button>
+          <button class="btn btn-sm btn-outline-secondary float-end" id="refreshHistory"><i class="fas fa-sync-alt"></i> Refresh</button>
+        </div>
         <div class="card-body table-responsive" id="historyContainer"><p class="text-muted">Loading...</p></div>
       </div>
     </div>
