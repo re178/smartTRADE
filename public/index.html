@@ -15,6 +15,8 @@
     .price-down { color: #dc3545; }
     .loading { opacity: 0.6; pointer-events: none; }
     #tradesTable td { vertical-align: middle; }
+    .product-toggle .btn { border-radius: 20px; }
+    .product-toggle .btn.active { background: #0d6efd; color: white; }
   </style>
 </head>
 <body>
@@ -63,6 +65,35 @@
               <button class="btn btn-sm btn-outline-primary" id="testNotificationBtn">Test Notification</button>
             </div>
           </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== NEW: Trading Product Toggle ========== -->
+  <div class="row">
+    <div class="col-12">
+      <div class="card">
+        <div class="card-header">
+          <i class="fas fa-exchange-alt"></i> Trading Product
+          <span class="badge bg-secondary float-end" id="currentProduct">deriv_cfd</span>
+        </div>
+        <div class="card-body">
+          <div class="btn-group btn-group-toggle d-flex flex-wrap product-toggle" data-toggle="buttons">
+            <label class="btn btn-outline-primary flex-fill m-1">
+              <input type="radio" name="product" value="mt5" onchange="window.handleProductChange(event)"> MT5
+            </label>
+            <label class="btn btn-outline-primary flex-fill m-1">
+              <input type="radio" name="product" value="deriv_cfd" onchange="window.handleProductChange(event)"> Deriv CFD
+            </label>
+            <label class="btn btn-outline-primary flex-fill m-1">
+              <input type="radio" name="product" value="deriv_multiplier" onchange="window.handleProductChange(event)"> Deriv Multiplier
+            </label>
+            <label class="btn btn-outline-primary flex-fill m-1">
+              <input type="radio" name="product" value="deriv_basic" onchange="window.handleProductChange(event)"> Deriv Basic
+            </label>
+          </div>
+          <small class="text-muted">Switching will apply to all subsequent trades and account data.</small>
         </div>
       </div>
     </div>
