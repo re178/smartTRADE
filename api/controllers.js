@@ -1,6 +1,7 @@
-// api/controllers.js – Complete Request Handlers (with product support)
+// api/controllers.js – Complete Request Handlers (with product support, Order & Trade models)
 
 const Trade = require('../models/Trade');
+const Order = require('../models/Order');
 const marketProvider = require('../core/market/provider');
 const { getBroker } = require('../core/execution/brokerFactory');
 const orderService = require('../core/execution/orderService');
@@ -145,35 +146,37 @@ exports.placeOrder = async (req, res) => {
       return res.status(400).json({ error: approval.reason });
     }
 
-    // Place the order via orderService (which also needs product)
+    // Place the order via orderService
     const orderResult = await orderService.placeMarketOrder(
       instrument,
       side,
       lotSize,
       stopLoss || null,
       takeProfit || null,
-      product   // <-- pass product so orderService uses correct broker
+      product
     );
 
-    // Save to database
-    const trade = await portfolioLogger.logTrade({
+    // Save to Trade model (market orders are immediately filled)
+    const trade = new Trade({
       pair: instrument,
       side,
-      entryPrice: orderResult.price || orderResult.averagePrice,
+      entryPrice: orderResult.price || currentPrice,
       stopLoss: stopLoss || null,
       takeProfit: takeProfit || null,
       lotSize,
       status: 'OPEN',
-      oandaTradeId: orderResult.tradeID || orderResult.id,
-      oandaOrderId: orderResult.id,
+      openTime: new Date(),
+      oandaTradeId: orderResult.contractId,
+      oandaOrderId: orderResult.contractId,
       broker: product === 'mt5' ? 'MT5' : 'Deriv',
       strategy: 'Manual',
     });
+    await trade.save();
 
     // Send notification
     notifyTrade('OPENED', trade, account).catch(err => logger.error('[Notification] Error:', err.message));
 
-    res.json({ success: true, trade, oanda: orderResult });
+    res.json({ success: true, trade, raw: orderResult });
   } catch (error) {
     logger.error('[placeOrder] Error:', error.message);
     res.status(500).json({ error: error.message });
@@ -186,17 +189,15 @@ exports.closeTrade = async (req, res) => {
   if (!tradeId) return res.status(400).json({ error: 'tradeId required' });
   try {
     const product = getProduct(req);
-    const result = await orderService.closeTrade(tradeId, product); // pass product
+    const result = await orderService.closeTrade(tradeId, product);
+
+    // The orderService updates the Trade status, but we also need to update portfolio & P&L
     const updated = await Trade.findOneAndUpdate(
       { oandaTradeId: tradeId },
-      {
-        status: 'CLOSED',
-        closeTime: new Date(),
-        closePrice: result.price || null,
-        pnl: result.pl || 0,
-      },
+      { status: 'CLOSED', closeTime: new Date(), closePrice: result.price || null, pnl: result.pl || 0 },
       { new: true }
     );
+
     portfolioManager.updateDailyPnL(result.pl || 0);
 
     if (updated) {
@@ -226,11 +227,7 @@ exports.getSignal = async (req, res) => {
   try {
     const product = getProduct(req);
     const instrument = pair.toUpperCase();
-    // strategyEngine might need market data – we pass product to marketProvider internally?
-    // We'll assume strategyEngine uses marketProvider which now accepts product.
-    // But strategyEngine may not accept product; we may need to modify it too.
-    // For now, we'll pass product to strategyEngine if it supports it.
-    // We'll assume strategyEngine can accept an options object with product.
+    // Pass product to strategy engine (it may need market data)
     const signal = await strategyEngine.generateSignal(instrument, strategy, { ...params, product });
     if (!signal) {
       return res.json({ signal: null, message: 'No signal generated' });
@@ -249,7 +246,7 @@ exports.autoTrade = async (req, res) => {
     const product = getProduct(req);
     const instrument = pair.toUpperCase();
 
-    // Generate signal (pass product)
+    // Generate signal
     const signal = await strategyEngine.generateSignal(instrument, strategy, { ...params, product });
     if (!signal) {
       return res.json({ success: false, message: 'No trading signal' });
@@ -283,26 +280,62 @@ exports.autoTrade = async (req, res) => {
       product
     );
 
-    const trade = await portfolioLogger.logTrade({
+    const trade = new Trade({
       pair: instrument,
       side: signal.side,
-      entryPrice: orderResult.price || orderResult.averagePrice,
+      entryPrice: orderResult.price || signal.entryPrice,
       stopLoss: signal.stopLoss,
       takeProfit: signal.takeProfit,
       lotSize,
       status: 'OPEN',
-      oandaTradeId: orderResult.tradeID || orderResult.id,
-      oandaOrderId: orderResult.id,
+      openTime: new Date(),
+      oandaTradeId: orderResult.contractId,
+      oandaOrderId: orderResult.contractId,
       broker: product === 'mt5' ? 'MT5' : 'Deriv',
       strategy: signal.strategy || strategy,
       notes: 'Auto-trade from strategy',
     });
+    await trade.save();
 
     notifyTrade('OPENED', trade, account).catch(err => logger.error('[Notification] Error:', err.message));
 
-    res.json({ success: true, signal, trade, oanda: orderResult });
+    res.json({ success: true, signal, trade, raw: orderResult });
   } catch (error) {
     logger.error('[autoTrade] Error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+// ---------- Pending Orders ----------
+exports.getPendingOrders = async (req, res) => {
+  try {
+    const pending = await Order.find({
+      status: { $in: ['PENDING', 'ACCEPTED', 'EXECUTING'] }
+    }).sort({ createdAt: -1 });
+    res.json(pending);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.cancelOrder = async (req, res) => {
+  const { orderId } = req.params;
+  if (!orderId) return res.status(400).json({ error: 'orderId required' });
+  try {
+    const product = getProduct(req);
+    const result = await orderService.cancelOrder(orderId, product);
+    res.json({ success: true, result });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+// ---------- Delete History ----------
+exports.deleteHistory = async (req, res) => {
+  try {
+    const count = await orderService.deleteClosedTrades();
+    res.json({ success: true, deletedCount: count });
+  } catch (error) {
     res.status(500).json({ error: error.message });
   }
 };
