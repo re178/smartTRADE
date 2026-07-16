@@ -1,9 +1,11 @@
-// core/risk/manager.js – Risk Management Engine (with lot size cap)
+// core/risk/manager.js – Risk Management Engine (with lot size cap and product support)
 
 const accountService = require('../portfolio/accountService');
 const orderService = require('../execution/orderService');
+const { getBroker } = require('../execution/brokerFactory');
 const eventBus = require('../../infrastructure/eventBus');
 const { getPipSize, formatPrice } = require('../../shared/helpers');
+const logger = require('../../infrastructure/logger') || console;
 
 /**
  * Calculate the appropriate lot size (in units) based on account balance,
@@ -13,12 +15,13 @@ const { getPipSize, formatPrice } = require('../../shared/helpers');
  * @param {number} stopLoss - Stop loss price.
  * @param {number} riskPercent - Percentage of account to risk (e.g., 1 for 1%).
  * @param {number} maxLot - Maximum allowed lot size (default 1000).
+ * @param {string} [product] - Trading product (optional, defaults to env or 'deriv_cfd')
  * @returns {Promise<number>} Lot size (units, positive).
  */
-async function calculateLotSize(instrument, entryPrice, stopLoss, riskPercent = 1, maxLot = 1000) {
+async function calculateLotSize(instrument, entryPrice, stopLoss, riskPercent = 1, maxLot = 1000, product) {
   try {
-    // Get account balance
-    const account = await accountService.getAccount();
+    // Get account balance (pass product)
+    const account = await accountService.getAccount(product || process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd');
     const balance = parseFloat(account.balance);
     if (!balance || balance <= 0) {
       throw new Error('Invalid account balance');
@@ -49,12 +52,12 @@ async function calculateLotSize(instrument, entryPrice, stopLoss, riskPercent = 
     const maxAllowed = parseInt(process.env.MAX_POSITION_SIZE) || maxLot;
     if (lotSize > maxAllowed) {
       lotSize = maxAllowed;
-      console.warn(`[RiskManager] Lot size capped at ${maxAllowed} (calculated ${lotSize})`);
+      logger.warn(`[RiskManager] Lot size capped at ${maxAllowed} (calculated ${lotSize})`);
     }
 
     return lotSize;
   } catch (error) {
-    console.error('Lot size calculation error:', error.message);
+    logger.error('Lot size calculation error:', error.message);
     return 0.01; // fallback
   }
 }
@@ -69,14 +72,15 @@ async function calculateLotSize(instrument, entryPrice, stopLoss, riskPercent = 
  * @param {string} instrument - Instrument name.
  * @param {string} side - 'BUY' or 'SELL'.
  * @param {number} lotSize - Proposed lot size.
+ * @param {string} [product] - Trading product (optional)
  * @returns {Promise<Object>} { approved: boolean, reason: string }
  */
-async function validateTrade(instrument, side, lotSize) {
+async function validateTrade(instrument, side, lotSize, product) {
   const validation = { approved: true, reason: '' };
   try {
     // 1. Check maximum open positions (configurable)
     const maxPositions = parseInt(process.env.MAX_OPEN_POSITIONS) || 5;
-    const openTrades = await orderService.getOpenTrades();
+    const openTrades = await orderService.getOpenTrades(product || process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd');
     if (openTrades.length >= maxPositions) {
       validation.approved = false;
       validation.reason = `Max open positions (${maxPositions}) reached`;
@@ -94,7 +98,7 @@ async function validateTrade(instrument, side, lotSize) {
 
     return validation;
   } catch (error) {
-    console.error('Trade validation error:', error.message);
+    logger.error('Trade validation error:', error.message);
     validation.approved = false;
     validation.reason = 'Validation error: ' + error.message;
     return validation;
@@ -111,11 +115,24 @@ async function getTodayPnL() {
 }
 
 /**
- * Get current spread for an instrument (placeholder).
+ * Get current spread for an instrument.
  * @param {string} instrument - Instrument name.
+ * @param {string} [product] - Trading product (optional)
  * @returns {Promise<number>} Spread in pips.
  */
-async function getSpread(instrument) {
+async function getSpread(instrument, product) {
+  try {
+    const broker = getBroker(product || process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd');
+    const prices = await broker.getPrices([instrument]);
+    if (prices && prices.length > 0) {
+      const bid = parseFloat(prices[0].bids[0].price);
+      const ask = parseFloat(prices[0].asks[0].price);
+      const pipSize = getPipSize(instrument);
+      return Math.abs(ask - bid) / pipSize;
+    }
+  } catch (error) {
+    logger.warn('[RiskManager] getSpread error:', error.message);
+  }
   return 1.0;
 }
 
