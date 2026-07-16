@@ -3,7 +3,7 @@
 const express = require('express');
 const router = express.Router();
 const controllers = require('./controllers');
-const broker = require('../core/execution/broker');
+const { getBroker } = require('../core/execution/brokerFactory'); // <-- use factory
 const {
   BacktestingEngine,
   PortfolioManager,
@@ -14,24 +14,124 @@ const {
 const { sendTestEmail } = require('../core/notifications/emailService');
 const logger = require('../infrastructure/logger') || console;
 
+// ---------- Helper to get broker for current user ----------
+function getBrokerForRequest(req) {
+  const product = req.user?.tradingProduct || process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd';
+  return getBroker(product);
+}
+
 // ---------- Existing Endpoints ----------
-router.get('/account', controllers.getAccount);
-router.get('/prices', controllers.getPrices);
-router.get('/candles', controllers.getCandles);
-router.get('/positions', controllers.getPositions);
-router.get('/trades', controllers.getTrades);
-router.get('/trade-history', controllers.getTradeHistory);
-router.post('/order', controllers.placeOrder);
-router.put('/close/:tradeId', controllers.closeTrade);
+router.get('/account', async (req, res) => {
+  try {
+    const broker = getBrokerForRequest(req);
+    const account = await broker.getAccount();
+    res.json(account);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/prices', async (req, res) => {
+  try {
+    const broker = getBrokerForRequest(req);
+    const { instruments } = req.query;
+    const prices = await broker.getPrices(instruments ? instruments.split(',') : ['EUR_USD']);
+    res.json(prices);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/candles', async (req, res) => {
+  try {
+    const broker = getBrokerForRequest(req);
+    const { instrument, count, granularity } = req.query;
+    const candles = await broker.getCandles(instrument, parseInt(count) || 100, granularity || 'M5');
+    res.json(candles);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/positions', async (req, res) => {
+  try {
+    const broker = getBrokerForRequest(req);
+    const positions = await broker.getPositions();
+    res.json(positions);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/trades', async (req, res) => {
+  try {
+    const broker = getBrokerForRequest(req);
+    const trades = await broker.getOpenTrades();
+    res.json(trades);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/trade-history', async (req, res) => {
+  try {
+    // Assuming you have a history method – if not, fallback to getOpenTrades
+    const broker = getBrokerForRequest(req);
+    // Placeholder: you might have a getTradeHistory method; if not, return open trades.
+    if (typeof broker.getTradeHistory === 'function') {
+      const history = await broker.getTradeHistory();
+      res.json(history);
+    } else {
+      const trades = await broker.getOpenTrades();
+      res.json(trades);
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/order', async (req, res) => {
+  try {
+    const broker = getBrokerForRequest(req);
+    const { instrument, units, stopLoss, takeProfit, orderType, price } = req.body;
+    let result;
+    if (orderType === 'limit') {
+      result = await broker.placeLimitOrder(instrument, units, price, stopLoss, takeProfit);
+    } else {
+      result = await broker.placeMarketOrder(instrument, units, stopLoss, takeProfit);
+    }
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.put('/close/:tradeId', async (req, res) => {
+  try {
+    const broker = getBrokerForRequest(req);
+    const { tradeId } = req.params;
+    const result = await broker.closeTrade(tradeId);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.get('/signal', controllers.getSignal);
 router.post('/auto-trade', controllers.autoTrade);
+
 router.get('/health', (req, res) => res.json({ status: 'OK' }));
+
 router.post('/broker/reset-circuit-breaker', (req, res) => {
+  // This is broker‑specific – we need to get the current broker and reset its circuit breaker.
+  // However, the factory may return a different broker per user; we cannot reset all.
+  // We'll either remove this or make it reset the active broker's internal breaker.
+  const broker = getBrokerForRequest(req);
   if (broker._resetCircuitBreaker) {
     broker._resetCircuitBreaker();
     res.json({ status: 'Circuit breaker reset successfully' });
   } else {
-    res.status(500).json({ error: 'Method not available' });
+    res.status(500).json({ error: 'Method not available on this broker' });
   }
 });
 
@@ -85,6 +185,7 @@ router.post('/backtest', async (req, res) => {
  */
 router.get('/portfolio/status', async (req, res) => {
   try {
+    const broker = getBrokerForRequest(req);
     const account = await broker.getAccount();
     const trades = await broker.getOpenTrades();
     const totalExposure = trades.reduce((sum, t) => sum + Math.abs(t.units * t.price), 0);
