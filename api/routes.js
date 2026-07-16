@@ -1,13 +1,10 @@
-// src/api/routes.js – Complete API Routes (with notifications, analytics, backtesting, pending orders, delete history)
+// src/api/routes.js – Complete API Routes (with notifications, analytics, backtesting, pending orders, and preferences)
 
 const express = require('express');
 const router = express.Router();
 const controllers = require('./controllers');
-const { getBroker } = require('../core/execution/brokerFactory');
 const {
   BacktestingEngine,
-  PortfolioManager,
-  ExecutionAnalytics,
   WalkForwardOptimizer,
   PerformanceLearner,
 } = require('../core/analytics/performanceSuite');
@@ -26,19 +23,19 @@ router.put('/close/:tradeId', controllers.closeTrade);
 router.get('/signal', controllers.getSignal);
 router.post('/auto-trade', controllers.autoTrade);
 router.get('/health', (req, res) => res.json({ status: 'OK' }));
-
-// ---------- Broker Management ----------
 router.post('/broker/reset-circuit-breaker', (req, res) => {
-  // Get product from request (if available)
-  const product = req.user?.tradingProduct || process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd';
-  const broker = getBroker(product);
+  const broker = controllers.getBrokerForRequest(req);
   if (broker._resetCircuitBreaker) {
     broker._resetCircuitBreaker();
     res.json({ status: 'Circuit breaker reset successfully' });
   } else {
-    res.status(500).json({ error: 'Method not available on this broker' });
+    res.status(500).json({ error: 'Method not available' });
   }
 });
+
+// ---------- User Preferences (Product Toggle) ----------
+router.get('/user/preferences', controllers.getPreferences);
+router.post('/user/preferences', controllers.updatePreferences);
 
 // ---------- Notification Endpoints ----------
 router.get('/notifications/status', (req, res) => {
@@ -74,12 +71,6 @@ router.delete('/order/:orderId', controllers.cancelOrder);
 router.delete('/history', controllers.deleteHistory);
 
 // ---------- Performance Suite Endpoints ----------
-
-/**
- * Run a backtest
- * POST /api/backtest
- * Body: { instrument, strategy, timeframe, startDate, endDate, initialBalance, slippage, params }
- */
 router.post('/backtest', async (req, res) => {
   try {
     const engine = new BacktestingEngine(req.body);
@@ -91,50 +82,24 @@ router.post('/backtest', async (req, res) => {
   }
 });
 
-/**
- * Get portfolio status (open trades, exposure, daily P&L)
- * GET /api/portfolio/status
- */
 router.get('/portfolio/status', async (req, res) => {
   try {
-    const product = req.user?.tradingProduct || process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd';
-    const broker = getBroker(product);
+    const product = controllers.getProduct(req);
+    const broker = require('../core/execution/brokerFactory').getBroker(product);
     const account = await broker.getAccount();
     const trades = await broker.getOpenTrades();
     const totalExposure = trades.reduce((sum, t) => sum + Math.abs(t.units * t.price), 0);
-    res.json({
-      account,
-      openTrades: trades,
-      totalExposure,
-    });
+    res.json({ account, openTrades: trades, totalExposure });
   } catch (err) {
     logger.error('[portfolio/status] Error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-/**
- * Get execution analytics report
- * GET /api/execution/analytics
- */
 router.get('/execution/analytics', (req, res) => {
-  try {
-    // In production, you would have a persistent ExecutionAnalytics instance.
-    // For now, we return a placeholder – you can integrate with orderService.
-    res.json({
-      message: 'Execution analytics – integrate with orderService.getExecutionAnalytics()',
-    });
-  } catch (err) {
-    logger.error('[execution/analytics] Error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+  res.json({ message: 'Execution analytics – integrate with orderService.getExecutionAnalytics()' });
 });
 
-/**
- * Run walk‑forward optimization
- * POST /api/walkforward
- * Body: { instrument, strategy, timeframe, startDate, endDate, paramRanges, windowSize, stepSize, initialBalance }
- */
 router.post('/walkforward', async (req, res) => {
   try {
     const optimizer = new WalkForwardOptimizer(req.body);
@@ -146,11 +111,6 @@ router.post('/walkforward', async (req, res) => {
   }
 });
 
-/**
- * Initialise performance learning (loads historical trades)
- * POST /api/performance/learn
- * Body: { learningRate, minSamples } (optional)
- */
 router.post('/performance/learn', async (req, res) => {
   try {
     const learner = new PerformanceLearner(req.body);
