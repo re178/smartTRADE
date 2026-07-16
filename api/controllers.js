@@ -2,6 +2,7 @@
 
 const Trade = require('../models/Trade');
 const Order = require('../models/Order');
+const User = require('../models/User');
 const marketProvider = require('../core/market/provider');
 const { getBroker } = require('../core/execution/brokerFactory');
 const orderService = require('../core/execution/orderService');
@@ -41,12 +42,48 @@ function getProduct(req) {
   return req.user?.tradingProduct || process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd';
 }
 
+// ---------- User Preferences ----------
+exports.getPreferences = async (req, res) => {
+  try {
+    const userId = req.user?.id || 'admin';
+    let user = await User.findOne({ userId });
+    if (!user) {
+      user = new User({ userId, tradingProduct: process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd' });
+      await user.save();
+    }
+    res.json({ tradingProduct: user.tradingProduct });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.updatePreferences = async (req, res) => {
+  const { tradingProduct } = req.body;
+  const validProducts = ['mt5', 'deriv_cfd', 'deriv_multiplier', 'deriv_basic'];
+  if (!validProducts.includes(tradingProduct)) {
+    return res.status(400).json({ error: 'Invalid product' });
+  }
+  try {
+    const userId = req.user?.id || 'admin';
+    let user = await User.findOne({ userId });
+    if (!user) {
+      user = new User({ userId, tradingProduct });
+    } else {
+      user.tradingProduct = tradingProduct;
+    }
+    await user.save();
+    if (req.user) req.user.tradingProduct = tradingProduct;
+    res.json({ success: true, tradingProduct });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
 // ---------- Account ----------
 exports.getAccount = async (req, res) => {
   try {
     const product = getProduct(req);
-    const broker = getBroker(product);
-    const account = await broker.getAccount();
+    const account = await accountService.getAccount(product);
     res.json(account);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -114,22 +151,16 @@ exports.getTradeHistory = async (req, res) => {
 // ---------- Manual Order ----------
 exports.placeOrder = async (req, res) => {
   const { pair, side, lotSize, stopLoss, takeProfit } = req.body;
-
   const validation = validateOrderInput({ pair, side, lotSize, stopLoss, takeProfit });
   if (!validation.valid) {
     return res.status(400).json({ error: validation.message });
   }
-
   try {
     const product = getProduct(req);
     const instrument = pair.toUpperCase();
-
-    // Get broker for this product
     const broker = getBroker(product);
     const account = await broker.getAccount();
     const currentPositions = await broker.getOpenTrades();
-
-    // Get current price from market provider (with product)
     const currentPrice = await marketProvider.getCurrentPrice(instrument, product);
     const signal = {
       pair: instrument,
@@ -139,24 +170,13 @@ exports.placeOrder = async (req, res) => {
       takeProfit: takeProfit || null,
       recommendedLotSize: lotSize,
     };
-
-    // Portfolio Manager approval
     const approval = await portfolioManager.canOpenTrade(signal, parseFloat(account.balance), currentPositions);
     if (!approval.allowed) {
       return res.status(400).json({ error: approval.reason });
     }
-
-    // Place the order via orderService
     const orderResult = await orderService.placeMarketOrder(
-      instrument,
-      side,
-      lotSize,
-      stopLoss || null,
-      takeProfit || null,
-      product
+      instrument, side, lotSize, stopLoss || null, takeProfit || null, product
     );
-
-    // Save to Trade model (market orders are immediately filled)
     const trade = new Trade({
       pair: instrument,
       side,
@@ -172,10 +192,7 @@ exports.placeOrder = async (req, res) => {
       strategy: 'Manual',
     });
     await trade.save();
-
-    // Send notification
     notifyTrade('OPENED', trade, account).catch(err => logger.error('[Notification] Error:', err.message));
-
     res.json({ success: true, trade, raw: orderResult });
   } catch (error) {
     logger.error('[placeOrder] Error:', error.message);
@@ -190,21 +207,16 @@ exports.closeTrade = async (req, res) => {
   try {
     const product = getProduct(req);
     const result = await orderService.closeTrade(tradeId, product);
-
-    // The orderService updates the Trade status, but we also need to update portfolio & P&L
     const updated = await Trade.findOneAndUpdate(
       { oandaTradeId: tradeId },
       { status: 'CLOSED', closeTime: new Date(), closePrice: result.price || null, pnl: result.pl || 0 },
       { new: true }
     );
-
     portfolioManager.updateDailyPnL(result.pl || 0);
-
     if (updated) {
       const broker = getBroker(product);
       const account = await broker.getAccount();
       notifyTrade('CLOSED', updated, account).catch(err => logger.error('[Notification] Error:', err.message));
-
       try {
         const learner = await getPerformanceLearner();
         learner.recordTrade(updated);
@@ -212,7 +224,6 @@ exports.closeTrade = async (req, res) => {
         logger.warn('[PerformanceLearner] Failed to record trade:', err.message);
       }
     }
-
     res.json({ success: true, result });
   } catch (error) {
     logger.error('[closeTrade] Error:', error.message);
@@ -227,11 +238,8 @@ exports.getSignal = async (req, res) => {
   try {
     const product = getProduct(req);
     const instrument = pair.toUpperCase();
-    // Pass product to strategy engine (it may need market data)
     const signal = await strategyEngine.generateSignal(instrument, strategy, { ...params, product });
-    if (!signal) {
-      return res.json({ signal: null, message: 'No signal generated' });
-    }
+    if (!signal) return res.json({ signal: null, message: 'No signal generated' });
     res.json(signal);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -245,41 +253,20 @@ exports.autoTrade = async (req, res) => {
   try {
     const product = getProduct(req);
     const instrument = pair.toUpperCase();
-
-    // Generate signal
     const signal = await strategyEngine.generateSignal(instrument, strategy, { ...params, product });
-    if (!signal) {
-      return res.json({ success: false, message: 'No trading signal' });
-    }
-
+    if (!signal) return res.json({ success: false, message: 'No trading signal' });
     const broker = getBroker(product);
     const account = await broker.getAccount();
     const currentPositions = await broker.getOpenTrades();
-
     const approval = await portfolioManager.canOpenTrade(signal, parseFloat(account.balance), currentPositions);
-    if (!approval.allowed) {
-      return res.json({ success: false, message: approval.reason });
-    }
-
+    if (!approval.allowed) return res.json({ success: false, message: approval.reason });
     let lotSize = signal.recommendedLotSize;
     if (!lotSize) {
-      lotSize = await riskManager.calculateLotSize(
-        instrument,
-        signal.entryPrice,
-        signal.stopLoss,
-        riskPercent
-      );
+      lotSize = await riskManager.calculateLotSize(instrument, signal.entryPrice, signal.stopLoss, riskPercent, 1000, product);
     }
-
     const orderResult = await orderService.placeMarketOrder(
-      instrument,
-      signal.side,
-      lotSize,
-      signal.stopLoss,
-      signal.takeProfit,
-      product
+      instrument, signal.side, lotSize, signal.stopLoss, signal.takeProfit, product
     );
-
     const trade = new Trade({
       pair: instrument,
       side: signal.side,
@@ -296,9 +283,7 @@ exports.autoTrade = async (req, res) => {
       notes: 'Auto-trade from strategy',
     });
     await trade.save();
-
     notifyTrade('OPENED', trade, account).catch(err => logger.error('[Notification] Error:', err.message));
-
     res.json({ success: true, signal, trade, raw: orderResult });
   } catch (error) {
     logger.error('[autoTrade] Error:', error.message);
@@ -339,3 +324,6 @@ exports.deleteHistory = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
+
+// ---------- Export helper for other modules ----------
+exports.getProduct = getProduct;
