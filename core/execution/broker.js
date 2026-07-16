@@ -83,6 +83,16 @@ const FALLBACK_SYMBOLS = {
   'GBP_JPY': 'frxGBPJPY',
 };
 
+// --- Helper to redact sensitive data ---
+function redactSensitive(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const copy = JSON.parse(JSON.stringify(obj));
+  if (copy.authorize) copy.authorize = '***REDACTED***';
+  if (copy.api_token) copy.api_token = '***REDACTED***';
+  if (copy.token) copy.token = '***REDACTED***';
+  return copy;
+}
+
 // ============================================================
 // RATE LIMITER
 // ============================================================
@@ -260,8 +270,10 @@ class CFDExecutor extends BaseExecutor {
     if (stopLoss && !isNaN(stopLoss) && stopLoss > 0) payload.stop_loss = stopLoss;
     if (takeProfit && !isNaN(takeProfit) && takeProfit > 0) payload.take_profit = takeProfit;
 
-    logger.info('[CFDExecutor] Opening CFD position:', JSON.stringify(payload));
+    logger.info('[CFDExecutor] Sending open position request:', JSON.stringify(redactSensitive(payload), null, 2));
     const response = await this.broker._sendRequest(payload);
+    logger.info('[CFDExecutor] Open position response:', JSON.stringify(redactSensitive(response), null, 2));
+
     const result = response.cfd_open_position;
     if (!result || !result.position_id) {
       throw new Error('Failed to open CFD position: ' + JSON.stringify(response));
@@ -287,7 +299,9 @@ class CFDExecutor extends BaseExecutor {
   async close(tradeId) {
     if (!tradeId) throw new Error('Position ID required');
     const payload = { cfd_close_position: 1, position_id: tradeId };
+    logger.info('[CFDExecutor] Sending close position request:', JSON.stringify(redactSensitive(payload), null, 2));
     const response = await this.broker._sendRequest(payload);
+    logger.info('[CFDExecutor] Close position response:', JSON.stringify(redactSensitive(response), null, 2));
     const result = response.cfd_close_position;
     if (!result) throw new Error('Failed to close CFD position: ' + JSON.stringify(response));
     return result;
@@ -299,7 +313,9 @@ class CFDExecutor extends BaseExecutor {
     if (stopLoss && !isNaN(stopLoss) && stopLoss > 0) payload.stop_loss = stopLoss;
     if (takeProfit && !isNaN(takeProfit) && takeProfit > 0) payload.take_profit = takeProfit;
     if (!payload.stop_loss && !payload.take_profit) throw new Error('At least one of stop_loss or take_profit required');
+    logger.info('[CFDExecutor] Sending update position request:', JSON.stringify(redactSensitive(payload), null, 2));
     const response = await this.broker._sendRequest(payload);
+    logger.info('[CFDExecutor] Update position response:', JSON.stringify(redactSensitive(response), null, 2));
     return response.cfd_update_position;
   }
 
@@ -311,7 +327,10 @@ class CFDExecutor extends BaseExecutor {
   }
 
   async getPositions() {
-    const response = await this.broker._sendRequest({ cfd_get_positions: 1 });
+    const payload = { cfd_get_positions: 1 };
+    logger.info('[CFDExecutor] Sending get positions request:', JSON.stringify(redactSensitive(payload), null, 2));
+    const response = await this.broker._sendRequest(payload);
+    logger.info('[CFDExecutor] Get positions response:', JSON.stringify(redactSensitive(response), null, 2));
     const positions = response.cfd_get_positions || [];
     return positions.map(pos => ({
       id: pos.position_id,
@@ -827,7 +846,13 @@ class DerivBroker extends EventEmitter {
       }, 10000);
 
       this._pendingRequests.set(reqId, {
-        resolve: (msg) => { clearTimeout(timeout); resolve(msg); },
+        resolve: (msg) => {
+          clearTimeout(timeout);
+          // --- Log authorization response ---
+          const safeMsg = redactSensitive(msg);
+          logger.info('[Auth] Authorization response:', JSON.stringify(safeMsg, null, 2));
+          resolve(msg);
+        },
         reject: (err) => { clearTimeout(timeout); reject(err); },
         timeout,
         sentAt: Date.now(),
@@ -910,11 +935,21 @@ class DerivBroker extends EventEmitter {
   _handleMessage(rawData) {
     try {
       const msg = JSON.parse(rawData);
+      logger.debug('[In]', JSON.stringify(redactSensitive(msg)));
+
+      let handled = false;
+
       if (msg.pong) {
         this._lastPong = Date.now();
         this.metrics.lastPong = this._lastPong;
-        return;
+        handled = true;
       }
+
+      if (msg.error) {
+        logger.error('[In] API Error:', JSON.stringify(msg.error, null, 2));
+      }
+
+      // --- Handle pending requests by req_id ---
       if (msg.req_id && this._pendingRequests.has(msg.req_id)) {
         const pending = this._pendingRequests.get(msg.req_id);
         clearTimeout(pending.timeout);
@@ -929,22 +964,42 @@ class DerivBroker extends EventEmitter {
         } else {
           this.metrics.requestsSent++;
           this._resetCircuitBreaker();
-          // Handle order responses if any
           this._handleOrderResponse(msg);
           pending.resolve(msg);
         }
-        return;
+        handled = true;
       }
+
+      // --- Tick handling ---
       if (msg.msg_type === 'tick' && msg.tick) {
         this.streaming.handleTick(msg.tick);
-        return;
+        handled = true;
       }
-      // Handle buy/sell/CFD responses
+
+      // --- Order responses not tied to pending requests (async updates) ---
       if (msg.buy || msg.sell || msg.cfd_open_position) {
         this._handleOrderResponse(msg);
+        handled = true;
+      }
+
+      // --- LOG CFD responses at info level (even if already handled) ---
+      if (msg.cfd_open_position || msg.cfd_close_position || msg.cfd_update_position || msg.cfd_get_positions) {
+        logger.info('[In] CFD response:', JSON.stringify(redactSensitive(msg), null, 2));
+      }
+
+      // --- LOG portfolio at info level ---
+      if (msg.portfolio || msg.contracts) {
+        const portfolio = msg.portfolio || msg.contracts;
+        logger.info('[In] Portfolio response (first 2):', JSON.stringify(Array.isArray(portfolio) ? portfolio.slice(0, 2) : portfolio, null, 2));
+        logger.debug('[In] Full portfolio:', JSON.stringify(portfolio, null, 2));
+      }
+
+      // --- Unknown message ---
+      if (!handled) {
+        logger.warn('[In] Unknown message type:', JSON.stringify(redactSensitive(msg), null, 2));
       }
     } catch (err) {
-      logger.error('[DerivBroker] Error parsing WebSocket message:', err.message);
+      logger.error('[In] Parse error:', err.message);
     }
   }
 
@@ -991,6 +1046,16 @@ class DerivBroker extends EventEmitter {
       return;
     }
     try {
+      // --- Log outgoing messages ---
+      const isImportant = payload.cfd_open_position || payload.cfd_close_position ||
+                          payload.cfd_update_position || payload.cfd_get_positions ||
+                          payload.buy || payload.sell || payload.proposal || payload.portfolio ||
+                          payload.authorize || payload.active_symbols;
+      if (isImportant) {
+        logger.info(`[Out] ${payload.req_id || 'no-req-id'} →`, JSON.stringify(redactSensitive(payload), null, 2));
+      } else {
+        logger.debug(`[Out] ${payload.req_id || 'no-req-id'} →`, JSON.stringify(redactSensitive(payload)));
+      }
       this._socket.send(JSON.stringify(payload));
     } catch (err) {
       logger.error('[DerivBroker] Send error:', err.message);
@@ -1086,9 +1151,11 @@ class DerivBroker extends EventEmitter {
       const response = await this._sendRawRequest({ active_symbols: 'brief' }, 10000);
       const symbols = response.active_symbols || [];
       if (symbols.length > 0) {
+        logger.info(`[Symbols] Loaded ${symbols.length} symbols (brief).`);
+        logger.info('[Symbols] First 5 symbols:', JSON.stringify(symbols.slice(0, 5), null, 2));
+        logger.debug('[Symbols] Full list:', JSON.stringify(symbols, null, 2));
         this._buildSymbolMaps(symbols);
         this.symbolManager.setSymbols(symbols);
-        logger.info(`[DerivBroker] Loaded ${symbols.length} symbols (brief).`);
         return;
       }
     } catch (err) {
@@ -1099,9 +1166,11 @@ class DerivBroker extends EventEmitter {
       const response = await this._sendRawRequest({ active_symbols: 'all' }, 10000);
       const symbols = response.active_symbols || [];
       if (symbols.length > 0) {
+        logger.info(`[Symbols] Loaded ${symbols.length} symbols (all).`);
+        logger.info('[Symbols] First 5 symbols:', JSON.stringify(symbols.slice(0, 5), null, 2));
+        logger.debug('[Symbols] Full list:', JSON.stringify(symbols, null, 2));
         this._buildSymbolMaps(symbols);
         this.symbolManager.setSymbols(symbols);
-        logger.info(`[DerivBroker] Loaded ${symbols.length} symbols (all).`);
         return;
       }
     } catch (err) {
@@ -1167,6 +1236,7 @@ class DerivBroker extends EventEmitter {
       // For CFD, we use cfd_get_positions
       if (this.productType === 'cfd') {
         const positions = await this.executor.getPositions();
+        logger.info('[Reconcile] CFD positions from API:', JSON.stringify(positions, null, 2));
         // Sync with DB
         const dbOrders = await Order.find({ status: ORDER_STATUS.FILLED });
         const dbMap = new Map();
