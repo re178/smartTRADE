@@ -1,4 +1,4 @@
-// public/js/app.js – Dashboard Logic (with debounce & live P&L updates)
+// public/js/app.js – Dashboard Logic (with debounce, live P&L updates, and product toggles)
 
 // ---- Configuration ----
 const REFRESH_INTERVAL = 10000; // 10 seconds
@@ -20,6 +20,46 @@ async function fetchJson(url, options = {}) {
 
 function formatPrice(p) {
   return parseFloat(p).toFixed(5);
+}
+
+// ---- Load Product Preference ----
+async function loadProductPreference() {
+  try {
+    const data = await fetchJson(`${CONFIG.API_BASE}/api/user/preferences`);
+    const product = data.tradingProduct || 'deriv_cfd';
+    // Update radio buttons
+    document.querySelectorAll('input[name="product"]').forEach(el => {
+      el.checked = (el.value === product);
+    });
+    // Update displayed label
+    document.getElementById('currentProduct').textContent = product.toUpperCase();
+  } catch (e) {
+    console.error('Failed to load product preference:', e);
+  }
+}
+
+// ---- Handle Product Toggle Change ----
+async function handleProductChange(e) {
+  const value = e.target.value;
+  // Immediately update UI (optimistic)
+  document.querySelectorAll('input[name="product"]').forEach(el => {
+    el.checked = (el.value === value);
+  });
+  document.getElementById('currentProduct').textContent = value.toUpperCase();
+  
+  try {
+    await fetchJson(`${CONFIG.API_BASE}/api/user/preferences`, {
+      method: 'POST',
+      body: JSON.stringify({ tradingProduct: value })
+    });
+    // Optionally show a success message
+    console.log('Product preference updated to:', value);
+    // Refresh account/prices to reflect new product? Not needed; backend uses new product for subsequent calls.
+  } catch (e) {
+    alert('Failed to update product preference: ' + e.message);
+    // Revert UI to previous state – we can reload the preference
+    loadProductPreference();
+  }
 }
 
 // ---- Load Account ----
@@ -303,6 +343,7 @@ function startLiveUpdates() {
 }
 
 // ---- Initialise ----
+loadProductPreference();
 loadAccount();
 loadPrices();
 loadOpenTrades();
