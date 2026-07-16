@@ -1,4 +1,4 @@
-// core/execution/orderService.js – Order Management (uses brokerFactory)
+// core/execution/orderService.js – Order Management (uses brokerFactory with product support)
 
 const { getBroker } = require('./brokerFactory');
 const eventBus = require('../../infrastructure/eventBus');
@@ -7,13 +7,10 @@ const { formatPrice } = require('../../shared/helpers');
 const { ExecutionAnalytics } = require('../analytics/performanceSuite');
 const logger = require('../../infrastructure/logger') || console;
 
-// Singleton Execution Analytics instance
+// Singleton Execution Analytics instance (product-agnostic)
 const executionAnalytics = new ExecutionAnalytics({
   slippageTolerance: parseFloat(process.env.SLIPPAGE_TOLERANCE) || 1,
 });
-
-// Get the appropriate broker instance (CFD or Multiplier)
-const broker = getBroker();
 
 /**
  * Place a market order (BUY/SELL).
@@ -22,9 +19,10 @@ const broker = getBroker();
  * @param {number} lotSize - Number of units (positive)
  * @param {number|null} stopLoss - Stop loss price (optional)
  * @param {number|null} takeProfit - Take profit price (optional)
+ * @param {string} [product] - Trading product (e.g., 'mt5', 'deriv_cfd')
  * @returns {Promise<Object>} { tradeId, orderId, price, ... }
  */
-async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, takeProfit = null) {
+async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, takeProfit = null, product) {
   const validation = validateOrderInput({ pair: instrument, side, lotSize, stopLoss, takeProfit });
   if (!validation.valid) {
     throw new Error(validation.message);
@@ -32,6 +30,9 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
 
   const units = side.toUpperCase() === 'BUY' ? lotSize : -lotSize;
   const startTime = Date.now();
+
+  // Get broker for the specified product
+  const broker = getBroker(product);
 
   // Ensure broker is connected
   if (!broker.isConnected()) {
@@ -43,7 +44,7 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
     const latency = Date.now() - startTime;
 
     // Record execution analytics
-    const spread = await getSpread(instrument);
+    const spread = await getSpread(instrument, product);
     executionAnalytics.recordExecution({
       orderId: result.id || 'N/A',
       instrument,
@@ -91,11 +92,13 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
 /**
  * Close an open trade by its ID.
  * @param {string} tradeId - Trade ID (contract ID)
+ * @param {string} [product] - Trading product
  * @returns {Promise<Object>} Result from broker.
  */
-async function closeTrade(tradeId) {
+async function closeTrade(tradeId, product) {
   if (!tradeId) throw new Error('tradeId is required');
   const startTime = Date.now();
+  const broker = getBroker(product);
   if (!broker.isConnected()) {
     await broker.connect();
   }
@@ -113,10 +116,12 @@ async function closeTrade(tradeId) {
 /**
  * Get current spread for an instrument (stub – implement with real data).
  * @param {string} instrument
+ * @param {string} [product] - Trading product
  * @returns {Promise<number>} Spread in pips.
  */
-async function getSpread(instrument) {
+async function getSpread(instrument, product) {
   try {
+    const broker = getBroker(product);
     const prices = await broker.getPrices([instrument]);
     if (prices && prices.length > 0) {
       const bid = parseFloat(prices[0].bids[0].price);
@@ -129,9 +134,11 @@ async function getSpread(instrument) {
 
 /**
  * Get all open trades from the broker.
+ * @param {string} [product] - Trading product
  * @returns {Promise<Array>} List of open trade objects.
  */
-async function getOpenTrades() {
+async function getOpenTrades(product) {
+  const broker = getBroker(product);
   if (!broker.isConnected()) {
     await broker.connect();
   }
@@ -140,9 +147,11 @@ async function getOpenTrades() {
 
 /**
  * Get all positions from the broker.
+ * @param {string} [product] - Trading product
  * @returns {Promise<Array>} List of position objects.
  */
-async function getPositions() {
+async function getPositions(product) {
+  const broker = getBroker(product);
   if (!broker.isConnected()) {
     await broker.connect();
   }
