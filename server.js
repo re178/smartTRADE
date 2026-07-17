@@ -1,4 +1,4 @@
-// server.js – RTS Entry Point (with database cleanup on start)
+// server.js – RTS Entry Point (with MT5 Bridge integration)
 
 require('dotenv').config();
 
@@ -10,8 +10,11 @@ const mongoose = require('mongoose');
 // Database connection
 const connectDB = require('./config/db');
 
-// API routes
+// API routes (existing)
 const apiRoutes = require('./api/routes');
+
+// MT5 Bridge routes (NEW)
+const mt5Routes = require('./api/routes/mt5');
 
 // Models
 const User = require('./models/User');
@@ -82,6 +85,9 @@ app.use(async (req, res, next) => {
 // ---------- API Routes ----------
 app.use('/api', apiRoutes);
 
+// ---------- MT5 Bridge Routes (NEW) ----------
+app.use('/api/mt5', mt5Routes);
+
 // ---------- Health Check ----------
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'OK', message: 'RTS is running' });
@@ -105,6 +111,7 @@ async function startServer() {
     console.log(`✅ RTS server running on http://localhost:${PORT}`);
     console.log(`📊 Dashboard: http://localhost:${PORT}`);
     console.log(`🔌 API base: http://localhost:${PORT}/api`);
+    console.log(`🟢 MT5 Bridge endpoints: http://localhost:${PORT}/api/mt5`);
   });
 }
 
