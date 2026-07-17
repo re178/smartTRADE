@@ -10,11 +10,6 @@
     body { background: #f8f9fa; padding: 20px; }
     .card { margin-bottom: 20px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
     .card-header { background: #fff; font-weight: 600; border-bottom: 1px solid #e9ecef; }
-    .signal-badge { font-size: 1.1rem; padding: 8px 16px; }
-    .price-up { color: #28a745; }
-    .price-down { color: #dc3545; }
-    .loading { opacity: 0.6; pointer-events: none; }
-    #tradesTable td { vertical-align: middle; }
     .product-toggle .btn { border-radius: 20px; }
     .product-toggle .btn.active { background: #0d6efd; color: white; }
   </style>
@@ -49,7 +44,7 @@
     </div>
   </div>
 
-  <!-- Notifications -->
+  <!-- Notifications (optional) -->
   <div class="row">
     <div class="col-12">
       <div class="card">
@@ -70,18 +65,18 @@
     </div>
   </div>
 
-  <!-- Trading Product Toggle -->
+  <!-- Product Toggle -->
   <div class="row">
     <div class="col-12">
       <div class="card">
         <div class="card-header">
           <i class="fas fa-exchange-alt"></i> Trading Product
-          <span class="badge bg-secondary float-end" id="currentProduct">deriv_cfd</span>
+          <span class="badge bg-secondary float-end" id="currentProduct">mt5</span>
         </div>
         <div class="card-body">
           <div class="btn-group btn-group-toggle d-flex flex-wrap product-toggle" data-toggle="buttons">
             <label class="btn btn-outline-primary flex-fill m-1">
-              <input type="radio" name="product" value="mt5" onchange="window.handleProductChange(event)"> MT5
+              <input type="radio" name="product" value="mt5" onchange="window.handleProductChange(event)" checked> MT5
             </label>
             <label class="btn btn-outline-primary flex-fill m-1">
               <input type="radio" name="product" value="deriv_cfd" onchange="window.handleProductChange(event)"> Deriv CFD
@@ -106,7 +101,7 @@
         <div class="card-header"><i class="fas fa-lightbulb"></i> Signal Generator</div>
         <div class="card-body">
           <div class="input-group mb-3">
-            <input type="text" id="signalPair" class="form-control" placeholder="Pair e.g. EUR_USD" value="EUR_USD" />
+            <input type="text" id="signalPair" class="form-control" placeholder="Pair e.g. EURUSD" value="EURUSD" />
             <select id="signalStrategy" class="form-select" style="max-width: 150px;">
               <option value="sma">SMA</option>
               <option value="ema">EMA</option>
@@ -131,7 +126,7 @@
         <div class="card-body">
           <form id="tradeForm">
             <div class="row">
-              <div class="col-6"><label>Pair</label><input type="text" class="form-control" id="tradePair" value="EUR_USD" required /></div>
+              <div class="col-6"><label>Pair</label><input type="text" class="form-control" id="tradePair" value="EURUSD" required /></div>
               <div class="col-6"><label>Side</label>
                 <select class="form-select" id="tradeSide">
                   <option value="BUY">BUY</option>
@@ -147,7 +142,7 @@
           <hr />
           <form id="autoTradeForm">
             <div class="row">
-              <div class="col-5"><label>Pair</label><input type="text" class="form-control" id="autoPair" value="EUR_USD" required /></div>
+              <div class="col-5"><label>Pair</label><input type="text" class="form-control" id="autoPair" value="EURUSD" required /></div>
               <div class="col-3"><label>Risk %</label><input type="number" step="0.1" class="form-control" id="autoRisk" value="1" required /></div>
               <div class="col-4"><label>Strategy</label>
                 <select class="form-select" id="autoStrategy">
@@ -212,7 +207,400 @@
   </div>
 </div>
 
-<script src="js/config.js"></script>
-<script src="js/app.js"></script>
+<script>
+  // ---- CONFIG ----
+  const CONFIG = {
+    API_BASE: '/api',
+    PRICE_PAIRS: ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'XAUUSD'],
+    PRICE_REFRESH_INTERVAL: 5000,
+    DEFAULT_LOT: 0.01,
+    REFRESH_INTERVAL: 10000,
+  };
+
+  // ---- Helpers ----
+  async function fetchJson(url, options = {}) {
+    const res = await fetch(url, {
+      headers: { 'Content-Type': 'application/json' },
+      ...options,
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`HTTP ${res.status}: ${text}`);
+    }
+    return res.json();
+  }
+
+  function formatPrice(p) {
+    return parseFloat(p).toFixed(5);
+  }
+
+  // ---- Product Preference ----
+  async function loadProductPreference() {
+    try {
+      const data = await fetchJson(`${CONFIG.API_BASE}/user/preferences`);
+      const product = data.tradingProduct || 'mt5';
+      document.querySelectorAll('input[name="product"]').forEach(el => {
+        el.checked = (el.value === product);
+      });
+      document.getElementById('currentProduct').textContent = product.toUpperCase();
+    } catch (e) {
+      console.error('Failed to load product preference:', e);
+    }
+  }
+
+  window.handleProductChange = async function(e) {
+    const value = e.target.value;
+    document.querySelectorAll('input[name="product"]').forEach(el => {
+      el.checked = (el.value === value);
+    });
+    document.getElementById('currentProduct').textContent = value.toUpperCase();
+    try {
+      await fetchJson(`${CONFIG.API_BASE}/user/preferences`, {
+        method: 'POST',
+        body: JSON.stringify({ tradingProduct: value }),
+      });
+      refreshAll();
+    } catch (err) {
+      alert('Failed to update product: ' + err.message);
+      loadProductPreference();
+    }
+  };
+
+  // ---- Account ----
+  async function loadAccount() {
+    try {
+      const acc = await fetchJson(`${CONFIG.API_BASE}/account`);
+      document.getElementById('accountInfo').innerHTML = `
+        <p><strong>ID:</strong> ${acc.id || 'N/A'}</p>
+        <p><strong>Currency:</strong> ${acc.currency || 'USD'}</p>
+        <p><strong>Balance:</strong> ${acc.balance}</p>
+        <p><strong>Equity:</strong> ${acc.equity}</p>
+        <p><strong>Margin Used:</strong> ${acc.marginUsed}</p>
+        <p><strong>Free Margin:</strong> ${acc.marginAvailable}</p>
+      `;
+    } catch (e) {
+      document.getElementById('accountInfo').innerHTML = `<p class="text-danger">Error: ${e.message}</p>`;
+    }
+  }
+
+  // ---- Prices ----
+  async function loadPrices() {
+    try {
+      const data = await fetchJson(
+        `${CONFIG.API_BASE}/prices?instruments=${CONFIG.PRICE_PAIRS.join(',')}`
+      );
+      let html = '';
+      data.forEach(p => {
+        const bid = parseFloat(p.bids[0].price);
+        const ask = parseFloat(p.asks[0].price);
+        const mid = (bid + ask) / 2;
+        html += `<div class="d-flex justify-content-between">
+          <span>${p.instrument}</span>
+          <span><strong>${formatPrice(mid)}</strong> (Bid ${formatPrice(bid)} / Ask ${formatPrice(ask)})</span>
+        </div>`;
+      });
+      document.getElementById('priceInfo').innerHTML = html;
+    } catch (e) {
+      document.getElementById('priceInfo').innerHTML = `<p class="text-danger">Error: ${e.message}</p>`;
+    }
+  }
+
+  // ---- Open Trades (works for MT5 & Deriv) ----
+  async function loadOpenTrades() {
+    const container = document.getElementById('openTradesContainer');
+    container.innerHTML = '<p class="text-muted">Loading open trades...</p>';
+    try {
+      const trades = await fetchJson(`${CONFIG.API_BASE}/trades`);
+      if (!trades || trades.length === 0) {
+        container.innerHTML = '<p class="text-muted">No open trades.</p>';
+        return;
+      }
+      let html = `<table class="table table-striped">
+        <thead><tr>
+          <th>ID</th><th>Pair</th><th>Side</th><th>Open Price</th><th>Current Price</th><th>Units</th><th>P/L</th><th>Action</th>
+        </tr></thead><tbody>`;
+      let totalPL = 0;
+      for (const t of trades) {
+        const id = t.id || t.ticket || t.tradeId || 'N/A';
+        const pair = t.instrument || t.symbol || t.pair;
+        const side = t.side || t.type;
+        const price = t.price || t.openPrice || t.entryPrice;
+        const currentPrice = t.currentPrice || t.current_price || t.price || 'N/A';
+        const units = t.units || t.volume || t.lotSize;
+        const pl = t.unrealizedPL !== undefined ? parseFloat(t.unrealizedPL).toFixed(2) :
+                   t.profit !== undefined ? parseFloat(t.profit).toFixed(2) : '0.00';
+        totalPL += parseFloat(pl) || 0;
+        html += `<tr>
+          <td>${id}</td>
+          <td>${pair}</td>
+          <td><span class="badge ${side === 'BUY' ? 'bg-success' : 'bg-danger'}">${side}</span></td>
+          <td>${formatPrice(price)}</td>
+          <td>${currentPrice}</td>
+          <td>${units}</td>
+          <td class="${pl >= 0 ? 'text-success' : 'text-danger'}">${pl}</td>
+          <td><button class="btn btn-sm btn-danger" onclick="closeTrade('${id}')">Close</button></td>
+        </tr>`;
+      }
+      html += `<tr><td colspan="6"><strong>Total Unrealized P&L</strong></td>
+        <td class="${totalPL >= 0 ? 'text-success' : 'text-danger'}"><strong>${totalPL.toFixed(2)}</strong></td><td></td></tr>`;
+      html += '</tbody></table>';
+      container.innerHTML = html;
+    } catch (e) {
+      container.innerHTML = `<p class="text-danger">Error: ${e.message}</p>`;
+    }
+  }
+
+  window.closeTrade = async function(tradeId) {
+    if (!confirm(`Close trade ${tradeId}?`)) return;
+    try {
+      await fetchJson(`${CONFIG.API_BASE}/close/${tradeId}`, { method: 'PUT' });
+      alert('Trade closed.');
+      refreshAll();
+    } catch (e) {
+      alert('Error closing trade: ' + e.message);
+    }
+  };
+
+  // ---- Pending Orders ----
+  async function loadPendingOrders() {
+    const container = document.getElementById('pendingOrdersContainer');
+    if (!container) return;
+    container.innerHTML = '<p class="text-muted">Loading pending orders...</p>';
+    try {
+      const orders = await fetchJson(`${CONFIG.API_BASE}/pending-orders`);
+      if (!orders || orders.length === 0) {
+        container.innerHTML = '<p class="text-muted">No pending orders.</p>';
+        return;
+      }
+      let html = `<table class="table table-striped">
+        <thead><tr><th>ID</th><th>Pair</th><th>Side</th><th>Entry Price</th><th>Lot</th><th>Status</th><th>Action</th></tr></thead><tbody>`;
+      for (const o of orders) {
+        const id = o.contractId || o.clientOrderId || o.id || 'N/A';
+        html += `<tr>
+          <td>${id}</td>
+          <td>${o.instrument || o.symbol}</td>
+          <td><span class="badge ${o.side === 'BUY' ? 'bg-success' : 'bg-danger'}">${o.side}</span></td>
+          <td>${o.entryPrice || o.price || '-'}</td>
+          <td>${o.units || o.lotSize || o.volume}</td>
+          <td><span class="badge bg-warning">${o.status}</span></td>
+          <td><button class="btn btn-sm btn-danger" onclick="cancelPending('${id}')">Cancel</button></td>
+        </tr>`;
+      }
+      html += '</tbody></table>';
+      container.innerHTML = html;
+    } catch (e) {
+      container.innerHTML = `<p class="text-danger">Error: ${e.message}</p>`;
+    }
+  }
+
+  window.cancelPending = async function(orderId) {
+    if (!confirm(`Cancel order ${orderId}?`)) return;
+    try {
+      await fetchJson(`${CONFIG.API_BASE}/order/${orderId}`, { method: 'DELETE' });
+      alert('Order cancelled.');
+      refreshAll();
+    } catch (e) {
+      alert('Error cancelling: ' + e.message);
+    }
+  };
+
+  // ---- Trade History ----
+  async function loadTradeHistory() {
+    const container = document.getElementById('historyContainer');
+    container.innerHTML = '<p class="text-muted">Loading history...</p>';
+    try {
+      const trades = await fetchJson(`${CONFIG.API_BASE}/trade-history`);
+      if (!trades || trades.length === 0) {
+        container.innerHTML = '<p class="text-muted">No history yet.</p>';
+        return;
+      }
+      let html = `<table class="table table-striped table-sm">
+        <thead><tr><th>Pair</th><th>Side</th><th>Entry</th><th>Exit</th><th>Lot</th><th>P/L</th><th>Status</th><th>Date</th></tr></thead><tbody>`;
+      trades.forEach(t => {
+        const pl = t.pnl ? parseFloat(t.pnl).toFixed(2) : '0.00';
+        const statusClass = t.status === 'OPEN' ? 'bg-primary' : (pl >= 0 ? 'bg-success' : 'bg-danger');
+        html += `<tr>
+          <td>${t.pair}</td>
+          <td><span class="badge ${t.side === 'BUY' ? 'bg-success' : 'bg-danger'}">${t.side}</span></td>
+          <td>${t.entryPrice}</td>
+          <td>${t.closePrice || '-'}</td>
+          <td>${t.lotSize}</td>
+          <td class="${pl >= 0 ? 'text-success' : 'text-danger'}">${pl}</td>
+          <td><span class="badge ${statusClass}">${t.status}</span></td>
+          <td>${new Date(t.createdAt).toLocaleString()}</td>
+        </tr>`;
+      });
+      html += '</tbody></table>';
+      container.innerHTML = html;
+    } catch (e) {
+      container.innerHTML = `<p class="text-danger">Error: ${e.message}</p>`;
+    }
+  }
+
+  document.getElementById('deleteHistoryBtn')?.addEventListener('click', async function() {
+    if (!confirm('Delete all closed trades from history?')) return;
+    try {
+      const result = await fetchJson(`${CONFIG.API_BASE}/history`, { method: 'DELETE' });
+      alert(`Deleted ${result.deletedCount} closed trades.`);
+      loadTradeHistory();
+    } catch (e) {
+      alert('Error: ' + e.message);
+    }
+  });
+
+  // ---- Place Order ----
+  let isSubmitting = false;
+  document.getElementById('tradeForm')?.addEventListener('submit', async function(e) {
+    e.preventDefault();
+    if (isSubmitting) return alert('Please wait...');
+    isSubmitting = true;
+    const btn = this.querySelector('button[type="submit"]');
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Placing...';
+    try {
+      const pair = document.getElementById('tradePair').value.trim().toUpperCase();
+      const side = document.getElementById('tradeSide').value;
+      const lotSize = parseFloat(document.getElementById('tradeLot').value);
+      const sl = document.getElementById('tradeSL').value ? parseFloat(document.getElementById('tradeSL').value) : null;
+      const tp = document.getElementById('tradeTP').value ? parseFloat(document.getElementById('tradeTP').value) : null;
+      if (!pair || !side || isNaN(lotSize) || lotSize <= 0) throw new Error('Invalid inputs');
+      const result = await fetchJson(`${CONFIG.API_BASE}/order`, {
+        method: 'POST',
+        body: JSON.stringify({ pair, side, lotSize, stopLoss: sl, takeProfit: tp }),
+      });
+      alert('Order placed! ID: ' + (result.trade?.contractId || result.trade?.oandaTradeId || 'N/A'));
+      refreshAll();
+    } catch (e) {
+      alert('Error: ' + e.message);
+    } finally {
+      isSubmitting = false;
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fas fa-paper-plane"></i> Place Order';
+    }
+  });
+
+  // ---- Auto-Trade ----
+  let isAutoSubmitting = false;
+  document.getElementById('autoTradeForm')?.addEventListener('submit', async function(e) {
+    e.preventDefault();
+    if (isAutoSubmitting) return alert('Please wait...');
+    isAutoSubmitting = true;
+    const btn = this.querySelector('button[type="submit"]');
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Auto-trading...';
+    try {
+      const pair = document.getElementById('autoPair').value.trim().toUpperCase();
+      const risk = parseFloat(document.getElementById('autoRisk').value);
+      const strategy = document.getElementById('autoStrategy')?.value || 'sma';
+      if (!pair || isNaN(risk) || risk <= 0) throw new Error('Invalid inputs');
+      const result = await fetchJson(`${CONFIG.API_BASE}/auto-trade`, {
+        method: 'POST',
+        body: JSON.stringify({ pair, riskPercent: risk, strategy }),
+      });
+      if (result.success) {
+        alert('Auto-trade executed!');
+        refreshAll();
+      } else {
+        alert('Auto-trade: ' + (result.message || 'No signal'));
+      }
+    } catch (e) {
+      alert('Error: ' + e.message);
+    } finally {
+      isAutoSubmitting = false;
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fas fa-robot"></i> Auto-Trade';
+    }
+  });
+
+  // ---- Signal ----
+  document.getElementById('getSignalBtn')?.addEventListener('click', async function() {
+    const pair = document.getElementById('signalPair').value.trim().toUpperCase();
+    const strategy = document.getElementById('signalStrategy')?.value || 'sma';
+    const resultDiv = document.getElementById('signalResult');
+    resultDiv.innerHTML = '<p class="text-muted">Fetching signal...</p>';
+    try {
+      const signal = await fetchJson(`${CONFIG.API_BASE}/signal?pair=${pair}&strategy=${strategy}`);
+      if (!signal || !signal.side) {
+        resultDiv.innerHTML = `<p class="text-warning">No signal for ${pair}.</p>`;
+        return;
+      }
+      let details = `<div class="alert alert-${signal.side === 'BUY' ? 'success' : 'danger'}">
+        <h5><strong>${signal.side}</strong> ${signal.pair}</h5>
+        <p>Entry: ${formatPrice(signal.entryPrice)} | SL: ${formatPrice(signal.stopLoss)} | TP: ${formatPrice(signal.takeProfit)}</p>
+        <p>Confidence: ${signal.confidence || 75}%</p>
+        ${signal.strategy ? `<p>Strategy: ${signal.strategy}</p>` : ''}
+        ${signal.recommendedLotSize ? `<p>Recommended Lot: ${signal.recommendedLotSize}</p>` : ''}
+      </div>`;
+      if (signal.entryPrice && signal.stopLoss && signal.takeProfit) {
+        details += `<button class="btn btn-sm btn-outline-primary" onclick="fillTradeForm('${signal.pair}','${signal.side}','${signal.entryPrice}','${signal.stopLoss}','${signal.takeProfit}','${signal.recommendedLotSize || CONFIG.DEFAULT_LOT}')">
+          <i class="fas fa-arrow-right"></i> Use for Trade
+        </button>`;
+      }
+      resultDiv.innerHTML = details;
+    } catch (e) {
+      resultDiv.innerHTML = `<p class="text-danger">Error: ${e.message}</p>`;
+    }
+  });
+
+  window.fillTradeForm = function(pair, side, entry, sl, tp, lot) {
+    document.getElementById('tradePair').value = pair;
+    document.getElementById('tradeSide').value = side;
+    document.getElementById('tradeLot').value = lot || CONFIG.DEFAULT_LOT;
+    document.getElementById('tradeSL').value = sl;
+    document.getElementById('tradeTP').value = tp;
+    document.querySelector('#tradeForm').scrollIntoView({ behavior: 'smooth' });
+  };
+
+  // ---- Refresh All ----
+  function refreshAll() {
+    loadAccount();
+    loadOpenTrades();
+    loadTradeHistory();
+    loadPendingOrders();
+    loadPrices();
+  }
+
+  // ---- Notifications (optional) ----
+  async function loadNotificationStatus() {
+    try {
+      const status = await fetchJson(`${CONFIG.API_BASE}/notifications/status`);
+      document.getElementById('emailStatus').textContent = status.emailEnabled ? 'Enabled' : 'Disabled';
+      document.getElementById('emailStatus').className = `badge bg-${status.emailEnabled ? 'success' : 'danger'}`;
+      document.getElementById('instagramStatus').textContent = status.instagramEnabled ? 'Enabled' : 'Disabled';
+      document.getElementById('instagramStatus').className = `badge bg-${status.instagramEnabled ? 'success' : 'danger'}`;
+      document.getElementById('emailAddress').textContent = status.email || 'Not set';
+    } catch (e) { /* ignore */ }
+  }
+  document.getElementById('testNotificationBtn')?.addEventListener('click', async function() {
+    try {
+      await fetchJson(`${CONFIG.API_BASE}/test-email`, { method: 'POST' });
+      alert('Test email sent!');
+    } catch (e) { alert('Error: ' + e.message); }
+  });
+
+  // ---- Live Updates ----
+  let openTradesInterval = null, priceInterval = null;
+  function startLiveUpdates() {
+    if (openTradesInterval) clearInterval(openTradesInterval);
+    if (priceInterval) clearInterval(priceInterval);
+    openTradesInterval = setInterval(loadOpenTrades, CONFIG.REFRESH_INTERVAL);
+    priceInterval = setInterval(loadPrices, CONFIG.PRICE_REFRESH_INTERVAL);
+  }
+
+  // ---- Init ----
+  document.addEventListener('DOMContentLoaded', function() {
+    loadProductPreference();
+    refreshAll();
+    startLiveUpdates();
+    loadNotificationStatus();
+    document.getElementById('refreshTrades')?.addEventListener('click', loadOpenTrades);
+    document.getElementById('refreshHistory')?.addEventListener('click', loadTradeHistory);
+    document.getElementById('refreshPending')?.addEventListener('click', loadPendingOrders);
+  });
+  window.addEventListener('beforeunload', function() {
+    if (openTradesInterval) clearInterval(openTradesInterval);
+    if (priceInterval) clearInterval(priceInterval);
+  });
+</script>
 </body>
 </html>
