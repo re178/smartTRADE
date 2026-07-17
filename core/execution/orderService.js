@@ -4,8 +4,8 @@ const { getBroker } = require('./brokerFactory');
 const eventBus = require('../../infrastructure/eventBus');
 const { validateOrderInput } = require('../../shared/validators');
 const { ExecutionAnalytics } = require('../analytics/performanceSuite');
-const Order = require('../../models/Order');   // for all orders (including market)
-const Trade = require('../../models/Trade');   // for open/closed trades
+const Order = require('../../models/Order');
+const Trade = require('../../models/Trade');
 const logger = require('../../infrastructure/logger') || console;
 
 // Singleton Execution Analytics instance
@@ -14,7 +14,7 @@ const executionAnalytics = new ExecutionAnalytics({
 });
 
 /**
- * Place a market order (BUY/SELL) – uses product parameter for per‑user broker selection.
+ * Place a market order (BUY/SELL)
  * @param {string} instrument - e.g., 'EUR_USD'
  * @param {string} side - 'BUY' or 'SELL'
  * @param {number} lotSize - Number of units (positive)
@@ -30,22 +30,32 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
   }
 
   const broker = getBroker(product);
-  const units = side.toUpperCase() === 'BUY' ? lotSize : -lotSize;
   const startTime = Date.now();
+
+  // ---- Capability check ----
+  if (!broker.capabilities?.supportsMarketOrders) {
+    throw new Error('Broker does not support market orders');
+  }
 
   if (!broker.isConnected()) {
     await broker.connect();
   }
 
+  const units = side.toUpperCase() === 'BUY' ? lotSize : -lotSize;
+
   try {
     const result = await broker.placeMarketOrder(instrument, units, stopLoss, takeProfit);
     const latency = Date.now() - startTime;
 
-    // ---- FIX: Use generic contractId (tradeID from MT5, or id from other brokers) ----
+    // ---- Extract contractId and price from result ----
     const contractId = result.tradeID || result.id || null;
     const price = result.price || result.averagePrice || null;
 
-    // ---- FIX: Create Order document (was missing) ----
+    if (!contractId) {
+      throw new Error('Broker did not return a trade ID');
+    }
+
+    // ---- Create Order document ----
     const newOrder = new Order({
       contractId,
       instrument,
@@ -54,15 +64,15 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
       stopLoss,
       takeProfit,
       status: 'FILLED',
-      product,               // store which broker/product was used
+      product,
       filledPrice: price,
       placedAt: new Date(),
     });
     await newOrder.save();
 
-    // ---- FIX: Also create a Trade record (open trade) ----
+    // ---- Create Trade record (open trade) ----
     const newTrade = new Trade({
-      contractId,            // use this generic field instead of oandaTradeId
+      contractId,
       instrument,
       side: side.toUpperCase(),
       lotSize,
@@ -70,14 +80,13 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
       status: 'OPEN',
       openTime: new Date(),
       product,
-      // optionally store stopLoss/takeProfit if needed
     });
     await newTrade.save();
 
-    // Record analytics (spread may be 0 if broker doesn't support getPrices)
-    const spread = await getSpread(instrument, product);
+    // ---- Record analytics with extended fields ----
+    const spread = await broker.getSpread(instrument).catch(() => 0);
     executionAnalytics.recordExecution({
-      orderId: contractId || 'N/A',
+      orderId: contractId,
       instrument,
       side,
       requestedPrice: price || 0,
@@ -85,6 +94,9 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
       latency,
       spread: spread || 0,
       status: 'FILLED',
+      ticket: result.ticket || contractId,
+      server: broker.serverName || 'unknown',
+      broker: product || 'default',
     });
 
     eventBus.emit('order.placed', {
@@ -109,6 +121,8 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
       latency: Date.now() - startTime,
       spread: 0,
       status: 'REJECTED',
+      error: err.message,
+      broker: product || 'default',
     });
     throw err;
   }
@@ -116,24 +130,21 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
 
 /**
  * Cancel a pending order by its contract ID.
- * @param {string} contractId - The contract/trade ID
+ * @param {string} contractId - The contract/trade ID (ticket)
  * @param {string} [product] - Trading product (optional)
  * @returns {Promise<Object>} Result from broker.
  */
 async function cancelOrder(contractId, product) {
   if (!contractId) throw new Error('contractId is required');
   const broker = getBroker(product);
+  if (!broker.capabilities?.supportsCancel) {
+    throw new Error('Broker does not support cancelling pending orders');
+  }
   if (!broker.isConnected()) {
     await broker.connect();
   }
-  // Use broker's cancelOrder if available, else closeTrade (Deriv)
-  let result;
-  if (typeof broker.cancelOrder === 'function') {
-    result = await broker.cancelOrder(contractId);
-  } else {
-    result = await broker.closeTrade(contractId);
-  }
-  // Update Order status to CANCELLED (uses contractId field)
+  const result = await broker.cancelOrder(contractId);
+  // Update Order status to CANCELLED
   await Order.findOneAndUpdate(
     { contractId },
     { status: 'CANCELLED', updatedAt: new Date() },
@@ -144,7 +155,7 @@ async function cancelOrder(contractId, product) {
 }
 
 /**
- * Close an open trade by its contract ID (updates Trade model).
+ * Close an open trade by its contract ID (updates Trade and Order models).
  * @param {string} contractId - Trade ID (contract ID)
  * @param {string} [product] - Trading product (optional)
  * @returns {Promise<Object>} Result from broker.
@@ -152,6 +163,9 @@ async function cancelOrder(contractId, product) {
 async function closeTrade(contractId, product) {
   if (!contractId) throw new Error('contractId is required');
   const broker = getBroker(product);
+  if (!broker.capabilities?.supportsClose) {
+    throw new Error('Broker does not support closing trades');
+  }
   const startTime = Date.now();
   if (!broker.isConnected()) {
     await broker.connect();
@@ -159,7 +173,8 @@ async function closeTrade(contractId, product) {
   try {
     const result = await broker.closeTrade(contractId);
     const latency = Date.now() - startTime;
-    // ---- FIX: Use contractId (was oandaTradeId) ----
+
+    // ---- Update Trade record ----
     const updatedTrade = await Trade.findOneAndUpdate(
       { contractId },
       {
@@ -172,7 +187,29 @@ async function closeTrade(contractId, product) {
     );
     if (!updatedTrade) {
       logger.warn(`[closeTrade] No Trade found with contractId: ${contractId}`);
+    } else {
+      // ---- Also update Order status to CLOSED ----
+      await Order.findOneAndUpdate(
+        { contractId },
+        { status: 'CLOSED', updatedAt: new Date() },
+        { upsert: false }
+      );
     }
+
+    // ---- Record analytics for close ----
+    executionAnalytics.recordExecution({
+      orderId: contractId,
+      instrument: updatedTrade?.instrument || 'unknown',
+      side: updatedTrade?.side || 'unknown',
+      requestedPrice: 0,
+      filledPrice: result.price || 0,
+      latency,
+      spread: 0,
+      status: 'CLOSED',
+      ticket: contractId,
+      broker: product || 'default',
+    });
+
     eventBus.emit('trade.closed', { contractId, result, timestamp: new Date().toISOString() });
     return result;
   } catch (err) {
@@ -182,30 +219,40 @@ async function closeTrade(contractId, product) {
 }
 
 /**
- * Get current spread for an instrument.
- * @param {string} instrument
- * @param {string} [product]
- * @returns {Promise<number>} Spread in pips.
+ * Modify stop-loss and take-profit for an open trade.
+ * @param {string} contractId - Trade ID (ticket)
+ * @param {number|null} stopLoss - New stop loss (or null to leave unchanged)
+ * @param {number|null} takeProfit - New take profit (or null to leave unchanged)
+ * @param {string} [product] - Trading product (optional)
+ * @returns {Promise<Object>} Result from broker.
  */
-async function getSpread(instrument, product) {
+async function modifyTrade(contractId, stopLoss, takeProfit, product) {
+  if (!contractId) throw new Error('contractId is required');
   const broker = getBroker(product);
-  try {
-    // Some brokers (like OANDA) have getPrices; MT5 may not.
-    // Gracefully fall back to 0 if method missing or fails.
-    const prices = await broker.getPrices([instrument]);
-    if (prices && prices.length > 0) {
-      const bid = parseFloat(prices[0].bids[0].price);
-      const ask = parseFloat(prices[0].asks[0].price);
-      return Math.abs(ask - bid) / 0.0001;
-    }
-  } catch (e) {
-    // ignore – likely 'getPrices is not a function' or network error
+  if (!broker.capabilities?.supportsModify) {
+    throw new Error('Broker does not support modifying SL/TP');
   }
-  return 0;
+  if (!broker.isConnected()) {
+    await broker.connect();
+  }
+  const result = await broker.modifySLTP(contractId, stopLoss, takeProfit);
+  // Update the Order and Trade records with new SL/TP
+  await Order.findOneAndUpdate(
+    { contractId },
+    { stopLoss, takeProfit, updatedAt: new Date() },
+    { upsert: false }
+  );
+  await Trade.findOneAndUpdate(
+    { contractId },
+    { stopLoss, takeProfit, updatedAt: new Date() },
+    { upsert: false }
+  );
+  eventBus.emit('order.modified', { contractId, stopLoss, takeProfit, result, timestamp: new Date().toISOString() });
+  return result;
 }
 
 /**
- * Get all open trades from the broker (not from DB).
+ * Get all open trades from the broker.
  * @param {string} [product]
  * @returns {Promise<Array>} List of open trade objects.
  */
@@ -252,9 +299,9 @@ module.exports = {
   placeMarketOrder,
   cancelOrder,
   closeTrade,
+  modifyTrade,
   getOpenTrades,
   getPositions,
   getExecutionAnalytics,
-  getSpread,
   deleteClosedTrades,
 };
