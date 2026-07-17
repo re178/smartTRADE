@@ -1,4 +1,4 @@
-// server.js – RTS Entry Point (with MT5 Bridge & full body read fix)
+// server.js – RTS Entry Point (with MT5 Bridge & manual body reader)
 
 require('dotenv').config();
 
@@ -50,7 +50,6 @@ async function cleanDatabaseAndCreateAdmin() {
 
   } catch (err) {
     console.error('❌ Database cleanup failed:', err.message);
-    // Continue anyway – maybe collections don't exist yet
   }
 }
 
@@ -58,37 +57,51 @@ async function cleanDatabaseAndCreateAdmin() {
 app.use(cors());
 
 // ================================================================
-// FIX: Use express.text() to read the raw body as a complete string
-// This forces the server to wait for all TCP packets before parsing.
+// FIX: Manual raw body reader – waits for ALL data chunks
+// This ensures the entire request body is captured, even if
+// split across multiple TCP packets.
 // ================================================================
-app.use(express.text({
-  type: 'application/json',
-  limit: '1mb',
-  verify: (req, res, buf) => {
-    req.rawBody = buf.toString('utf8');
-  }
-}));
-
-// Parse the raw body as JSON and attach to req.body
 app.use((req, res, next) => {
-  // Only for POST/PUT with Content-Type: application/json
-  if (['POST', 'PUT', 'PATCH'].includes(req.method) && 
-      req.headers['content-type']?.includes('application/json')) {
-    try {
-      req.body = JSON.parse(req.rawBody || '');
-      // If parsing succeeded, continue
-    } catch (err) {
-      console.error('========== JSON PARSE ERROR ==========');
-      console.error('Raw body length:', req.rawBody?.length);
-      console.error('Raw body:', req.rawBody);
-      console.error('Error:', err.message);
-      console.error('======================================');
-      return res.status(400).json({
-        error: 'Invalid JSON payload',
-        raw: req.rawBody,
-        message: err.message
-      });
+  let rawBody = '';
+  req.on('data', chunk => {
+    rawBody += chunk.toString();
+  });
+  req.on('end', () => {
+    req.rawBody = rawBody;
+    // If Content-Type is JSON, parse it now
+    const contentType = req.headers['content-type'] || '';
+    if (contentType.includes('application/json') && rawBody.length > 0) {
+      try {
+        req.body = JSON.parse(rawBody);
+      } catch (err) {
+        console.error('========== JSON PARSE ERROR ==========');
+        console.error('Raw body length:', rawBody.length);
+        console.error('Raw body:', rawBody);
+        console.error('Error:', err.message);
+        console.error('======================================');
+        // Still attach rawBody, but we'll return error later
+        req.body = null;
+        req.parseError = err;
+      }
+    } else {
+      req.body = {};
     }
+    next();
+  });
+  req.on('error', (err) => {
+    console.error('Request error:', err);
+    next(err);
+  });
+});
+
+// Handle JSON parse errors
+app.use((req, res, next) => {
+  if (req.parseError) {
+    return res.status(400).json({
+      error: 'Invalid JSON payload',
+      raw: req.rawBody,
+      message: req.parseError.message
+    });
   }
   next();
 });
@@ -99,7 +112,8 @@ app.use((req, res, next) => {
   console.log(new Date().toISOString());
   console.log(req.method, req.originalUrl);
   console.log('Headers:', JSON.stringify(req.headers, null, 2));
-  console.log('Body:', JSON.stringify(req.body, null, 2));
+  console.log('Body length:', req.rawBody?.length || 0);
+  console.log('Body:', req.rawBody);
   console.log('==============================');
   next();
 });
@@ -156,7 +170,7 @@ async function startServer() {
     console.log(`🔌 API base: http://localhost:${PORT}/api`);
     console.log(`🟢 MT5 Bridge endpoints: http://localhost:${PORT}/api/mt5`);
     console.log('📡 Request logging enabled for all endpoints.');
-    console.log('🛠️  JSON parser now reads full body (text() + manual parse).');
+    console.log('🛠️  Manual raw body reader enabled (waits for all chunks).');
   });
 }
 
