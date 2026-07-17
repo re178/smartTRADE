@@ -111,7 +111,7 @@ class MT5Broker extends EventEmitter {
     this.renderUrl = config.renderUrl || process.env.RENDER_URL || 'https://tradermarketopen.onrender.com';
     this.pollInterval = config.pollInterval || 1000;
     this.heartbeatInterval = config.heartbeatInterval || 5000;
-    this.priceRefreshInterval = config.priceRefreshInterval || 3000; // update prices every 3s
+    this.priceRefreshInterval = config.priceRefreshInterval || 30000; // 30s – now used for active polling
     this.reconnectBaseDelay = config.reconnectBaseDelay || 2000;
     this.maxReconnectDelay = config.maxReconnectDelay || 30000;
     this.maxRetries = config.maxRetries || 3;
@@ -251,7 +251,7 @@ class MT5Broker extends EventEmitter {
         this._startPolling();
         this._startHeartbeat();
         this._startReconcile();
-        this._startPriceRefresh();
+        this._startPriceRefresh(); // now actively polls prices
         this._flushQueue();
         this.emit('ready');
         this.emit('connected');
@@ -503,8 +503,8 @@ class MT5Broker extends EventEmitter {
       throw err;
     }
 
-    // Wait for result
-    const result = await this._waitForResult(cmdId, 30000);
+    // Wait for result (reduced timeout from 30s to 10s)
+    const result = await this._waitForResult(cmdId, 10000);
     if (!result.success) {
       await this._updateOrderStatus(clientOrderId, ORDER_STATUS.REJECTED, null, result.error || 'Execution failed');
       throw new Error(result.error || 'Order execution failed');
@@ -583,7 +583,7 @@ class MT5Broker extends EventEmitter {
       throw err;
     }
 
-    const result = await this._waitForResult(cmdId, 30000);
+    const result = await this._waitForResult(cmdId, 10000);
     if (!result.success) throw new Error(result.error || 'Close failed');
 
     if (clientOrderId) {
@@ -616,7 +616,7 @@ class MT5Broker extends EventEmitter {
       throw err;
     }
 
-    const result = await this._waitForResult(cmdId, 30000);
+    const result = await this._waitForResult(cmdId, 10000);
     if (!result.success) throw new Error(result.error || 'Modify failed');
 
     const clientOrderId = this._orderMap.get(String(tradeId));
@@ -654,7 +654,7 @@ class MT5Broker extends EventEmitter {
       throw err;
     }
 
-    const result = await this._waitForResult(cmdId, 30000);
+    const result = await this._waitForResult(cmdId, 10000);
     if (!result.success) throw new Error(result.error || 'Partial close failed');
 
     // Update order? We need to track partial close – we may create a new order for the remaining part.
@@ -678,7 +678,7 @@ class MT5Broker extends EventEmitter {
   // ============================================================
   // WAIT FOR COMMAND RESULT (POLLING)
   // ============================================================
-  _waitForResult(commandId, timeoutMs = 30000) {
+  _waitForResult(commandId, timeoutMs = 10000) { // reduced from 30s to 10s
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this._pendingCommands.delete(commandId);
@@ -776,40 +776,66 @@ class MT5Broker extends EventEmitter {
   }
 
   // ============================================================
-  // PRICE REFRESH (from EA price posts)
+  // PRICE REFRESH – ACTIVE POLLING (NO STREAMING)
   // ============================================================
-  // This method is called when the EA posts new prices to /api/mt5/prices
-  updatePrices(priceData) {
-    // priceData: { symbol: { bid, ask, mid, timestamp } }
-    const now = Date.now();
-    for (const [symbol, data] of Object.entries(priceData)) {
-      const mt5Symbol = this._toMT5Symbol(symbol) || symbol;
-      const bid = parseFloat(data.bid);
-      const ask = parseFloat(data.ask);
-      const mid = parseFloat(data.mid) || (bid && ask ? (bid + ask) / 2 : bid || ask);
-      if (!isNaN(mid)) {
-        this.priceCache.set(mt5Symbol, { bid, ask, mid, timestamp: data.timestamp || now });
-        this.metrics.priceUpdates++;
-        // Emit price event
-        this.emit('price', { symbol: mt5Symbol, bid, ask, mid, timestamp: data.timestamp || now });
-        // Update spread
-        if (bid && ask) {
-          const spread = (ask - bid) * 10000; // in points (approx)
-          this.spreadCache.set(mt5Symbol, spread);
+  async _refreshPrices() {
+    if (this._state !== STATE.READY) return;
+    const symbols = Array.from(this.supportedSymbols);
+    if (symbols.length === 0) return;
+
+    // Fetch prices in batches to avoid overwhelming the bridge
+    const batchSize = 10;
+    for (let i = 0; i < symbols.length; i += batchSize) {
+      const batch = symbols.slice(i, i + batchSize);
+      try {
+        // Use the getPrices method which will fetch from bridge if needed,
+        // but we want to update cache directly.
+        // We'll call the bridge directly for each symbol with a short timeout.
+        for (const sym of batch) {
+          try {
+            const resp = await this._axiosGet(`/api/mt5/tick/${sym}`, { timeout: 2000 });
+            const tick = resp.data;
+            if (tick) {
+              const bid = parseFloat(tick.bid) || parseFloat(tick.price) - 0.00005;
+              const ask = parseFloat(tick.ask) || parseFloat(tick.price) + 0.00005;
+              const mid = (bid + ask) / 2;
+              const timestamp = tick.time || Date.now();
+              this.priceCache.set(sym, { bid, ask, mid, timestamp });
+              // Emit price event for live dashboards
+              this.emit('price', { symbol: sym, bid, ask, mid, timestamp });
+              this.metrics.priceUpdates++;
+            }
+          } catch (err) {
+            // Log but don't fail the whole batch
+            logger.debug(`[MT5Broker] Failed to fetch tick for ${sym}: ${err.message}`);
+          }
         }
+      } catch (err) {
+        logger.warn(`[MT5Broker] Price refresh batch failed: ${err.message}`);
       }
     }
   }
 
   _startPriceRefresh() {
-    // No need for a timer if EA pushes prices.
-    // We keep this as placeholder.
-    // But we can also periodically request prices from the bridge if needed.
-    // We'll rely on EA posting.
+    if (this._priceRefreshTimer) return;
+    const interval = this.priceRefreshInterval || 30000;
+    this._priceRefreshTimer = setInterval(async () => {
+      try {
+        await this._refreshPrices();
+      } catch (err) {
+        logger.warn('[MT5Broker] Periodic price refresh error:', err.message);
+      }
+    }, interval);
+    // Run immediately on start
+    this._refreshPrices().catch(err => logger.warn('[MT5Broker] Initial price refresh error:', err.message));
+    logger.info(`[MT5Broker] Started active price polling every ${interval}ms`);
   }
 
   _stopPriceRefresh() {
-    // Nothing to stop.
+    if (this._priceRefreshTimer) {
+      clearInterval(this._priceRefreshTimer);
+      this._priceRefreshTimer = null;
+    }
   }
 
   // ============================================================
@@ -1235,12 +1261,15 @@ class MT5Broker extends EventEmitter {
   async getPositions() { return this.getOpenTrades(); }
 
   // ---------- Get Prices ----------
+  // Now uses cache primarily; if cache empty, falls back to bridge with short timeout.
   async getPrices(instruments) {
     const results = [];
+    const missing = [];
+
     for (const inst of instruments) {
       const mt5Symbol = this._toMT5Symbol(inst);
       const cached = this.priceCache.get(mt5Symbol);
-      if (cached) {
+      if (cached && (Date.now() - cached.timestamp < 30000)) { // cache valid for 30s
         results.push({
           instrument: inst,
           bids: [{ price: cached.bid ? cached.bid.toFixed(5) : (cached.mid - 0.00005).toFixed(5) }],
@@ -1248,23 +1277,34 @@ class MT5Broker extends EventEmitter {
           time: cached.timestamp,
         });
       } else {
-        // Fallback to bridge
-        try {
-          const resp = await this._axiosGet(`/api/mt5/tick/${mt5Symbol}`, { timeout: 3000 });
-          const tick = resp.data;
-          if (tick) {
-            results.push({
-              instrument: inst,
-              bids: [{ price: tick.bid ? tick.bid.toFixed(5) : (tick.price - 0.00005).toFixed(5) }],
-              asks: [{ price: tick.ask ? tick.ask.toFixed(5) : (tick.price + 0.00005).toFixed(5) }],
-              time: tick.time || Date.now(),
-            });
-          }
-        } catch (err) {
-          logger.warn(`[MT5Broker] Failed to get price for ${inst}:`, err.message);
-        }
+        missing.push(mt5Symbol);
       }
     }
+
+    // If we have missing symbols, fetch them one by one with a short timeout
+    for (const sym of missing) {
+      try {
+        const resp = await this._axiosGet(`/api/mt5/tick/${sym}`, { timeout: 2000 });
+        const tick = resp.data;
+        if (tick) {
+          const bid = parseFloat(tick.bid) || parseFloat(tick.price) - 0.00005;
+          const ask = parseFloat(tick.ask) || parseFloat(tick.price) + 0.00005;
+          const mid = (bid + ask) / 2;
+          const timestamp = tick.time || Date.now();
+          // Cache it
+          this.priceCache.set(sym, { bid, ask, mid, timestamp });
+          results.push({
+            instrument: this.reverseMap[sym] || sym,
+            bids: [{ price: bid.toFixed(5) }],
+            asks: [{ price: ask.toFixed(5) }],
+            time: timestamp,
+          });
+        }
+      } catch (err) {
+        logger.warn(`[MT5Broker] Failed to fetch tick for ${sym}:`, err.message);
+      }
+    }
+
     return results;
   }
 
@@ -1387,12 +1427,17 @@ class MT5Broker extends EventEmitter {
 }
 
 // ============================================================
-// EXPORT – singleton AND class
+// EXPORT – class as default, instance as named export
 // ============================================================
+// Main export = the class (so `new MT5Broker()` works)
+module.exports = MT5Broker;
+
+// Provide a default instance (optional)
 const mt5BrokerInstance = new MT5Broker({
   renderUrl: process.env.RENDER_URL,
   pollInterval: parseInt(process.env.MT5_POLL_INTERVAL) || 1000,
   heartbeatInterval: parseInt(process.env.MT5_HEARTBEAT_INTERVAL) || 5000,
+  priceRefreshInterval: parseInt(process.env.MT5_PRICE_REFRESH_INTERVAL) || 30000,
   reconnectBaseDelay: parseInt(process.env.MT5_RECONNECT_DELAY) || 2000,
   maxReconnectDelay: parseInt(process.env.MT5_MAX_RECONNECT_DELAY) || 30000,
   maxRetries: parseInt(process.env.MT5_MAX_RETRIES) || 3,
@@ -1408,5 +1453,6 @@ const mt5BrokerInstance = new MT5Broker({
   duplicateCommandTTL: parseInt(process.env.MT5_DUPLICATE_TTL) || 300000,
 });
 
-module.exports = mt5BrokerInstance;
+// Named exports for backward compatibility
+module.exports.mt5Broker = mt5BrokerInstance;
 module.exports.MT5Broker = MT5Broker;
