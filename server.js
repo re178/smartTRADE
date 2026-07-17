@@ -1,4 +1,4 @@
-// server.js – RTS Entry Point (with MT5 Bridge & manual body reader)
+// server.js – RTS Entry Point (with MT5 Bridge & JSON repair)
 
 require('dotenv').config();
 
@@ -53,13 +53,47 @@ async function cleanDatabaseAndCreateAdmin() {
   }
 }
 
+// ---------- Helper: Repair truncated JSON ----------
+function repairJson(raw) {
+  // Count open braces and brackets
+  let openBraces = 0;
+  let openBrackets = 0;
+  let inString = false;
+  let escape = false;
+
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === '\\') {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === '{') openBraces++;
+    else if (ch === '}') openBraces--;
+    else if (ch === '[') openBrackets++;
+    else if (ch === ']') openBrackets--;
+  }
+
+  let repaired = raw;
+  // Append missing closing brackets/braces
+  while (openBrackets > 0) { repaired += ']'; openBrackets--; }
+  while (openBraces > 0) { repaired += '}'; openBraces--; }
+  return repaired;
+}
+
 // ---------- Middleware ----------
 app.use(cors());
 
 // ================================================================
-// FIX: Manual raw body reader – waits for ALL data chunks
-// This ensures the entire request body is captured, even if
-// split across multiple TCP packets.
+// Manual raw body reader with JSON repair
 // ================================================================
 app.use((req, res, next) => {
   let rawBody = '';
@@ -68,20 +102,50 @@ app.use((req, res, next) => {
   });
   req.on('end', () => {
     req.rawBody = rawBody;
-    // If Content-Type is JSON, parse it now
+
+    // If Content-Type is JSON, try to parse it, repairing if needed
     const contentType = req.headers['content-type'] || '';
     if (contentType.includes('application/json') && rawBody.length > 0) {
+      let parsed = null;
+      let parseError = null;
+      let repaired = rawBody;
+
+      // First attempt: parse as is
       try {
-        req.body = JSON.parse(rawBody);
+        parsed = JSON.parse(rawBody);
       } catch (err) {
+        // If parsing fails, try to repair
+        if (err instanceof SyntaxError && err.message.includes('Unexpected end')) {
+          repaired = repairJson(rawBody);
+          try {
+            parsed = JSON.parse(repaired);
+            console.log('✅ JSON repaired successfully.');
+            console.log('   Original:', rawBody);
+            console.log('   Repaired:', repaired);
+          } catch (err2) {
+            parseError = err2;
+          }
+        } else {
+          parseError = err;
+        }
+      }
+
+      if (parsed !== null) {
+        req.body = parsed;
+        // If we used repaired, also attach original for debugging
+        if (repaired !== rawBody) {
+          req.originalRawBody = rawBody;
+          req.repairedRawBody = repaired;
+        }
+      } else {
+        req.body = null;
+        req.parseError = parseError || new Error('Invalid JSON');
         console.error('========== JSON PARSE ERROR ==========');
         console.error('Raw body length:', rawBody.length);
         console.error('Raw body:', rawBody);
-        console.error('Error:', err.message);
+        console.error('Repaired attempt:', repaired);
+        console.error('Error:', parseError?.message);
         console.error('======================================');
-        // Still attach rawBody, but we'll return error later
-        req.body = null;
-        req.parseError = err;
       }
     } else {
       req.body = {};
@@ -100,6 +164,7 @@ app.use((req, res, next) => {
     return res.status(400).json({
       error: 'Invalid JSON payload',
       raw: req.rawBody,
+      repaired: req.repairedRawBody || undefined,
       message: req.parseError.message
     });
   }
@@ -114,6 +179,9 @@ app.use((req, res, next) => {
   console.log('Headers:', JSON.stringify(req.headers, null, 2));
   console.log('Body length:', req.rawBody?.length || 0);
   console.log('Body:', req.rawBody);
+  if (req.repairedRawBody) {
+    console.log('Repaired:', req.repairedRawBody);
+  }
   console.log('==============================');
   next();
 });
@@ -170,7 +238,7 @@ async function startServer() {
     console.log(`🔌 API base: http://localhost:${PORT}/api`);
     console.log(`🟢 MT5 Bridge endpoints: http://localhost:${PORT}/api/mt5`);
     console.log('📡 Request logging enabled for all endpoints.');
-    console.log('🛠️  Manual raw body reader enabled (waits for all chunks).');
+    console.log('🛠️  JSON repair enabled for truncated payloads.');
   });
 }
 
