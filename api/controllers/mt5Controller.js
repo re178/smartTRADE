@@ -1,5 +1,15 @@
 const mongoose = require('mongoose');
 
+// ---------- Helper: Log endpoint ----------
+function logEndpoint(name, req, result) {
+  console.log('\n========== ' + name + ' ==========');
+  console.log('Request Body:');
+  console.log(JSON.stringify(req.body, null, 2));
+  console.log('Response:');
+  console.log(JSON.stringify(result, null, 2));
+  console.log('==================================');
+}
+
 // ---------- Models ----------
 const commandSchema = new mongoose.Schema({
   commandId: { type: String, required: true, unique: true, index: true },
@@ -53,33 +63,37 @@ const Position = mongoose.model('MT5Position', positionSchema);
 
 // ---------- Controllers ----------
 
-// 1. Create command (broker)
 exports.createCommand = async (req, res) => {
   try {
     const { commandId, action, instrument, side, units, stopLoss, takeProfit, tradeId } = req.body;
 
-    // FIX 1: Allow CLOSE/MODIFY without instrument
     if (!commandId || !action) {
-      return res.status(400).json({ error: 'commandId and action required' });
+      const err = { error: 'commandId and action required', received: req.body };
+      logEndpoint('createCommand', req, err);
+      return res.status(400).json(err);
     }
     if (action === 'OPEN' && !instrument) {
-      return res.status(400).json({ error: 'instrument required for OPEN orders' });
+      const err = { error: 'instrument required for OPEN orders', received: req.body };
+      logEndpoint('createCommand', req, err);
+      return res.status(400).json(err);
     }
 
     const newCmd = new Command({ commandId, action, instrument, side, units, stopLoss, takeProfit, tradeId });
     await newCmd.save();
-    res.status(201).json({ success: true });
+    const response = { success: true };
+    logEndpoint('createCommand', req, response);
+    res.status(201).json(response);
   } catch (err) {
-    console.error('MT5 createCommand error:', err);
-    res.status(500).json({ error: err.message });
+    const response = { error: err.message };
+    logEndpoint('createCommand', req, response);
+    res.status(500).json(response);
   }
 };
 
-// 2. Get pending commands (EA)
 exports.getPending = async (req, res) => {
   try {
     const commands = await Command.find({ status: 'pending' }).sort({ createdAt: 1 }).lean();
-    res.json(commands.map(c => ({
+    const response = commands.map(c => ({
       commandId: c.commandId,
       action: c.action,
       instrument: c.instrument,
@@ -88,18 +102,31 @@ exports.getPending = async (req, res) => {
       stopLoss: c.stopLoss,
       takeProfit: c.takeProfit,
       tradeId: c.tradeId,
-    })));
+    }));
+    logEndpoint('getPending', req, response);
+    res.json(response);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const response = { error: err.message };
+    logEndpoint('getPending', req, response);
+    res.status(500).json(response);
   }
 };
 
-// 3. Store execution result (EA)
 exports.handleResult = async (req, res) => {
   try {
     const { commandId, success, ticket, error } = req.body;
+    if (!commandId) {
+      const err = { error: 'commandId required', received: req.body };
+      logEndpoint('handleResult', req, err);
+      return res.status(400).json(err);
+    }
+
     const command = await Command.findOne({ commandId });
-    if (!command) return res.status(404).json({ error: 'Command not found' });
+    if (!command) {
+      const err = { error: 'Command not found', received: req.body };
+      logEndpoint('handleResult', req, err);
+      return res.status(404).json(err);
+    }
 
     command.status = success ? 'executed' : 'failed';
     command.ticket = ticket || 0;
@@ -107,56 +134,74 @@ exports.handleResult = async (req, res) => {
     command.executedAt = new Date();
     await command.save();
 
-    // FIX 3: Cleanup executed commands after 60 seconds
+    // Cleanup after 60 seconds
     setTimeout(async () => {
-      try {
-        await Command.deleteOne({ commandId });
-      } catch (e) {
-        // ignore
-      }
+      try { await Command.deleteOne({ commandId }); } catch (e) {}
     }, 60000);
 
-    res.json({ success: true });
+    const response = { success: true };
+    logEndpoint('handleResult', req, response);
+    res.json(response);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const response = { error: err.message };
+    logEndpoint('handleResult', req, response);
+    res.status(500).json(response);
   }
 };
 
-// 4. Poll result (broker)
 exports.getResult = async (req, res) => {
   try {
     const command = await Command.findOne({ commandId: req.params.commandId });
-    if (!command) return res.status(404).json({ error: 'Not found' });
-    if (command.status === 'pending') return res.status(404).json({ error: 'Pending' });
-    res.json({ success: command.status === 'executed', ticket: command.ticket, error: command.error });
+    if (!command) {
+      const response = { error: 'Not found' };
+      logEndpoint('getResult', req, response);
+      return res.status(404).json(response);
+    }
+    if (command.status === 'pending') {
+      const response = { error: 'Pending' };
+      logEndpoint('getResult', req, response);
+      return res.status(404).json(response);
+    }
+    const response = { success: command.status === 'executed', ticket: command.ticket, error: command.error };
+    logEndpoint('getResult', req, response);
+    res.json(response);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const response = { error: err.message };
+    logEndpoint('getResult', req, response);
+    res.status(500).json(response);
   }
 };
 
-// 5. Account status (EA posts)
 exports.updateAccount = async (req, res) => {
   try {
     const { login, balance, equity, margin, free_margin, profit, currency, server, status = 'online' } = req.body;
-    if (!login) return res.status(400).json({ error: 'login required' });
+    if (!login) {
+      const err = { error: 'login required', received: req.body };
+      logEndpoint('updateAccount', req, err);
+      return res.status(400).json(err);
+    }
+
     await Account.findOneAndUpdate(
       { login },
       { balance, equity, margin, free_margin, profit, currency, server, status, lastSeen: new Date() },
       { upsert: true, new: true }
     );
-    res.json({ success: true });
+    const response = { success: true };
+    logEndpoint('updateAccount', req, response);
+    res.json(response);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const response = { error: err.message };
+    logEndpoint('updateAccount', req, response);
+    res.status(500).json(response);
   }
 };
 
-// 6. Account status (dashboard/broker GET)
 exports.getAccount = async (req, res) => {
   try {
     const account = await Account.findOne().sort({ lastSeen: -1 });
-    // FIX 2: Return default offline status instead of 404
+    let response;
     if (!account) {
-      return res.json({
+      response = {
         login: 0,
         balance: 0,
         equity: 0,
@@ -165,15 +210,19 @@ exports.getAccount = async (req, res) => {
         profit: 0,
         currency: 'USD',
         status: 'offline'
-      });
+      };
+    } else {
+      response = account;
     }
-    res.json(account);
+    logEndpoint('getAccount', req, response);
+    res.json(response);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const response = { error: err.message };
+    logEndpoint('getAccount', req, response);
+    res.status(500).json(response);
   }
 };
 
-// 7. Positions (EA posts)
 exports.updatePositions = async (req, res) => {
   try {
     const { login } = req.body;
@@ -183,6 +232,7 @@ exports.updatePositions = async (req, res) => {
       const latest = await Account.findOne().sort({ lastSeen: -1 });
       accountLogin = latest ? latest.login : 0;
     }
+
     await Position.deleteMany({ login: accountLogin });
     if (positions.length) {
       const docs = positions.map(p => ({
@@ -205,52 +255,79 @@ exports.updatePositions = async (req, res) => {
       }));
       await Position.insertMany(docs);
     }
-    res.json({ success: true });
+    const response = { success: true };
+    logEndpoint('updatePositions', req, response);
+    res.json(response);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const response = { error: err.message };
+    logEndpoint('updatePositions', req, response);
+    res.status(500).json(response);
   }
 };
 
-// 8. Positions (dashboard/broker GET)
 exports.getPositions = async (req, res) => {
   try {
     const latest = await Account.findOne().sort({ lastSeen: -1 });
-    if (!latest) return res.json({ positions: [] });
-    const positions = await Position.find({ login: latest.login }).lean();
-    res.json({ positions });
+    let response;
+    if (!latest) {
+      response = { positions: [] };
+    } else {
+      const positions = await Position.find({ login: latest.login }).lean();
+      response = { positions };
+    }
+    logEndpoint('getPositions', req, response);
+    res.json(response);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const response = { error: err.message };
+    logEndpoint('getPositions', req, response);
+    res.status(500).json(response);
   }
 };
 
-// 9. Heartbeat (EA)
 exports.handleHeartbeat = async (req, res) => {
   try {
     const { login, status = 'online', timestamp } = req.body;
-    if (!login) return res.status(400).json({ error: 'login required' });
+    if (!login) {
+      const err = { error: 'login required', received: req.body };
+      logEndpoint('handleHeartbeat', req, err);
+      return res.status(400).json(err);
+    }
+
     await Account.findOneAndUpdate(
       { login },
       { status, lastSeen: new Date() },
       { upsert: true }
     );
-    res.json({ success: true });
+    const response = { success: true };
+    logEndpoint('handleHeartbeat', req, response);
+    res.json(response);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const response = { error: err.message };
+    logEndpoint('handleHeartbeat', req, response);
+    res.status(500).json(response);
   }
 };
 
-// 10. Sync (EA startup)
 exports.sync = async (req, res) => {
   try {
     const { login } = req.body;
-    if (!login) return res.status(400).json({ error: 'login required' });
+    if (!login) {
+      const err = { error: 'login required', received: req.body };
+      logEndpoint('sync', req, err);
+      return res.status(400).json(err);
+    }
+
     await Account.findOneAndUpdate(
       { login },
       { status: 'online', lastSeen: new Date() },
       { upsert: true }
     );
-    res.json({ success: true });
+    const response = { success: true };
+    logEndpoint('sync', req, response);
+    res.json(response);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const response = { error: err.message };
+    logEndpoint('sync', req, response);
+    res.status(500).json(response);
   }
 };
