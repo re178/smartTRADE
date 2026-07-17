@@ -1,6 +1,6 @@
 const mongoose = require('mongoose');
 
-// ---------- Models (defined here to avoid extra files) ----------
+// ---------- Models ----------
 const commandSchema = new mongoose.Schema({
   commandId: { type: String, required: true, unique: true, index: true },
   action: { type: String, enum: ['OPEN', 'CLOSE', 'MODIFY'], required: true },
@@ -52,12 +52,20 @@ const positionSchema = new mongoose.Schema({
 const Position = mongoose.model('MT5Position', positionSchema);
 
 // ---------- Controllers ----------
+
+// 1. Create command (broker)
 exports.createCommand = async (req, res) => {
   try {
     const { commandId, action, instrument, side, units, stopLoss, takeProfit, tradeId } = req.body;
-    if (!commandId || !action || !instrument) {
-      return res.status(400).json({ error: 'commandId, action, instrument required' });
+
+    // FIX 1: Allow CLOSE/MODIFY without instrument
+    if (!commandId || !action) {
+      return res.status(400).json({ error: 'commandId and action required' });
     }
+    if (action === 'OPEN' && !instrument) {
+      return res.status(400).json({ error: 'instrument required for OPEN orders' });
+    }
+
     const newCmd = new Command({ commandId, action, instrument, side, units, stopLoss, takeProfit, tradeId });
     await newCmd.save();
     res.status(201).json({ success: true });
@@ -67,6 +75,7 @@ exports.createCommand = async (req, res) => {
   }
 };
 
+// 2. Get pending commands (EA)
 exports.getPending = async (req, res) => {
   try {
     const commands = await Command.find({ status: 'pending' }).sort({ createdAt: 1 }).lean();
@@ -85,22 +94,35 @@ exports.getPending = async (req, res) => {
   }
 };
 
+// 3. Store execution result (EA)
 exports.handleResult = async (req, res) => {
   try {
     const { commandId, success, ticket, error } = req.body;
     const command = await Command.findOne({ commandId });
     if (!command) return res.status(404).json({ error: 'Command not found' });
+
     command.status = success ? 'executed' : 'failed';
     command.ticket = ticket || 0;
     command.error = error || '';
     command.executedAt = new Date();
     await command.save();
+
+    // FIX 3: Cleanup executed commands after 60 seconds
+    setTimeout(async () => {
+      try {
+        await Command.deleteOne({ commandId });
+      } catch (e) {
+        // ignore
+      }
+    }, 60000);
+
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 };
 
+// 4. Poll result (broker)
 exports.getResult = async (req, res) => {
   try {
     const command = await Command.findOne({ commandId: req.params.commandId });
@@ -112,6 +134,7 @@ exports.getResult = async (req, res) => {
   }
 };
 
+// 5. Account status (EA posts)
 exports.updateAccount = async (req, res) => {
   try {
     const { login, balance, equity, margin, free_margin, profit, currency, server, status = 'online' } = req.body;
@@ -127,16 +150,30 @@ exports.updateAccount = async (req, res) => {
   }
 };
 
+// 6. Account status (dashboard/broker GET)
 exports.getAccount = async (req, res) => {
   try {
     const account = await Account.findOne().sort({ lastSeen: -1 });
-    if (!account) return res.status(404).json({ error: 'No MT5 data yet' });
+    // FIX 2: Return default offline status instead of 404
+    if (!account) {
+      return res.json({
+        login: 0,
+        balance: 0,
+        equity: 0,
+        margin: 0,
+        free_margin: 0,
+        profit: 0,
+        currency: 'USD',
+        status: 'offline'
+      });
+    }
     res.json(account);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 };
 
+// 7. Positions (EA posts)
 exports.updatePositions = async (req, res) => {
   try {
     const { login } = req.body;
@@ -174,6 +211,7 @@ exports.updatePositions = async (req, res) => {
   }
 };
 
+// 8. Positions (dashboard/broker GET)
 exports.getPositions = async (req, res) => {
   try {
     const latest = await Account.findOne().sort({ lastSeen: -1 });
@@ -185,6 +223,7 @@ exports.getPositions = async (req, res) => {
   }
 };
 
+// 9. Heartbeat (EA)
 exports.handleHeartbeat = async (req, res) => {
   try {
     const { login, status = 'online', timestamp } = req.body;
@@ -200,6 +239,7 @@ exports.handleHeartbeat = async (req, res) => {
   }
 };
 
+// 10. Sync (EA startup)
 exports.sync = async (req, res) => {
   try {
     const { login } = req.body;
