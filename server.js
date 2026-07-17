@@ -1,4 +1,4 @@
-// server.js – RTS Entry Point (with MT5 Bridge & JSON Error Logging)
+// server.js – RTS Entry Point (with MT5 Bridge & full body read fix)
 
 require('dotenv').config();
 
@@ -57,31 +57,43 @@ async function cleanDatabaseAndCreateAdmin() {
 // ---------- Middleware ----------
 app.use(cors());
 
-// ---------- JSON Parser with Raw Body Capture & Error Handling ----------
-app.use(express.json({
+// ================================================================
+// FIX: Use express.text() to read the raw body as a complete string
+// This forces the server to wait for all TCP packets before parsing.
+// ================================================================
+app.use(express.text({
+  type: 'application/json',
+  limit: '1mb',
   verify: (req, res, buf) => {
     req.rawBody = buf.toString('utf8');
   }
 }));
 
-// Error handler for JSON syntax errors
-app.use((err, req, res, next) => {
-  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
-    console.error('========== INVALID JSON ==========');
-    console.error('Raw body received:');
-    console.error(req.rawBody);
-    console.error('Error:', err.message);
-    console.error('==================================');
-    return res.status(400).json({
-      error: 'Invalid JSON payload',
-      raw: req.rawBody,
-      message: err.message
-    });
+// Parse the raw body as JSON and attach to req.body
+app.use((req, res, next) => {
+  // Only for POST/PUT with Content-Type: application/json
+  if (['POST', 'PUT', 'PATCH'].includes(req.method) && 
+      req.headers['content-type']?.includes('application/json')) {
+    try {
+      req.body = JSON.parse(req.rawBody || '');
+      // If parsing succeeded, continue
+    } catch (err) {
+      console.error('========== JSON PARSE ERROR ==========');
+      console.error('Raw body length:', req.rawBody?.length);
+      console.error('Raw body:', req.rawBody);
+      console.error('Error:', err.message);
+      console.error('======================================');
+      return res.status(400).json({
+        error: 'Invalid JSON payload',
+        raw: req.rawBody,
+        message: err.message
+      });
+    }
   }
-  next(err);
+  next();
 });
 
-// ---------- Request Logger Middleware (after JSON parser) ----------
+// ---------- Request Logger Middleware ----------
 app.use((req, res, next) => {
   console.log('\n==============================');
   console.log(new Date().toISOString());
@@ -144,7 +156,7 @@ async function startServer() {
     console.log(`🔌 API base: http://localhost:${PORT}/api`);
     console.log(`🟢 MT5 Bridge endpoints: http://localhost:${PORT}/api/mt5`);
     console.log('📡 Request logging enabled for all endpoints.');
-    console.log('🛠️  JSON syntax errors will be logged with raw body.');
+    console.log('🛠️  JSON parser now reads full body (text() + manual parse).');
   });
 }
 
