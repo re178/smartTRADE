@@ -1,4 +1,4 @@
-// server.js – RTS Entry Point (with MT5 Bridge & JSON repair)
+// server.js – RTS Entry Point (with MT5 Bridge & robust JSON repair)
 
 require('dotenv').config();
 
@@ -18,8 +18,6 @@ const mt5Routes = require('./api/routes/mt5');
 
 // Models
 const User = require('./models/User');
-const Order = require('./models/Order');
-const Trade = require('./models/Trade');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -31,38 +29,38 @@ connectDB();
 async function cleanDatabaseAndCreateAdmin() {
   try {
     console.log('🧹 Cleaning database...');
-
     const collections = await mongoose.connection.db.collections();
     for (const collection of collections) {
       await collection.drop();
       console.log(`   Dropped collection: ${collection.collectionName}`);
     }
-
     console.log('✅ Database cleaned successfully.');
 
     const defaultProduct = process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd';
-    const admin = new User({
-      userId: 'admin',
-      tradingProduct: defaultProduct,
-    });
+    const admin = new User({ userId: 'admin', tradingProduct: defaultProduct });
     await admin.save();
     console.log(`✅ Admin user created with product: ${defaultProduct}`);
-
   } catch (err) {
     console.error('❌ Database cleanup failed:', err.message);
   }
 }
 
-// ---------- Helper: Repair truncated JSON ----------
+// ---------- JSON Repair Helper ----------
 function repairJson(raw) {
+  let repaired = raw.trim();
+  // Remove trailing comma if present (before any potential closing)
+  if (repaired.endsWith(',')) {
+    repaired = repaired.slice(0, -1);
+  }
+
   // Count open braces and brackets
   let openBraces = 0;
   let openBrackets = 0;
   let inString = false;
   let escape = false;
 
-  for (let i = 0; i < raw.length; i++) {
-    const ch = raw[i];
+  for (let i = 0; i < repaired.length; i++) {
+    const ch = repaired[i];
     if (escape) {
       escape = false;
       continue;
@@ -82,19 +80,17 @@ function repairJson(raw) {
     else if (ch === ']') openBrackets--;
   }
 
-  let repaired = raw;
   // Append missing closing brackets/braces
   while (openBrackets > 0) { repaired += ']'; openBrackets--; }
   while (openBraces > 0) { repaired += '}'; openBraces--; }
+
   return repaired;
 }
 
 // ---------- Middleware ----------
 app.use(cors());
 
-// ================================================================
-// Manual raw body reader with JSON repair
-// ================================================================
+// ---------- Manual Raw Body Reader with JSON Repair ----------
 app.use((req, res, next) => {
   let rawBody = '';
   req.on('data', chunk => {
@@ -103,19 +99,17 @@ app.use((req, res, next) => {
   req.on('end', () => {
     req.rawBody = rawBody;
 
-    // If Content-Type is JSON, try to parse it, repairing if needed
     const contentType = req.headers['content-type'] || '';
     if (contentType.includes('application/json') && rawBody.length > 0) {
       let parsed = null;
-      let parseError = null;
       let repaired = rawBody;
 
-      // First attempt: parse as is
+      // First, try to parse as is
       try {
         parsed = JSON.parse(rawBody);
       } catch (err) {
-        // If parsing fails, try to repair
-        if (err instanceof SyntaxError && err.message.includes('Unexpected end')) {
+        // On any SyntaxError, attempt repair
+        if (err instanceof SyntaxError) {
           repaired = repairJson(rawBody);
           try {
             parsed = JSON.parse(repaired);
@@ -123,28 +117,31 @@ app.use((req, res, next) => {
             console.log('   Original:', rawBody);
             console.log('   Repaired:', repaired);
           } catch (err2) {
-            parseError = err2;
+            // If repair fails, log and keep null
+            console.error('❌ JSON repair also failed:', err2.message);
+            console.error('   Raw:', rawBody);
+            console.error('   Repaired:', repaired);
           }
         } else {
-          parseError = err;
+          // Non‑syntax error, rethrow
+          throw err;
         }
       }
 
       if (parsed !== null) {
         req.body = parsed;
-        // If we used repaired, also attach original for debugging
         if (repaired !== rawBody) {
-          req.originalRawBody = rawBody;
           req.repairedRawBody = repaired;
         }
       } else {
-        req.body = null;
-        req.parseError = parseError || new Error('Invalid JSON');
+        // If we couldn't parse even after repair, we still set an empty body
+        // but we'll log the error and continue (we return 200 later)
+        req.body = {};
+        req.parseError = new Error('Invalid JSON after repair');
         console.error('========== JSON PARSE ERROR ==========');
         console.error('Raw body length:', rawBody.length);
         console.error('Raw body:', rawBody);
         console.error('Repaired attempt:', repaired);
-        console.error('Error:', parseError?.message);
         console.error('======================================');
       }
     } else {
@@ -158,27 +155,15 @@ app.use((req, res, next) => {
   });
 });
 
-// Handle JSON parse errors
-app.use((req, res, next) => {
-  if (req.parseError) {
-    return res.status(400).json({
-      error: 'Invalid JSON payload',
-      raw: req.rawBody,
-      repaired: req.repairedRawBody || undefined,
-      message: req.parseError.message
-    });
-  }
-  next();
-});
-
-// ---------- Request Logger Middleware ----------
+// ---------- Request Logger ----------
 app.use((req, res, next) => {
   console.log('\n==============================');
   console.log(new Date().toISOString());
   console.log(req.method, req.originalUrl);
-  console.log('Headers:', JSON.stringify(req.headers, null, 2));
   console.log('Body length:', req.rawBody?.length || 0);
-  console.log('Body:', req.rawBody);
+  if (req.rawBody && req.rawBody.length > 0) {
+    console.log('Raw Body:', req.rawBody);
+  }
   if (req.repairedRawBody) {
     console.log('Repaired:', req.repairedRawBody);
   }
@@ -210,8 +195,6 @@ app.use(async (req, res, next) => {
 
 // ---------- API Routes ----------
 app.use('/api', apiRoutes);
-
-// ---------- MT5 Bridge Routes ----------
 app.use('/api/mt5', mt5Routes);
 
 // ---------- Health Check ----------
@@ -231,14 +214,13 @@ app.get('*', (req, res) => {
 // ---------- Start Server ----------
 async function startServer() {
   await cleanDatabaseAndCreateAdmin();
-
   app.listen(PORT, () => {
     console.log(`✅ RTS server running on http://localhost:${PORT}`);
     console.log(`📊 Dashboard: http://localhost:${PORT}`);
     console.log(`🔌 API base: http://localhost:${PORT}/api`);
     console.log(`🟢 MT5 Bridge endpoints: http://localhost:${PORT}/api/mt5`);
-    console.log('📡 Request logging enabled for all endpoints.');
-    console.log('🛠️  JSON repair enabled for truncated payloads.');
+    console.log('📡 Request logging enabled.');
+    console.log('🛠️  JSON repair enabled (auto‑closes missing braces).');
   });
 }
 
