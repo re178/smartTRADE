@@ -4,8 +4,8 @@ const { getBroker } = require('./brokerFactory');
 const eventBus = require('../../infrastructure/eventBus');
 const { validateOrderInput } = require('../../shared/validators');
 const { ExecutionAnalytics } = require('../analytics/performanceSuite');
-const Order = require('../../models/Order');   // for pending orders
-const Trade = require('../../models/Trade');   // for completed trades
+const Order = require('../../models/Order');   // for all orders (including market)
+const Trade = require('../../models/Trade');   // for open/closed trades
 const logger = require('../../infrastructure/logger') || console;
 
 // Singleton Execution Analytics instance
@@ -41,20 +41,51 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
     const result = await broker.placeMarketOrder(instrument, units, stopLoss, takeProfit);
     const latency = Date.now() - startTime;
 
+    // ---- FIX: Use generic contractId (tradeID from MT5, or id from other brokers) ----
+    const contractId = result.tradeID || result.id || null;
+    const price = result.price || result.averagePrice || null;
+
+    // ---- FIX: Create Order document (was missing) ----
+    const newOrder = new Order({
+      contractId,
+      instrument,
+      side: side.toUpperCase(),
+      lotSize,
+      stopLoss,
+      takeProfit,
+      status: 'FILLED',
+      product,               // store which broker/product was used
+      filledPrice: price,
+      placedAt: new Date(),
+    });
+    await newOrder.save();
+
+    // ---- FIX: Also create a Trade record (open trade) ----
+    const newTrade = new Trade({
+      contractId,            // use this generic field instead of oandaTradeId
+      instrument,
+      side: side.toUpperCase(),
+      lotSize,
+      openPrice: price,
+      status: 'OPEN',
+      openTime: new Date(),
+      product,
+      // optionally store stopLoss/takeProfit if needed
+    });
+    await newTrade.save();
+
+    // Record analytics (spread may be 0 if broker doesn't support getPrices)
     const spread = await getSpread(instrument, product);
     executionAnalytics.recordExecution({
-      orderId: result.id || 'N/A',
+      orderId: contractId || 'N/A',
       instrument,
       side,
-      requestedPrice: result.price || 0,
-      filledPrice: result.price || 0,
+      requestedPrice: price || 0,
+      filledPrice: price || 0,
       latency,
       spread: spread || 0,
       status: 'FILLED',
     });
-
-    const contractId = result.tradeID || result.id || null;
-    const price = result.price || result.averagePrice || null;
 
     eventBus.emit('order.placed', {
       instrument,
@@ -102,9 +133,9 @@ async function cancelOrder(contractId, product) {
   } else {
     result = await broker.closeTrade(contractId);
   }
-  // Update Order status to CANCELLED
+  // Update Order status to CANCELLED (uses contractId field)
   await Order.findOneAndUpdate(
-    { contractId: contractId },
+    { contractId },
     { status: 'CANCELLED', updatedAt: new Date() },
     { upsert: false }
   );
@@ -128,12 +159,20 @@ async function closeTrade(contractId, product) {
   try {
     const result = await broker.closeTrade(contractId);
     const latency = Date.now() - startTime;
-    // Update Trade status to CLOSED
-    await Trade.findOneAndUpdate(
-      { oandaTradeId: contractId }, // or contractId if you store it
-      { status: 'CLOSED', closeTime: new Date(), closePrice: result.price || null, pnl: result.pl || 0 },
+    // ---- FIX: Use contractId (was oandaTradeId) ----
+    const updatedTrade = await Trade.findOneAndUpdate(
+      { contractId },
+      {
+        status: 'CLOSED',
+        closeTime: new Date(),
+        closePrice: result.price || null,
+        pnl: result.pl || 0,
+      },
       { new: true }
     );
+    if (!updatedTrade) {
+      logger.warn(`[closeTrade] No Trade found with contractId: ${contractId}`);
+    }
     eventBus.emit('trade.closed', { contractId, result, timestamp: new Date().toISOString() });
     return result;
   } catch (err) {
@@ -151,13 +190,17 @@ async function closeTrade(contractId, product) {
 async function getSpread(instrument, product) {
   const broker = getBroker(product);
   try {
+    // Some brokers (like OANDA) have getPrices; MT5 may not.
+    // Gracefully fall back to 0 if method missing or fails.
     const prices = await broker.getPrices([instrument]);
     if (prices && prices.length > 0) {
       const bid = parseFloat(prices[0].bids[0].price);
       const ask = parseFloat(prices[0].asks[0].price);
       return Math.abs(ask - bid) / 0.0001;
     }
-  } catch (e) {}
+  } catch (e) {
+    // ignore – likely 'getPrices is not a function' or network error
+  }
   return 0;
 }
 
