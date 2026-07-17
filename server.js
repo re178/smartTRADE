@@ -1,4 +1,4 @@
-// server.js – RTS Entry Point (with MT5 Bridge integration)
+// server.js – RTS Entry Point (with MT5 Bridge & Request Logging)
 
 require('dotenv').config();
 
@@ -32,7 +32,6 @@ async function cleanDatabaseAndCreateAdmin() {
   try {
     console.log('🧹 Cleaning database...');
 
-    // Drop all collections (this wipes everything)
     const collections = await mongoose.connection.db.collections();
     for (const collection of collections) {
       await collection.drop();
@@ -41,7 +40,6 @@ async function cleanDatabaseAndCreateAdmin() {
 
     console.log('✅ Database cleaned successfully.');
 
-    // Create admin user with default product
     const defaultProduct = process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd';
     const admin = new User({
       userId: 'admin',
@@ -59,6 +57,19 @@ async function cleanDatabaseAndCreateAdmin() {
 // ---------- Middleware ----------
 app.use(cors());
 app.use(express.json());
+
+// ========== REQUEST LOGGER MIDDLEWARE (for ALL requests) ==========
+app.use((req, res, next) => {
+  console.log('\n==============================');
+  console.log(new Date().toISOString());
+  console.log(req.method, req.originalUrl);
+  console.log('Headers:', JSON.stringify(req.headers, null, 2));
+  console.log('Body:', JSON.stringify(req.body, null, 2));
+  console.log('==============================');
+  next();
+});
+// =================================================================
+
 app.use(express.static('public'));
 
 // ---------- Admin User Middleware ----------
@@ -67,7 +78,6 @@ app.use(async (req, res, next) => {
     const adminId = 'admin';
     let admin = await User.findOne({ userId: adminId });
     if (!admin) {
-      // Fallback: create if not exists (should already exist)
       const defaultProduct = process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd';
       admin = new User({ userId: adminId, tradingProduct: defaultProduct });
       await admin.save();
@@ -85,7 +95,7 @@ app.use(async (req, res, next) => {
 // ---------- API Routes ----------
 app.use('/api', apiRoutes);
 
-// ---------- MT5 Bridge Routes (NEW) ----------
+// ---------- MT5 Bridge Routes ----------
 app.use('/api/mt5', mt5Routes);
 
 // ---------- Health Check ----------
@@ -104,7 +114,6 @@ app.get('*', (req, res) => {
 
 // ---------- Start Server ----------
 async function startServer() {
-  // Wait for DB connection and clean up before starting
   await cleanDatabaseAndCreateAdmin();
 
   app.listen(PORT, () => {
@@ -112,6 +121,7 @@ async function startServer() {
     console.log(`📊 Dashboard: http://localhost:${PORT}`);
     console.log(`🔌 API base: http://localhost:${PORT}/api`);
     console.log(`🟢 MT5 Bridge endpoints: http://localhost:${PORT}/api/mt5`);
+    console.log('📡 Request logging enabled for all endpoints.');
   });
 }
 
