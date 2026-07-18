@@ -9,7 +9,7 @@ class MT5Broker extends EventEmitter {
   constructor(config = {}) {
     super();
     this.renderUrl = config.renderUrl || process.env.RENDER_URL || 'https://tradermarketopen.onrender.com';
-    this.pollInterval = config.pollInterval || 2000; // increased from 1000 to be gentler
+    this.pollInterval = config.pollInterval || 2000; // ms between result checks
     this._state = 'DISCONNECTED';
     this._pendingCommands = new Map(); // commandId -> { resolve, reject, timeout }
     this._pollingTimer = null;
@@ -25,20 +25,20 @@ class MT5Broker extends EventEmitter {
     // ---- Updated capabilities ----
     this.capabilities = {
       supportsMarketOrders: true,
-      supportsLimitOrders: true,        // FIX: now true
-      supportsPendingOrders: true,      // FIX: now true
+      supportsLimitOrders: true,
+      supportsPendingOrders: true,
       supportsModify: true,
       supportsClose: true,
       supportsCancel: true,
-      supportsPartialClose: false,      // optional; EA can support but we set false if not yet
+      supportsPartialClose: false,
       supportsHedging: true,
       supportsNetting: false,
       supportsPriceFeed: true,
       supportsSpread: true,
-      supportsHistory: true,
+      supportsHistory: true,      // now we have a history endpoint
     };
 
-    this.serverName = 'MT5'; // for analytics
+    this.serverName = 'MT5';
 
     logger.info('[MT5Broker] Initialized with Render URL:', this.renderUrl);
   }
@@ -50,14 +50,22 @@ class MT5Broker extends EventEmitter {
     }
   }
 
-  // ---------- Connection ----------
+  // ---------- Connection with Heartbeat Check ----------
   async connect() {
     if (this._state === 'READY') return;
     try {
+      // First, check if the EA is alive via heartbeat
+      const heartbeatResp = await axios.get(`${this.renderUrl}/api/mt5/heartbeat`, { timeout: 3000 });
+      const heartbeat = heartbeatResp.data;
+      if (!heartbeat || !heartbeat.online) {
+        throw new Error('EA is not online according to heartbeat');
+      }
+      this._heartbeatState.eaOnline = true;
+
+      // Then check account status
       await axios.get(`${this.renderUrl}/api/mt5/account/status`, { timeout: 5000 });
       this._state = 'READY';
       this._heartbeatState.bridgeOnline = true;
-      this._heartbeatState.eaOnline = true;
       this._heartbeatState.brokerOnline = true;
       this._heartbeatState.tradingAllowed = true;
       this.emit('ready');
@@ -66,7 +74,7 @@ class MT5Broker extends EventEmitter {
       this._startPolling();
     } catch (err) {
       logger.error('[MT5Broker] Connection failed:', err.message);
-      throw new Error('MT5 Bridge unreachable');
+      throw new Error('MT5 Bridge unreachable or EA offline');
     }
   }
 
@@ -105,7 +113,6 @@ class MT5Broker extends EventEmitter {
       throw new Error(result.error || 'Order execution failed');
     }
 
-    // ---- FIX: Return execution price from result ----
     return {
       tradeID: String(result.ticket || result.tradeID || ''),
       ticket: result.ticket || result.tradeID || '',
@@ -163,7 +170,7 @@ class MT5Broker extends EventEmitter {
         `${this.renderUrl}/api/mt5/price/${encodeURIComponent(symbol)}`,
         { timeout: 5000 }
       );
-      return response.data; // { bid, ask, spread, digits, point, tick_size, tick_value, symbol, time }
+      return response.data;
     } catch (err) {
       logger.warn(`[MT5Broker] getPrice failed for ${symbol}:`, err.message);
       throw err;
@@ -179,6 +186,35 @@ class MT5Broker extends EventEmitter {
       logger.warn(`[MT5Broker] getSpread failed for ${symbol}:`, err.message);
       return 0;
     }
+  }
+
+  // ---------- getPrices (dashboard compatibility) ----------
+  async getPrices(instruments) {
+    if (!Array.isArray(instruments)) {
+      instruments = [instruments];
+    }
+    const results = [];
+    for (const symbol of instruments) {
+      try {
+        const priceData = await this.getPrice(symbol);
+        results.push({
+          symbol: priceData.symbol,
+          bids: [{ price: priceData.bid }],
+          asks: [{ price: priceData.ask }],
+          time: priceData.time,
+          spread: priceData.spread,
+        });
+      } catch (err) {
+        logger.warn(`[MT5Broker] getPrices failed for ${symbol}:`, err.message);
+        results.push({
+          symbol,
+          bids: [{ price: 0 }],
+          asks: [{ price: 0 }],
+          error: err.message,
+        });
+      }
+    }
+    return results;
   }
 
   // ---------- Get Trade by ticket ----------
@@ -231,7 +267,6 @@ class MT5Broker extends EventEmitter {
     if (this._pollingTimer) return;
     this._pollingTimer = setInterval(async () => {
       if (this._pendingCommands.size === 0) return;
-      // ---- FIX: Snapshot to avoid mutation issues ----
       const entries = Array.from(this._pendingCommands.entries());
       for (const [cmdId, pending] of entries) {
         try {
