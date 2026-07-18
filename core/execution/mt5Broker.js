@@ -64,11 +64,11 @@ class MT5Broker extends EventEmitter {
     }
   }
 
-  // ---------- Connection: tolerant of missing account status ----------
+  // ---------- Connection (tolerant – does not fail on missing account status) ----------
   async connect() {
     if (this._state === 'READY') return;
     try {
-      // Try to get account status, but don't fail if it's not available yet
+      // Try to get account status, but don't fail if not available yet
       let accountAvailable = false;
       try {
         const statusResp = await axios.get(`${this.renderUrl}/api/mt5/account/status`, {
@@ -85,10 +85,9 @@ class MT5Broker extends EventEmitter {
         } else {
           logger.warn('[MT5Broker] Account status check failed:', err.message);
         }
-        // We continue – the bridge is still considered reachable
+        // Continue – bridge considered reachable even without account yet
       }
 
-      // Assume the bridge is ready if we can reach the server (even if no account yet)
       this._state = 'READY';
       this._heartbeatState.bridgeOnline = true;
       this._heartbeatState.eaOnline = true;
@@ -350,39 +349,47 @@ class MT5Broker extends EventEmitter {
     this._pendingCommands.clear();
   }
 
-  // ---------- Get Account ----------
+  // ---------- Get Account (with retry) ----------
   async getAccount() {
     await this._ensureReady();
-    try {
-      const response = await axios.get(
-        `${this.renderUrl}/api/mt5/account/status`,
-        {
-          headers: this._getHeaders(),
-          timeout: 5000,
+    // Retry up to 5 times with 1s delay to allow EA to send status
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const response = await axios.get(
+          `${this.renderUrl}/api/mt5/account/status`,
+          {
+            headers: this._getHeaders(),
+            timeout: 5000,
+          }
+        );
+        const data = response.data;
+        if (data && data.login) {
+          this._lastStatus = data;
+          return {
+            id: String(data.login),
+            balance: String(data.balance || 0),
+            currency: data.currency || 'USD',
+            equity: String(data.equity || 0),
+            marginUsed: String(data.margin || 0),
+            marginAvailable: String(data.free_margin || 0),
+            leverage: data.leverage || '0',
+            marginLevel: data.marginLevel || '0',
+            stopOut: data.stopOut || '0',
+            tradeMode: data.tradeMode || 'unknown',
+            company: data.company || '',
+            accountName: data.accountName || '',
+            server: data.server || '',
+          };
         }
-      );
-      const data = response.data;
-      if (data && data.login) {
-        this._lastStatus = data;
-        return {
-          id: String(data.login),
-          balance: String(data.balance || 0),
-          currency: data.currency || 'USD',
-          equity: String(data.equity || 0),
-          marginUsed: String(data.margin || 0),
-          marginAvailable: String(data.free_margin || 0),
-          leverage: data.leverage || '0',
-          marginLevel: data.marginLevel || '0',
-          stopOut: data.stopOut || '0',
-          tradeMode: data.tradeMode || 'unknown',
-          company: data.company || '',
-          accountName: data.accountName || '',
-          server: data.server || '',
-        };
+      } catch (err) {
+        logger.warn(`[MT5Broker] getAccount attempt ${attempt + 1} failed:`, err.message);
+        if (attempt < 4) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
       }
-    } catch (err) {
-      logger.warn('[MT5Broker] getAccount failed, returning default');
     }
+    // If all attempts fail, return default account
+    logger.warn('[MT5Broker] getAccount failed after retries, returning default');
     return {
       id: 'MT5_ACCOUNT',
       balance: '0',
