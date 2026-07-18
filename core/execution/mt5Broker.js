@@ -349,11 +349,14 @@ class MT5Broker extends EventEmitter {
     this._pendingCommands.clear();
   }
 
-  // ---------- Get Account (with retry) ----------
+  // ---------- Get Account (aggressive retry) ----------
   async getAccount() {
     await this._ensureReady();
-    // Retry up to 5 times with 1s delay to allow EA to send status
-    for (let attempt = 0; attempt < 5; attempt++) {
+
+    const maxAttempts = 15;
+    const delayMs = 1500;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
         const response = await axios.get(
           `${this.renderUrl}/api/mt5/account/status`,
@@ -365,6 +368,7 @@ class MT5Broker extends EventEmitter {
         const data = response.data;
         if (data && data.login) {
           this._lastStatus = data;
+          logger.info(`[MT5Broker] Account fetched on attempt ${attempt + 1}`);
           return {
             id: String(data.login),
             balance: String(data.balance || 0),
@@ -382,14 +386,16 @@ class MT5Broker extends EventEmitter {
           };
         }
       } catch (err) {
-        logger.warn(`[MT5Broker] getAccount attempt ${attempt + 1} failed:`, err.message);
-        if (attempt < 4) {
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        }
+        logger.warn(`[MT5Broker] getAccount attempt ${attempt + 1}/${maxAttempts} failed:`, err.message);
+      }
+
+      // Wait before next attempt (except after the last)
+      if (attempt < maxAttempts - 1) {
+        await new Promise(resolve => setTimeout(resolve, delayMs));
       }
     }
-    // If all attempts fail, return default account
-    logger.warn('[MT5Broker] getAccount failed after retries, returning default');
+
+    logger.warn('[MT5Broker] getAccount failed after all retries, returning default');
     return {
       id: 'MT5_ACCOUNT',
       balance: '0',
