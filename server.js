@@ -36,7 +36,7 @@ async function ensureAdmin() {
   }
 }
 
-// ---------- JSON Repair Helper (fallback only) ----------
+// ---------- JSON Repair Helper (fallback) ----------
 function repairJson(raw) {
   let repaired = raw.trim();
   if (repaired.endsWith(',')) {
@@ -62,33 +62,60 @@ function repairJson(raw) {
 // ---------- Middleware ----------
 app.use(cors());
 
-// ---------- SINGLE JSON PARSER (with raw body capture) ----------
-app.use(express.json({
-  limit: '2mb',
-  verify: (req, res, buf) => {
-    req.rawBody = buf.toString('utf8');
-  }
-}));
-
-// ---------- Fallback repair for malformed JSON ----------
-app.use((err, req, res, next) => {
-  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
-    const raw = req.rawBody || '';
-    console.warn('⚠️ Malformed JSON – attempting repair...');
-    console.warn('Raw (stringified):', JSON.stringify(raw));
-    try {
-      const repaired = repairJson(raw);
-      const parsed = JSON.parse(repaired);
-      req.body = parsed;
-      req.repairedRawBody = repaired;
-      console.log('✅ JSON repaired successfully.');
-      return next();
-    } catch (repairErr) {
-      console.error('❌ JSON repair failed:', repairErr.message);
-      console.error('   Raw:', raw);
+// ---------- Custom body parser: sanitize null bytes & BOM ----------
+app.use((req, res, next) => {
+  let rawBody = '';
+  req.on('data', chunk => {
+    rawBody += chunk.toString();
+  });
+  req.on('end', () => {
+    // 1. Remove BOM
+    if (rawBody.charCodeAt(0) === 0xFEFF) {
+      rawBody = rawBody.slice(1);
     }
-  }
-  next(err);
+    // 2. Remove all null bytes (\0)
+    rawBody = rawBody.replace(/\0/g, '');
+    // 3. Trim whitespace
+    const trimmed = rawBody.trim();
+    req.rawBody = trimmed;
+
+    const contentType = req.headers['content-type'] || '';
+    if (contentType.includes('application/json') && trimmed.length > 0) {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(trimmed);
+        req.body = parsed;
+      } catch (err) {
+        // Attempt repair only if parse failed
+        if (err instanceof SyntaxError) {
+          const repaired = repairJson(trimmed);
+          try {
+            parsed = JSON.parse(repaired);
+            req.body = parsed;
+            req.repairedRawBody = repaired;
+            console.log('✅ JSON repaired successfully.');
+            console.log('   Original (stringified):', JSON.stringify(trimmed));
+            console.log('   Repaired:', repaired);
+          } catch (err2) {
+            console.error('❌ JSON repair also failed:', err2.message);
+            console.error('   Raw (stringified):', JSON.stringify(trimmed));
+            console.error('   Repaired:', repaired);
+            req.body = {};
+            req.parseError = err2;
+          }
+        } else {
+          throw err;
+        }
+      }
+    } else {
+      req.body = {};
+    }
+    next();
+  });
+  req.on('error', (err) => {
+    console.error('Request body error:', err);
+    next(err);
+  });
 });
 
 // ---------- Request Logger (clean) ----------
@@ -158,6 +185,7 @@ async function startServer() {
     console.log(`🟢 MT5 Bridge endpoints: http://localhost:${PORT}/api/mt5`);
     console.log('📡 Request logging enabled.');
     console.log('🛠️  JSON repair enabled as fallback.');
+    console.log('🧹  Null bytes (\\0) stripped from all incoming JSON.');
     console.log('💾 MT5 data is persistent (MongoDB).');
   });
 }
