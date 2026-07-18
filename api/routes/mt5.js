@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const logger = require('../infrastructure/logger') || console;
+const logger = console;
 
 // Import Mongoose models
 const Mt5Command = require('../models/Mt5Command');
