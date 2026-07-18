@@ -9,7 +9,7 @@ class MT5Broker extends EventEmitter {
   constructor(config = {}) {
     super();
     this.renderUrl = config.renderUrl || process.env.RENDER_URL || 'https://tradermarketopen.onrender.com';
-    this.apiKey = config.apiKey || process.env.MT5_API_KEY || '';   // <-- NEW
+    this.apiKey = config.apiKey || process.env.MT5_API_KEY || '';
     this.pollInterval = config.pollInterval || 2000;
     this._state = 'DISCONNECTED';
     this._pendingCommands = new Map();
@@ -64,37 +64,32 @@ class MT5Broker extends EventEmitter {
     }
   }
 
-  // ---------- Connection with Heartbeat Check ----------
+  // ---------- Connection (uses account status, not heartbeat) ----------
   async connect() {
     if (this._state === 'READY') return;
     try {
-      // Check heartbeat (with API key)
-      const heartbeatResp = await axios.get(`${this.renderUrl}/api/mt5/heartbeat`, {
-        headers: this._getHeaders(),
-        timeout: 3000,
-      });
-      const heartbeat = heartbeatResp.data;
-      if (!heartbeat || !heartbeat.online) {
-        throw new Error('EA is not online according to heartbeat');
-      }
-      this._heartbeatState.eaOnline = true;
-
       // Check account status (with API key)
-      await axios.get(`${this.renderUrl}/api/mt5/account/status`, {
+      const statusResp = await axios.get(`${this.renderUrl}/api/mt5/account/status`, {
         headers: this._getHeaders(),
         timeout: 5000,
       });
+      const data = statusResp.data;
+      if (!data || !data.login) {
+        throw new Error('Invalid account status response');
+      }
+      this._lastStatus = data;
       this._state = 'READY';
       this._heartbeatState.bridgeOnline = true;
+      this._heartbeatState.eaOnline = true;    // EA is online if account status is available
       this._heartbeatState.brokerOnline = true;
       this._heartbeatState.tradingAllowed = true;
       this.emit('ready');
       this.emit('connected');
-      logger.info('[MT5Broker] Connected to MT5 Bridge');
+      logger.info('[MT5Broker] Connected to MT5 Bridge (via account status)');
       this._startPolling();
     } catch (err) {
       logger.error('[MT5Broker] Connection failed:', err.message);
-      throw new Error('MT5 Bridge unreachable or EA offline');
+      throw new Error('MT5 Bridge unreachable or EA offline (account status check failed)');
     }
   }
 
