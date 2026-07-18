@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const logger = console;
+const logger = require('../../infrastructure/logger') || console;
 
 // Import Mongoose models
 const Mt5Command = require('../../models/Mt5Command');
@@ -9,13 +9,29 @@ const Mt5Account = require('../../models/Mt5Account');
 const Mt5Position = require('../../models/Mt5Position');
 const Mt5Price = require('../../models/Mt5Price');
 const Mt5Heartbeat = require('../../models/Mt5Heartbeat');
+const Trade = require('../../models/Trade'); // for history
+
+// ---------- Authentication ----------
+const API_KEY = process.env.MT5_API_KEY || 'change-me-in-production';
+
+const authenticate = (req, res, next) => {
+  const key = req.headers['x-api-key'];
+  if (key && key === API_KEY) {
+    return next();
+  }
+  // Allow unauthenticated for health or sync if needed, but we protect everything
+  res.status(401).json({ error: 'Unauthorized: Invalid or missing API key' });
+};
+
+// Apply authentication to all routes (except maybe we can skip for GET /heartbeat if needed)
+router.use(authenticate);
 
 // ---------- Utility ----------
 function generateCommandId() {
   return `cmd_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 }
 
-// ---------- Endpoints ----------
+// ---------- Command Endpoints ----------
 
 // POST /api/mt5/orders/command
 router.post('/orders/command', async (req, res) => {
@@ -24,6 +40,8 @@ router.post('/orders/command', async (req, res) => {
     if (!command.commandId) {
       command.commandId = generateCommandId();
     }
+    // Ensure state is QUEUED (or set default)
+    command.state = 'QUEUED';
     await Mt5Command.findOneAndUpdate(
       { commandId: command.commandId },
       command,
@@ -37,10 +55,39 @@ router.post('/orders/command', async (req, res) => {
   }
 });
 
-// GET /api/mt5/orders/pending
+// POST /api/mt5/orders/claim – atomic claim
+router.post('/orders/claim', async (req, res) => {
+  try {
+    const { commandId } = req.body;
+    if (!commandId) {
+      return res.status(400).json({ error: 'Missing commandId' });
+    }
+    const command = await Mt5Command.findOneAndUpdate(
+      { commandId, state: 'QUEUED' },
+      {
+        $set: {
+          state: 'PROCESSING',
+          processingStartedAt: new Date(),
+          lastAttemptAt: new Date(),
+        },
+        $inc: { attempts: 1 },
+      },
+      { new: true }
+    );
+    if (command) {
+      res.json(command);
+    } else {
+      res.status(404).json({ error: 'Command not available for claiming' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/mt5/orders/pending – only returns QUEUED commands
 router.get('/orders/pending', async (req, res) => {
   try {
-    const commands = await Mt5Command.find().lean();
+    const commands = await Mt5Command.find({ state: 'QUEUED' }).lean();
     res.json(commands);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -55,13 +102,25 @@ router.post('/orders/result', async (req, res) => {
     if (!commandId) {
       return res.status(400).json({ error: 'Missing commandId' });
     }
+    // Save the result
     await Mt5CommandResult.findOneAndUpdate(
       { commandId },
       result,
       { upsert: true, new: true }
     );
-    await Mt5Command.deleteOne({ commandId });
-    logger.info(`[MT5] Result stored for ${commandId}`);
+    // Update command state based on success
+    const success = result.success === true;
+    await Mt5Command.findOneAndUpdate(
+      { commandId },
+      {
+        $set: {
+          state: success ? 'COMPLETED' : 'FAILED',
+          error: success ? null : (result.error || 'Execution failed'),
+        },
+      }
+    );
+    // Optionally delete the command after a while? We keep it for history, but TTL will remove later.
+    logger.info(`[MT5] Result stored for ${commandId}, success=${success}`);
     res.status(201).json({ status: 'accepted' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -83,7 +142,7 @@ router.get('/orders/result/:commandId', async (req, res) => {
   }
 });
 
-// POST /api/mt5/account/status
+// ---------- Account ----------
 router.post('/account/status', async (req, res) => {
   try {
     const status = req.body;
@@ -99,7 +158,6 @@ router.post('/account/status', async (req, res) => {
   }
 });
 
-// GET /api/mt5/account/status
 router.get('/account/status', async (req, res) => {
   try {
     const account = await Mt5Account.findOne().sort({ updatedAt: -1 }).lean();
@@ -113,10 +171,11 @@ router.get('/account/status', async (req, res) => {
   }
 });
 
-// POST /api/mt5/positions
+// ---------- Positions ----------
 router.post('/positions', async (req, res) => {
   try {
     const { login, positions, timestamp } = req.body;
+    // Replace all positions for this login
     await Mt5Position.deleteMany({ login });
     if (positions && positions.length) {
       const docs = positions.map(p => ({ ...p, login, updatedAt: new Date() }));
@@ -129,7 +188,6 @@ router.post('/positions', async (req, res) => {
   }
 });
 
-// GET /api/mt5/positions
 router.get('/positions', async (req, res) => {
   try {
     const positions = await Mt5Position.find().lean();
@@ -139,7 +197,7 @@ router.get('/positions', async (req, res) => {
   }
 });
 
-// POST /api/mt5/heartbeat
+// ---------- Heartbeat ----------
 router.post('/heartbeat', async (req, res) => {
   try {
     const { login, status, timestamp } = req.body;
@@ -155,7 +213,6 @@ router.post('/heartbeat', async (req, res) => {
   }
 });
 
-// GET /api/mt5/heartbeat
 router.get('/heartbeat', async (req, res) => {
   try {
     const heartbeat = await Mt5Heartbeat.findOne().sort({ updatedAt: -1 }).lean();
@@ -165,7 +222,7 @@ router.get('/heartbeat', async (req, res) => {
   }
 });
 
-// POST /api/mt5/price
+// ---------- Price Feed ----------
 router.post('/price', async (req, res) => {
   try {
     const priceData = req.body;
@@ -184,7 +241,6 @@ router.post('/price', async (req, res) => {
   }
 });
 
-// GET /api/mt5/price/:symbol
 router.get('/price/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
@@ -199,7 +255,7 @@ router.get('/price/:symbol', async (req, res) => {
   }
 });
 
-// GET /api/mt5/trade/:ticket
+// ---------- Trade by ticket ----------
 router.get('/trade/:ticket', async (req, res) => {
   try {
     const { ticket } = req.params;
@@ -213,12 +269,23 @@ router.get('/trade/:ticket', async (req, res) => {
   }
 });
 
-// GET /api/mt5/history (stub – expand with your Trade model)
+// ---------- History (using Trade model) ----------
 router.get('/history', async (req, res) => {
-  res.json({ history: [] });
+  try {
+    const { from, to, symbol } = req.query;
+    const filter = { status: 'CLOSED' };
+    if (symbol) filter.instrument = symbol;
+    if (from) filter.closeTime = { $gte: new Date(Number(from)) };
+    if (to) filter.closeTime = { ...filter.closeTime, $lte: new Date(Number(to)) };
+    const trades = await Trade.find(filter).sort({ closeTime: -1 }).lean();
+    res.json({ history: trades });
+  } catch (err) {
+    logger.warn('[MT5] History error:', err.message);
+    res.json({ history: [] }); // fallback empty
+  }
 });
 
-// POST /api/mt5/sync
+// ---------- Sync (EA startup) ----------
 router.post('/sync', async (req, res) => {
   const { login, status } = req.body;
   logger.info(`[MT5] Sync received: login=${login}, status=${status}`);
