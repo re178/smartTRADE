@@ -19,11 +19,10 @@ const authenticate = (req, res, next) => {
   if (key && key === API_KEY) {
     return next();
   }
-  // Allow unauthenticated for health or sync if needed, but we protect everything
   res.status(401).json({ error: 'Unauthorized: Invalid or missing API key' });
 };
 
-// Apply authentication to all routes (except maybe we can skip for GET /heartbeat if needed)
+// Apply authentication to all routes
 router.use(authenticate);
 
 // ---------- Utility ----------
@@ -40,7 +39,6 @@ router.post('/orders/command', async (req, res) => {
     if (!command.commandId) {
       command.commandId = generateCommandId();
     }
-    // Ensure state is QUEUED (or set default)
     command.state = 'QUEUED';
     await Mt5Command.findOneAndUpdate(
       { commandId: command.commandId },
@@ -102,13 +100,11 @@ router.post('/orders/result', async (req, res) => {
     if (!commandId) {
       return res.status(400).json({ error: 'Missing commandId' });
     }
-    // Save the result
     await Mt5CommandResult.findOneAndUpdate(
       { commandId },
       result,
       { upsert: true, new: true }
     );
-    // Update command state based on success
     const success = result.success === true;
     await Mt5Command.findOneAndUpdate(
       { commandId },
@@ -119,7 +115,6 @@ router.post('/orders/result', async (req, res) => {
         },
       }
     );
-    // Optionally delete the command after a while? We keep it for history, but TTL will remove later.
     logger.info(`[MT5] Result stored for ${commandId}, success=${success}`);
     res.status(201).json({ status: 'accepted' });
   } catch (err) {
@@ -175,7 +170,6 @@ router.get('/account/status', async (req, res) => {
 router.post('/positions', async (req, res) => {
   try {
     const { login, positions, timestamp } = req.body;
-    // Replace all positions for this login
     await Mt5Position.deleteMany({ login });
     if (positions && positions.length) {
       const docs = positions.map(p => ({ ...p, login, updatedAt: new Date() }));
@@ -241,14 +235,28 @@ router.post('/price', async (req, res) => {
   }
 });
 
+// ---- UPDATED: handle underscores in symbol names ----
 router.get('/price/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
-    const price = await Mt5Price.findOne({ symbol }).lean();
+    // Remove underscores to match MT5 symbol format (e.g., EUR_USD -> EURUSD)
+    const lookupSymbol = symbol.replace(/_/g, '');
+    let price = await Mt5Price.findOne({ symbol: lookupSymbol }).lean();
+    // If not found, try the original symbol (just in case)
+    if (!price) {
+      price = await Mt5Price.findOne({ symbol }).lean();
+    }
     if (price) {
       res.json(price);
     } else {
-      res.status(404).json({ error: 'Price not found' });
+      // Return a fallback structure to avoid dashboard errors
+      res.status(404).json({
+        symbol: lookupSymbol,
+        bid: 0,
+        ask: 0,
+        spread: 0,
+        error: 'Price not yet available from EA'
+      });
     }
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -281,7 +289,7 @@ router.get('/history', async (req, res) => {
     res.json({ history: trades });
   } catch (err) {
     logger.warn('[MT5] History error:', err.message);
-    res.json({ history: [] }); // fallback empty
+    res.json({ history: [] });
   }
 });
 
