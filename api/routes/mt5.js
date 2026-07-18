@@ -31,8 +31,6 @@ function generateCommandId() {
 }
 
 // ---------- Command Endpoints ----------
-
-// POST /api/mt5/orders/command
 router.post('/orders/command', async (req, res) => {
   try {
     const command = req.body;
@@ -53,7 +51,6 @@ router.post('/orders/command', async (req, res) => {
   }
 });
 
-// POST /api/mt5/orders/claim – atomic claim
 router.post('/orders/claim', async (req, res) => {
   try {
     const { commandId } = req.body;
@@ -82,7 +79,6 @@ router.post('/orders/claim', async (req, res) => {
   }
 });
 
-// GET /api/mt5/orders/pending – only returns QUEUED commands
 router.get('/orders/pending', async (req, res) => {
   try {
     const commands = await Mt5Command.find({ state: 'QUEUED' }).lean();
@@ -92,7 +88,6 @@ router.get('/orders/pending', async (req, res) => {
   }
 });
 
-// POST /api/mt5/orders/result
 router.post('/orders/result', async (req, res) => {
   try {
     const result = req.body;
@@ -122,7 +117,6 @@ router.post('/orders/result', async (req, res) => {
   }
 });
 
-// GET /api/mt5/orders/result/:commandId
 router.get('/orders/result/:commandId', async (req, res) => {
   try {
     const { commandId } = req.params;
@@ -137,18 +131,34 @@ router.get('/orders/result/:commandId', async (req, res) => {
   }
 });
 
-// ---------- Account ----------
+// ---------- Account (with detailed logging) ----------
 router.post('/account/status', async (req, res) => {
   try {
     const status = req.body;
-    await Mt5Account.findOneAndUpdate(
+    logger.info(`[MT5] POST account/status received: login=${status.login}, balance=${status.balance}`);
+
+    const saved = await Mt5Account.findOneAndUpdate(
       { login: status.login },
-      status,
-      { upsert: true, new: true }
+      {
+        ...status,
+        updatedAt: new Date(),
+      },
+      {
+        upsert: true,
+        new: true,
+        runValidators: true,
+      }
     );
-    logger.debug(`[MT5] Account status updated for ${status.login}`);
-    res.status(201).json({ status: 'accepted' });
+
+    if (saved) {
+      logger.info('[MT5] Saved account:', JSON.stringify(saved, null, 2));
+      res.status(201).json({ status: 'accepted', account: saved });
+    } else {
+      logger.error('[MT5] Account save returned null');
+      res.status(500).json({ error: 'Failed to save account' });
+    }
   } catch (err) {
+    logger.error('[MT5] Error saving account status:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -156,12 +166,16 @@ router.post('/account/status', async (req, res) => {
 router.get('/account/status', async (req, res) => {
   try {
     const account = await Mt5Account.findOne().sort({ updatedAt: -1 }).lean();
-    if (account) {
-      res.json(account);
-    } else {
-      res.status(404).json({ error: 'No account status yet' });
+
+    logger.info('[MT5] GET account/status:', JSON.stringify(account, null, 2));
+
+    if (!account) {
+      return res.status(404).json({ error: 'No account status yet' });
     }
+
+    res.json(account);
   } catch (err) {
+    logger.error('[MT5] GET account/status error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -210,7 +224,11 @@ router.post('/heartbeat', async (req, res) => {
 router.get('/heartbeat', async (req, res) => {
   try {
     const heartbeat = await Mt5Heartbeat.findOne().sort({ updatedAt: -1 }).lean();
-    res.json(heartbeat || { online: false });
+    if (!heartbeat) {
+      // Return a default if no heartbeat yet
+      return res.json({ online: false, lastHeartbeat: null });
+    }
+    res.json(heartbeat);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
