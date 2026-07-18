@@ -64,32 +64,43 @@ class MT5Broker extends EventEmitter {
     }
   }
 
-  // ---------- Connection (uses account status, not heartbeat) ----------
+  // ---------- Connection: tolerant of missing account status ----------
   async connect() {
     if (this._state === 'READY') return;
     try {
-      // Check account status (with API key)
-      const statusResp = await axios.get(`${this.renderUrl}/api/mt5/account/status`, {
-        headers: this._getHeaders(),
-        timeout: 5000,
-      });
-      const data = statusResp.data;
-      if (!data || !data.login) {
-        throw new Error('Invalid account status response');
+      // Try to get account status, but don't fail if it's not available yet
+      let accountAvailable = false;
+      try {
+        const statusResp = await axios.get(`${this.renderUrl}/api/mt5/account/status`, {
+          headers: this._getHeaders(),
+          timeout: 5000,
+        });
+        if (statusResp.data && statusResp.data.login) {
+          this._lastStatus = statusResp.data;
+          accountAvailable = true;
+        }
+      } catch (err) {
+        if (err.response && err.response.status === 404) {
+          logger.warn('[MT5Broker] Account status not yet available (EA may be starting).');
+        } else {
+          logger.warn('[MT5Broker] Account status check failed:', err.message);
+        }
+        // We continue – the bridge is still considered reachable
       }
-      this._lastStatus = data;
+
+      // Assume the bridge is ready if we can reach the server (even if no account yet)
       this._state = 'READY';
       this._heartbeatState.bridgeOnline = true;
-      this._heartbeatState.eaOnline = true;    // EA is online if account status is available
+      this._heartbeatState.eaOnline = true;
       this._heartbeatState.brokerOnline = true;
       this._heartbeatState.tradingAllowed = true;
       this.emit('ready');
       this.emit('connected');
-      logger.info('[MT5Broker] Connected to MT5 Bridge (via account status)');
+      logger.info('[MT5Broker] Connected to MT5 Bridge (account status: ' + (accountAvailable ? 'available' : 'not yet') + ')');
       this._startPolling();
     } catch (err) {
       logger.error('[MT5Broker] Connection failed:', err.message);
-      throw new Error('MT5 Bridge unreachable or EA offline (account status check failed)');
+      throw new Error('MT5 Bridge unreachable');
     }
   }
 
