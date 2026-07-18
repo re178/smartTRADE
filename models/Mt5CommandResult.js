@@ -17,11 +17,12 @@ const Mt5CommandResultSchema = new mongoose.Schema({
   retcode: Number,
   retcodeDescription: String,
   error: String,
-  time: Number,            // timestamp from EA
+  time: Number,                   // timestamp from EA
+
   receivedAt: {
     type: Date,
     default: Date.now,
-    expires: 3600,         // auto-delete after 1 hour
+    expires: 3600,               // auto-delete after 1 hour
   },
 });
 
