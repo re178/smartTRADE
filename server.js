@@ -1,4 +1,4 @@
-// server.js – RTS Entry Point (with MT5 Bridge & robust JSON repair)
+// server.js – RTS Entry Point (with MT5 Bridge & robust JSON handling)
 
 require('dotenv').config();
 
@@ -43,18 +43,16 @@ async function ensureAdmin() {
   }
 }
 
-// ---------- JSON Repair Helper ----------
+// ---------- JSON Repair Helper (fallback only) ----------
 function repairJson(raw) {
   let repaired = raw.trim();
   if (repaired.endsWith(',')) {
     repaired = repaired.slice(0, -1);
   }
-
   let openBraces = 0;
   let openBrackets = 0;
   let inString = false;
   let escape = false;
-
   for (let i = 0; i < repaired.length; i++) {
     const ch = repaired[i];
     if (escape) {
@@ -75,88 +73,65 @@ function repairJson(raw) {
     else if (ch === '[') openBrackets++;
     else if (ch === ']') openBrackets--;
   }
-
   while (openBrackets > 0) { repaired += ']'; openBrackets--; }
   while (openBraces > 0) { repaired += '}'; openBraces--; }
-
   return repaired;
 }
 
 // ---------- Middleware ----------
 app.use(cors());
 
-// ---------- Manual Raw Body Reader with JSON Repair ----------
-app.use((req, res, next) => {
-  let rawBody = '';
-  req.on('data', chunk => {
-    rawBody += chunk.toString();
-  });
-  req.on('end', () => {
-    req.rawBody = rawBody;
+// ---------- Express built‑in JSON parser with raw body capture ----------
+app.use(express.json({
+  limit: '2mb',
+  verify: (req, res, buf) => {
+    // Store raw body as string for logging/debugging
+    req.rawBody = buf.toString('utf8');
+  }
+}));
 
-    const contentType = req.headers['content-type'] || '';
-    if (contentType.includes('application/json') && rawBody.length > 0) {
-      let parsed = null;
-      let repaired = rawBody;
-
-      try {
-        parsed = JSON.parse(rawBody);
-      } catch (err) {
-        if (err instanceof SyntaxError) {
-          repaired = repairJson(rawBody);
-          try {
-            parsed = JSON.parse(repaired);
-            console.log('✅ JSON repaired successfully.');
-            console.log('   Original:', rawBody);
-            console.log('   Repaired:', repaired);
-          } catch (err2) {
-            console.error('❌ JSON repair also failed:', err2.message);
-            console.error('   Raw:', rawBody);
-            console.error('   Repaired:', repaired);
-          }
-        } else {
-          throw err;
-        }
-      }
-
-      if (parsed !== null) {
-        req.body = parsed;
-        if (repaired !== rawBody) {
-          req.repairedRawBody = repaired;
-        }
-      } else {
-        req.body = {};
-        req.parseError = new Error('Invalid JSON after repair');
-        console.error('========== JSON PARSE ERROR ==========');
-        console.error('Raw body length:', rawBody.length);
-        console.error('Raw body:', rawBody);
-        console.error('Repaired attempt:', repaired);
-        console.error('======================================');
-      }
-    } else {
-      req.body = {};
+// ---------- Error handler for malformed JSON (fallback repair) ----------
+app.use((err, req, res, next) => {
+  // Only handle JSON parse errors
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    const raw = req.rawBody || '';
+    console.warn('⚠️ Malformed JSON received. Attempting repair...');
+    console.warn('Raw:', raw);
+    try {
+      const repaired = repairJson(raw);
+      const parsed = JSON.parse(repaired);
+      // If repair succeeds, replace body and continue
+      req.body = parsed;
+      req.repairedRawBody = repaired;
+      console.log('✅ JSON repaired successfully.');
+      console.log('   Repaired:', repaired);
+      return next();
+    } catch (repairErr) {
+      console.error('❌ JSON repair failed:', repairErr.message);
+      console.error('   Raw:', raw);
+      // Fall through to default error handler
     }
-    next();
-  });
-  req.on('error', (err) => {
-    console.error('Request error:', err);
-    next(err);
-  });
+  }
+  // If we reach here, pass the error to Express's default handler
+  next(err);
 });
 
-// ---------- Request Logger ----------
+// ---------- Request Logger (short, clean) ----------
 app.use((req, res, next) => {
-  console.log('\n==============================');
-  console.log(new Date().toISOString());
-  console.log(req.method, req.originalUrl);
-  console.log('Body length:', req.rawBody?.length || 0);
-  if (req.rawBody && req.rawBody.length > 0) {
-    console.log('Raw Body:', req.rawBody);
+  // Only log if not a static asset
+  if (req.path.startsWith('/api')) {
+    console.log('\n==============================');
+    console.log(new Date().toISOString());
+    console.log(req.method, req.originalUrl);
+    console.log('Body length:', req.rawBody?.length || 0);
+    if (req.rawBody && req.rawBody.length > 0 && req.rawBody.length < 500) {
+      console.log('Raw Body:', req.rawBody);
+    }
+    if (req.repairedRawBody) {
+      console.log('Repaired:', req.repairedRawBody);
+    }
+    console.log('==============================');
   }
-  if (req.repairedRawBody) {
-    console.log('Repaired:', req.repairedRawBody);
-  }
-  console.log('==============================');
   next();
 });
 
@@ -184,7 +159,7 @@ app.use(async (req, res, next) => {
 
 // ---------- API Routes ----------
 app.use('/api', apiRoutes);
-app.use('/api/mt5', mt5Routes);   // <-- persistent MT5 endpoints
+app.use('/api/mt5', mt5Routes);
 
 // ---------- Health Check ----------
 app.get('/health', (req, res) => {
@@ -202,14 +177,14 @@ app.get('*', (req, res) => {
 
 // ---------- Start Server ----------
 async function startServer() {
-  await ensureAdmin();   // only creates admin if missing, no collection drops
+  await ensureAdmin();
   app.listen(PORT, () => {
     console.log(`✅ RTS server running on http://localhost:${PORT}`);
     console.log(`📊 Dashboard: http://localhost:${PORT}`);
     console.log(`🔌 API base: http://localhost:${PORT}/api`);
     console.log(`🟢 MT5 Bridge endpoints: http://localhost:${PORT}/api/mt5`);
-    console.log('📡 Request logging enabled.');
-    console.log('🛠️  JSON repair enabled (auto‑closes missing braces).');
+    console.log('📡 Request logging enabled (truncated for large bodies).');
+    console.log('🛠️  JSON repair enabled as a fallback (rare).');
     console.log('💾 MT5 data is now persistent (MongoDB).');
   });
 }
