@@ -26,14 +26,13 @@ const Mt5PositionSchema = new mongoose.Schema({
   open_time: Number,
   reason: Number,
   identifier: Number,
-  // Compound index to ensure we can upsert per login+ticket
   updatedAt: {
     type: Date,
     default: Date.now,
   },
 });
 
-// Ensure we don't have duplicates for the same login+ticket
+// Compound unique index to avoid duplicates per login+ticket
 Mt5PositionSchema.index({ login: 1, ticket: 1 }, { unique: true });
 
 module.exports = mongoose.model('Mt5Position', Mt5PositionSchema);
