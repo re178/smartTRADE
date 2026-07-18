@@ -7,16 +7,9 @@ const cors = require('cors');
 const path = require('path');
 const mongoose = require('mongoose');
 
-// Database connection
 const connectDB = require('./config/db');
-
-// API routes (existing)
 const apiRoutes = require('./api/routes');
-
-// MT5 Bridge routes (persistent, using Mongoose)
 const mt5Routes = require('./api/routes/mt5');
-
-// Models
 const User = require('./models/User');
 
 const app = express();
@@ -25,7 +18,7 @@ const PORT = process.env.PORT || 5000;
 // ---------- Connect to MongoDB ----------
 connectDB();
 
-// ---------- Admin Creation (without dropping collections) ----------
+// ---------- Admin Creation ----------
 async function ensureAdmin() {
   try {
     const adminId = 'admin';
@@ -49,24 +42,12 @@ function repairJson(raw) {
   if (repaired.endsWith(',')) {
     repaired = repaired.slice(0, -1);
   }
-  let openBraces = 0;
-  let openBrackets = 0;
-  let inString = false;
-  let escape = false;
+  let openBraces = 0, openBrackets = 0, inString = false, escape = false;
   for (let i = 0; i < repaired.length; i++) {
     const ch = repaired[i];
-    if (escape) {
-      escape = false;
-      continue;
-    }
-    if (ch === '\\') {
-      escape = true;
-      continue;
-    }
-    if (ch === '"') {
-      inString = !inString;
-      continue;
-    }
+    if (escape) { escape = false; continue; }
+    if (ch === '\\') { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
     if (inString) continue;
     if (ch === '{') openBraces++;
     else if (ch === '}') openBraces--;
@@ -81,51 +62,44 @@ function repairJson(raw) {
 // ---------- Middleware ----------
 app.use(cors());
 
-// ---------- Express built‑in JSON parser with raw body capture ----------
+// ---------- SINGLE JSON PARSER (with raw body capture) ----------
 app.use(express.json({
   limit: '2mb',
   verify: (req, res, buf) => {
-    // Store raw body as string for logging/debugging
     req.rawBody = buf.toString('utf8');
   }
 }));
 
-// ---------- Error handler for malformed JSON (fallback repair) ----------
+// ---------- Fallback repair for malformed JSON ----------
 app.use((err, req, res, next) => {
-  // Only handle JSON parse errors
   if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
     const raw = req.rawBody || '';
-    console.warn('⚠️ Malformed JSON received. Attempting repair...');
-    console.warn('Raw:', raw);
+    console.warn('⚠️ Malformed JSON – attempting repair...');
+    console.warn('Raw (stringified):', JSON.stringify(raw));
     try {
       const repaired = repairJson(raw);
       const parsed = JSON.parse(repaired);
-      // If repair succeeds, replace body and continue
       req.body = parsed;
       req.repairedRawBody = repaired;
       console.log('✅ JSON repaired successfully.');
-      console.log('   Repaired:', repaired);
       return next();
     } catch (repairErr) {
       console.error('❌ JSON repair failed:', repairErr.message);
       console.error('   Raw:', raw);
-      // Fall through to default error handler
     }
   }
-  // If we reach here, pass the error to Express's default handler
   next(err);
 });
 
-// ---------- Request Logger (short, clean) ----------
+// ---------- Request Logger (clean) ----------
 app.use((req, res, next) => {
-  // Only log if not a static asset
   if (req.path.startsWith('/api')) {
     console.log('\n==============================');
     console.log(new Date().toISOString());
     console.log(req.method, req.originalUrl);
     console.log('Body length:', req.rawBody?.length || 0);
     if (req.rawBody && req.rawBody.length > 0 && req.rawBody.length < 500) {
-      console.log('Raw Body:', req.rawBody);
+      console.log('Raw Body (stringified):', JSON.stringify(req.rawBody));
     }
     if (req.repairedRawBody) {
       console.log('Repaired:', req.repairedRawBody);
@@ -140,15 +114,14 @@ app.use(express.static('public'));
 // ---------- Admin User Middleware ----------
 app.use(async (req, res, next) => {
   try {
-    const adminId = 'admin';
-    let admin = await User.findOne({ userId: adminId });
+    let admin = await User.findOne({ userId: 'admin' });
     if (!admin) {
       const defaultProduct = process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd';
-      admin = new User({ userId: adminId, tradingProduct: defaultProduct });
+      admin = new User({ userId: 'admin', tradingProduct: defaultProduct });
       await admin.save();
-      console.log('✅ Admin user auto-created (fallback).');
+      console.log('✅ Admin user auto-created.');
     }
-    req.user = { id: adminId, tradingProduct: admin.tradingProduct };
+    req.user = { id: 'admin', tradingProduct: admin.tradingProduct };
     next();
   } catch (err) {
     console.error('❌ Admin middleware error:', err.message);
@@ -183,9 +156,9 @@ async function startServer() {
     console.log(`📊 Dashboard: http://localhost:${PORT}`);
     console.log(`🔌 API base: http://localhost:${PORT}/api`);
     console.log(`🟢 MT5 Bridge endpoints: http://localhost:${PORT}/api/mt5`);
-    console.log('📡 Request logging enabled (truncated for large bodies).');
-    console.log('🛠️  JSON repair enabled as a fallback (rare).');
-    console.log('💾 MT5 data is now persistent (MongoDB).');
+    console.log('📡 Request logging enabled.');
+    console.log('🛠️  JSON repair enabled as fallback.');
+    console.log('💾 MT5 data is persistent (MongoDB).');
   });
 }
 
