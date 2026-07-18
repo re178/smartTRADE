@@ -9,9 +9,10 @@ class MT5Broker extends EventEmitter {
   constructor(config = {}) {
     super();
     this.renderUrl = config.renderUrl || process.env.RENDER_URL || 'https://tradermarketopen.onrender.com';
-    this.pollInterval = config.pollInterval || 2000; // ms between result checks
+    this.apiKey = config.apiKey || process.env.MT5_API_KEY || '';   // <-- NEW
+    this.pollInterval = config.pollInterval || 2000;
     this._state = 'DISCONNECTED';
-    this._pendingCommands = new Map(); // commandId -> { resolve, reject, timeout }
+    this._pendingCommands = new Map();
     this._pollingTimer = null;
     this._lastStatus = null;
     this._positions = [];
@@ -22,7 +23,6 @@ class MT5Broker extends EventEmitter {
       tradingAllowed: false,
     };
 
-    // ---- Updated capabilities ----
     this.capabilities = {
       supportsMarketOrders: true,
       supportsLimitOrders: true,
@@ -35,12 +35,26 @@ class MT5Broker extends EventEmitter {
       supportsNetting: false,
       supportsPriceFeed: true,
       supportsSpread: true,
-      supportsHistory: true,      // now we have a history endpoint
+      supportsHistory: true,
     };
 
     this.serverName = 'MT5';
 
     logger.info('[MT5Broker] Initialized with Render URL:', this.renderUrl);
+    if (this.apiKey) {
+      logger.info('[MT5Broker] API key configured (length:', this.apiKey.length, ')');
+    } else {
+      logger.warn('[MT5Broker] No API key set – requests will be unauthenticated.');
+    }
+  }
+
+  // ---------- Helper: get headers with API key ----------
+  _getHeaders(extra = {}) {
+    const headers = { 'Content-Type': 'application/json', ...extra };
+    if (this.apiKey) {
+      headers['X-API-Key'] = this.apiKey;
+    }
+    return headers;
   }
 
   // ---------- Internal: ensure ready ----------
@@ -54,16 +68,22 @@ class MT5Broker extends EventEmitter {
   async connect() {
     if (this._state === 'READY') return;
     try {
-      // First, check if the EA is alive via heartbeat
-      const heartbeatResp = await axios.get(`${this.renderUrl}/api/mt5/heartbeat`, { timeout: 3000 });
+      // Check heartbeat (with API key)
+      const heartbeatResp = await axios.get(`${this.renderUrl}/api/mt5/heartbeat`, {
+        headers: this._getHeaders(),
+        timeout: 3000,
+      });
       const heartbeat = heartbeatResp.data;
       if (!heartbeat || !heartbeat.online) {
         throw new Error('EA is not online according to heartbeat');
       }
       this._heartbeatState.eaOnline = true;
 
-      // Then check account status
-      await axios.get(`${this.renderUrl}/api/mt5/account/status`, { timeout: 5000 });
+      // Check account status (with API key)
+      await axios.get(`${this.renderUrl}/api/mt5/account/status`, {
+        headers: this._getHeaders(),
+        timeout: 5000,
+      });
       this._state = 'READY';
       this._heartbeatState.bridgeOnline = true;
       this._heartbeatState.brokerOnline = true;
@@ -106,7 +126,10 @@ class MT5Broker extends EventEmitter {
       takeProfit,
     };
 
-    await axios.post(`${this.renderUrl}/api/mt5/orders/command`, payload, { timeout: 5000 });
+    await axios.post(`${this.renderUrl}/api/mt5/orders/command`, payload, {
+      headers: this._getHeaders(),
+      timeout: 5000,
+    });
 
     const result = await this._waitForResult(cmdId);
     if (!result.success) {
@@ -127,7 +150,10 @@ class MT5Broker extends EventEmitter {
     if (!this.capabilities.supportsClose) throw new Error('Close not supported');
     const cmdId = `close_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
     const payload = { commandId: cmdId, action: 'CLOSE', tradeId };
-    await axios.post(`${this.renderUrl}/api/mt5/orders/command`, payload, { timeout: 5000 });
+    await axios.post(`${this.renderUrl}/api/mt5/orders/command`, payload, {
+      headers: this._getHeaders(),
+      timeout: 5000,
+    });
     const result = await this._waitForResult(cmdId);
     if (!result.success) throw new Error(result.error || 'Close failed');
     return result;
@@ -139,7 +165,10 @@ class MT5Broker extends EventEmitter {
     if (!this.capabilities.supportsModify) throw new Error('Modify not supported');
     const cmdId = `mod_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
     const payload = { commandId: cmdId, action: 'MODIFY', tradeId, stopLoss, takeProfit };
-    await axios.post(`${this.renderUrl}/api/mt5/orders/command`, payload, { timeout: 5000 });
+    await axios.post(`${this.renderUrl}/api/mt5/orders/command`, payload, {
+      headers: this._getHeaders(),
+      timeout: 5000,
+    });
     const result = await this._waitForResult(cmdId);
     if (!result.success) throw new Error(result.error || 'Modify failed');
     return result;
@@ -151,7 +180,10 @@ class MT5Broker extends EventEmitter {
     if (!this.capabilities.supportsCancel) throw new Error('Cancel not supported');
     const cmdId = `cancel_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
     const payload = { commandId: cmdId, action: 'CANCEL', tradeId };
-    await axios.post(`${this.renderUrl}/api/mt5/orders/command`, payload, { timeout: 5000 });
+    await axios.post(`${this.renderUrl}/api/mt5/orders/command`, payload, {
+      headers: this._getHeaders(),
+      timeout: 5000,
+    });
     const result = await this._waitForResult(cmdId);
     if (!result.success) throw new Error(result.error || 'Cancel failed');
     return result;
@@ -168,7 +200,10 @@ class MT5Broker extends EventEmitter {
     try {
       const response = await axios.get(
         `${this.renderUrl}/api/mt5/price/${encodeURIComponent(symbol)}`,
-        { timeout: 5000 }
+        {
+          headers: this._getHeaders(),
+          timeout: 5000,
+        }
       );
       return response.data;
     } catch (err) {
@@ -223,7 +258,10 @@ class MT5Broker extends EventEmitter {
     try {
       const response = await axios.get(
         `${this.renderUrl}/api/mt5/trade/${encodeURIComponent(ticket)}`,
-        { timeout: 5000 }
+        {
+          headers: this._getHeaders(),
+          timeout: 5000,
+        }
       );
       return response.data;
     } catch (err) {
@@ -242,7 +280,10 @@ class MT5Broker extends EventEmitter {
       if (to) params.append('to', to);
       if (symbol) params.append('symbol', symbol);
       const url = `${this.renderUrl}/api/mt5/history?${params.toString()}`;
-      const response = await axios.get(url, { timeout: 10000 });
+      const response = await axios.get(url, {
+        headers: this._getHeaders(),
+        timeout: 10000,
+      });
       return response.data;
     } catch (err) {
       logger.warn('[MT5Broker] getHistory failed:', err.message);
@@ -272,7 +313,10 @@ class MT5Broker extends EventEmitter {
         try {
           const response = await axios.get(
             `${this.renderUrl}/api/mt5/orders/result/${cmdId}`,
-            { timeout: 3000 }
+            {
+              headers: this._getHeaders(),
+              timeout: 3000,
+            }
           );
           const result = response.data;
           if (result && result.success !== undefined) {
@@ -306,7 +350,10 @@ class MT5Broker extends EventEmitter {
     try {
       const response = await axios.get(
         `${this.renderUrl}/api/mt5/account/status`,
-        { timeout: 5000 }
+        {
+          headers: this._getHeaders(),
+          timeout: 5000,
+        }
       );
       const data = response.data;
       if (data && data.login) {
@@ -346,7 +393,10 @@ class MT5Broker extends EventEmitter {
     try {
       const response = await axios.get(
         `${this.renderUrl}/api/mt5/positions`,
-        { timeout: 5000 }
+        {
+          headers: this._getHeaders(),
+          timeout: 5000,
+        }
       );
       const positions = response.data?.positions || [];
       this._positions = positions;
