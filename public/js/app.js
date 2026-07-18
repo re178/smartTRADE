@@ -1,11 +1,41 @@
-// public/js/app.js – Dashboard Logic (with debounce, live P&L updates, product toggles, pending orders)
+// public/js/app.js – Dashboard Logic (with sound & faster refresh)
 
 // ---- Configuration ----
-const REFRESH_INTERVAL = 10000; // 10 seconds
+const REFRESH_INTERVAL = 3000; // 3 seconds – faster for real‑time feel
 let isSubmitting = false;
 let isAutoSubmitting = false;
 
-// ---- API helper ----
+// ---- Sound Helper (fallback if audio files missing) ----
+function playSound(type) {
+  try {
+    const audio = new Audio();
+    if (type === 'open') {
+      audio.src = '/sounds/trade-open.mp3';
+    } else if (type === 'close') {
+      audio.src = '/sounds/trade-close.mp3';
+    } else if (type === 'alert') {
+      audio.src = '/sounds/alert.mp3';
+    } else {
+      return;
+    }
+    audio.play().catch(() => {
+      // Fallback: generate beep using Web Audio API
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.frequency.value = type === 'alert' ? 800 : 600;
+      gain.gain.value = 0.3;
+      osc.start();
+      osc.stop(ctx.currentTime + 0.3);
+    });
+  } catch (e) {
+    // Silently fail if sound not supported
+  }
+}
+
+// ---- API helper (unchanged) ----
 async function fetchJson(url, options = {}) {
   const res = await fetch(url, {
     headers: { 'Content-Type': 'application/json' },
@@ -22,57 +52,52 @@ function formatPrice(p) {
   return parseFloat(p).toFixed(5);
 }
 
-// ---- Load Product Preference ----
+// ---- Load Product Preference (unchanged) ----
 async function loadProductPreference() {
   try {
     const data = await fetchJson(`${CONFIG.API_BASE}/api/user/preferences`);
     const product = data.tradingProduct || 'deriv_cfd';
-    // Update radio buttons
     document.querySelectorAll('input[name="product"]').forEach(el => {
       el.checked = (el.value === product);
     });
-    // Update displayed label
     document.getElementById('currentProduct').textContent = product.toUpperCase();
   } catch (e) {
     console.error('Failed to load product preference:', e);
   }
 }
 
-// ---- Handle Product Toggle Change ----
+// ---- Handle Product Toggle (unchanged) ----
 async function handleProductChange(e) {
   const value = e.target.value;
-  // Immediately update UI (optimistic)
   document.querySelectorAll('input[name="product"]').forEach(el => {
     el.checked = (el.value === value);
   });
   document.getElementById('currentProduct').textContent = value.toUpperCase();
-  
   try {
     await fetchJson(`${CONFIG.API_BASE}/api/user/preferences`, {
       method: 'POST',
       body: JSON.stringify({ tradingProduct: value })
     });
     console.log('Product preference updated to:', value);
-    // Refresh account and trades to reflect new product
     loadAccount();
     loadOpenTrades();
     loadPendingOrders();
   } catch (e) {
     alert('Failed to update product preference: ' + e.message);
-    loadProductPreference(); // revert UI
+    loadProductPreference();
   }
 }
-// Make it globally accessible for HTML onchange
 window.handleProductChange = handleProductChange;
 
-// ---- Load Account ----
+// ---- Load Account (with createdTime fix) ----
 async function loadAccount() {
   try {
     const acc = await fetchJson(`${CONFIG.API_BASE}/api/account`);
+    const created = acc.createdTime || acc.createdAt || acc.updatedAt || null;
     document.getElementById('accountInfo').innerHTML = `
       <p><strong>ID:</strong> ${acc.id}</p>
       <p><strong>Currency:</strong> ${acc.currency}</p>
-      <p><strong>Created:</strong> ${new Date(acc.createdTime).toLocaleDateString()}</p>
+      <p><strong>Created:</strong> ${created ? new Date(created).toLocaleDateString() : 'N/A'}</p>
     `;
     document.getElementById('balanceInfo').innerHTML = `
       <p><strong>Balance:</strong> ${acc.balance} ${acc.currency}</p>
@@ -86,7 +111,7 @@ async function loadAccount() {
   }
 }
 
-// ---- Load Prices ----
+// ---- Load Prices (unchanged) ----
 async function loadPrices() {
   const pairs = CONFIG.PRICE_PAIRS;
   try {
@@ -104,7 +129,7 @@ async function loadPrices() {
   }
 }
 
-// ---- Load Notification Status ----
+// ---- Load Notification Status (unchanged) ----
 async function loadNotificationStatus() {
   try {
     const status = await fetchJson(`${CONFIG.API_BASE}/api/notifications/status`);
@@ -119,7 +144,7 @@ async function loadNotificationStatus() {
   }
 }
 
-// ---- Signal Generation ----
+// ---- Signal Generation (unchanged) ----
 document.getElementById('getSignalBtn').addEventListener('click', async function() {
   const pair = document.getElementById('signalPair').value.trim();
   const strategy = document.getElementById('signalStrategy')?.value || 'sma';
@@ -160,7 +185,7 @@ window.fillTradeForm = function(pair, side, entry, sl, tp, lotSize) {
   document.querySelector('#tradeForm').scrollIntoView({ behavior: 'smooth' });
 };
 
-// ---- Manual Trade (with debounce) ----
+// ---- Manual Trade (with sound) ----
 document.getElementById('tradeForm').addEventListener('submit', async function(e) {
   e.preventDefault();
   if (isSubmitting) {
@@ -186,7 +211,8 @@ document.getElementById('tradeForm').addEventListener('submit', async function(e
       method: 'POST',
       body: JSON.stringify({ pair, side, lotSize, stopLoss: sl, takeProfit: tp })
     });
-    alert('Order placed successfully! Trade ID: ' + (result.trade?.oandaTradeId || 'N/A'));
+    playSound('open'); // <-- Sound on open
+    alert('Order placed successfully! Trade ID: ' + (result.trade?.contractId || result.trade?.oandaTradeId || 'N/A'));
     loadOpenTrades();
     loadTradeHistory();
     loadAccount();
@@ -199,7 +225,7 @@ document.getElementById('tradeForm').addEventListener('submit', async function(e
   }
 });
 
-// ---- Auto-Trade (with debounce) ----
+// ---- Auto-Trade (with sound) ----
 document.getElementById('autoTradeForm').addEventListener('submit', async function(e) {
   e.preventDefault();
   if (isAutoSubmitting) {
@@ -224,6 +250,7 @@ document.getElementById('autoTradeForm').addEventListener('submit', async functi
       body: JSON.stringify({ pair, riskPercent: risk, strategy })
     });
     if (result.success) {
+      playSound('open');
       alert(`Auto-trade executed! Trade opened.`);
       loadOpenTrades();
       loadTradeHistory();
@@ -240,7 +267,7 @@ document.getElementById('autoTradeForm').addEventListener('submit', async functi
   }
 });
 
-// ---- Load Open Trades (live P&L) ----
+// ---- Load Open Trades (unchanged) ----
 let openTradesInterval = null;
 
 async function loadOpenTrades() {
@@ -277,11 +304,12 @@ async function loadOpenTrades() {
   }
 }
 
-// ---- Close Trade ----
+// ---- Close Trade (with sound) ----
 window.closeTrade = async function(tradeId) {
   if (!confirm(`Close trade ${tradeId}?`)) return;
   try {
     await fetchJson(`${CONFIG.API_BASE}/api/close/${tradeId}`, { method: 'PUT' });
+    playSound('close');
     alert('Trade closed successfully.');
     loadOpenTrades();
     loadTradeHistory();
@@ -291,7 +319,7 @@ window.closeTrade = async function(tradeId) {
   }
 };
 
-// ---- Load Trade History ----
+// ---- Load Trade History (unchanged) ----
 async function loadTradeHistory() {
   const container = document.getElementById('historyContainer');
   container.innerHTML = '<p class="text-muted">Loading history...</p>';
@@ -323,7 +351,7 @@ async function loadTradeHistory() {
   }
 }
 
-// ---- Load Pending Orders ----
+// ---- Load Pending Orders (unchanged) ----
 async function loadPendingOrders() {
   const container = document.getElementById('pendingOrdersContainer');
   if (!container) return;
@@ -355,7 +383,7 @@ async function loadPendingOrders() {
   }
 }
 
-// ---- Cancel Pending Order ----
+// ---- Cancel Pending Order (unchanged) ----
 window.cancelPending = async function(orderId) {
   if (!confirm(`Cancel order ${orderId}?`)) return;
   try {
@@ -368,7 +396,7 @@ window.cancelPending = async function(orderId) {
   }
 };
 
-// ---- Delete History ----
+// ---- Delete History (unchanged) ----
 document.getElementById('deleteHistoryBtn')?.addEventListener('click', async function() {
   if (!confirm('Delete all closed trades from history? This cannot be undone.')) return;
   try {
@@ -380,7 +408,7 @@ document.getElementById('deleteHistoryBtn')?.addEventListener('click', async fun
   }
 });
 
-// ---- Test Notification ----
+// ---- Test Notification (unchanged) ----
 document.getElementById('testNotificationBtn')?.addEventListener('click', async function() {
   try {
     const result = await fetchJson(`${CONFIG.API_BASE}/api/test-email`, { method: 'POST' });
@@ -390,7 +418,7 @@ document.getElementById('testNotificationBtn')?.addEventListener('click', async 
   }
 });
 
-// ---- Refresh buttons ----
+// ---- Refresh buttons (unchanged) ----
 document.getElementById('refreshTrades')?.addEventListener('click', loadOpenTrades);
 document.getElementById('refreshHistory')?.addEventListener('click', loadTradeHistory);
 document.getElementById('refreshPending')?.addEventListener('click', loadPendingOrders);
@@ -409,8 +437,6 @@ loadOpenTrades();
 loadTradeHistory();
 loadPendingOrders();
 loadNotificationStatus();
-
-// Start live updates
 startLiveUpdates();
 
 // Auto-refresh prices (already in config)
