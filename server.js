@@ -13,7 +13,7 @@ const connectDB = require('./config/db');
 // API routes (existing)
 const apiRoutes = require('./api/routes');
 
-// MT5 Bridge routes
+// MT5 Bridge routes (persistent, using Mongoose)
 const mt5Routes = require('./api/routes/mt5');
 
 // Models
@@ -25,35 +25,31 @@ const PORT = process.env.PORT || 5000;
 // ---------- Connect to MongoDB ----------
 connectDB();
 
-// ---------- Database Cleanup & Admin Creation ----------
-async function cleanDatabaseAndCreateAdmin() {
+// ---------- Admin Creation (without dropping collections) ----------
+async function ensureAdmin() {
   try {
-    console.log('🧹 Cleaning database...');
-    const collections = await mongoose.connection.db.collections();
-    for (const collection of collections) {
-      await collection.drop();
-      console.log(`   Dropped collection: ${collection.collectionName}`);
+    const adminId = 'admin';
+    let admin = await User.findOne({ userId: adminId });
+    if (!admin) {
+      const defaultProduct = process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd';
+      admin = new User({ userId: adminId, tradingProduct: defaultProduct });
+      await admin.save();
+      console.log('✅ Admin user created with product:', defaultProduct);
+    } else {
+      console.log('✅ Admin user already exists.');
     }
-    console.log('✅ Database cleaned successfully.');
-
-    const defaultProduct = process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd';
-    const admin = new User({ userId: 'admin', tradingProduct: defaultProduct });
-    await admin.save();
-    console.log(`✅ Admin user created with product: ${defaultProduct}`);
   } catch (err) {
-    console.error('❌ Database cleanup failed:', err.message);
+    console.error('❌ Admin creation failed:', err.message);
   }
 }
 
 // ---------- JSON Repair Helper ----------
 function repairJson(raw) {
   let repaired = raw.trim();
-  // Remove trailing comma if present (before any potential closing)
   if (repaired.endsWith(',')) {
     repaired = repaired.slice(0, -1);
   }
 
-  // Count open braces and brackets
   let openBraces = 0;
   let openBrackets = 0;
   let inString = false;
@@ -80,7 +76,6 @@ function repairJson(raw) {
     else if (ch === ']') openBrackets--;
   }
 
-  // Append missing closing brackets/braces
   while (openBrackets > 0) { repaired += ']'; openBrackets--; }
   while (openBraces > 0) { repaired += '}'; openBraces--; }
 
@@ -104,11 +99,9 @@ app.use((req, res, next) => {
       let parsed = null;
       let repaired = rawBody;
 
-      // First, try to parse as is
       try {
         parsed = JSON.parse(rawBody);
       } catch (err) {
-        // On any SyntaxError, attempt repair
         if (err instanceof SyntaxError) {
           repaired = repairJson(rawBody);
           try {
@@ -117,13 +110,11 @@ app.use((req, res, next) => {
             console.log('   Original:', rawBody);
             console.log('   Repaired:', repaired);
           } catch (err2) {
-            // If repair fails, log and keep null
             console.error('❌ JSON repair also failed:', err2.message);
             console.error('   Raw:', rawBody);
             console.error('   Repaired:', repaired);
           }
         } else {
-          // Non‑syntax error, rethrow
           throw err;
         }
       }
@@ -134,8 +125,6 @@ app.use((req, res, next) => {
           req.repairedRawBody = repaired;
         }
       } else {
-        // If we couldn't parse even after repair, we still set an empty body
-        // but we'll log the error and continue (we return 200 later)
         req.body = {};
         req.parseError = new Error('Invalid JSON after repair');
         console.error('========== JSON PARSE ERROR ==========');
@@ -195,7 +184,7 @@ app.use(async (req, res, next) => {
 
 // ---------- API Routes ----------
 app.use('/api', apiRoutes);
-app.use('/api/mt5', mt5Routes);
+app.use('/api/mt5', mt5Routes);   // <-- persistent MT5 endpoints
 
 // ---------- Health Check ----------
 app.get('/health', (req, res) => {
@@ -213,7 +202,7 @@ app.get('*', (req, res) => {
 
 // ---------- Start Server ----------
 async function startServer() {
-  await cleanDatabaseAndCreateAdmin();
+  await ensureAdmin();   // only creates admin if missing, no collection drops
   app.listen(PORT, () => {
     console.log(`✅ RTS server running on http://localhost:${PORT}`);
     console.log(`📊 Dashboard: http://localhost:${PORT}`);
@@ -221,6 +210,7 @@ async function startServer() {
     console.log(`🟢 MT5 Bridge endpoints: http://localhost:${PORT}/api/mt5`);
     console.log('📡 Request logging enabled.');
     console.log('🛠️  JSON repair enabled (auto‑closes missing braces).');
+    console.log('💾 MT5 data is now persistent (MongoDB).');
   });
 }
 
