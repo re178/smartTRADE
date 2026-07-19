@@ -1,4 +1,4 @@
-// server.js – RTS Entry Point (with MT5 Bridge & robust JSON handling)
+// server.js – RTS Entry Point (with MT5 Bridge, Cognitive Intelligence, WebSocket)
 
 require('dotenv').config();
 
@@ -6,11 +6,28 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const mongoose = require('mongoose');
+const WebSocket = require('ws');
+const http = require('http');
 
 const connectDB = require('./config/db');
 const apiRoutes = require('./api/routes');
 const mt5Routes = require('./api/routes/mt5');
 const User = require('./models/User');
+
+// ---------- COGNITIVE MODULES ----------
+const priceBuffer = require('./core/data/priceBuffer');
+const candleStore = require('./core/data/candleStore');
+const marketIntelligence = require('./core/market/intelligence');
+const regimeEngine = require('./core/market/regime');
+const fusionEngine = require('./core/signal/fusion');
+const selfLearner = require('./core/learning/learner');
+const analyticsDashboard = require('./core/analytics/dashboard');
+const eventBus = require('./infrastructure/eventBus');
+
+// Optional: validation engine, explainability (not started automatically)
+// const validationEngine = require('./core/validation/engine');
+
+const logger = require('./infrastructure/logger') || console;
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -69,13 +86,10 @@ app.use((req, res, next) => {
     rawBody += chunk.toString();
   });
   req.on('end', () => {
-    // 1. Remove BOM
     if (rawBody.charCodeAt(0) === 0xFEFF) {
       rawBody = rawBody.slice(1);
     }
-    // 2. Remove all null bytes (\0)
     rawBody = rawBody.replace(/\0/g, '');
-    // 3. Trim whitespace
     const trimmed = rawBody.trim();
     req.rawBody = trimmed;
 
@@ -86,7 +100,6 @@ app.use((req, res, next) => {
         parsed = JSON.parse(trimmed);
         req.body = parsed;
       } catch (err) {
-        // Attempt repair only if parse failed
         if (err instanceof SyntaxError) {
           const repaired = repairJson(trimmed);
           try {
@@ -118,7 +131,7 @@ app.use((req, res, next) => {
   });
 });
 
-// ---------- Request Logger (clean) ----------
+// ---------- Request Logger ----------
 app.use((req, res, next) => {
   if (req.path.startsWith('/api')) {
     console.log('\n==============================');
@@ -175,19 +188,120 @@ app.get('*', (req, res) => {
   }
 });
 
+// ---------- Create HTTP server ----------
+const server = http.createServer(app);
+
+// ---------- WebSocket Server ----------
+const wss = new WebSocket.Server({ server });
+
+wss.on('connection', (ws) => {
+  console.log('[WebSocket] Client connected.');
+  ws.on('close', () => console.log('[WebSocket] Client disconnected.'));
+  ws.on('error', (err) => console.error('[WebSocket] Error:', err.message));
+});
+
+// ---------- Broadcast functions ----------
+function broadcast(type, data) {
+  const message = JSON.stringify({ type, data });
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(message);
+    }
+  });
+}
+
+// ---------- Connect cognitive events to WebSocket ----------
+// 1. Fusion decisions
+fusionEngine.on('decision', (decision) => {
+  broadcast('decision', decision);
+});
+
+// 2. Regime changes
+regimeEngine.on('regime', (regime) => {
+  broadcast('regime', regime);
+});
+
+// 3. Market closed events
+fusionEngine.on('marketClosed', (data) => {
+  broadcast('marketClosed', data);
+});
+
+// 4. Performance metrics (if analyticsDashboard emits)
+analyticsDashboard.on('metrics', (metrics) => {
+  broadcast('metrics', metrics);
+});
+
+// Optional: explanation events
+fusionEngine.on('explanation', (explanation) => {
+  broadcast('explanation', explanation);
+});
+
+// ---------- Start Cognitive Engines ----------
+async function startCognitiveEngines() {
+  try {
+    // Load historical trades for self‑learner
+    await selfLearner.loadHistory();
+    console.log('[Cognitive] SelfLearner loaded history.');
+
+    // Start the fusion engine (which loads weights from learner)
+    await fusionEngine.start();
+    console.log('[Cognitive] FusionEngine started.');
+
+    // Start analytics dashboard
+    analyticsDashboard.start();
+    console.log('[Cognitive] AnalyticsDashboard started.');
+
+    // Connect learner to fusion for weight updates
+    selfLearner.on('weightsUpdated', (weights) => {
+      fusionEngine.updateWeights(weights);
+      console.log('[Cognitive] Fusion weights updated.');
+    });
+
+    // Connect trade closure events to the learner
+    eventBus.on('trade.closed', (data) => {
+      if (data.trade) {
+        selfLearner.recordTrade(data.trade);
+        // Also update analytics dashboard (if needed)
+        // analyticsDashboard._addTrade(data.trade); // optional
+      }
+    });
+
+    // Also forward account updates to analytics dashboard
+    eventBus.on('account.fetched', (account) => {
+      const equity = parseFloat(account.equity);
+      const balance = parseFloat(account.balance);
+      // Set initial balance if not set
+      if (analyticsDashboard._initialBalance === 0) {
+        analyticsDashboard.setInitialBalance(balance);
+      }
+      // The dashboard will update equity via its own event listener.
+    });
+
+    console.log('[Cognitive] All cognitive modules initialized.');
+  } catch (err) {
+    console.error('[Cognitive] Initialization error:', err.message);
+  }
+}
+
 // ---------- Start Server ----------
 async function startServer() {
   await ensureAdmin();
-  app.listen(PORT, () => {
+
+  // Start HTTP server
+  server.listen(PORT, () => {
     console.log(`✅ RTS server running on http://localhost:${PORT}`);
     console.log(`📊 Dashboard: http://localhost:${PORT}`);
     console.log(`🔌 API base: http://localhost:${PORT}/api`);
     console.log(`🟢 MT5 Bridge endpoints: http://localhost:${PORT}/api/mt5`);
+    console.log('📡 WebSocket server ready for real‑time signals.');
     console.log('📡 Request logging enabled.');
     console.log('🛠️  JSON repair enabled as fallback.');
     console.log('🧹  Null bytes (\\0) stripped from all incoming JSON.');
     console.log('💾 MT5 data is persistent (MongoDB).');
   });
+
+  // Start cognitive engines after server is up
+  setTimeout(startCognitiveEngines, 2000);
 }
 
 startServer().catch(err => {
