@@ -148,7 +148,7 @@ exports.getTradeHistory = async (req, res) => {
   }
 };
 
-// ---------- Manual Order ----------
+// ---------- Manual Order (FIXED: no duplicate Trade) ----------
 exports.placeOrder = async (req, res) => {
   const { pair, side, lotSize, stopLoss, takeProfit } = req.body;
   const validation = validateOrderInput({ pair, side, lotSize, stopLoss, takeProfit });
@@ -174,24 +174,22 @@ exports.placeOrder = async (req, res) => {
     if (!approval.allowed) {
       return res.status(400).json({ error: approval.reason });
     }
+    // Order service will create both Order and Trade documents
     const orderResult = await orderService.placeMarketOrder(
       instrument, side, lotSize, stopLoss || null, takeProfit || null, product
     );
-    const trade = new Trade({
-      pair: instrument,
-      side,
-      entryPrice: orderResult.price || currentPrice,
-      stopLoss: stopLoss || null,
-      takeProfit: takeProfit || null,
-      lotSize,
-      status: 'OPEN',
-      openTime: new Date(),
-      oandaTradeId: orderResult.contractId,
-      oandaOrderId: orderResult.contractId,
-      broker: product === 'mt5' ? 'MT5' : 'Deriv',
-      strategy: 'Manual',
-    });
-    await trade.save();
+    // Retrieve the trade that was just created by orderService (by contractId)
+    const trade = await Trade.findOne({ contractId: orderResult.contractId });
+    if (!trade) {
+      // Fallback: try to find the most recent trade for this instrument
+      const fallbackTrade = await Trade.findOne({ instrument }).sort({ openTime: -1 });
+      if (fallbackTrade) {
+        logger.warn(`[placeOrder] Trade not found by contractId ${orderResult.contractId}, using most recent trade ${fallbackTrade.contractId}`);
+        notifyTrade('OPENED', fallbackTrade, account).catch(err => logger.error('[Notification] Error:', err.message));
+        return res.json({ success: true, trade: fallbackTrade, raw: orderResult });
+      }
+      return res.status(500).json({ error: 'Order placed but trade record not found' });
+    }
     notifyTrade('OPENED', trade, account).catch(err => logger.error('[Notification] Error:', err.message));
     res.json({ success: true, trade, raw: orderResult });
   } catch (error) {
@@ -208,7 +206,7 @@ exports.closeTrade = async (req, res) => {
     const product = getProduct(req);
     const result = await orderService.closeTrade(tradeId, product);
     const updated = await Trade.findOneAndUpdate(
-      { oandaTradeId: tradeId },
+      { contractId: tradeId },
       { status: 'CLOSED', closeTime: new Date(), closePrice: result.price || null, pnl: result.pl || 0 },
       { new: true }
     );
@@ -246,7 +244,7 @@ exports.getSignal = async (req, res) => {
   }
 };
 
-// ---------- Auto Trade ----------
+// ---------- Auto Trade (FIXED: no duplicate Trade) ----------
 exports.autoTrade = async (req, res) => {
   const { pair, riskPercent = 1, strategy = 'sma', ...params } = req.body;
   if (!pair) return res.status(400).json({ error: 'pair required' });
@@ -267,22 +265,11 @@ exports.autoTrade = async (req, res) => {
     const orderResult = await orderService.placeMarketOrder(
       instrument, signal.side, lotSize, signal.stopLoss, signal.takeProfit, product
     );
-    const trade = new Trade({
-      pair: instrument,
-      side: signal.side,
-      entryPrice: orderResult.price || signal.entryPrice,
-      stopLoss: signal.stopLoss,
-      takeProfit: signal.takeProfit,
-      lotSize,
-      status: 'OPEN',
-      openTime: new Date(),
-      oandaTradeId: orderResult.contractId,
-      oandaOrderId: orderResult.contractId,
-      broker: product === 'mt5' ? 'MT5' : 'Deriv',
-      strategy: signal.strategy || strategy,
-      notes: 'Auto-trade from strategy',
-    });
-    await trade.save();
+    const trade = await Trade.findOne({ contractId: orderResult.contractId });
+    if (!trade) {
+      logger.warn(`[autoTrade] Trade not found by contractId ${orderResult.contractId}`);
+      return res.json({ success: true, raw: orderResult, trade: null });
+    }
     notifyTrade('OPENED', trade, account).catch(err => logger.error('[Notification] Error:', err.message));
     res.json({ success: true, signal, trade, raw: orderResult });
   } catch (error) {
