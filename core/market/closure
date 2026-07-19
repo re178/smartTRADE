@@ -1,0 +1,140 @@
+// core/market/closure.js
+// RTS Market Closure Detector – with Deriv‑specific schedule + caching
+
+const logger = require('../../infrastructure/logger') || console;
+
+// Deriv's known trading schedules (GMT)
+const DERIV_SCHEDULE = {
+  forex: {
+    openDay: 0,    // Sunday
+    closeDay: 5,   // Friday
+    openHour: 22,
+    closeHour: 22,
+    openMinute: 0,
+    closeMinute: 0,
+  },
+  synthetic: {
+    openDay: 0,
+    closeDay: 6,
+    openHour: 0,
+    closeHour: 24,
+  },
+  indices: {
+    openDay: 1,
+    closeDay: 5,
+    openHour: 0,
+    closeHour: 22,
+    openMinute: 0,
+    closeMinute: 0,
+  },
+  commodities: {
+    openDay: 1,
+    closeDay: 5,
+    openHour: 0,
+    closeHour: 22,
+  },
+};
+
+function getMarketType(symbol) {
+  const upper = symbol.toUpperCase();
+  if (upper.includes('VOL') || upper.includes('R_') || upper.includes('JUMP')) return 'synthetic';
+  if (upper.includes('US500') || upper.includes('UK100')) return 'indices';
+  if (upper.includes('XAU') || upper.includes('XAG')) return 'commodities';
+  return 'forex';
+}
+
+class MarketClosure {
+  constructor() {
+    this._brokerErrorCache = new Map(); // symbol -> { expiresAt }
+  }
+
+  isMarketOpen(symbol, marketType = null) {
+    const now = new Date();
+    const day = now.getUTCDay();
+    const hours = now.getUTCHours();
+    const minutes = now.getUTCMinutes();
+    const totalMinutes = hours * 60 + minutes;
+
+    const cacheKey = symbol.toUpperCase();
+    if (this._brokerErrorCache.has(cacheKey)) {
+      const entry = this._brokerErrorCache.get(cacheKey);
+      if (entry.expiresAt > now) {
+        return {
+          isOpen: false,
+          reason: `Broker reported market closed until ${entry.expiresAt.toUTCString()}`,
+          nextOpen: entry.expiresAt,
+        };
+      } else {
+        this._brokerErrorCache.delete(cacheKey);
+      }
+    }
+
+    const type = marketType || getMarketType(symbol);
+    const config = DERIV_SCHEDULE[type] || DERIV_SCHEDULE.forex;
+
+    const openDay = config.openDay;
+    const closeDay = config.closeDay;
+    const openTotalMinutes = (config.openHour * 60) + (config.openMinute || 0);
+    const closeTotalMinutes = (config.closeHour * 60) + (config.closeMinute || 0);
+
+    if (openDay === 0 && closeDay === 6 && openTotalMinutes === 0 && closeTotalMinutes === 1440) {
+      return { isOpen: true, reason: '24/7 market.', nextOpen: null };
+    }
+
+    if (type === 'forex') {
+      if (day === openDay && totalMinutes >= openTotalMinutes) return { isOpen: true, reason: 'Open (Sunday).', nextOpen: null };
+      if (day > openDay && day < closeDay) return { isOpen: true, reason: 'Open (weekday).', nextOpen: null };
+      if (day === closeDay && totalMinutes < closeTotalMinutes) return { isOpen: true, reason: 'Open (Friday).', nextOpen: null };
+      const nextOpen = this._calculateNextOpen(openDay, openTotalMinutes);
+      return { isOpen: false, reason: `Closed. Next open: ${nextOpen.toUTCString()}`, nextOpen };
+    }
+
+    if (type === 'indices' || type === 'commodities') {
+      if (day >= openDay && day <= closeDay) {
+        if (day === openDay && totalMinutes < openTotalMinutes) {
+          const nextOpen = this._calculateNextOpen(openDay, openTotalMinutes);
+          return { isOpen: false, reason: `Not yet open. Next: ${nextOpen.toUTCString()}`, nextOpen };
+        }
+        if (day === closeDay && totalMinutes >= closeTotalMinutes) {
+          const nextOpen = this._calculateNextOpen(openDay, openTotalMinutes);
+          return { isOpen: false, reason: `Closed. Next: ${nextOpen.toUTCString()}`, nextOpen };
+        }
+        return { isOpen: true, reason: 'Open.', nextOpen: null };
+      } else {
+        const nextOpen = this._calculateNextOpen(openDay, openTotalMinutes);
+        return { isOpen: false, reason: `Closed. Next: ${nextOpen.toUTCString()}`, nextOpen };
+      }
+    }
+
+    return { isOpen: true, reason: 'Default open.', nextOpen: null };
+  }
+
+  recordBrokerClosure(symbol, durationMinutes = 120) {
+    const expiresAt = new Date(Date.now() + durationMinutes * 60 * 1000);
+    this._brokerErrorCache.set(symbol.toUpperCase(), { expiresAt });
+    logger.warn(`[MarketClosure] Broker closure cached for ${symbol} until ${expiresAt.toUTCString()}`);
+  }
+
+  clearBrokerClosure(symbol) {
+    this._brokerErrorCache.delete(symbol.toUpperCase());
+  }
+
+  getStatus(symbol) {
+    const result = this.isMarketOpen(symbol);
+    return { symbol, isOpen: result.isOpen, reason: result.reason, nextOpen: result.nextOpen };
+  }
+
+  _calculateNextOpen(openDay, openTotalMinutes) {
+    const now = new Date();
+    const currentDay = now.getUTCDay();
+    const currentTotalMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
+    let daysUntilOpen = (openDay - currentDay + 7) % 7;
+    if (daysUntilOpen === 0 && currentTotalMinutes >= openTotalMinutes) daysUntilOpen = 7;
+    const nextOpen = new Date(now);
+    nextOpen.setUTCDate(now.getUTCDate() + daysUntilOpen);
+    nextOpen.setUTCHours(Math.floor(openTotalMinutes / 60), openTotalMinutes % 60, 0, 0);
+    return nextOpen;
+  }
+}
+
+module.exports = new MarketClosure();
