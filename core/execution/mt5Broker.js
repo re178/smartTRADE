@@ -10,7 +10,7 @@ class MT5Broker extends EventEmitter {
     super();
     this.renderUrl = config.renderUrl || process.env.RENDER_URL || 'https://tradermarketopen.onrender.com';
     this.apiKey = config.apiKey || process.env.MT5_API_KEY || '';
-    this.pollInterval = config.pollInterval || 2000;
+    this.pollInterval = config.pollInterval || 500; // 500ms for faster result polling
     this._state = 'DISCONNECTED';
     this._pendingCommands = new Map();
     this._pollingTimer = null;
@@ -238,7 +238,7 @@ class MT5Broker extends EventEmitter {
       try {
         const priceData = await this.getPrice(symbol);
         results.push({
-          symbol: priceData.symbol,
+          instrument: priceData.symbol,
           bids: [{ price: priceData.bid }],
           asks: [{ price: priceData.ask }],
           time: priceData.time,
@@ -247,7 +247,7 @@ class MT5Broker extends EventEmitter {
       } catch (err) {
         logger.warn(`[MT5Broker] getPrices failed for ${symbol}:`, err.message);
         results.push({
-          symbol,
+          instrument: symbol,
           bids: [{ price: 0 }],
           asks: [{ price: 0 }],
           error: err.message,
@@ -349,12 +349,11 @@ class MT5Broker extends EventEmitter {
     this._pendingCommands.clear();
   }
 
-  // ---------- Get Account (aggressive retry) ----------
+  // ---------- Get Account (with retry and createdTime) ----------
   async getAccount() {
     await this._ensureReady();
-
-    const maxAttempts = 15;
-    const delayMs = 1500;
+    const maxAttempts = 5;
+    const delayMs = 2000;
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
@@ -366,7 +365,7 @@ class MT5Broker extends EventEmitter {
           }
         );
         const data = response.data;
-        if (data && data.login) {
+        if (data && data.login && data.login !== 0) {
           this._lastStatus = data;
           logger.info(`[MT5Broker] Account fetched on attempt ${attempt + 1}`);
           return {
@@ -383,19 +382,20 @@ class MT5Broker extends EventEmitter {
             company: data.company || '',
             accountName: data.accountName || '',
             server: data.server || '',
+            // ---- FIX: add createdTime for dashboard ----
+            createdTime: data.createdAt || data.updatedAt || data.timestamp || null,
+            updatedTime: data.updatedAt || data.timestamp || null,
           };
         }
       } catch (err) {
         logger.warn(`[MT5Broker] getAccount attempt ${attempt + 1}/${maxAttempts} failed:`, err.message);
       }
-
-      // Wait before next attempt (except after the last)
       if (attempt < maxAttempts - 1) {
         await new Promise(resolve => setTimeout(resolve, delayMs));
       }
     }
 
-    logger.warn('[MT5Broker] getAccount failed after all retries, returning default');
+    logger.warn('[MT5Broker] getAccount returning default after attempts');
     return {
       id: 'MT5_ACCOUNT',
       balance: '0',
@@ -403,6 +403,8 @@ class MT5Broker extends EventEmitter {
       equity: '0',
       marginUsed: '0',
       marginAvailable: '0',
+      createdTime: null,
+      updatedTime: null,
     };
   }
 
