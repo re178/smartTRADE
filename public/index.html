@@ -17,13 +17,22 @@
     #tradesTable td { vertical-align: middle; }
     .product-toggle .btn { border-radius: 20px; }
     .product-toggle .btn.active { background: #0d6efd; color: white; }
+    /* Live signal card styling */
+    .live-signal-card { position: relative; }
+    .live-signal-card .btn-execute { margin-top: 8px; }
+    #wsStatus { font-weight: bold; padding: 4px 12px; border-radius: 20px; }
+    .ws-connected { color: #28a745; background: #d4edda; }
+    .ws-disconnected { color: #dc3545; background: #f8d7da; }
   </style>
 </head>
 <body>
 <div class="container-fluid">
   <div class="row">
     <div class="col-12">
-      <h1 class="display-6 mb-4"><i class="fas fa-chart-line text-primary"></i> RTS Trading Dashboard</h1>
+      <h1 class="display-6 mb-4">
+        <i class="fas fa-chart-line text-primary"></i> RTS Trading Dashboard
+        <span id="wsStatus" class="badge bg-secondary ms-3">Connecting...</span>
+      </h1>
     </div>
   </div>
 
@@ -65,6 +74,40 @@
               <button class="btn btn-sm btn-outline-primary" id="testNotificationBtn">Test Notification</button>
             </div>
           </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== NEW: Live Cognitive Intelligence Panels ====== -->
+  <div class="row">
+    <!-- Live Signal Panel -->
+    <div class="col-md-6">
+      <div class="card">
+        <div class="card-header">
+          <i class="fas fa-bolt text-warning"></i> Live Signal
+          <span class="badge bg-info float-end">Real‑time</span>
+        </div>
+        <div class="card-body" id="liveSignalPanel">
+          <p class="text-muted">Waiting for live signals...</p>
+        </div>
+      </div>
+    </div>
+    <!-- Regime Panel -->
+    <div class="col-md-3">
+      <div class="card">
+        <div class="card-header"><i class="fas fa-flag"></i> Market Regime</div>
+        <div class="card-body" id="regimePanel">
+          <p class="text-muted">Waiting for regime data...</p>
+        </div>
+      </div>
+    </div>
+    <!-- Metrics Panel -->
+    <div class="col-md-3">
+      <div class="card">
+        <div class="card-header"><i class="fas fa-chart-bar"></i> Live Metrics</div>
+        <div class="card-body" id="metricsPanel">
+          <p class="text-muted">Waiting for metrics...</p>
         </div>
       </div>
     </div>
@@ -212,7 +255,11 @@
   </div>
 </div>
 
+<!-- JavaScript includes -->
 <script src="js/config.js"></script>
 <script src="js/app.js"></script>
+<!-- NEW: Live WebSocket client (must be after app.js) -->
+<script src="js/live.js"></script>
+
 </body>
 </html>
