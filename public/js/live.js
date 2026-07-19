@@ -1,17 +1,17 @@
 // public/js/live.js
-// RTS Live WebSocket Client – Real‑time signals, regime, metrics, and clickable trade actions.
+// RTS Live WebSocket Client – Real‑time signals, regime, metrics, and market closure status.
 
 (function() {
   'use strict';
 
   // ---- Configuration ----
-  const WS_RECONNECT_DELAY = 2000; // initial reconnection delay
+  const WS_RECONNECT_DELAY = 2000;
   const WS_MAX_RECONNECT_DELAY = 30000;
   let reconnectAttempts = 0;
   let ws = null;
   let wsConnected = false;
 
-  // ---- DOM references (assumes these IDs exist in your HTML) ----
+  // ---- DOM references ----
   const liveSignalPanel = document.getElementById('liveSignalPanel');
   const regimePanel = document.getElementById('regimePanel');
   const metricsPanel = document.getElementById('metricsPanel');
@@ -22,7 +22,7 @@
     wsConnected = connected;
     if (wsStatus) {
       wsStatus.textContent = connected ? '🟢 Live' : '🔴 Disconnected';
-      wsStatus.className = connected ? 'text-success' : 'text-danger';
+      wsStatus.className = connected ? 'badge bg-success' : 'badge bg-danger';
     }
   }
 
@@ -76,7 +76,7 @@
 
   // ---- Message handler ----
   function handleMessage(msg) {
-    // msg format: { type: 'decision'|'regime'|'metrics', data: ... }
+    // msg format: { type: 'decision'|'regime'|'metrics'|'marketClosed', data: ... }
     switch (msg.type) {
       case 'decision':
         displayDecision(msg.data);
@@ -86,6 +86,9 @@
         break;
       case 'metrics':
         displayMetrics(msg.data);
+        break;
+      case 'marketClosed':
+        displayMarketClosed(msg.data);
         break;
       default:
         console.debug('[Live] Unknown message type:', msg.type);
@@ -115,12 +118,24 @@
     html += `</div>`;
 
     liveSignalPanel.innerHTML = html;
-    // Play sound for new signal (if it's a BUY/SELL)
-    if (side && side !== 'NO_TRADE') {
-      if (typeof playSound === 'function') {
-        playSound('signal');
-      }
+    // Play sound for new signal if it's a BUY/SELL and the sound function exists
+    if (side && side !== 'NO_TRADE' && typeof window.playSound === 'function') {
+      window.playSound('signal');
     }
+  }
+
+  // ---- Display market closed status ----
+  function displayMarketClosed(data) {
+    if (!liveSignalPanel) return;
+    const { symbol, reason, nextOpen } = data;
+    liveSignalPanel.innerHTML = `
+      <div class="alert alert-warning">
+        <h5><i class="fas fa-hourglass-end"></i> Market Closed</h5>
+        <p><strong>${symbol}</strong></p>
+        <p>${reason}</p>
+        <p><strong>Next open:</strong> ${nextOpen ? new Date(nextOpen).toLocaleString() : 'Unknown'}</p>
+      </div>
+    `;
   }
 
   // ---- Display regime ----
@@ -180,18 +195,17 @@
     const tp = parseFloat(card.dataset.tp) || null;
     const lot = parseFloat(card.dataset.lot) || 0.01;
 
-    // Fill the trade form using the existing window.fillTradeForm (from app.js)
+    // Use the existing window.fillTradeForm (from app.js) to fill the form
     if (typeof window.fillTradeForm === 'function') {
       window.fillTradeForm(symbol, side, entry, sl, tp, lot);
-      // Optionally auto-submit (if you want one-click execution)
-      // You can uncomment the line below to auto-submit after filling:
+      // Optionally auto-submit: uncomment the next line if you want one-click execution
       // document.getElementById('tradeForm')?.dispatchEvent(new Event('submit'));
     } else {
       alert('Trade form fill function not available.');
     }
   };
 
-  // ---- Additional helper: formatPrice (reuse from app.js) ----
+  // ---- Helper: formatPrice (reuse from app.js) ----
   function formatPrice(p) {
     if (p === undefined || p === null) return 'N/A';
     return parseFloat(p).toFixed(5);
