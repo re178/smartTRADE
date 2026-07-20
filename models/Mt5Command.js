@@ -17,13 +17,11 @@ const Mt5CommandSchema = new mongoose.Schema({
   units: Number,
   stopLoss: Number,
   takeProfit: Number,
-  tradeId: String,           // for close/modify/cancel
-  orderType: String,         // for pending orders
-  price: Number,             // for pending orders
-  stopLimitPrice: Number,    // for stop-limit
-  volume: Number,            // for partial close
-
-  // ---------- New state fields ----------
+  tradeId: Number,          // Changed from String to Number
+  orderType: String,
+  price: Number,
+  stopLimitPrice: Number,
+  volume: Number,
   state: {
     type: String,
     enum: ['QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED'],
@@ -36,12 +34,11 @@ const Mt5CommandSchema = new mongoose.Schema({
     default: 0,
   },
   lastAttemptAt: Date,
-  error: String,             // last error message if FAILED
-
+  error: String,
   createdAt: {
     type: Date,
     default: Date.now,
-    expires: 300,            // auto-delete after 5 minutes (stale commands)
+    expires: 300,
   },
 });
 
