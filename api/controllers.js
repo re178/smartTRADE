@@ -139,19 +139,17 @@ exports.getTrades = async (req, res) => {
   }
 };
 
-// ---------- Trade History (ENHANCED with logging) ----------
+// ---------- Trade History (reads from DB) ----------
 exports.getTradeHistory = async (req, res) => {
   try {
     const trades = await Trade.find().sort({ createdAt: -1 });
-    logger.info(`[getTradeHistory] Found ${trades.length} total trades.`);
     res.json(trades);
   } catch (error) {
-    logger.error('[getTradeHistory] Error:', error.message);
     res.status(500).json({ error: error.message });
   }
 };
 
-// ---------- Manual Order (unchanged) ----------
+// ---------- Manual Order ----------
 exports.placeOrder = async (req, res) => {
   const { pair, side, lotSize, stopLoss, takeProfit } = req.body;
   const validation = validateOrderInput({ pair, side, lotSize, stopLoss, takeProfit });
@@ -180,7 +178,7 @@ exports.placeOrder = async (req, res) => {
     const orderResult = await orderService.placeMarketOrder(
       instrument, side, lotSize, stopLoss || null, takeProfit || null, product
     );
-    const trade = await Trade.findOne({ contractId: orderResult.contractId });
+    const trade = await Trade.findOne({ oandaTradeId: orderResult.contractId });
     notifyTrade('OPENED', trade, account).catch(err => logger.error('[Notification] Error:', err.message));
     res.json({ success: true, trade, raw: orderResult });
   } catch (error) {
@@ -189,15 +187,42 @@ exports.placeOrder = async (req, res) => {
   }
 };
 
-// ---------- Close Trade (YOUR WORKING VERSION – unchanged) ----------
+// ---------- Close Trade (FIXED: uses oandaTradeId) ----------
 exports.closeTrade = async (req, res) => {
   const { tradeId } = req.params;
   if (!tradeId) return res.status(400).json({ error: 'tradeId required' });
   try {
-    const product = getProduct(req);
-    const result = await orderService.closeTrade(tradeId, product);
+    const idStr = String(tradeId);
+
+    // 1. Find trade by oandaTradeId
+    const trade = await Trade.findOne({ oandaTradeId: idStr });
+    if (!trade) {
+      logger.warn(`[closeTrade] Trade not found with oandaTradeId: ${idStr}`);
+      return res.status(404).json({ error: 'Trade not found' });
+    }
+
+    // 2. Determine product from trade.broker
+    let product = null;
+    if (trade.broker) {
+      const brokerMap = {
+        'MT5': 'mt5',
+        'Deriv': 'deriv_cfd',
+        'OANDA': 'oanda',
+      };
+      product = brokerMap[trade.broker] || null;
+    }
+    if (!product) {
+      product = getProduct(req);
+    }
+
+    logger.info(`[closeTrade] Closing trade ${idStr} using product: ${product}`);
+
+    // 3. Execute close via orderService
+    const result = await orderService.closeTrade(idStr, product);
+
+    // 4. Update trade status
     const updated = await Trade.findOneAndUpdate(
-      { contractId: tradeId },
+      { oandaTradeId: idStr },
       {
         status: 'CLOSED',
         closeTime: new Date(),
@@ -206,7 +231,18 @@ exports.closeTrade = async (req, res) => {
       },
       { new: true }
     );
-    if (updated) {
+
+    if (!updated) {
+      logger.warn(`[closeTrade] Trade ${idStr} not updated.`);
+    } else {
+      logger.info(`[closeTrade] Trade ${idStr} updated to CLOSED.`);
+      // Update Order if exists
+      await Order.findOneAndUpdate(
+        { contractId: idStr },
+        { status: 'CLOSED', updatedAt: new Date() },
+        { upsert: false }
+      );
+      // Portfolio, notifications, learner
       portfolioManager.updateDailyPnL(result.pl || 0);
       const broker = getBroker(product);
       const account = await broker.getAccount();
@@ -218,6 +254,7 @@ exports.closeTrade = async (req, res) => {
         logger.warn('[PerformanceLearner] Failed to record trade:', err.message);
       }
     }
+
     res.json({ success: true, result, updated });
   } catch (error) {
     logger.error('[closeTrade] Error:', error.message);
@@ -261,7 +298,7 @@ exports.autoTrade = async (req, res) => {
     const orderResult = await orderService.placeMarketOrder(
       instrument, signal.side, lotSize, signal.stopLoss, signal.takeProfit, product
     );
-    const trade = await Trade.findOne({ contractId: orderResult.contractId });
+    const trade = await Trade.findOne({ oandaTradeId: orderResult.contractId });
     notifyTrade('OPENED', trade, account).catch(err => logger.error('[Notification] Error:', err.message));
     res.json({ success: true, signal, trade, raw: orderResult });
   } catch (error) {
