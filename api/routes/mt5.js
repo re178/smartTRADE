@@ -2,9 +2,6 @@ const express = require('express');
 const router = express.Router();
 const logger = require('../../infrastructure/logger') || console;
 
-// ---- ADD THIS LINE: import priceBuffer for cognitive engine ----
-const priceBuffer = require('../../core/data/priceBuffer');
-
 // Import Mongoose models
 const Mt5Command = require('../../models/Mt5Command');
 const Mt5CommandResult = require('../../models/Mt5CommandResult');
@@ -12,7 +9,7 @@ const Mt5Account = require('../../models/Mt5Account');
 const Mt5Position = require('../../models/Mt5Position');
 const Mt5Price = require('../../models/Mt5Price');
 const Mt5Heartbeat = require('../../models/Mt5Heartbeat');
-const Trade = require('../../models/Trade');
+const Trade = require('../../models/Trade'); // for history
 
 // ---------- Authentication ----------
 const API_KEY = process.env.MT5_API_KEY || 'change-me-in-production';
@@ -139,6 +136,7 @@ router.post('/account/status', async (req, res) => {
   try {
     const status = req.body;
     logger.info(`[MT5] POST account/status received: login=${status.login}, balance=${status.balance}`);
+
     const saved = await Mt5Account.findOneAndUpdate(
       { login: status.login },
       {
@@ -151,6 +149,7 @@ router.post('/account/status', async (req, res) => {
         runValidators: true,
       }
     );
+
     if (saved) {
       logger.info('[MT5] Saved account:', JSON.stringify(saved, null, 2));
       res.status(201).json({ status: 'accepted', account: saved });
@@ -166,11 +165,28 @@ router.post('/account/status', async (req, res) => {
 
 router.get('/account/status', async (req, res) => {
   try {
-    const account = await Mt5Account.findOne().sort({ updatedAt: -1 }).lean();
-    logger.info('[MT5] GET account/status:', JSON.stringify(account, null, 2));
+    let account = await Mt5Account.findOne().sort({ updatedAt: -1 }).lean();
     if (!account) {
-      return res.status(404).json({ error: 'No account status yet' });
+      // Fallback to avoid 404
+      account = {
+        login: 0,
+        balance: 0,
+        equity: 0,
+        margin: 0,
+        free_margin: 0,
+        profit: 0,
+        currency: 'USD',
+        server: 'Unknown',
+        leverage: 0,
+        marginLevel: 0,
+        tradeMode: 0,
+        company: '',
+        accountName: '',
+        status: 'offline',
+        timestamp: Date.now(),
+      };
     }
+    logger.info('[MT5] GET account/status:', JSON.stringify(account, null, 2));
     res.json(account);
   } catch (err) {
     logger.error('[MT5] GET account/status error:', err.message);
@@ -222,29 +238,19 @@ router.post('/heartbeat', async (req, res) => {
 router.get('/heartbeat', async (req, res) => {
   try {
     const heartbeat = await Mt5Heartbeat.findOne().sort({ updatedAt: -1 }).lean();
-    if (!heartbeat) {
-      return res.json({ online: false, lastHeartbeat: null });
-    }
-    res.json(heartbeat);
+    res.json(heartbeat || { online: false });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ---------- Price Feed (with Cognitive Engine Integration) ----------
+// ---------- Price Feed (without cognitive) ----------
 router.post('/price', async (req, res) => {
   try {
     const priceData = req.body;
     if (!priceData.symbol) {
       return res.status(400).json({ error: 'Missing symbol' });
     }
-
-    // ---- COGNITIVE ENGINE INTEGRATION ----
-    // Forward the live price to the priceBuffer for candle building and signal generation
-    priceBuffer.update(priceData.symbol, priceData.bid, priceData.ask, priceData.time);
-    // -------------------------------------
-
-    // Save to database for historical queries
     await Mt5Price.findOneAndUpdate(
       { symbol: priceData.symbol },
       priceData,
@@ -253,12 +259,11 @@ router.post('/price', async (req, res) => {
     logger.debug(`[MT5] Price updated for ${priceData.symbol}`);
     res.status(201).json({ status: 'accepted' });
   } catch (err) {
-    logger.error('[MT5] Price POST error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ---- Price GET (with underscore handling) ----
+// ---- UPDATED: handle underscores in symbol names ----
 router.get('/price/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
