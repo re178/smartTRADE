@@ -139,7 +139,6 @@ exports.getTrades = async (req, res) => {
   }
 };
 
-// ---------- Trade History (reads from DB) ----------
 exports.getTradeHistory = async (req, res) => {
   try {
     const trades = await Trade.find().sort({ createdAt: -1 });
@@ -149,7 +148,7 @@ exports.getTradeHistory = async (req, res) => {
   }
 };
 
-// ---------- Manual Order ----------
+// ---------- Manual Order (FIXED: no duplicate Trade) ----------
 exports.placeOrder = async (req, res) => {
   const { pair, side, lotSize, stopLoss, takeProfit } = req.body;
   const validation = validateOrderInput({ pair, side, lotSize, stopLoss, takeProfit });
@@ -175,10 +174,22 @@ exports.placeOrder = async (req, res) => {
     if (!approval.allowed) {
       return res.status(400).json({ error: approval.reason });
     }
+    // Order service will create both Order and Trade documents
     const orderResult = await orderService.placeMarketOrder(
       instrument, side, lotSize, stopLoss || null, takeProfit || null, product
     );
-    const trade = await Trade.findOne({ oandaTradeId: orderResult.contractId });
+    // Retrieve the trade that was just created by orderService (by contractId)
+    const trade = await Trade.findOne({ contractId: orderResult.contractId });
+    if (!trade) {
+      // Fallback: try to find the most recent trade for this instrument
+      const fallbackTrade = await Trade.findOne({ instrument }).sort({ openTime: -1 });
+      if (fallbackTrade) {
+        logger.warn(`[placeOrder] Trade not found by contractId ${orderResult.contractId}, using most recent trade ${fallbackTrade.contractId}`);
+        notifyTrade('OPENED', fallbackTrade, account).catch(err => logger.error('[Notification] Error:', err.message));
+        return res.json({ success: true, trade: fallbackTrade, raw: orderResult });
+      }
+      return res.status(500).json({ error: 'Order placed but trade record not found' });
+    }
     notifyTrade('OPENED', trade, account).catch(err => logger.error('[Notification] Error:', err.message));
     res.json({ success: true, trade, raw: orderResult });
   } catch (error) {
@@ -187,63 +198,20 @@ exports.placeOrder = async (req, res) => {
   }
 };
 
-// ---------- Close Trade (FIXED: uses oandaTradeId) ----------
+// ---------- Close Trade ----------
 exports.closeTrade = async (req, res) => {
   const { tradeId } = req.params;
   if (!tradeId) return res.status(400).json({ error: 'tradeId required' });
   try {
-    const idStr = String(tradeId);
-
-    // 1. Find trade by oandaTradeId
-    const trade = await Trade.findOne({ oandaTradeId: idStr });
-    if (!trade) {
-      logger.warn(`[closeTrade] Trade not found with oandaTradeId: ${idStr}`);
-      return res.status(404).json({ error: 'Trade not found' });
-    }
-
-    // 2. Determine product from trade.broker
-    let product = null;
-    if (trade.broker) {
-      const brokerMap = {
-        'MT5': 'mt5',
-        'Deriv': 'deriv_cfd',
-        'OANDA': 'oanda',
-      };
-      product = brokerMap[trade.broker] || null;
-    }
-    if (!product) {
-      product = getProduct(req);
-    }
-
-    logger.info(`[closeTrade] Closing trade ${idStr} using product: ${product}`);
-
-    // 3. Execute close via orderService
-    const result = await orderService.closeTrade(idStr, product);
-
-    // 4. Update trade status
+    const product = getProduct(req);
+    const result = await orderService.closeTrade(tradeId, product);
     const updated = await Trade.findOneAndUpdate(
-      { oandaTradeId: idStr },
-      {
-        status: 'CLOSED',
-        closeTime: new Date(),
-        closePrice: result.price || null,
-        pnl: result.pl || 0,
-      },
+      { contractId: tradeId },
+      { status: 'CLOSED', closeTime: new Date(), closePrice: result.price || null, pnl: result.pl || 0 },
       { new: true }
     );
-
-    if (!updated) {
-      logger.warn(`[closeTrade] Trade ${idStr} not updated.`);
-    } else {
-      logger.info(`[closeTrade] Trade ${idStr} updated to CLOSED.`);
-      // Update Order if exists
-      await Order.findOneAndUpdate(
-        { contractId: idStr },
-        { status: 'CLOSED', updatedAt: new Date() },
-        { upsert: false }
-      );
-      // Portfolio, notifications, learner
-      portfolioManager.updateDailyPnL(result.pl || 0);
+    portfolioManager.updateDailyPnL(result.pl || 0);
+    if (updated) {
       const broker = getBroker(product);
       const account = await broker.getAccount();
       notifyTrade('CLOSED', updated, account).catch(err => logger.error('[Notification] Error:', err.message));
@@ -254,8 +222,7 @@ exports.closeTrade = async (req, res) => {
         logger.warn('[PerformanceLearner] Failed to record trade:', err.message);
       }
     }
-
-    res.json({ success: true, result, updated });
+    res.json({ success: true, result });
   } catch (error) {
     logger.error('[closeTrade] Error:', error.message);
     res.status(500).json({ error: error.message });
@@ -277,7 +244,7 @@ exports.getSignal = async (req, res) => {
   }
 };
 
-// ---------- Auto Trade ----------
+// ---------- Auto Trade (FIXED: no duplicate Trade) ----------
 exports.autoTrade = async (req, res) => {
   const { pair, riskPercent = 1, strategy = 'sma', ...params } = req.body;
   if (!pair) return res.status(400).json({ error: 'pair required' });
@@ -298,7 +265,11 @@ exports.autoTrade = async (req, res) => {
     const orderResult = await orderService.placeMarketOrder(
       instrument, signal.side, lotSize, signal.stopLoss, signal.takeProfit, product
     );
-    const trade = await Trade.findOne({ oandaTradeId: orderResult.contractId });
+    const trade = await Trade.findOne({ contractId: orderResult.contractId });
+    if (!trade) {
+      logger.warn(`[autoTrade] Trade not found by contractId ${orderResult.contractId}`);
+      return res.json({ success: true, raw: orderResult, trade: null });
+    }
     notifyTrade('OPENED', trade, account).catch(err => logger.error('[Notification] Error:', err.message));
     res.json({ success: true, signal, trade, raw: orderResult });
   } catch (error) {
@@ -341,5 +312,5 @@ exports.deleteHistory = async (req, res) => {
   }
 };
 
-// ---------- Export helper ----------
+// ---------- Export helper for other modules ----------
 exports.getProduct = getProduct;
