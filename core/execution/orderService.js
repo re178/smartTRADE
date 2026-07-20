@@ -60,7 +60,7 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
     });
     await newOrder.save();
 
-    // ---- Create Trade record (open trade) ----
+    // ---- Create Trade record ----
     const newTrade = new Trade({
       pair: instrument,
       side: side.toUpperCase(),
@@ -72,7 +72,7 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
       openTime: new Date(),
       product,
       broker: product === 'mt5' ? 'MT5' : 'Deriv',
-      oandaTradeId: idStr,          // <-- the ticket number is stored here
+      oandaTradeId: idStr,          // store ticket ID here
       strategy: 'Manual',
     });
     await newTrade.save();
@@ -154,9 +154,9 @@ async function closeTrade(contractId, product) {
     const latency = Date.now() - startTime;
     const idStr = String(contractId);
 
-    // ---- Update Trade by oandaTradeId (the field that stores the ticket) ----
+    // ---- Update Trade by oandaTradeId ----
     const updatedTrade = await Trade.findOneAndUpdate(
-      { oandaTradeId: idStr },   // <-- this is the key change
+      { oandaTradeId: idStr },   // <-- key fix
       {
         status: 'CLOSED',
         closeTime: new Date(),
@@ -226,7 +226,7 @@ async function modifyTrade(contractId, stopLoss, takeProfit, product) {
   return result;
 }
 
-// ---- Get Open Trades (unchanged) ----
+// ---- Get Open Trades ----
 async function getOpenTrades(product) {
   const broker = getBroker(product);
   if (!broker.isConnected()) {
