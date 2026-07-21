@@ -2,21 +2,36 @@
   "name": "rts-platform",
   "version": "2.0.0",
   "description": "RTS Trading Platform – Modular, AI-ready, multi-broker",
+  "private": true,
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js"
   },
   "dependencies": {
-    "axios": "^1.6.0",
+    "axios": "^1.11.0",
+    "bcryptjs": "^3.0.2",
+    "connect-mongo": "^5.1.0",
     "cors": "^2.8.5",
-    "dotenv": "^16.0.3",
-    "express": "^4.18.2",
-    "mongoose": "^7.5.0",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.1",
+    "express-session": "^1.18.1",
+    "helmet": "^8.1.0",
+    "moment": "^2.30.1",
+    "moment-timezone": "^0.5.48",
+    "mongoose": "^8.17.1",
+    "node-cron": "^4.2.1",
     "nodemailer": "^7.0.5",
-    "ws": "^8.18.0"
+    "openai": "^5.12.2",
+    "uuid": "^11.1.0",
+    "ws": "^8.18.3"
   },
   "devDependencies": {
-    "nodemon": "^3.0.1"
+    "nodemon": "^3.1.10"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
   }
-}
