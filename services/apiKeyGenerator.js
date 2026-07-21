@@ -1,6 +1,6 @@
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs'); // Use existing bcrypt if already in project, otherwise install bcryptjs
-const { logger } = require('../utils/logger');
+const logger = require('../core/portfolio/logger');
 
 const API_KEY_PREFIX = 'rts_pk_';
 const API_SECRET_PREFIX = 'rts_sk_';
