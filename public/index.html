@@ -22,8 +22,6 @@
     #wsStatus { font-weight: bold; padding: 4px 12px; border-radius: 20px; }
     .ws-connected { color: #28a745; background: #d4edda; }
     .ws-disconnected { color: #dc3545; background: #f8d7da; }
-    /* New: Developer portal button style */
-    .dev-portal-btn { margin-left: 15px; }
   </style>
 </head>
 <body>
@@ -35,7 +33,7 @@
         <span id="wsStatus" class="badge bg-secondary ms-3">Connecting...</span>
       </h1>
       <!-- NEW: Developer Portal Button -->
-      <a href="/developer-api" class="btn btn-outline-primary dev-portal-btn">
+      <a href="/developer-api.html" class="btn btn-outline-primary">
         <i class="fas fa-key"></i> Developer API
       </a>
     </div>
@@ -84,7 +82,7 @@
     </div>
   </div>
 
-  <!-- ====== COGNITIVE INTELLIGENCE PANELS ====== -->
+  <!-- Cognitive Intelligence Panels -->
   <div class="row">
     <div class="col-md-6">
       <div class="card">
@@ -260,8 +258,6 @@
 <!-- JavaScript includes -->
 <script src="js/config.js"></script>
 <script src="js/app.js"></script>
-<!-- Live WebSocket client (must be after app.js) -->
 <script src="js/live.js"></script>
-
 </body>
 </html>
