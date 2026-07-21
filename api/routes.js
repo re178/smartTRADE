@@ -11,7 +11,7 @@ const {
 const { sendTestEmail } = require('../core/notifications/emailService');
 
 // ---------- Use your existing logger ----------
-const logger = require('../core/portfolio/logger');
+const logger = console;
 
 // ---------- Developer Key Management (Models + Services) ----------
 const ApiKey = require('../models/ApiKey');
