@@ -9,7 +9,7 @@ const {
   PerformanceLearner,
 } = require('../core/analytics/performanceSuite');
 const { sendTestEmail } = require('../core/notifications/emailService');
-const logger = require('../core/portfolio/logger');
+const logger = console;
 
 // ---------- Developer Key Management (Models + Services) ----------
 const ApiKey = require('../models/ApiKey');
