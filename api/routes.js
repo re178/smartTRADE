@@ -9,13 +9,18 @@ const {
   PerformanceLearner,
 } = require('../core/analytics/performanceSuite');
 const { sendTestEmail } = require('../core/notifications/emailService');
-const logger = console;
+
+// ---------- Use your existing logger ----------
+const logger = require('../core/portfolio/logger');
 
 // ---------- Developer Key Management (Models + Services) ----------
 const ApiKey = require('../models/ApiKey');
 const { generateApiKey, generateApiSecret, hashSecret } = require('../services/apiKeyGenerator');
 
-// ---------- Existing Endpoints ----------
+// ================================================================
+// ================ EXISTING ENDPOINTS =============================
+// ================================================================
+
 router.get('/account', controllers.getAccount);
 router.get('/prices', controllers.getPrices);
 router.get('/candles', controllers.getCandles);
@@ -127,10 +132,8 @@ router.post('/performance/learn', async (req, res) => {
 });
 
 // ================================================================
-// ================ NEW: Developer API Key Management ==============
+// ================ DEVELOPER API KEY MANAGEMENT ===================
 // ================================================================
-// All these routes require authentication – ensure they are behind your auth middleware.
-// If your whole router is already protected, this is fine.
 
 // GET all developer keys (admin only – adjust ownership as needed)
 router.get('/dashboard/developer-keys', async (req, res) => {
@@ -178,7 +181,7 @@ router.post('/dashboard/developer-keys/generate', async (req, res) => {
     });
   } catch (err) {
     logger.error('Error generating API key:', err);
-    res.status(500).json({ error: 'Server error' });
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -221,7 +224,7 @@ router.delete('/dashboard/developer-keys/:id', async (req, res) => {
   }
 });
 
-// PUT regenerate secret
+// PUT regenerate secret (FIXED: also returns apiKey)
 router.put('/dashboard/developer-keys/:id/regenerate-secret', async (req, res) => {
   try {
     const apiSecret = generateApiSecret();
@@ -233,8 +236,12 @@ router.put('/dashboard/developer-keys/:id/regenerate-secret', async (req, res) =
     ).select('-hashedSecret');
     if (!key) return res.status(404).json({ error: 'Key not found' });
     logger.info(`API Secret regenerated for: ${key.apiKey}`);
-    // Return new secret (once)
-    res.json({ message: 'Secret regenerated', apiSecret });
+    // Return BOTH apiKey and apiSecret
+    res.json({
+      message: 'Secret regenerated',
+      apiKey: key.apiKey,   // <-- now included
+      apiSecret
+    });
   } catch (err) {
     logger.error('Error regenerating secret:', err);
     res.status(500).json({ error: 'Server error' });
@@ -242,12 +249,12 @@ router.put('/dashboard/developer-keys/:id/regenerate-secret', async (req, res) =
 });
 
 // ================================================================
-// ================ NEW: Serve the Developer Portal Page ===========
+// ================ SERVE THE DEVELOPER PORTAL PAGE ================
 // ================================================================
-// This route renders the developerApi.ejs page (protected behind dashboard auth)
+// Note: If you prefer to serve this via static HTML (public/developer-api.html),
+// you can remove this route. Otherwise, it renders the EJS view.
 router.get('/developer-api', (req, res) => {
-  // Ensure user is authenticated (assuming you have a middleware)
-  // You can add your own auth check here or rely on a parent router middleware
+  // Ensure user is authenticated (add your own auth middleware here)
   res.render('developerApi');
 });
 
