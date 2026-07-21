@@ -1,5 +1,5 @@
 const mongoose = require('mongoose');
-const { logger } = require('../utils/logger'); // reuse existing RTS logger if available, else console
+const { logger } = require('../core/portfolio/logger'); 
 
 const apiKeySchema = new mongoose.Schema({
   applicationName: {
