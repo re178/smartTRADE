@@ -1,0 +1,168 @@
+<%- include('partials/header') %>
+
+<div class="container-fluid">
+  <div class="d-flex justify-content-between align-items-center mb-4">
+    <h2><i class="fas fa-key"></i> Developer API</h2>
+    <div>
+      <button class="btn btn-info me-2" data-bs-toggle="modal" data-bs-target="#docsModal">
+        <i class="fas fa-book"></i> API Documentation
+      </button>
+      <a href="/" class="btn btn-outline-secondary">
+        <i class="fas fa-arrow-left"></i> Back to Dashboard
+      </a>
+    </div>
+  </div>
+
+  <!-- Create new application -->
+  <div class="card mb-4">
+    <div class="card-header">Create API Credentials</div>
+    <div class="card-body">
+      <div class="row">
+        <div class="col-md-4">
+          <label>Application Name *</label>
+          <input type="text" id="appName" class="form-control" placeholder="My Trading App">
+        </div>
+        <div class="col-md-4">
+          <label>Description (optional)</label>
+          <input type="text" id="appDescription" class="form-control" placeholder="What is this key for?">
+        </div>
+        <div class="col-md-4">
+          <label>Permissions</label>
+          <div class="form-check">
+            <input class="form-check-input" type="checkbox" value="market.read" id="permMarket"> market.read
+          </div>
+          <div class="form-check">
+            <input class="form-check-input" type="checkbox" value="account.read" id="permAccount"> account.read
+          </div>
+          <div class="form-check">
+            <input class="form-check-input" type="checkbox" value="positions.read" id="permPositions"> positions.read
+          </div>
+          <div class="form-check">
+            <input class="form-check-input" type="checkbox" value="history.read" id="permHistory"> history.read
+          </div>
+          <div class="form-check">
+            <input class="form-check-input" type="checkbox" value="signals.write" id="permSignals"> signals.write
+          </div>
+          <div class="form-check">
+            <input class="form-check-input" type="checkbox" value="orders.write" id="permOrders"> orders.write
+          </div>
+        </div>
+      </div>
+      <button class="btn btn-primary mt-3" onclick="generateCredentials()">
+        <i class="fas fa-plus-circle"></i> Generate Credentials
+      </button>
+    </div>
+  </div>
+
+  <!-- Generated credentials panel (hidden by default) -->
+  <div id="generatedPanel" class="card mb-4" style="display:none;">
+    <div class="card-header bg-success text-white">
+      <i class="fas fa-check-circle"></i> Credentials Created – Copy them now
+    </div>
+    <div class="card-body">
+      <div class="row">
+        <div class="col-md-6">
+          <label>API Key</label>
+          <div class="input-group">
+            <input type="text" id="newApiKey" class="form-control" readonly>
+            <button class="btn btn-outline-secondary" onclick="copyToClipboard('newApiKey')">
+              <i class="fas fa-copy"></i> Copy
+            </button>
+          </div>
+        </div>
+        <div class="col-md-6">
+          <label>API Secret (shown only once)</label>
+          <div class="input-group">
+            <input type="text" id="newApiSecret" class="form-control" readonly>
+            <button class="btn btn-outline-secondary" onclick="copyToClipboard('newApiSecret')">
+              <i class="fas fa-copy"></i> Copy
+            </button>
+          </div>
+        </div>
+      </div>
+      <small class="text-danger"><i class="fas fa-exclamation-triangle"></i> Store the secret securely. It will not be shown again.</small>
+    </div>
+  </div>
+
+  <!-- Existing applications table -->
+  <div class="card">
+    <div class="card-header">Applications</div>
+    <div class="card-body table-responsive">
+      <table class="table table-striped" id="appsTable">
+        <thead>
+          <tr>
+            <th>Application Name</th>
+            <th>API Key</th>
+            <th>Status</th>
+            <th>Permissions</th>
+            <th>Created</th>
+            <th>Last Used</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td colspan="7" class="text-muted">Loading keys...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- Documentation Modal -->
+<div class="modal fade" id="docsModal" tabindex="-1" aria-labelledby="docsModalLabel" aria-hidden="true">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="docsModalLabel"><i class="fas fa-book-open"></i> Public API Documentation</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <h5>🔐 Authentication</h5>
+        <p>All requests must include the following headers:</p>
+        <ul>
+          <li><code>X-API-Key: &lt;your_api_key&gt;</code></li>
+          <li><code>X-API-Secret: &lt;your_api_secret&gt;</code></li>
+        </ul>
+        <p>If invalid or missing, you will receive a <strong>401 Unauthorized</strong>. Disabled keys return <strong>403 Forbidden</strong>.</p>
+
+        <h5>📡 Base URL</h5>
+        <p><code>https://your-rts-server.com/api/public</code></p>
+
+        <h5>📊 Endpoints</h5>
+        <table class="table table-sm table-bordered">
+          <thead>
+            <tr><th>Method</th><th>Endpoint</th><th>Description</th><th>Permission</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>GET</td><td>/account</td><td>Latest account info</td><td>account.read</td></tr>
+            <tr><td>GET</td><td>/positions</td><td>All open positions</td><td>positions.read</td></tr>
+            <tr><td>GET</td><td>/prices</td><td>All current prices</td><td>market.read</td></tr>
+            <tr><td>GET</td><td>/price/:symbol</td><td>Price for one symbol (e.g. /price/EURUSD)</td><td>market.read</td></tr>
+            <tr><td>GET</td><td>/history</td><td>Trade history</td><td>history.read</td></tr>
+            <tr><td>POST</td><td>/signals</td><td>Submit a trade signal</td><td>signals.write</td></tr>
+            <tr><td>POST</td><td>/orders</td><td>Place a trade order</td><td>orders.write</td></tr>
+          </tbody>
+        </table>
+
+        <h5>📨 Example Request (cURL)</h5>
+        <pre><code>curl -H "X-API-Key: rts_pk_abc123..." \
+     -H "X-API-Secret: rts_sk_def456..." \
+     https://your-rts-server.com/api/public/account</code></pre>
+
+        <h5>📥 Example POST /orders</h5>
+        <pre><code>curl -X POST https://your-rts-server.com/api/public/orders \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: rts_pk_..." \
+  -H "X-API-Secret: rts_sk_..." \
+  -d '{"symbol":"EURUSD", "type":"buy", "volume":0.1}'</code></pre>
+
+        <p class="text-muted">Replace the domain with your actual RTS server address.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<%- include('partials/footer') %>
+
+<!-- Developer API JavaScript (independent) -->
+<script src="/js/developer-api.js"></script>
