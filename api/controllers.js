@@ -1,4 +1,4 @@
-// api/controllers.js – Complete Request Handlers (without Signal model)
+// api/controllers.js – Complete Request Handlers (with product support, Order & Trade models)
 
 const Trade = require('../models/Trade');
 const Order = require('../models/Order');
@@ -111,53 +111,6 @@ exports.getCandles = async (req, res) => {
     const product = getProduct(req);
     const candles = await marketProvider.getCandles(pair, parseInt(count), granularity, product);
     res.json(candles);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-};
-
-// ---------- Symbol Metadata ----------
-exports.getSymbols = async (req, res) => {
-  try {
-    const product = getProduct(req);
-    const broker = getBroker(product);
-    if (!broker.isConnected()) {
-      await broker.connect();
-    }
-    let symbols = [];
-    if (broker.symbolManager && typeof broker.symbolManager._symbols === 'object') {
-      symbols = Array.from(broker.symbolManager._symbols.values());
-    } else if (broker.symbols) {
-      symbols = typeof broker.symbols === 'function' ? await broker.symbols() : broker.symbols;
-    } else {
-      try {
-        const allSymbols = await marketProvider.getSymbols(product);
-        if (allSymbols) symbols = allSymbols;
-      } catch (e) {
-        // ignore
-      }
-    }
-    res.json(symbols);
-  } catch (error) {
-    logger.error('[getSymbols] Error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-};
-
-// ---------- Broker Capabilities ----------
-exports.getCapabilities = async (req, res) => {
-  try {
-    const product = getProduct(req);
-    const broker = getBroker(product);
-    const caps = broker.capabilities || {};
-    const info = {
-      product,
-      name: broker.serverName || product,
-      connected: broker.isConnected(),
-      state: broker._state || 'unknown',
-      capabilities: caps,
-    };
-    res.json(info);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
