@@ -1,5 +1,5 @@
-// core/execution/broker.js – Full Deriv broker with true CFD via cfd_open_position
-// FIXED: active_symbols: "full", cfd_get_positions fallback, dynamic registry
+// core/execution/broker.js – Full Deriv broker
+// FIXED: Auto-connect, robust symbol loading, better timeouts, error handling
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -344,12 +344,11 @@ class CFDExecutor extends BaseExecutor {
   }
 
   async getPositions() {
-    // Try cfd_get_positions first; if it fails (UnrecognisedRequest), fallback to portfolio
+    // Try cfd_get_positions first; fallback to portfolio
     try {
       const payload = { cfd_get_positions: 1 };
-      logger.info('[CFDExecutor] Sending get positions request (cfd_get_positions):', JSON.stringify(redactSensitive(payload), null, 2));
+      logger.info('[CFDExecutor] Sending get positions (cfd_get_positions)...');
       const response = await this.broker._sendRequest(payload);
-      logger.info('[CFDExecutor] Get positions response:', JSON.stringify(redactSensitive(response), null, 2));
       const positions = response.cfd_get_positions || [];
       return positions.map(pos => ({
         id: pos.position_id,
@@ -361,9 +360,8 @@ class CFDExecutor extends BaseExecutor {
         currentPrice: pos.current_spot || pos.entry_price || 0,
       }));
     } catch (err) {
-      if (err.message.includes('UnrecognisedRequest') || err.message.includes('unknown')) {
+      if (err.message.includes('UnrecognisedRequest')) {
         logger.warn('[CFDExecutor] cfd_get_positions not supported, falling back to portfolio.');
-        // Fallback to portfolio
         const portfolioResponse = await this.broker._sendRequest({ portfolio: 1 });
         let contracts = portfolioResponse.portfolio || portfolioResponse.contracts || [];
         if (!Array.isArray(contracts)) {
@@ -380,7 +378,6 @@ class CFDExecutor extends BaseExecutor {
             contracts = [];
           }
         }
-        // Filter for CFD contracts (if possible) – we assume all are CFDs for this product type
         return contracts
           .filter(c => c.contract_id)
           .map(c => ({
@@ -568,7 +565,7 @@ class OptionsExecutor extends BaseExecutor {
 }
 
 // ============================================================
-// MAIN BROKER CLASS – DYNAMIC SYMBOL REGISTRY
+// MAIN BROKER CLASS – with Auto-Connect
 // ============================================================
 const BROKER_CAPABILITIES = {
   supportsTrailingStop: false,
@@ -613,8 +610,9 @@ class DerivBroker extends EventEmitter {
       riskValidator: config.riskValidator || null,
       fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || 3),
       readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 30000),
-      symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 30000),
+      symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 60000), // increased to 60s
       heartbeatTimeout: parseInt(config.heartbeatTimeout || process.env.DERIV_HEARTBEAT_TIMEOUT || 60000),
+      autoConnect: config.autoConnect !== undefined ? config.autoConnect : true, // new option
     };
 
     const rawProduct = (config.productType || process.env.TRADING_PRODUCT || 'cfd').toLowerCase();
@@ -701,6 +699,14 @@ class DerivBroker extends EventEmitter {
     }
 
     logger.info(`[DerivBroker] Created with product type: ${this.productType}, using ${this.executor.constructor.name}`);
+
+    // ---------- Auto-Connect ----------
+    if (this.config.autoConnect) {
+      logger.info('[DerivBroker] Auto-connect enabled – attempting connection...');
+      this.connect().catch(err => {
+        logger.error('[DerivBroker] Auto-connect failed:', err.message);
+      });
+    }
   }
 
   // ============================================================
@@ -1222,7 +1228,7 @@ class DerivBroker extends EventEmitter {
   }
 
   // ============================================================
-  // SYMBOL LOADING – FIXED: USE "full" INSTEAD OF "all"
+  // SYMBOL LOADING – with 'brief' only and longer timeout
   // ============================================================
   async _loadSymbolsWithTimeout() {
     return Promise.race([
@@ -1237,9 +1243,9 @@ class DerivBroker extends EventEmitter {
     logger.info('[DerivBroker] Fetching active symbols from LIVE API...');
     let lastError = null;
 
-    // Try 'brief' first (fast)
+    // Try 'brief' first – it's fast and sufficient for mapping
     try {
-      const response = await this._sendRawRequest({ active_symbols: 'brief' }, 10000);
+      const response = await this._sendRawRequest({ active_symbols: 'brief' }, 15000);
       let symbols = response.active_symbols || [];
       if (symbols.length > 0) {
         symbols = symbols.filter(s =>
@@ -1258,9 +1264,9 @@ class DerivBroker extends EventEmitter {
       logger.warn('[DerivBroker] Brief symbol request failed:', err.message);
     }
 
-    // Fallback to 'full' (correct, not 'all')
+    // Fallback to 'full' if brief fails (some accounts may need more info)
     try {
-      const response = await this._sendRawRequest({ active_symbols: 'full' }, 10000);
+      const response = await this._sendRawRequest({ active_symbols: 'full' }, 20000);
       let symbols = response.active_symbols || [];
       if (symbols.length > 0) {
         symbols = symbols.filter(s =>
@@ -1279,7 +1285,7 @@ class DerivBroker extends EventEmitter {
       logger.warn('[DerivBroker] Full symbol request failed:', err.message);
     }
 
-    // If we get here, API failed – keep _symbolsLoaded = false so fallback is used
+    // If both fail, we keep _symbolsLoaded = false and use fallback
     this._symbolsLoaded = false;
     throw lastError || new Error('Failed to load symbols from Deriv API.');
   }
@@ -1291,17 +1297,14 @@ class DerivBroker extends EventEmitter {
       const display = sym.display_name || '';
       let ourPair = null;
 
-      // Strategy 1: "EUR/USD"
       let match = display.match(/([A-Z]{3})\/([A-Z]{3})/);
       if (match) ourPair = match[1] + '_' + match[2];
 
-      // Strategy 2: "EURUSD"
       if (!ourPair) {
         match = display.match(/\b([A-Z]{3})([A-Z]{3})\b/);
         if (match) ourPair = match[1] + '_' + match[2];
       }
 
-      // Strategy 3: from derivSymbol (frxEURUSDm)
       if (!ourPair && derivSymbol.startsWith('frx')) {
         const base = derivSymbol.replace(/^frx/, '').replace(/[^A-Z]/g, '');
         if (base.length === 6) {
@@ -1309,7 +1312,6 @@ class DerivBroker extends EventEmitter {
         }
       }
 
-      // Strategy 4: synthetic/crypto keep as-is
       if (!ourPair && (sym.market === 'synthetic' || sym.market === 'crypto')) {
         ourPair = derivSymbol;
       }
@@ -1364,7 +1366,7 @@ class DerivBroker extends EventEmitter {
   }
 
   // ============================================================
-  // POSITION RECONCILIATION – now uses executor's getPositions
+  // POSITION RECONCILIATION
   // ============================================================
   async _reconcilePositions() {
     logger.info('[DerivBroker] Reconciling positions...');
@@ -1604,7 +1606,6 @@ class DerivBroker extends EventEmitter {
 
   async getOpenTrades() {
     await this._ensureReady();
-    // Use executor's getPositions (which handles fallback)
     return this.executor.getPositions();
   }
 
@@ -1752,9 +1753,10 @@ const brokerInstance = new DerivBroker({
   duration: process.env.DERIV_DURATION ? parseInt(process.env.DERIV_DURATION) : 60,
   fatalAfterAuthFailures: parseInt(process.env.DERIV_FATAL_AFTER_AUTH_FAILURES) || 3,
   readinessTimeout: parseInt(process.env.DERIV_READINESS_TIMEOUT) || 30000,
-  symbolTimeout: parseInt(process.env.DERIV_SYMBOL_TIMEOUT) || 30000,
+  symbolTimeout: parseInt(process.env.DERIV_SYMBOL_TIMEOUT) || 60000, // increased
   heartbeatTimeout: parseInt(process.env.DERIV_HEARTBEAT_TIMEOUT) || 60000,
   productType: process.env.TRADING_PRODUCT || 'cfd',
+  autoConnect: true, // connects immediately
 });
 
 module.exports = brokerInstance;
