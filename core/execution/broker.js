@@ -1,5 +1,5 @@
 // core/execution/broker.js – Full Deriv broker with true CFD via cfd_open_position
-// FIXED: Dynamic Symbol Registry, no hardcoded fallback override
+// FIXED: active_symbols: "full", cfd_get_positions fallback, dynamic registry
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -210,17 +210,13 @@ class StreamingManager {
     let ask = tick.ask ? parseFloat(tick.ask) : null;
     let mid = tick.quote ? parseFloat(tick.quote) : null;
 
-    // If we have bid & ask, derive mid from them
     if (bid !== null && ask !== null) {
       mid = (bid + ask) / 2;
-    }
-    // If we only have a quote (mid), fabricate bid/ask using the dynamic spread map
-    else if (mid !== null) {
+    } else if (mid !== null) {
       const spread = this.broker.spreadMap?.[symbol] || 0.0001;
       bid = mid - spread / 2;
       ask = mid + spread / 2;
     } else {
-      // No usable price
       return;
     }
 
@@ -228,7 +224,6 @@ class StreamingManager {
     this._priceCache.set(symbol, { bid, ask, mid, time });
     this._lastTickTime = time;
 
-    // Dispatch to callbacks
     for (const [key, sub] of this._subscriptions) {
       if (sub.symbol === symbol) {
         for (const cb of sub.callbacks) {
@@ -349,20 +344,57 @@ class CFDExecutor extends BaseExecutor {
   }
 
   async getPositions() {
-    const payload = { cfd_get_positions: 1 };
-    logger.info('[CFDExecutor] Sending get positions request:', JSON.stringify(redactSensitive(payload), null, 2));
-    const response = await this.broker._sendRequest(payload);
-    logger.info('[CFDExecutor] Get positions response:', JSON.stringify(redactSensitive(response), null, 2));
-    const positions = response.cfd_get_positions || [];
-    return positions.map(pos => ({
-      id: pos.position_id,
-      instrument: this.broker._fromDerivSymbol(pos.symbol) || 'UNKNOWN',
-      side: pos.direction === 'up' ? 'BUY' : 'SELL',
-      price: pos.entry_price || 0,
-      units: pos.amount || 0,
-      unrealizedPL: pos.profit_loss || 0,
-      currentPrice: pos.current_spot || pos.entry_price || 0,
-    }));
+    // Try cfd_get_positions first; if it fails (UnrecognisedRequest), fallback to portfolio
+    try {
+      const payload = { cfd_get_positions: 1 };
+      logger.info('[CFDExecutor] Sending get positions request (cfd_get_positions):', JSON.stringify(redactSensitive(payload), null, 2));
+      const response = await this.broker._sendRequest(payload);
+      logger.info('[CFDExecutor] Get positions response:', JSON.stringify(redactSensitive(response), null, 2));
+      const positions = response.cfd_get_positions || [];
+      return positions.map(pos => ({
+        id: pos.position_id,
+        instrument: this.broker._fromDerivSymbol(pos.symbol) || 'UNKNOWN',
+        side: pos.direction === 'up' ? 'BUY' : 'SELL',
+        price: pos.entry_price || 0,
+        units: pos.amount || 0,
+        unrealizedPL: pos.profit_loss || 0,
+        currentPrice: pos.current_spot || pos.entry_price || 0,
+      }));
+    } catch (err) {
+      if (err.message.includes('UnrecognisedRequest') || err.message.includes('unknown')) {
+        logger.warn('[CFDExecutor] cfd_get_positions not supported, falling back to portfolio.');
+        // Fallback to portfolio
+        const portfolioResponse = await this.broker._sendRequest({ portfolio: 1 });
+        let contracts = portfolioResponse.portfolio || portfolioResponse.contracts || [];
+        if (!Array.isArray(contracts)) {
+          if (typeof contracts === 'object' && contracts !== null) {
+            const keys = Object.keys(contracts);
+            if (keys.length > 0 && !isNaN(keys[0])) {
+              contracts = Object.values(contracts);
+            } else {
+              const maybeArray = Object.values(contracts).find(v => Array.isArray(v));
+              if (maybeArray) contracts = maybeArray;
+              else contracts = [];
+            }
+          } else {
+            contracts = [];
+          }
+        }
+        // Filter for CFD contracts (if possible) – we assume all are CFDs for this product type
+        return contracts
+          .filter(c => c.contract_id)
+          .map(c => ({
+            id: c.contract_id,
+            instrument: this.broker._fromDerivSymbol(c.symbol) || 'UNKNOWN',
+            side: c.buy ? 'BUY' : 'SELL',
+            price: c.buy_price || c.entry_spot || 0,
+            units: c.buy ? (c.amount || 0) : -(c.amount || 0),
+            unrealizedPL: c.profit_loss || 0,
+            currentPrice: c.current_spot || c.entry_spot || 0,
+          }));
+      }
+      throw err;
+    }
   }
 
   _prepare(instrument, units) {
@@ -585,7 +617,6 @@ class DerivBroker extends EventEmitter {
       heartbeatTimeout: parseInt(config.heartbeatTimeout || process.env.DERIV_HEARTBEAT_TIMEOUT || 60000),
     };
 
-    // Product type
     const rawProduct = (config.productType || process.env.TRADING_PRODUCT || 'cfd').toLowerCase();
     const validProducts = ['cfd', 'multiplier', 'basic'];
     if (!validProducts.includes(rawProduct)) {
@@ -616,20 +647,17 @@ class DerivBroker extends EventEmitter {
     this._cbFailureCount = 0;
     this._cbOpenedAt = null;
 
-    // ---------- SYMBOL REGISTRY (FIXED) ----------
-    // START EMPTY – we load from live API first
+    // ---------- SYMBOL REGISTRY ----------
     this.symbolMap = {};
     this.reverseMap = {};
     this.spreadMap = {};
     this._symbolsLoaded = false;
-    // Keep the hardcoded fallback as an absolute last resort (emergency only)
     this._fallbackSymbols = { ...FALLBACK_SYMBOLS };
     for (const [key, val] of Object.entries(FALLBACK_SYMBOLS)) {
-      // Pre-populate reverse map for fallback, but do NOT put into symbolMap yet
       this.reverseMap[val] = key;
       this.spreadMap[val] = 0.0001;
     }
-    logger.info(`[DerivBroker] Initialized empty symbol registry. Fallbacks available as emergency only.`);
+    logger.info(`[DerivBroker] Initialized empty symbol registry.`);
 
     // ---------- Order tracking ----------
     this._orders = new Map();
@@ -676,24 +704,21 @@ class DerivBroker extends EventEmitter {
   }
 
   // ============================================================
-  // SYMBOL RESOLUTION – LIVE FIRST, FALLBACK ONLY IF NOT LOADED
+  // SYMBOL RESOLUTION – LIVE FIRST
   // ============================================================
   _toDerivSymbol(pair) {
     if (!pair) return null;
     const upper = pair.toUpperCase();
 
-    // 1. PRIMARY: Live symbols loaded from API
     if (this.symbolMap[upper]) {
       return this.symbolMap[upper];
     }
 
-    // 2. EMERGENCY: Only if API symbols haven't loaded yet, use hardcoded fallback
     if (!this._symbolsLoaded && this._fallbackSymbols[upper]) {
       logger.warn(`[Symbol] Using HARDCODED emergency fallback for ${upper} (API symbols not loaded yet!)`);
       return this._fallbackSymbols[upper];
     }
 
-    // 3. If symbols are loaded but not found, log available pairs for debugging
     if (this._symbolsLoaded) {
       const available = Object.keys(this.symbolMap).slice(0, 10).join(', ');
       logger.error(`[Symbol] Unknown pair: ${upper}. Available: ${available}...`);
@@ -705,7 +730,6 @@ class DerivBroker extends EventEmitter {
   _fromDerivSymbol(derivSymbol) {
     if (!derivSymbol) return 'UNKNOWN';
     if (this.reverseMap[derivSymbol]) return this.reverseMap[derivSymbol];
-    // Fallback: try to parse manually
     const clean = derivSymbol.replace(/^frx/, '');
     if (clean.length >= 6) {
       return clean.slice(0, 3) + '_' + clean.slice(3, 6);
@@ -800,15 +824,12 @@ class DerivBroker extends EventEmitter {
                 this._authFailCount = 0;
                 this._setState(STATE.AUTHENTICATING);
 
-                // ---------- CRITICAL: Load LIVE symbols before anything else ----------
                 logger.info('[DerivBroker] Startup: Loading symbols from API...');
                 try {
                   await this._loadSymbolsWithTimeout();
                   logger.info(`[DerivBroker] Startup: Symbols loaded. Registry has ${Object.keys(this.symbolMap).length} pairs.`);
                 } catch (err) {
                   logger.error('[DerivBroker] Startup: Symbol loading FAILED:', err.message);
-                  // If live loading fails, we fallback to hardcoded, but we set _symbolsLoaded = false
-                  // so _toDerivSymbol will still use fallback with warnings.
                   this._symbolsLoaded = false;
                   logger.warn('[DerivBroker] Using emergency fallback symbols.');
                 }
@@ -1201,7 +1222,7 @@ class DerivBroker extends EventEmitter {
   }
 
   // ============================================================
-  // SYMBOL LOADING – LIVE API PRIMARY (FIXED)
+  // SYMBOL LOADING – FIXED: USE "full" INSTEAD OF "all"
   // ============================================================
   async _loadSymbolsWithTimeout() {
     return Promise.race([
@@ -1216,12 +1237,11 @@ class DerivBroker extends EventEmitter {
     logger.info('[DerivBroker] Fetching active symbols from LIVE API...');
     let lastError = null;
 
-    // Try 'brief' first
+    // Try 'brief' first (fast)
     try {
       const response = await this._sendRawRequest({ active_symbols: 'brief' }, 10000);
       let symbols = response.active_symbols || [];
       if (symbols.length > 0) {
-        // Filter tradable symbols
         symbols = symbols.filter(s =>
           s.trade_status === 'open' &&
           !s.is_trading_suspended
@@ -1238,16 +1258,16 @@ class DerivBroker extends EventEmitter {
       logger.warn('[DerivBroker] Brief symbol request failed:', err.message);
     }
 
-    // Fallback to 'all'
+    // Fallback to 'full' (correct, not 'all')
     try {
-      const response = await this._sendRawRequest({ active_symbols: 'all' }, 10000);
+      const response = await this._sendRawRequest({ active_symbols: 'full' }, 10000);
       let symbols = response.active_symbols || [];
       if (symbols.length > 0) {
         symbols = symbols.filter(s =>
           s.trade_status === 'open' &&
           !s.is_trading_suspended
         );
-        logger.info(`[Symbols] Loaded ${symbols.length} tradable symbols (all).`);
+        logger.info(`[Symbols] Loaded ${symbols.length} tradable symbols (full).`);
         this._buildSymbolMaps(symbols);
         this.symbolManager.setSymbols(symbols);
         this._symbolsLoaded = true;
@@ -1256,7 +1276,7 @@ class DerivBroker extends EventEmitter {
       }
     } catch (err) {
       lastError = err;
-      logger.warn('[DerivBroker] All symbol request failed:', err.message);
+      logger.warn('[DerivBroker] Full symbol request failed:', err.message);
     }
 
     // If we get here, API failed – keep _symbolsLoaded = false so fallback is used
@@ -1275,13 +1295,13 @@ class DerivBroker extends EventEmitter {
       let match = display.match(/([A-Z]{3})\/([A-Z]{3})/);
       if (match) ourPair = match[1] + '_' + match[2];
 
-      // Strategy 2: "EURUSD" (no slash)
+      // Strategy 2: "EURUSD"
       if (!ourPair) {
         match = display.match(/\b([A-Z]{3})([A-Z]{3})\b/);
         if (match) ourPair = match[1] + '_' + match[2];
       }
 
-      // Strategy 3: Extract from derivSymbol itself (frxEURUSDm -> EUR_USD)
+      // Strategy 3: from derivSymbol (frxEURUSDm)
       if (!ourPair && derivSymbol.startsWith('frx')) {
         const base = derivSymbol.replace(/^frx/, '').replace(/[^A-Z]/g, '');
         if (base.length === 6) {
@@ -1289,7 +1309,7 @@ class DerivBroker extends EventEmitter {
         }
       }
 
-      // Strategy 4: If it's a synthetic index or crypto, keep the symbol itself as pair
+      // Strategy 4: synthetic/crypto keep as-is
       if (!ourPair && (sym.market === 'synthetic' || sym.market === 'crypto')) {
         ourPair = derivSymbol;
       }
@@ -1297,7 +1317,6 @@ class DerivBroker extends EventEmitter {
       if (ourPair) {
         this.symbolMap[ourPair] = derivSymbol;
         this.reverseMap[derivSymbol] = ourPair;
-        // Use API pip value for accurate spread
         if (sym.pip) {
           this.spreadMap[derivSymbol] = parseFloat(sym.pip) * 0.5;
         } else {
@@ -1345,99 +1364,28 @@ class DerivBroker extends EventEmitter {
   }
 
   // ============================================================
-  // POSITION RECONCILIATION
+  // POSITION RECONCILIATION – now uses executor's getPositions
   // ============================================================
   async _reconcilePositions() {
     logger.info('[DerivBroker] Reconciling positions...');
     try {
-      if (this.productType === 'cfd') {
-        const positions = await this.executor.getPositions();
-        logger.info('[Reconcile] CFD positions from API:', JSON.stringify(positions, null, 2));
-        const dbOrders = await Order.find({ status: ORDER_STATUS.FILLED });
-        const dbMap = new Map();
-        for (const ord of dbOrders) {
-          if (ord.contractId) dbMap.set(ord.contractId, ord);
-        }
-        for (const pos of positions) {
-          const contractId = pos.id;
-          const existing = dbMap.get(contractId);
-          if (!existing) {
-            const newOrder = new Order({
-              clientOrderId: generateClientOrderId(),
-              instrument: pos.instrument,
-              side: pos.side,
-              units: pos.units,
-              entryPrice: pos.price,
-              status: ORDER_STATUS.FILLED,
-              contractId: contractId,
-              filledAt: new Date(),
-            });
-            await newOrder.save();
-            this._orders.set(newOrder.clientOrderId, newOrder);
-            this._orderMap.set(contractId, newOrder.clientOrderId);
-            logger.warn(`[Reconcile] Created order for CFD position ${contractId}`);
-          }
-        }
-        for (const [contractId, clientOrderId] of this._orderMap) {
-          const stillOpen = positions.some(p => p.id === contractId);
-          if (!stillOpen) {
-            await this._updateOrderStatus(clientOrderId, ORDER_STATUS.CLOSED);
-            this._orderMap.delete(contractId);
-          }
-        }
-        logger.info('[Reconcile] CFD position reconciliation complete.');
-        return;
-      }
-
-      const response = await this._sendRequest({ portfolio: 1 });
-      let rawPortfolio = response.portfolio || response.contracts || [];
-      if (!Array.isArray(rawPortfolio)) {
-        if (typeof rawPortfolio === 'object' && rawPortfolio !== null) {
-          const keys = Object.keys(rawPortfolio);
-          if (keys.length > 0 && !isNaN(keys[0])) {
-            rawPortfolio = Object.values(rawPortfolio);
-          } else {
-            const maybeArray = Object.values(rawPortfolio).find(v => Array.isArray(v));
-            if (maybeArray) rawPortfolio = maybeArray;
-          }
-        }
-      }
-      if (!Array.isArray(rawPortfolio)) {
-        rawPortfolio = [];
-        logger.warn('[Reconcile] Unable to parse portfolio response; defaulting to empty array.');
-      }
-      if (!this._portfolioLogged) {
-        logger.info('[Reconcile] Portfolio structure (first 2 items):', JSON.stringify(rawPortfolio.slice(0, 2), null, 2));
-        this._portfolioLogged = true;
-      }
-
-      const brokerPositions = rawPortfolio;
+      const positions = await this.executor.getPositions();
+      logger.info('[Reconcile] Positions from API:', JSON.stringify(positions, null, 2));
       const dbOrders = await Order.find({ status: ORDER_STATUS.FILLED });
       const dbMap = new Map();
       for (const ord of dbOrders) {
         if (ord.contractId) dbMap.set(ord.contractId, ord);
       }
-
-      for (const pos of brokerPositions) {
-        const contractId = pos.contract_id;
-        if (!contractId) continue;
+      for (const pos of positions) {
+        const contractId = pos.id;
         const existing = dbMap.get(contractId);
         if (!existing) {
-          const side = pos.buy ? 'BUY' : 'SELL';
-          const instrument = this._fromDerivSymbol(pos.symbol) || 'UNKNOWN';
-          const amount = pos.amount || 0;
-          const units = Math.abs(amount) || 0.01;
-          const entryPrice = pos.buy_price || pos.entry_spot || 0;
-          if (isNaN(units) || units <= 0 || !instrument || !side) {
-            logger.warn(`[Reconcile] Skipping position with invalid data: ${JSON.stringify(pos)}`);
-            continue;
-          }
           const newOrder = new Order({
             clientOrderId: generateClientOrderId(),
-            instrument,
-            side,
-            units,
-            entryPrice,
+            instrument: pos.instrument,
+            side: pos.side,
+            units: Math.abs(pos.units),
+            entryPrice: pos.price,
             status: ORDER_STATUS.FILLED,
             contractId: contractId,
             filledAt: new Date(),
@@ -1451,9 +1399,8 @@ class DerivBroker extends EventEmitter {
           this._orderMap.set(contractId, existing.clientOrderId);
         }
       }
-
       for (const [contractId, clientOrderId] of this._orderMap) {
-        const stillOpen = brokerPositions.some(p => p.contract_id === contractId);
+        const stillOpen = positions.some(p => p.id === contractId);
         if (!stillOpen) {
           await this._updateOrderStatus(clientOrderId, ORDER_STATUS.CLOSED);
           this._orderMap.delete(contractId);
@@ -1467,7 +1414,7 @@ class DerivBroker extends EventEmitter {
   }
 
   // ============================================================
-  // RISK VALIDATION (uses real balance)
+  // RISK VALIDATION
   // ============================================================
   async _validateOrderRisk(instrument, side, units, stopLoss, takeProfit) {
     if (this.config.riskValidator) {
@@ -1493,7 +1440,6 @@ class DerivBroker extends EventEmitter {
   // ============================================================
   async getAccount() {
     await this._ensureReady();
-    // Fetch fresh balance from API
     try {
       const response = await this._sendRequest({ balance: 1 });
       if (response.balance) {
@@ -1602,7 +1548,7 @@ class DerivBroker extends EventEmitter {
   }
 
   // ============================================================
-  // PUBLIC API – ORDER EXECUTION (delegates to executor)
+  // PUBLIC API – ORDER EXECUTION
   // ============================================================
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null) {
     await this._ensureReady();
@@ -1658,36 +1604,8 @@ class DerivBroker extends EventEmitter {
 
   async getOpenTrades() {
     await this._ensureReady();
-    if (this.productType === 'cfd') {
-      return this.executor.getPositions();
-    }
-    const response = await this._sendRequest({ portfolio: 1 });
-    let contracts = response.portfolio || response.contracts || [];
-    if (!Array.isArray(contracts)) {
-      if (typeof contracts === 'object' && contracts !== null) {
-        const keys = Object.keys(contracts);
-        if (keys.length > 0 && !isNaN(keys[0])) {
-          contracts = Object.values(contracts);
-        } else {
-          const maybeArray = Object.values(contracts).find(v => Array.isArray(v));
-          if (maybeArray) contracts = maybeArray;
-          else contracts = [];
-        }
-      } else {
-        contracts = [];
-      }
-    }
-    return contracts
-      .filter(c => c.contract_id)
-      .map(c => ({
-        id: c.contract_id,
-        instrument: this._fromDerivSymbol(c.symbol) || 'UNKNOWN',
-        side: c.buy ? 'BUY' : 'SELL',
-        price: c.buy_price || c.entry_spot || 0,
-        units: c.buy ? (c.amount || 0) : -(c.amount || 0),
-        unrealizedPL: c.profit_loss || 0,
-        currentPrice: c.current_spot || c.entry_spot || 0,
-      }));
+    // Use executor's getPositions (which handles fallback)
+    return this.executor.getPositions();
   }
 
   async getPositions() { return this.getOpenTrades(); }
