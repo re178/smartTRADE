@@ -1,4 +1,4 @@
-// core/execution/broker.js – Stable version for Render (lazy connect, fixed symbol loading)
+// core/execution/broker.js – Full Deriv broker with true CFD via cfd_open_position
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -53,7 +53,23 @@ function generateClientOrderId() {
   return `ord_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
 }
 
-// ULTRA-LAST-RESORT fallback – only used if API fails to load ANY symbol
+function toDerivSymbol(pair, symbolMap) {
+  if (!pair) return null;
+  const upper = pair.toUpperCase();
+  if (symbolMap[upper]) return symbolMap[upper];
+  return upper;
+}
+
+function fromDerivSymbol(symbol, reverseMap) {
+  if (!symbol) return 'UNKNOWN';
+  if (reverseMap[symbol]) return reverseMap[symbol];
+  const clean = symbol.replace(/^frx/, '');
+  if (clean.length === 6) {
+    return clean.slice(0, 3) + '_' + clean.slice(3);
+  }
+  return symbol;
+}
+
 const FALLBACK_SYMBOLS = {
   'EUR_USD': 'frxEURUSD',
   'GBP_USD': 'frxGBPUSD',
@@ -67,6 +83,7 @@ const FALLBACK_SYMBOLS = {
   'GBP_JPY': 'frxGBPJPY',
 };
 
+// --- Helper to redact sensitive data ---
 function redactSensitive(obj) {
   if (!obj || typeof obj !== 'object') return obj;
   const copy = JSON.parse(JSON.stringify(obj));
@@ -104,7 +121,7 @@ class RateLimiter {
 }
 
 // ============================================================
-// STREAMING MANAGER (with watchdog)
+// STREAMING MANAGER
 // ============================================================
 class StreamingManager {
   constructor(broker) {
@@ -112,32 +129,6 @@ class StreamingManager {
     this._subscriptions = new Map();
     this._subscriptionIdMap = new Map();
     this._priceCache = new Map();
-    this._watchdogInterval = null;
-    this._lastTickTime = Date.now();
-  }
-
-  _startWatchdog() {
-    if (this._watchdogInterval) return;
-    this._watchdogInterval = setInterval(() => {
-      const now = Date.now();
-      const staleThreshold = 5000;
-      for (const [symbol, cache] of this._priceCache) {
-        if (now - cache.time > staleThreshold) {
-          logger.warn(`[Streaming] Stale price for ${symbol}, re-subscribing...`);
-          const key = `tick:${symbol}`;
-          const sub = this._subscriptions.get(key);
-          if (sub) {
-            this.unsubscribe('tick', symbol)
-              .then(() => {
-                if (sub.callbacks.length > 0) {
-                  this.subscribe('tick', symbol, sub.callbacks[0]);
-                }
-              })
-              .catch((err) => logger.error(`[Streaming] Failed to re-subscribe ${symbol}`, err));
-          }
-        }
-      }
-    }, 5000);
   }
 
   async subscribe(type, symbol, callback) {
@@ -160,7 +151,6 @@ class StreamingManager {
     this._subscriptions.set(key, { type, symbol, subscriptionId, callbacks: [callback] });
     this._subscriptionIdMap.set(subscriptionId, key);
     logger.info(`[Streaming] Subscribed to ${key} (ID: ${subscriptionId})`);
-    this._startWatchdog();
   }
 
   async unsubscribe(type, symbol, callback = null) {
@@ -205,24 +195,13 @@ class StreamingManager {
 
   handleTick(tick) {
     const symbol = tick.symbol;
-    let bid = tick.bid ? parseFloat(tick.bid) : null;
-    let ask = tick.ask ? parseFloat(tick.ask) : null;
-    let mid = tick.quote ? parseFloat(tick.quote) : null;
-
-    if (bid !== null && ask !== null) {
-      mid = (bid + ask) / 2;
-    } else if (mid !== null) {
-      const spread = this.broker.spreadMap?.[symbol] || 0.0001;
-      bid = mid - spread / 2;
-      ask = mid + spread / 2;
-    } else {
-      return;
+    const bid = tick.bid ? parseFloat(tick.bid) : null;
+    const ask = tick.ask ? parseFloat(tick.ask) : null;
+    const mid = tick.quote ? parseFloat(tick.quote) : null;
+    const price = mid || (bid && ask ? (bid + ask) / 2 : null);
+    if (price) {
+      this._priceCache.set(symbol, { bid, ask, mid: price, time: tick.epoch || Date.now() });
     }
-
-    const time = tick.epoch ? tick.epoch * 1000 : Date.now();
-    this._priceCache.set(symbol, { bid, ask, mid, time });
-    this._lastTickTime = time;
-
     for (const [key, sub] of this._subscriptions) {
       if (sub.symbol === symbol) {
         for (const cb of sub.callbacks) {
@@ -235,13 +214,6 @@ class StreamingManager {
 
   getPrice(symbol) { return this._priceCache.get(symbol) || null; }
   getAllPrices() { return Object.fromEntries(this._priceCache); }
-
-  stop() {
-    if (this._watchdogInterval) {
-      clearInterval(this._watchdogInterval);
-      this._watchdogInterval = null;
-    }
-  }
 }
 
 // ============================================================
@@ -250,7 +222,12 @@ class StreamingManager {
 class SymbolManager {
   constructor() {
     this._symbols = new Map();
-    this._leverageMap = {};
+    this._leverageMap = {
+      'frxEURUSD': 100, 'frxGBPUSD': 100, 'frxUSDJPY': 100,
+      'frxAUDUSD': 100, 'frxUSDCAD': 100, 'frxUSDCHF': 100,
+      'frxNZDUSD': 100, 'frxEURGBP': 100, 'frxEURJPY': 100,
+      'frxGBPJPY': 100,
+    };
   }
 
   setSymbols(symbols) {
@@ -343,58 +320,24 @@ class CFDExecutor extends BaseExecutor {
   }
 
   async getPositions() {
-    // Try cfd_get_positions first; fallback to portfolio
-    try {
-      const payload = { cfd_get_positions: 1 };
-      logger.info('[CFDExecutor] Sending get positions (cfd_get_positions)...');
-      const response = await this.broker._sendRequest(payload);
-      const positions = response.cfd_get_positions || [];
-      return positions.map(pos => ({
-        id: pos.position_id,
-        instrument: this.broker._fromDerivSymbol(pos.symbol) || 'UNKNOWN',
-        side: pos.direction === 'up' ? 'BUY' : 'SELL',
-        price: pos.entry_price || 0,
-        units: pos.amount || 0,
-        unrealizedPL: pos.profit_loss || 0,
-        currentPrice: pos.current_spot || pos.entry_price || 0,
-      }));
-    } catch (err) {
-      if (err.message.includes('UnrecognisedRequest') || err.message.includes('unknown')) {
-        logger.warn('[CFDExecutor] cfd_get_positions not supported, falling back to portfolio.');
-        const portfolioResponse = await this.broker._sendRequest({ portfolio: 1 });
-        let contracts = portfolioResponse.portfolio || portfolioResponse.contracts || [];
-        if (!Array.isArray(contracts)) {
-          if (typeof contracts === 'object' && contracts !== null) {
-            const keys = Object.keys(contracts);
-            if (keys.length > 0 && !isNaN(keys[0])) {
-              contracts = Object.values(contracts);
-            } else {
-              const maybeArray = Object.values(contracts).find(v => Array.isArray(v));
-              if (maybeArray) contracts = maybeArray;
-              else contracts = [];
-            }
-          } else {
-            contracts = [];
-          }
-        }
-        return contracts
-          .filter(c => c.contract_id)
-          .map(c => ({
-            id: c.contract_id,
-            instrument: this.broker._fromDerivSymbol(c.symbol) || 'UNKNOWN',
-            side: c.buy ? 'BUY' : 'SELL',
-            price: c.buy_price || c.entry_spot || 0,
-            units: c.buy ? (c.amount || 0) : -(c.amount || 0),
-            unrealizedPL: c.profit_loss || 0,
-            currentPrice: c.current_spot || c.entry_spot || 0,
-          }));
-      }
-      throw err;
-    }
+    const payload = { cfd_get_positions: 1 };
+    logger.info('[CFDExecutor] Sending get positions request:', JSON.stringify(redactSensitive(payload), null, 2));
+    const response = await this.broker._sendRequest(payload);
+    logger.info('[CFDExecutor] Get positions response:', JSON.stringify(redactSensitive(response), null, 2));
+    const positions = response.cfd_get_positions || [];
+    return positions.map(pos => ({
+      id: pos.position_id,
+      instrument: fromDerivSymbol(pos.symbol, this.broker.reverseMap) || 'UNKNOWN',
+      side: pos.direction === 'up' ? 'BUY' : 'SELL',
+      price: pos.entry_price || 0,
+      units: pos.amount || 0,
+      unrealizedPL: pos.profit_loss || 0,
+      currentPrice: pos.current_spot || pos.entry_price || 0,
+    }));
   }
 
   _prepare(instrument, units) {
-    const symbol = this.broker._toDerivSymbol(instrument);
+    const symbol = toDerivSymbol(instrument, this.broker.symbolMap);
     if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
     const amount = Math.abs(units);
     if (amount <= 0) throw new Error('Units must be positive');
@@ -403,7 +346,7 @@ class CFDExecutor extends BaseExecutor {
   }
 }
 
-// ---- Multiplier Executor ----
+// ---- Multiplier Executor (uses proposal -> buy) ----
 class MultiplierExecutor extends BaseExecutor {
   async placeMarket(instrument, units, stopLoss, takeProfit) {
     const { symbol, amount, side } = this._prepare(instrument, units);
@@ -479,7 +422,7 @@ class MultiplierExecutor extends BaseExecutor {
   }
 
   _prepare(instrument, units) {
-    const symbol = this.broker._toDerivSymbol(instrument);
+    const symbol = toDerivSymbol(instrument, this.broker.symbolMap);
     if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
     const amount = Math.abs(units);
     if (amount <= 0) throw new Error('Units must be positive');
@@ -500,7 +443,7 @@ class MultiplierExecutor extends BaseExecutor {
   }
 }
 
-// ---- Basic Options Executor ----
+// ---- Basic Options Executor (uses proposal -> buy) ----
 class OptionsExecutor extends BaseExecutor {
   async placeMarket(instrument, units, stopLoss, takeProfit) {
     const { symbol, amount, side } = this._prepare(instrument, units);
@@ -542,7 +485,7 @@ class OptionsExecutor extends BaseExecutor {
   }
 
   _prepare(instrument, units) {
-    const symbol = this.broker._toDerivSymbol(instrument);
+    const symbol = toDerivSymbol(instrument, this.broker.symbolMap);
     if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
     const amount = Math.abs(units);
     if (amount <= 0) throw new Error('Units must be positive');
@@ -564,7 +507,7 @@ class OptionsExecutor extends BaseExecutor {
 }
 
 // ============================================================
-// MAIN BROKER CLASS – Lazy connect (original behavior)
+// MAIN BROKER CLASS
 // ============================================================
 const BROKER_CAPABILITIES = {
   supportsTrailingStop: false,
@@ -608,12 +551,12 @@ class DerivBroker extends EventEmitter {
       duration: config.duration ? parseInt(config.duration) : 60,
       riskValidator: config.riskValidator || null,
       fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || 3),
-      readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 20000),
+      readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 30000),
       symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 30000),
       heartbeatTimeout: parseInt(config.heartbeatTimeout || process.env.DERIV_HEARTBEAT_TIMEOUT || 60000),
-      // NO autoConnect – lazy connect like original
     };
 
+    // ---- CHANGE: use config.productType, fallback to environment ----
     const rawProduct = (config.productType || process.env.TRADING_PRODUCT || 'cfd').toLowerCase();
     const validProducts = ['cfd', 'multiplier', 'basic'];
     if (!validProducts.includes(rawProduct)) {
@@ -644,17 +587,17 @@ class DerivBroker extends EventEmitter {
     this._cbFailureCount = 0;
     this._cbOpenedAt = null;
 
-    // ---------- SYMBOL REGISTRY ----------
-    this.symbolMap = {};
+    // ---------- Symbol maps ----------
+    this.symbolMap = { ...FALLBACK_SYMBOLS };
     this.reverseMap = {};
-    this.spreadMap = {};
-    this._symbolsLoaded = false;
-    this._fallbackSymbols = { ...FALLBACK_SYMBOLS };
     for (const [key, val] of Object.entries(FALLBACK_SYMBOLS)) {
       this.reverseMap[val] = key;
-      this.spreadMap[val] = 0.0001;
     }
-    logger.info(`[DerivBroker] Initialized empty symbol registry.`);
+    this.spreadMap = {};
+    for (const key of Object.keys(FALLBACK_SYMBOLS)) {
+      this.spreadMap[FALLBACK_SYMBOLS[key]] = 0.0001;
+    }
+    logger.info(`[DerivBroker] Using fallback symbols (${Object.keys(this.symbolMap).length} pairs).`);
 
     // ---------- Order tracking ----------
     this._orders = new Map();
@@ -682,7 +625,7 @@ class DerivBroker extends EventEmitter {
     this._account = null;
     this._portfolioLogged = false;
 
-    // ---------- Instantiate executor ----------
+    // ---------- Instantiate the appropriate executor ----------
     switch (this.productType) {
       case 'cfd':
         this.executor = new CFDExecutor(this);
@@ -698,45 +641,6 @@ class DerivBroker extends EventEmitter {
     }
 
     logger.info(`[DerivBroker] Created with product type: ${this.productType}, using ${this.executor.constructor.name}`);
-    // No auto-connect – wait for first request.
-  }
-
-  // ============================================================
-  // SYMBOL RESOLUTION – LIVE FIRST
-  // ============================================================
-  _toDerivSymbol(pair) {
-    if (!pair) return null;
-    const upper = pair.toUpperCase();
-
-    if (this.symbolMap[upper]) {
-      return this.symbolMap[upper];
-    }
-
-    if (!this._symbolsLoaded && this._fallbackSymbols[upper]) {
-      logger.warn(`[Symbol] Using HARDCODED emergency fallback for ${upper} (API symbols not loaded yet!)`);
-      return this._fallbackSymbols[upper];
-    }
-
-    if (this._symbolsLoaded) {
-      const available = Object.keys(this.symbolMap).slice(0, 10).join(', ');
-      logger.error(`[Symbol] Unknown pair: ${upper}. Available: ${available}...`);
-    }
-
-    return null;
-  }
-
-  _fromDerivSymbol(derivSymbol) {
-    if (!derivSymbol) return 'UNKNOWN';
-    if (this.reverseMap[derivSymbol]) return this.reverseMap[derivSymbol];
-    const clean = derivSymbol.replace(/^frx/, '');
-    if (clean.length >= 6) {
-      return clean.slice(0, 3) + '_' + clean.slice(3, 6);
-    }
-    return derivSymbol;
-  }
-
-  getLeverage(symbol) {
-    return this.symbolManager.getLeverage(symbol) || this.config.leverage || 100;
   }
 
   validateConfig() {
@@ -749,9 +653,11 @@ class DerivBroker extends EventEmitter {
     logger.info('[DerivBroker] Configuration validated.');
   }
 
-  // ============================================================
-  // CONNECTION – Lazy (original behavior)
-  // ============================================================
+  getLeverage(symbol) {
+    return this.symbolManager.getLeverage(symbol) || this.config.leverage || 100;
+  }
+
+  // ---------- CONNECTION ----------
   async connect() {
     if (this._state === STATE.READY) return;
     if (this._state === STATE.FATAL) throw new Error('Broker in FATAL state.');
@@ -822,14 +728,12 @@ class DerivBroker extends EventEmitter {
                 this._authFailCount = 0;
                 this._setState(STATE.AUTHENTICATING);
 
-                logger.info('[DerivBroker] Startup: Loading symbols from API...');
+                logger.info('[DerivBroker] Startup: Loading symbols...');
                 try {
                   await this._loadSymbolsWithTimeout();
-                  logger.info(`[DerivBroker] Startup: Symbols loaded. Registry has ${Object.keys(this.symbolMap).length} pairs.`);
+                  logger.info('[DerivBroker] Startup: Symbols loaded.');
                 } catch (err) {
-                  logger.error('[DerivBroker] Startup: Symbol loading FAILED:', err.message);
-                  this._symbolsLoaded = false;
-                  logger.warn('[DerivBroker] Using emergency fallback symbols.');
+                  logger.warn('[DerivBroker] Startup: Symbol loading failed, using fallback:', err.message);
                 }
 
                 this._setState(STATE.READY);
@@ -921,9 +825,7 @@ class DerivBroker extends EventEmitter {
     this.emit('stateChange', { from: old, to: newState });
   }
 
-  // ============================================================
-  // AUTHORIZATION
-  // ============================================================
+  // ---------- AUTHORIZATION ----------
   _authorize() {
     return new Promise((resolve, reject) => {
       const reqId = generateRequestId();
@@ -961,9 +863,7 @@ class DerivBroker extends EventEmitter {
     return Math.round(jitter);
   }
 
-  // ============================================================
-  // CIRCUIT BREAKER
-  // ============================================================
+  // ---------- CIRCUIT BREAKER ----------
   _recordFailure() {
     if (this._cbState === CB_STATE.OPEN) return;
     this._cbFailureCount++;
@@ -989,9 +889,7 @@ class DerivBroker extends EventEmitter {
     return true;
   }
 
-  // ============================================================
-  // HEARTBEAT
-  // ============================================================
+  // ---------- HEARTBEAT ----------
   _startHeartbeat() {
     this._stopHeartbeat();
     this._lastPong = Date.now();
@@ -1024,9 +922,7 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // ============================================================
-  // MESSAGE HANDLER
-  // ============================================================
+  // ---------- MESSAGE HANDLER ----------
   _handleMessage(rawData) {
     try {
       const msg = JSON.parse(rawData);
@@ -1118,9 +1014,7 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // ============================================================
-  // SEND LOGIC
-  // ============================================================
+  // ---------- SEND LOGIC ----------
   _sendRaw(payload) {
     if (!this._socket || this._socket.readyState !== WebSocket.OPEN) {
       if (this._messageQueue.length < this.config.maxQueueSize) {
@@ -1219,9 +1113,7 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // ============================================================
-  // SYMBOL LOADING – CORRECT: "brief" then "full"
-  // ============================================================
+  // ---------- SYMBOL LOADING ----------
   async _loadSymbolsWithTimeout() {
     return Promise.race([
       this._loadSymbolsInternal(),
@@ -1232,116 +1124,67 @@ class DerivBroker extends EventEmitter {
   }
 
   async _loadSymbolsInternal() {
-    logger.info('[DerivBroker] Fetching active symbols from LIVE API...');
+    logger.info('[DerivBroker] Fetching active symbols...');
     let lastError = null;
-
-    // Try 'brief' first (fast)
     try {
-      const response = await this._sendRawRequest({ active_symbols: 'brief' }, 15000);
-      let symbols = response.active_symbols || [];
+      const response = await this._sendRawRequest({ active_symbols: 'brief' }, 10000);
+      const symbols = response.active_symbols || [];
       if (symbols.length > 0) {
-        symbols = symbols.filter(s =>
-          s.trade_status === 'open' &&
-          !s.is_trading_suspended
-        );
-        logger.info(`[Symbols] Loaded ${symbols.length} tradable symbols (brief).`);
+        logger.info(`[Symbols] Loaded ${symbols.length} symbols (brief).`);
+        logger.info('[Symbols] First 5 symbols:', JSON.stringify(symbols.slice(0, 5), null, 2));
+        logger.debug('[Symbols] Full list:', JSON.stringify(symbols, null, 2));
         this._buildSymbolMaps(symbols);
         this.symbolManager.setSymbols(symbols);
-        this._symbolsLoaded = true;
-        logger.info(`[Symbols] Registry now has ${Object.keys(this.symbolMap).length} pairs.`);
         return;
       }
     } catch (err) {
       lastError = err;
       logger.warn('[DerivBroker] Brief symbol request failed:', err.message);
     }
-
-    // Fallback to 'full' (correct – NOT "all")
     try {
-      const response = await this._sendRawRequest({ active_symbols: 'full' }, 20000);
-      let symbols = response.active_symbols || [];
+      const response = await this._sendRawRequest({ active_symbols: 'all' }, 10000);
+      const symbols = response.active_symbols || [];
       if (symbols.length > 0) {
-        symbols = symbols.filter(s =>
-          s.trade_status === 'open' &&
-          !s.is_trading_suspended
-        );
-        logger.info(`[Symbols] Loaded ${symbols.length} tradable symbols (full).`);
+        logger.info(`[Symbols] Loaded ${symbols.length} symbols (all).`);
+        logger.info('[Symbols] First 5 symbols:', JSON.stringify(symbols.slice(0, 5), null, 2));
+        logger.debug('[Symbols] Full list:', JSON.stringify(symbols, null, 2));
         this._buildSymbolMaps(symbols);
         this.symbolManager.setSymbols(symbols);
-        this._symbolsLoaded = true;
-        logger.info(`[Symbols] Registry now has ${Object.keys(this.symbolMap).length} pairs.`);
         return;
       }
     } catch (err) {
       lastError = err;
-      logger.warn('[DerivBroker] Full symbol request failed:', err.message);
+      logger.warn('[DerivBroker] All symbol request failed:', err.message);
     }
-
-    // If both fail, fallback to hardcoded symbols (emergency)
-    this._symbolsLoaded = false;
     throw lastError || new Error('Failed to load symbols from Deriv API.');
   }
 
   _buildSymbolMaps(symbols) {
-    let count = 0;
     for (const sym of symbols) {
       const derivSymbol = sym.symbol;
       const display = sym.display_name || '';
-      let ourPair = null;
-
-      // Strategy 1: "EUR/USD"
-      let match = display.match(/([A-Z]{3})\/([A-Z]{3})/);
-      if (match) ourPair = match[1] + '_' + match[2];
-
-      // Strategy 2: "EURUSD"
-      if (!ourPair) {
-        match = display.match(/\b([A-Z]{3})([A-Z]{3})\b/);
-        if (match) ourPair = match[1] + '_' + match[2];
-      }
-
-      // Strategy 3: from derivSymbol (frxEURUSDm)
-      if (!ourPair && derivSymbol.startsWith('frx')) {
-        const base = derivSymbol.replace(/^frx/, '').replace(/[^A-Z]/g, '');
-        if (base.length === 6) {
-          ourPair = base.slice(0, 3) + '_' + base.slice(3);
-        }
-      }
-
-      // Strategy 4: synthetic/crypto keep as-is
-      if (!ourPair && (sym.market === 'synthetic' || sym.market === 'crypto')) {
-        ourPair = derivSymbol;
-      }
-
-      if (ourPair) {
+      const match = display.match(/([A-Z]{3})\/([A-Z]{3})/);
+      if (match) {
+        const ourPair = match[1] + '_' + match[2];
         this.symbolMap[ourPair] = derivSymbol;
         this.reverseMap[derivSymbol] = ourPair;
-        if (sym.pip) {
-          this.spreadMap[derivSymbol] = parseFloat(sym.pip) * 0.5;
-        } else {
-          this.spreadMap[derivSymbol] = 0.0001;
-        }
-        count++;
+        const pip = sym.pip || 0.0001;
+        this.spreadMap[derivSymbol] = pip * 0.5;
       }
     }
-    logger.info(`[DerivBroker] Built symbol map: ${count} pairs from LIVE API.`);
+    logger.info(`[DerivBroker] Symbol map built: ${Object.keys(this.symbolMap).length} forex pairs.`);
   }
 
-  // ============================================================
-  // ORDER PERSISTENCE
-  // ============================================================
+  // ---------- ORDER PERSISTENCE ----------
   async _loadPendingOrders() {
     logger.info('[DerivBroker] Loading pending orders from MongoDB...');
-    try {
-      const pendingOrders = await Order.find({ status: { $in: ['PENDING', 'ACCEPTED', 'EXECUTING'] } });
-      for (const order of pendingOrders) {
-        this._orders.set(order.clientOrderId, order);
-        if (order.contractId) this._orderMap.set(order.contractId, order.clientOrderId);
-        logger.info(`[DerivBroker] Loaded pending order ${order.clientOrderId} (${order.status})`);
-      }
-      logger.info(`[DerivBroker] Loaded ${pendingOrders.length} pending orders.`);
-    } catch (err) {
-      logger.error('[DerivBroker] Failed to load pending orders:', err.message);
+    const pendingOrders = await Order.find({ status: { $in: ['PENDING', 'ACCEPTED', 'EXECUTING'] } });
+    for (const order of pendingOrders) {
+      this._orders.set(order.clientOrderId, order);
+      if (order.contractId) this._orderMap.set(order.contractId, order.clientOrderId);
+      logger.info(`[DerivBroker] Loaded pending order ${order.clientOrderId} (${order.status})`);
     }
+    logger.info(`[DerivBroker] Loaded ${pendingOrders.length} pending orders.`);
   }
 
   async _updateOrderStatus(clientOrderId, status, contractId = null, txData = null) {
@@ -1352,12 +1195,7 @@ class DerivBroker extends EventEmitter {
       update.rejectedAt = new Date();
       update.rejectReason = txData?.error?.message || 'Unknown';
     }
-    try {
-      await Order.findOneAndUpdate({ clientOrderId }, update, { upsert: true, new: true });
-    } catch (err) {
-      logger.error(`[Order] Failed to update status for ${clientOrderId}:`, err.message);
-      return;
-    }
+    await Order.findOneAndUpdate({ clientOrderId }, update, { upsert: true, new: true });
     const order = this._orders.get(clientOrderId);
     if (order) {
       Object.assign(order, update);
@@ -1370,29 +1208,98 @@ class DerivBroker extends EventEmitter {
     this.emit('orderUpdate', { clientOrderId, status, contractId });
   }
 
-  // ============================================================
-  // POSITION RECONCILIATION
-  // ============================================================
+  // ---------- POSITION RECONCILIATION ----------
   async _reconcilePositions() {
     logger.info('[DerivBroker] Reconciling positions...');
     try {
-      const positions = await this.executor.getPositions();
-      logger.info('[Reconcile] Positions from API:', JSON.stringify(positions, null, 2));
+      if (this.productType === 'cfd') {
+        const positions = await this.executor.getPositions();
+        logger.info('[Reconcile] CFD positions from API:', JSON.stringify(positions, null, 2));
+        const dbOrders = await Order.find({ status: ORDER_STATUS.FILLED });
+        const dbMap = new Map();
+        for (const ord of dbOrders) {
+          if (ord.contractId) dbMap.set(ord.contractId, ord);
+        }
+        for (const pos of positions) {
+          const contractId = pos.id;
+          const existing = dbMap.get(contractId);
+          if (!existing) {
+            const newOrder = new Order({
+              clientOrderId: generateClientOrderId(),
+              instrument: pos.instrument,
+              side: pos.side,
+              units: pos.units,
+              entryPrice: pos.price,
+              status: ORDER_STATUS.FILLED,
+              contractId: contractId,
+              filledAt: new Date(),
+            });
+            await newOrder.save();
+            this._orders.set(newOrder.clientOrderId, newOrder);
+            this._orderMap.set(contractId, newOrder.clientOrderId);
+            logger.warn(`[Reconcile] Created order for CFD position ${contractId}`);
+          }
+        }
+        for (const [contractId, clientOrderId] of this._orderMap) {
+          const stillOpen = positions.some(p => p.id === contractId);
+          if (!stillOpen) {
+            await this._updateOrderStatus(clientOrderId, ORDER_STATUS.CLOSED);
+            this._orderMap.delete(contractId);
+          }
+        }
+        logger.info('[Reconcile] CFD position reconciliation complete.');
+        return;
+      }
+
+      const response = await this._sendRequest({ portfolio: 1 });
+      let rawPortfolio = response.portfolio || response.contracts || [];
+      if (!Array.isArray(rawPortfolio)) {
+        if (typeof rawPortfolio === 'object' && rawPortfolio !== null) {
+          const keys = Object.keys(rawPortfolio);
+          if (keys.length > 0 && !isNaN(keys[0])) {
+            rawPortfolio = Object.values(rawPortfolio);
+          } else {
+            const maybeArray = Object.values(rawPortfolio).find(v => Array.isArray(v));
+            if (maybeArray) rawPortfolio = maybeArray;
+          }
+        }
+      }
+      if (!Array.isArray(rawPortfolio)) {
+        rawPortfolio = [];
+        logger.warn('[Reconcile] Unable to parse portfolio response; defaulting to empty array.');
+      }
+      if (!this._portfolioLogged) {
+        logger.info('[Reconcile] Portfolio structure (first 2 items):', JSON.stringify(rawPortfolio.slice(0, 2), null, 2));
+        this._portfolioLogged = true;
+      }
+
+      const brokerPositions = rawPortfolio;
       const dbOrders = await Order.find({ status: ORDER_STATUS.FILLED });
       const dbMap = new Map();
       for (const ord of dbOrders) {
         if (ord.contractId) dbMap.set(ord.contractId, ord);
       }
-      for (const pos of positions) {
-        const contractId = pos.id;
+
+      for (const pos of brokerPositions) {
+        const contractId = pos.contract_id;
+        if (!contractId) continue;
         const existing = dbMap.get(contractId);
         if (!existing) {
+          const side = pos.buy ? 'BUY' : 'SELL';
+          const instrument = fromDerivSymbol(pos.symbol, this.reverseMap) || 'UNKNOWN';
+          const amount = pos.amount || 0;
+          const units = Math.abs(amount) || 0.01;
+          const entryPrice = pos.buy_price || pos.entry_spot || 0;
+          if (isNaN(units) || units <= 0 || !instrument || !side) {
+            logger.warn(`[Reconcile] Skipping position with invalid data: ${JSON.stringify(pos)}`);
+            continue;
+          }
           const newOrder = new Order({
             clientOrderId: generateClientOrderId(),
-            instrument: pos.instrument,
-            side: pos.side,
-            units: Math.abs(pos.units),
-            entryPrice: pos.price,
+            instrument,
+            side,
+            units,
+            entryPrice,
             status: ORDER_STATUS.FILLED,
             contractId: contractId,
             filledAt: new Date(),
@@ -1406,8 +1313,9 @@ class DerivBroker extends EventEmitter {
           this._orderMap.set(contractId, existing.clientOrderId);
         }
       }
+
       for (const [contractId, clientOrderId] of this._orderMap) {
-        const stillOpen = positions.some(p => p.id === contractId);
+        const stillOpen = brokerPositions.some(p => p.contract_id === contractId);
         if (!stillOpen) {
           await this._updateOrderStatus(clientOrderId, ORDER_STATUS.CLOSED);
           this._orderMap.delete(contractId);
@@ -1416,12 +1324,11 @@ class DerivBroker extends EventEmitter {
       logger.info('[Reconcile] Position reconciliation complete.');
     } catch (err) {
       logger.error('[Reconcile] Failed:', err.message);
+      throw err;
     }
   }
 
-  // ============================================================
-  // RISK VALIDATION
-  // ============================================================
+  // ---------- RISK VALIDATION ----------
   async _validateOrderRisk(instrument, side, units, stopLoss, takeProfit) {
     if (this.config.riskValidator) {
       const result = await this.config.riskValidator({
@@ -1435,26 +1342,16 @@ class DerivBroker extends EventEmitter {
       if (!result.approved) throw new Error(`Risk validation failed: ${result.reason}`);
     }
     const account = await this.getAccount();
+    const marginAvailable = parseFloat(account.marginAvailable);
+    if (marginAvailable <= 0) throw new Error('Insufficient margin');
     const balance = parseFloat(account.balance);
-    if (isNaN(balance) || balance <= 0) throw new Error('Invalid account balance');
     const exposure = units * 0.01;
     if (exposure > balance * 0.1) throw new Error(`Order size ${units} exceeds 10% of balance`);
   }
 
-  // ============================================================
-  // PUBLIC API – ACCOUNT
-  // ============================================================
+  // ---------- PUBLIC API ----------
   async getAccount() {
     await this._ensureReady();
-    try {
-      const response = await this._sendRequest({ balance: 1 });
-      if (response.balance) {
-        this._account = response.balance;
-        this.accountCurrency = this._account.currency || 'USD';
-      }
-    } catch (err) {
-      logger.warn('[DerivBroker] Balance fetch failed, using cached account:', err.message);
-    }
     if (!this._account) {
       logger.warn('[DerivBroker] Account not yet available, returning default.');
       return this._getDefaultAccount();
@@ -1465,8 +1362,8 @@ class DerivBroker extends EventEmitter {
       balance: acc.balance || '0',
       currency: acc.currency || 'USD',
       equity: acc.balance || '0',
-      marginUsed: acc.margin_used || '0',
-      marginAvailable: acc.margin_balance || acc.balance || '0',
+      marginUsed: '0',
+      marginAvailable: acc.balance || '0',
       createdTime: new Date().toISOString(),
     };
   }
@@ -1483,14 +1380,11 @@ class DerivBroker extends EventEmitter {
     };
   }
 
-  // ============================================================
-  // PUBLIC API – PRICES & CANDLES
-  // ============================================================
   async getPrices(instruments) {
     await this._ensureReady();
     const results = [];
     for (const pair of instruments) {
-      const symbol = this._toDerivSymbol(pair);
+      const symbol = toDerivSymbol(pair, this.symbolMap);
       if (!symbol) {
         logger.warn(`[getPrices] Unknown pair: ${pair}`);
         continue;
@@ -1529,7 +1423,7 @@ class DerivBroker extends EventEmitter {
 
   async getCandles(instrument, count = 100, granularity = 'M5') {
     await this._ensureReady();
-    const symbol = this._toDerivSymbol(instrument);
+    const symbol = toDerivSymbol(instrument, this.symbolMap);
     if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
     const intervalMap = {
       'M1': 60, 'M5': 300, 'M15': 900, 'M30': 1800,
@@ -1553,9 +1447,7 @@ class DerivBroker extends EventEmitter {
     }));
   }
 
-  // ============================================================
-  // PUBLIC API – ORDER EXECUTION
-  // ============================================================
+  // ---------- ORDER PLACEMENT (delegates to executor) ----------
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null) {
     await this._ensureReady();
     const amount = Math.abs(units);
@@ -1610,7 +1502,36 @@ class DerivBroker extends EventEmitter {
 
   async getOpenTrades() {
     await this._ensureReady();
-    return this.executor.getPositions();
+    if (this.productType === 'cfd') {
+      return this.executor.getPositions();
+    }
+    const response = await this._sendRequest({ portfolio: 1 });
+    let contracts = response.portfolio || response.contracts || [];
+    if (!Array.isArray(contracts)) {
+      if (typeof contracts === 'object' && contracts !== null) {
+        const keys = Object.keys(contracts);
+        if (keys.length > 0 && !isNaN(keys[0])) {
+          contracts = Object.values(contracts);
+        } else {
+          const maybeArray = Object.values(contracts).find(v => Array.isArray(v));
+          if (maybeArray) contracts = maybeArray;
+          else contracts = [];
+        }
+      } else {
+        contracts = [];
+      }
+    }
+    return contracts
+      .filter(c => c.contract_id)
+      .map(c => ({
+        id: c.contract_id,
+        instrument: fromDerivSymbol(c.symbol, this.reverseMap) || 'UNKNOWN',
+        side: c.buy ? 'BUY' : 'SELL',
+        price: c.buy_price || c.entry_spot || 0,
+        units: c.buy ? (c.amount || 0) : -(c.amount || 0),
+        unrealizedPL: c.profit_loss || 0,
+        currentPrice: c.current_spot || c.entry_spot || 0,
+      }));
   }
 
   async getPositions() { return this.getOpenTrades(); }
@@ -1638,8 +1559,6 @@ class DerivBroker extends EventEmitter {
         rejected: this.metrics.ordersRejected,
       },
       subscriptions: this.streaming._subscriptions.size,
-      symbolRegistrySize: Object.keys(this.symbolMap).length,
-      symbolsLoaded: this._symbolsLoaded,
     };
   }
 
@@ -1666,7 +1585,6 @@ class DerivBroker extends EventEmitter {
   async disconnect() {
     logger.info('[DerivBroker] Disconnecting gracefully...');
     this._stopHeartbeat();
-    this.streaming.stop();
     const subs = Array.from(this.streaming._subscriptions.keys());
     for (const key of subs) {
       const sub = this.streaming._subscriptions.get(key);
@@ -1735,7 +1653,7 @@ class DerivBroker extends EventEmitter {
 }
 
 // ============================================================
-// EXPORT – singleton
+// EXPORT – singleton AND class
 // ============================================================
 const brokerInstance = new DerivBroker({
   apiToken: process.env.DERIV_API_TOKEN,
@@ -1756,11 +1674,12 @@ const brokerInstance = new DerivBroker({
   leverage: parseFloat(process.env.DERIV_LEVERAGE) || 100,
   duration: process.env.DERIV_DURATION ? parseInt(process.env.DERIV_DURATION) : 60,
   fatalAfterAuthFailures: parseInt(process.env.DERIV_FATAL_AFTER_AUTH_FAILURES) || 3,
-  readinessTimeout: parseInt(process.env.DERIV_READINESS_TIMEOUT) || 20000,
+  readinessTimeout: parseInt(process.env.DERIV_READINESS_TIMEOUT) || 30000,
   symbolTimeout: parseInt(process.env.DERIV_SYMBOL_TIMEOUT) || 30000,
   heartbeatTimeout: parseInt(process.env.DERIV_HEARTBEAT_TIMEOUT) || 60000,
-  productType: process.env.TRADING_PRODUCT || 'cfd',
+  productType: process.env.TRADING_PRODUCT || 'cfd', // backward compatibility
 });
 
+// Export both the singleton and the class
 module.exports = brokerInstance;
 module.exports.DerivBroker = DerivBroker;
