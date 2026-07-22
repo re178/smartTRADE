@@ -1,13 +1,8 @@
-// ============================================================
-// developer-api.js – Independent JS for Developer Portal
-// ============================================================
+// public/js/developer-api.js – Developer Portal logic (independent of app.js)
 
 document.addEventListener('DOMContentLoaded', function() {
-  // Only run if we're on the developer API page
   const tableBody = document.querySelector('#appsTable tbody');
-  if (!tableBody) return;
-
-  // Load existing keys
+  if (!tableBody) return; // not on developer page
   fetchApps();
 });
 
@@ -59,7 +54,6 @@ function copyToClipboard(elementOrText) {
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(text).then(() => alert('Copied!')).catch(() => alert('Copy failed.'));
   } else {
-    // Fallback
     const el = document.createElement('textarea');
     el.value = text;
     document.body.appendChild(el);
@@ -97,9 +91,7 @@ async function generateCredentials() {
       document.getElementById('newApiKey').value = data.apiKey;
       document.getElementById('newApiSecret').value = data.apiSecret;
       document.getElementById('generatedPanel').style.display = 'block';
-      // Refresh the table
       fetchApps();
-      // Optionally clear the form
       document.getElementById('appName').value = '';
       document.getElementById('appDescription').value = '';
       document.querySelectorAll('.form-check-input:checked').forEach(cb => cb.checked = false);
@@ -151,6 +143,7 @@ async function regenerateSecret(id) {
     const data = await res.json();
     if (data.apiSecret) {
       document.getElementById('newApiSecret').value = data.apiSecret;
+      document.getElementById('newApiKey').value = data.apiKey || ''; // backend now returns apiKey too
       document.getElementById('generatedPanel').style.display = 'block';
       alert('New secret generated. Copy it now.');
       fetchApps();
