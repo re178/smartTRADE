@@ -3,6 +3,7 @@
 const Trade = require('../models/Trade');
 const Order = require('../models/Order');
 const User = require('../models/User');
+const Signal = require('../models/Signal'); // added for submitSignal
 const marketProvider = require('../core/market/provider');
 const { getBroker } = require('../core/execution/brokerFactory');
 const orderService = require('../core/execution/orderService');
@@ -116,6 +117,53 @@ exports.getCandles = async (req, res) => {
   }
 };
 
+// ---------- NEW: Symbol Metadata ----------
+exports.getSymbols = async (req, res) => {
+  try {
+    const product = getProduct(req);
+    const broker = getBroker(product);
+    if (!broker.isConnected()) {
+      await broker.connect();
+    }
+    let symbols = [];
+    if (broker.symbolManager && typeof broker.symbolManager._symbols === 'object') {
+      symbols = Array.from(broker.symbolManager._symbols.values());
+    } else if (broker.symbols) {
+      symbols = typeof broker.symbols === 'function' ? await broker.symbols() : broker.symbols;
+    } else {
+      try {
+        const allSymbols = await marketProvider.getSymbols(product);
+        if (allSymbols) symbols = allSymbols;
+      } catch (e) {
+        // ignore
+      }
+    }
+    res.json(symbols);
+  } catch (error) {
+    logger.error('[getSymbols] Error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+// ---------- NEW: Broker Capabilities ----------
+exports.getCapabilities = async (req, res) => {
+  try {
+    const product = getProduct(req);
+    const broker = getBroker(product);
+    const caps = broker.capabilities || {};
+    const info = {
+      product,
+      name: broker.serverName || product,
+      connected: broker.isConnected(),
+      state: broker._state || 'unknown',
+      capabilities: caps,
+    };
+    res.json(info);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
 // ---------- Positions & Trades ----------
 exports.getPositions = async (req, res) => {
   try {
@@ -148,7 +196,7 @@ exports.getTradeHistory = async (req, res) => {
   }
 };
 
-// ---------- Manual Order (FIXED: no duplicate Trade) ----------
+// ---------- Manual Order ----------
 exports.placeOrder = async (req, res) => {
   const { pair, side, lotSize, stopLoss, takeProfit } = req.body;
   const validation = validateOrderInput({ pair, side, lotSize, stopLoss, takeProfit });
@@ -174,14 +222,11 @@ exports.placeOrder = async (req, res) => {
     if (!approval.allowed) {
       return res.status(400).json({ error: approval.reason });
     }
-    // Order service will create both Order and Trade documents
     const orderResult = await orderService.placeMarketOrder(
       instrument, side, lotSize, stopLoss || null, takeProfit || null, product
     );
-    // Retrieve the trade that was just created by orderService (by contractId)
     const trade = await Trade.findOne({ contractId: orderResult.contractId });
     if (!trade) {
-      // Fallback: try to find the most recent trade for this instrument
       const fallbackTrade = await Trade.findOne({ instrument }).sort({ openTime: -1 });
       if (fallbackTrade) {
         logger.warn(`[placeOrder] Trade not found by contractId ${orderResult.contractId}, using most recent trade ${fallbackTrade.contractId}`);
@@ -244,7 +289,32 @@ exports.getSignal = async (req, res) => {
   }
 };
 
-// ---------- Auto Trade (FIXED: no duplicate Trade) ----------
+// ---------- NEW: Submit Signal (store in DB) ----------
+exports.submitSignal = async (req, res) => {
+  try {
+    const { symbol, direction, timeframe, price, comment } = req.body;
+    if (!symbol || !direction) {
+      return res.status(400).json({ error: 'symbol and direction are required' });
+    }
+    const signal = new Signal({
+      symbol: symbol.toUpperCase(),
+      direction: direction.toLowerCase(),
+      timeframe: timeframe || 'M5',
+      price: price || 0,
+      comment: comment || '',
+      apiKey: req.apiKey || 'public',
+      createdAt: new Date(),
+    });
+    await signal.save();
+    logger.info(`Signal created by ${req.apiKey || 'public'}: ${symbol} ${direction}`);
+    res.status(201).json({ message: 'Signal recorded', signalId: signal._id });
+  } catch (error) {
+    logger.error('Error saving signal:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+// ---------- Auto Trade ----------
 exports.autoTrade = async (req, res) => {
   const { pair, riskPercent = 1, strategy = 'sma', ...params } = req.body;
   if (!pair) return res.status(400).json({ error: 'pair required' });
