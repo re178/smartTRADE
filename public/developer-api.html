@@ -11,13 +11,15 @@
     .card { margin-bottom: 20px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
     .card-header { background: #fff; font-weight: 600; border-bottom: 1px solid #e9ecef; }
     #generatedPanel { display: none; }
-    pre { background: #f1f3f5; padding: 15px; border-radius: 6px; }
+    pre { background: #f1f3f5; padding: 15px; border-radius: 6px; overflow-x: auto; }
+    .modal-body table code { font-size: 0.8rem; }
+    .modal-body table td { vertical-align: middle; }
   </style>
 </head>
 <body>
 <div class="container-fluid">
   <div class="d-flex justify-content-between align-items-center mb-4">
-    <h2><i class="fas fa-key"></i> Developer API</h2>
+    <h2><i class="fas fa-key text-primary"></i> Developer API</h2>
     <div>
       <button class="btn btn-info me-2" data-bs-toggle="modal" data-bs-target="#docsModal">
         <i class="fas fa-book"></i> API Documentation
@@ -28,38 +30,44 @@
     </div>
   </div>
 
-  <!-- Create new application -->
+  <!-- ========== CREATE CREDENTIALS ========== -->
   <div class="card mb-4">
-    <div class="card-header">Create API Credentials</div>
+    <div class="card-header"><i class="fas fa-plus-circle"></i> Create API Credentials</div>
     <div class="card-body">
       <div class="row">
         <div class="col-md-4">
-          <label>Application Name *</label>
+          <label class="form-label">Application Name *</label>
           <input type="text" id="appName" class="form-control" placeholder="My Trading App">
         </div>
         <div class="col-md-4">
-          <label>Description (optional)</label>
+          <label class="form-label">Description (optional)</label>
           <input type="text" id="appDescription" class="form-control" placeholder="What is this key for?">
         </div>
         <div class="col-md-4">
-          <label>Permissions</label>
+          <label class="form-label">Permissions</label>
           <div class="form-check">
-            <input class="form-check-input" type="checkbox" value="market.read" id="permMarket"> market.read
+            <input class="form-check-input" type="checkbox" value="market.read" id="permMarket">
+            <label class="form-check-label" for="permMarket">market.read</label>
           </div>
           <div class="form-check">
-            <input class="form-check-input" type="checkbox" value="account.read" id="permAccount"> account.read
+            <input class="form-check-input" type="checkbox" value="account.read" id="permAccount">
+            <label class="form-check-label" for="permAccount">account.read</label>
           </div>
           <div class="form-check">
-            <input class="form-check-input" type="checkbox" value="positions.read" id="permPositions"> positions.read
+            <input class="form-check-input" type="checkbox" value="positions.read" id="permPositions">
+            <label class="form-check-label" for="permPositions">positions.read</label>
           </div>
           <div class="form-check">
-            <input class="form-check-input" type="checkbox" value="history.read" id="permHistory"> history.read
+            <input class="form-check-input" type="checkbox" value="history.read" id="permHistory">
+            <label class="form-check-label" for="permHistory">history.read</label>
           </div>
           <div class="form-check">
-            <input class="form-check-input" type="checkbox" value="signals.write" id="permSignals"> signals.write
+            <input class="form-check-input" type="checkbox" value="signals.write" id="permSignals">
+            <label class="form-check-label" for="permSignals">signals.write</label>
           </div>
           <div class="form-check">
-            <input class="form-check-input" type="checkbox" value="orders.write" id="permOrders"> orders.write
+            <input class="form-check-input" type="checkbox" value="orders.write" id="permOrders">
+            <label class="form-check-label" for="permOrders">orders.write</label>
           </div>
         </div>
       </div>
@@ -69,7 +77,7 @@
     </div>
   </div>
 
-  <!-- Generated credentials panel (hidden by default) -->
+  <!-- ========== GENERATED CREDENTIALS PANEL ========== -->
   <div id="generatedPanel" class="card mb-4">
     <div class="card-header bg-success text-white">
       <i class="fas fa-check-circle"></i> Credentials Created – Copy them now
@@ -77,7 +85,7 @@
     <div class="card-body">
       <div class="row">
         <div class="col-md-6">
-          <label>API Key</label>
+          <label class="form-label">API Key</label>
           <div class="input-group">
             <input type="text" id="newApiKey" class="form-control" readonly>
             <button class="btn btn-outline-secondary" onclick="copyToClipboard('newApiKey')">
@@ -86,7 +94,7 @@
           </div>
         </div>
         <div class="col-md-6">
-          <label>API Secret (shown only once)</label>
+          <label class="form-label">API Secret (shown only once)</label>
           <div class="input-group">
             <input type="text" id="newApiSecret" class="form-control" readonly>
             <button class="btn btn-outline-secondary" onclick="copyToClipboard('newApiSecret')">
@@ -99,9 +107,9 @@
     </div>
   </div>
 
-  <!-- Existing applications table -->
+  <!-- ========== EXISTING APPLICATIONS TABLE ========== -->
   <div class="card">
-    <div class="card-header">Applications</div>
+    <div class="card-header"><i class="fas fa-table"></i> Applications</div>
     <div class="card-body table-responsive">
       <table class="table table-striped" id="appsTable">
         <thead>
@@ -116,22 +124,26 @@
           </tr>
         </thead>
         <tbody>
-          <tr><td colspan="7" class="text-muted">Loading keys...</td></tr>
+          <tr><td colspan="7" class="text-muted text-center">Loading keys...</td></tr>
         </tbody>
       </table>
     </div>
   </div>
 </div>
 
-<!-- Documentation Modal -->
+<!-- ========================================================== -->
+<!-- ========== DOCUMENTATION MODAL (FULL) ===================== -->
+<!-- ========================================================== -->
 <div class="modal fade" id="docsModal" tabindex="-1" aria-labelledby="docsModalLabel" aria-hidden="true">
-  <div class="modal-dialog modal-lg">
+  <div class="modal-dialog modal-xl">
     <div class="modal-content">
       <div class="modal-header">
-        <h5 class="modal-title" id="docsModalLabel"><i class="fas fa-book-open"></i> Public API Documentation</h5>
+        <h5 class="modal-title" id="docsModalLabel"><i class="fas fa-book-open text-primary"></i> Public API Documentation</h5>
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
       <div class="modal-body">
+
+        <!-- Authentication -->
         <h5>🔐 Authentication</h5>
         <p>All requests must include the following headers:</p>
         <ul>
@@ -139,26 +151,157 @@
           <li><code>X-API-Secret: &lt;your_api_secret&gt;</code></li>
         </ul>
         <p>If invalid or missing, you will receive a <strong>401 Unauthorized</strong>. Disabled keys return <strong>403 Forbidden</strong>.</p>
+        <hr>
 
+        <!-- Base URL -->
         <h5>📡 Base URL</h5>
         <p><code>https://your-rts-server.com/api/public</code></p>
+        <hr>
 
+        <!-- Product Awareness Note -->
+        <div class="alert alert-info">
+          <i class="fas fa-info-circle"></i> <strong>Product‑Aware:</strong> The API automatically uses the trading product (MT5 or Deriv) that you have selected in the dashboard. All data is returned in real‑time where supported.
+        </div>
+
+        <!-- Endpoints Table -->
         <h5>📊 Endpoints</h5>
-        <table class="table table-sm table-bordered">
-          <thead>
-            <tr><th>Method</th><th>Endpoint</th><th>Description</th><th>Permission</th></tr>
-          </thead>
-          <tbody>
-            <tr><td>GET</td><td>/account</td><td>Latest account info</td><td>account.read</td></tr>
-            <tr><td>GET</td><td>/positions</td><td>All open positions</td><td>positions.read</td></tr>
-            <tr><td>GET</td><td>/prices</td><td>All current prices</td><td>market.read</td></tr>
-            <tr><td>GET</td><td>/price/:symbol</td><td>Price for one symbol (e.g. /price/EURUSD)</td><td>market.read</td></tr>
-            <tr><td>GET</td><td>/history</td><td>Trade history</td><td>history.read</td></tr>
-            <tr><td>POST</td><td>/signals</td><td>Submit a trade signal</td><td>signals.write</td></tr>
-            <tr><td>POST</td><td>/orders</td><td>Place a trade order</td><td>orders.write</td></tr>
-          </tbody>
-        </table>
+        <div class="table-responsive">
+          <table class="table table-sm table-bordered table-hover">
+            <thead class="table-light">
+              <tr>
+                <th style="width:70px;">Method</th>
+                <th style="width:250px;">Endpoint</th>
+                <th>Description</th>
+                <th style="width:130px;">Permission</th>
+              </tr>
+            </thead>
+            <tbody>
+              <!-- Account -->
+              <tr>
+                <td><span class="badge bg-primary">GET</span></td>
+                <td><code>/account</code></td>
+                <td>Latest account info (balance, equity, margin)</td>
+                <td><code>account.read</code></td>
+              </tr>
+              <!-- Positions -->
+              <tr>
+                <td><span class="badge bg-primary">GET</span></td>
+                <td><code>/positions</code></td>
+                <td>All open positions</td>
+                <td><code>positions.read</code></td>
+              </tr>
+              <!-- Trades (open) -->
+              <tr>
+                <td><span class="badge bg-primary">GET</span></td>
+                <td><code>/trades</code></td>
+                <td>All open trades (alias for positions)</td>
+                <td><code>positions.read</code></td>
+              </tr>
+              <!-- Prices -->
+              <tr>
+                <td><span class="badge bg-primary">GET</span></td>
+                <td><code>/prices?instruments=...&nbsp;(comma‑separated)</code></td>
+                <td>Real‑time bid/ask prices for one or more symbols</td>
+                <td><code>market.read</code></td>
+              </tr>
+              <!-- Price (single) -->
+              <tr>
+                <td><span class="badge bg-primary">GET</span></td>
+                <td><code>/price/:symbol</code></td>
+                <td>Real‑time price for a single symbol (e.g., <code>/price/EUR_USD</code>)</td>
+                <td><code>market.read</code></td>
+              </tr>
+              <!-- Candles (NEW) -->
+              <tr class="table-info">
+                <td><span class="badge bg-primary">GET</span></td>
+                <td><code>/candles?pair=...&count=...&granularity=...</code></td>
+                <td><strong>OHLCV candles</strong> for backtesting and technical indicators. Granularity: M1, M5, M15, M30, H1, H4, D</td>
+                <td><code>market.read</code></td>
+              </tr>
+              <!-- Symbols (NEW) -->
+              <tr class="table-info">
+                <td><span class="badge bg-primary">GET</span></td>
+                <td><code>/symbols</code></td>
+                <td><strong>Metadata</strong> for all trading symbols (pip, leverage, min/max lot, etc.)</td>
+                <td><code>market.read</code></td>
+              </tr>
+              <!-- Capabilities (NEW) -->
+              <tr class="table-info">
+                <td><span class="badge bg-primary">GET</span></td>
+                <td><code>/capabilities</code></td>
+                <td><strong>Broker capabilities</strong> (supportsMarketOrders, supportsLimitOrders, etc.)</td>
+                <td><code>market.read</code></td>
+              </tr>
+              <!-- History -->
+              <tr>
+                <td><span class="badge bg-primary">GET</span></td>
+                <td><code>/history</code></td>
+                <td>Trade history (closed trades)</td>
+                <td><code>history.read</code></td>
+              </tr>
+              <!-- Signal (generate) -->
+              <tr>
+                <td><span class="badge bg-primary">GET</span></td>
+                <td><code>/signal?pair=...&strategy=...</code></td>
+                <td>Generate a trading signal based on a strategy (sma, rsi, macd, etc.)</td>
+                <td><code>market.read</code></td>
+              </tr>
+              <!-- Signals (submit) -->
+              <tr>
+                <td><span class="badge bg-success">POST</span></td>
+                <td><code>/signals</code></td>
+                <td>Submit a trade signal (store it in the system)</td>
+                <td><code>signals.write</code></td>
+              </tr>
+              <!-- Orders -->
+              <tr>
+                <td><span class="badge bg-success">POST</span></td>
+                <td><code>/orders</code></td>
+                <td>Place a market order (requires <code>symbol</code>, <code>type</code> = buy/sell, <code>volume</code>)</td>
+                <td><code>orders.write</code></td>
+              </tr>
+              <!-- Close -->
+              <tr>
+                <td><span class="badge bg-success">POST</span></td>
+                <td><code>/close/:tradeId</code></td>
+                <td>Close an open trade by its ID</td>
+                <td><code>orders.write</code></td>
+              </tr>
+              <!-- Auto-trade -->
+              <tr>
+                <td><span class="badge bg-success">POST</span></td>
+                <td><code>/auto-trade</code></td>
+                <td>Auto‑trade based on a strategy signal (uses risk %)</td>
+                <td><code>orders.write</code></td>
+              </tr>
+              <!-- Pending orders -->
+              <tr>
+                <td><span class="badge bg-primary">GET</span></td>
+                <td><code>/pending-orders</code></td>
+                <td>List pending orders (if broker supports them)</td>
+                <td><code>orders.write</code></td>
+              </tr>
+              <!-- Cancel order -->
+              <tr>
+                <td><span class="badge bg-danger">DELETE</span></td>
+                <td><code>/order/:orderId</code></td>
+                <td>Cancel a pending order</td>
+                <td><code>orders.write</code></td>
+              </tr>
+              <!-- Delete history -->
+              <tr>
+                <td><span class="badge bg-danger">DELETE</span></td>
+                <td><code>/history</code></td>
+                <td>Delete all closed trades from history (cleanup)</td>
+                <td><code>history.write</code> (admin‑like)</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
 
+        <hr>
+
+        <!-- Example cURLs -->
         <h5>📨 Example Request (cURL)</h5>
         <pre><code>curl -H "X-API-Key: rts_pk_abc123..." \
      -H "X-API-Secret: rts_sk_def456..." \
@@ -171,15 +314,30 @@
   -H "X-API-Secret: rts_sk_..." \
   -d '{"symbol":"EURUSD", "type":"buy", "volume":0.1}'</code></pre>
 
-        <p class="text-muted">Replace the domain with your actual RTS server address.</p>
+        <h5>📥 Example GET /candles</h5>
+        <pre><code>curl "https://your-rts-server.com/api/public/candles?pair=EUR_USD&count=50&granularity=M5" \
+  -H "X-API-Key: rts_pk_..." \
+  -H "X-API-Secret: rts_sk_..."</code></pre>
+
+        <h5>📥 Example GET /symbols</h5>
+        <pre><code>curl -H "X-API-Key: rts_pk_..." \
+     -H "X-API-Secret: rts_sk_..." \
+     https://your-rts-server.com/api/public/symbols</code></pre>
+
+        <p class="text-muted mt-3"><i class="fas fa-globe"></i> Replace the domain with your actual RTS server address. The <code>granularity</code> supports M1, M5, M15, M30, H1, H4, D.</p>
+
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
       </div>
     </div>
   </div>
 </div>
 
-<!-- Developer API JavaScript (independent) -->
+<!-- ========================================================== -->
+<!-- ========== SCRIPTS ========================================= -->
+<!-- ========================================================== -->
 <script src="/js/developer-api.js"></script>
-<!-- Bootstrap JS for modal functionality -->
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>
