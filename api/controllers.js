@@ -1,9 +1,8 @@
-// api/controllers.js – Complete Request Handlers (with product support, Order & Trade models)
+// api/controllers.js – Complete Request Handlers (without Signal model)
 
 const Trade = require('../models/Trade');
 const Order = require('../models/Order');
 const User = require('../models/User');
-const Signal = require('../models/Signal'); // added for submitSignal
 const marketProvider = require('../core/market/provider');
 const { getBroker } = require('../core/execution/brokerFactory');
 const orderService = require('../core/execution/orderService');
@@ -117,7 +116,7 @@ exports.getCandles = async (req, res) => {
   }
 };
 
-// ---------- NEW: Symbol Metadata ----------
+// ---------- Symbol Metadata ----------
 exports.getSymbols = async (req, res) => {
   try {
     const product = getProduct(req);
@@ -145,7 +144,7 @@ exports.getSymbols = async (req, res) => {
   }
 };
 
-// ---------- NEW: Broker Capabilities ----------
+// ---------- Broker Capabilities ----------
 exports.getCapabilities = async (req, res) => {
   try {
     const product = getProduct(req);
@@ -286,31 +285,6 @@ exports.getSignal = async (req, res) => {
     res.json(signal);
   } catch (error) {
     res.status(500).json({ error: error.message });
-  }
-};
-
-// ---------- NEW: Submit Signal (store in DB) ----------
-exports.submitSignal = async (req, res) => {
-  try {
-    const { symbol, direction, timeframe, price, comment } = req.body;
-    if (!symbol || !direction) {
-      return res.status(400).json({ error: 'symbol and direction are required' });
-    }
-    const signal = new Signal({
-      symbol: symbol.toUpperCase(),
-      direction: direction.toLowerCase(),
-      timeframe: timeframe || 'M5',
-      price: price || 0,
-      comment: comment || '',
-      apiKey: req.apiKey || 'public',
-      createdAt: new Date(),
-    });
-    await signal.save();
-    logger.info(`Signal created by ${req.apiKey || 'public'}: ${symbol} ${direction}`);
-    res.status(201).json({ message: 'Signal recorded', signalId: signal._id });
-  } catch (error) {
-    logger.error('Error saving signal:', error);
-    res.status(500).json({ error: 'Internal server error' });
   }
 };
 
