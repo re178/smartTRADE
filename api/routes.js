@@ -1,4 +1,4 @@
-// src/api/routes.js – Complete API Routes (with Developer Key Management & Portal Page)
+// api/routes.js – Complete API Routes (with Developer Key Management & new endpoints)
 
 const express = require('express');
 const router = express.Router();
@@ -10,8 +10,8 @@ const {
 } = require('../core/analytics/performanceSuite');
 const { sendTestEmail } = require('../core/notifications/emailService');
 
-// ---------- Use your existing logger ----------
-const logger = console;
+// Use your existing logger
+const logger = require('../infrastructure/logger') || console;
 
 // ---------- Developer Key Management (Models + Services) ----------
 const ApiKey = require('../models/ApiKey');
@@ -42,7 +42,7 @@ router.post('/broker/reset-circuit-breaker', (req, res) => {
   }
 });
 
-// ---------- User Preferences (Product Toggle) ----------
+// ---------- User Preferences ----------
 router.get('/user/preferences', controllers.getPreferences);
 router.post('/user/preferences', controllers.updatePreferences);
 
@@ -79,7 +79,7 @@ router.delete('/order/:orderId', controllers.cancelOrder);
 // ---------- Delete History ----------
 router.delete('/history', controllers.deleteHistory);
 
-// ---------- Performance Suite Endpoints ----------
+// ---------- Performance Suite ----------
 router.post('/backtest', async (req, res) => {
   try {
     const engine = new BacktestingEngine(req.body);
@@ -132,13 +132,18 @@ router.post('/performance/learn', async (req, res) => {
 });
 
 // ================================================================
+// ================ NEW ENDPOINTS (expose to dashboard) ===========
+// ================================================================
+
+router.get('/symbols', controllers.getSymbols);           // symbol metadata
+router.get('/capabilities', controllers.getCapabilities); // broker capabilities
+
+// ================================================================
 // ================ DEVELOPER API KEY MANAGEMENT ===================
 // ================================================================
 
-// GET all developer keys (admin only – adjust ownership as needed)
 router.get('/dashboard/developer-keys', async (req, res) => {
   try {
-    // Optionally filter by owner if you have user sessions
     const keys = await ApiKey.find().sort({ createdAt: -1 }).select('-hashedSecret');
     res.json(keys);
   } catch (err) {
@@ -147,7 +152,6 @@ router.get('/dashboard/developer-keys', async (req, res) => {
   }
 });
 
-// POST generate new credentials
 router.post('/dashboard/developer-keys/generate', async (req, res) => {
   try {
     const { applicationName, description, permissions } = req.body;
@@ -165,13 +169,12 @@ router.post('/dashboard/developer-keys/generate', async (req, res) => {
       hashedSecret,
       permissions: permissions || [],
       status: 'active',
-      owner: req.user?.username || 'admin' // adjust to your session
+      owner: req.user?.userId || 'admin'
     });
 
     await newKey.save();
     logger.info(`API Key created for ${applicationName}`);
 
-    // Return the plain secret ONLY this once
     res.status(201).json({
       apiKey: newKey.apiKey,
       apiSecret,
@@ -185,7 +188,6 @@ router.post('/dashboard/developer-keys/generate', async (req, res) => {
   }
 });
 
-// PUT disable key
 router.put('/dashboard/developer-keys/:id/disable', async (req, res) => {
   try {
     const key = await ApiKey.findByIdAndUpdate(req.params.id, { status: 'disabled' }, { new: true }).select('-hashedSecret');
@@ -198,7 +200,6 @@ router.put('/dashboard/developer-keys/:id/disable', async (req, res) => {
   }
 });
 
-// PUT enable key
 router.put('/dashboard/developer-keys/:id/enable', async (req, res) => {
   try {
     const key = await ApiKey.findByIdAndUpdate(req.params.id, { status: 'active' }, { new: true }).select('-hashedSecret');
@@ -211,7 +212,6 @@ router.put('/dashboard/developer-keys/:id/enable', async (req, res) => {
   }
 });
 
-// DELETE key
 router.delete('/dashboard/developer-keys/:id', async (req, res) => {
   try {
     const key = await ApiKey.findByIdAndDelete(req.params.id);
@@ -224,7 +224,6 @@ router.delete('/dashboard/developer-keys/:id', async (req, res) => {
   }
 });
 
-// PUT regenerate secret (FIXED: also returns apiKey)
 router.put('/dashboard/developer-keys/:id/regenerate-secret', async (req, res) => {
   try {
     const apiSecret = generateApiSecret();
@@ -236,10 +235,9 @@ router.put('/dashboard/developer-keys/:id/regenerate-secret', async (req, res) =
     ).select('-hashedSecret');
     if (!key) return res.status(404).json({ error: 'Key not found' });
     logger.info(`API Secret regenerated for: ${key.apiKey}`);
-    // Return BOTH apiKey and apiSecret
     res.json({
       message: 'Secret regenerated',
-      apiKey: key.apiKey,   // <-- now included
+      apiKey: key.apiKey,
       apiSecret
     });
   } catch (err) {
@@ -251,10 +249,7 @@ router.put('/dashboard/developer-keys/:id/regenerate-secret', async (req, res) =
 // ================================================================
 // ================ SERVE THE DEVELOPER PORTAL PAGE ================
 // ================================================================
-// Note: If you prefer to serve this via static HTML (public/developer-api.html),
-// you can remove this route. Otherwise, it renders the EJS view.
 router.get('/developer-api', (req, res) => {
-  // Ensure user is authenticated (add your own auth middleware here)
   res.render('developerApi');
 });
 
