@@ -12,8 +12,8 @@
     .card-header { background: #fff; font-weight: 600; border-bottom: 1px solid #e9ecef; }
     #generatedPanel { display: none; }
     pre { background: #f1f3f5; padding: 15px; border-radius: 6px; overflow-x: auto; }
-    .modal-body table code { font-size: 0.8rem; }
-    .modal-body table td { vertical-align: middle; }
+    .modal-body .use-case { background: #f8f9fa; border-left: 4px solid #0d6efd; padding: 15px; margin-bottom: 20px; }
+    .modal-body .use-case h6 { color: #0d6efd; }
   </style>
 </head>
 <body>
@@ -132,7 +132,7 @@
 </div>
 
 <!-- ========================================================== -->
-<!-- ========== DOCUMENTATION MODAL (FULL) ===================== -->
+<!-- ========== DOCUMENTATION MODAL (EXPANDED PERMISSIONS) ==== -->
 <!-- ========================================================== -->
 <div class="modal fade" id="docsModal" tabindex="-1" aria-labelledby="docsModalLabel" aria-hidden="true">
   <div class="modal-dialog modal-xl">
@@ -143,7 +143,7 @@
       </div>
       <div class="modal-body">
 
-        <!-- Authentication -->
+        <!-- ===================== AUTHENTICATION ===================== -->
         <h5>🔐 Authentication</h5>
         <p>All requests must include the following headers:</p>
         <ul>
@@ -153,18 +153,18 @@
         <p>If invalid or missing, you will receive a <strong>401 Unauthorized</strong>. Disabled keys return <strong>403 Forbidden</strong>.</p>
         <hr>
 
-        <!-- Base URL -->
+        <!-- ===================== BASE URL ===================== -->
         <h5>📡 Base URL</h5>
         <p><code>https://your-rts-server.com/api/public</code></p>
         <hr>
 
-        <!-- Product Awareness Note -->
+        <!-- ===================== PRODUCT AWARENESS ===================== -->
         <div class="alert alert-info">
           <i class="fas fa-info-circle"></i> <strong>Product‑Aware:</strong> The API automatically uses the trading product (MT5 or Deriv) that you have selected in the dashboard. All data is returned in real‑time where supported.
         </div>
 
-        <!-- Endpoints Table -->
-        <h5>📊 Endpoints</h5>
+        <!-- ===================== ENDPOINT TABLE ===================== -->
+        <h5>📊 Endpoint Reference</h5>
         <div class="table-responsive">
           <table class="table table-sm table-bordered table-hover">
             <thead class="table-light">
@@ -177,154 +177,192 @@
             </thead>
             <tbody>
               <!-- Account -->
-              <tr>
-                <td><span class="badge bg-primary">GET</span></td>
-                <td><code>/account</code></td>
-                <td>Latest account info (balance, equity, margin)</td>
-                <td><code>account.read</code></td>
-              </tr>
+              <tr><td><span class="badge bg-primary">GET</span></td><td><code>/account</code></td><td>Latest account info (balance, equity, margin)</td><td><code>account.read</code></td></tr>
               <!-- Positions -->
-              <tr>
-                <td><span class="badge bg-primary">GET</span></td>
-                <td><code>/positions</code></td>
-                <td>All open positions</td>
-                <td><code>positions.read</code></td>
-              </tr>
-              <!-- Trades (open) -->
-              <tr>
-                <td><span class="badge bg-primary">GET</span></td>
-                <td><code>/trades</code></td>
-                <td>All open trades (alias for positions)</td>
-                <td><code>positions.read</code></td>
-              </tr>
+              <tr><td><span class="badge bg-primary">GET</span></td><td><code>/positions</code></td><td>All open positions</td><td><code>positions.read</code></td></tr>
+              <!-- Trades -->
+              <tr><td><span class="badge bg-primary">GET</span></td><td><code>/trades</code></td><td>All open trades (alias for positions)</td><td><code>positions.read</code></td></tr>
               <!-- Prices -->
-              <tr>
-                <td><span class="badge bg-primary">GET</span></td>
-                <td><code>/prices?instruments=...&nbsp;(comma‑separated)</code></td>
-                <td>Real‑time bid/ask prices for one or more symbols</td>
-                <td><code>market.read</code></td>
-              </tr>
+              <tr><td><span class="badge bg-primary">GET</span></td><td><code>/prices?instruments=...&nbsp;(comma‑separated)</code></td><td>Real‑time bid/ask prices for one or more symbols</td><td><code>market.read</code></td></tr>
               <!-- Price (single) -->
-              <tr>
-                <td><span class="badge bg-primary">GET</span></td>
-                <td><code>/price/:symbol</code></td>
-                <td>Real‑time price for a single symbol (e.g., <code>/price/EUR_USD</code>)</td>
-                <td><code>market.read</code></td>
-              </tr>
-              <!-- Candles (NEW) -->
-              <tr class="table-info">
-                <td><span class="badge bg-primary">GET</span></td>
-                <td><code>/candles?pair=...&count=...&granularity=...</code></td>
-                <td><strong>OHLCV candles</strong> for backtesting and technical indicators. Granularity: M1, M5, M15, M30, H1, H4, D</td>
-                <td><code>market.read</code></td>
-              </tr>
-              <!-- Symbols (NEW) -->
-              <tr class="table-info">
-                <td><span class="badge bg-primary">GET</span></td>
-                <td><code>/symbols</code></td>
-                <td><strong>Metadata</strong> for all trading symbols (pip, leverage, min/max lot, etc.)</td>
-                <td><code>market.read</code></td>
-              </tr>
-              <!-- Capabilities (NEW) -->
-              <tr class="table-info">
-                <td><span class="badge bg-primary">GET</span></td>
-                <td><code>/capabilities</code></td>
-                <td><strong>Broker capabilities</strong> (supportsMarketOrders, supportsLimitOrders, etc.)</td>
-                <td><code>market.read</code></td>
-              </tr>
+              <tr><td><span class="badge bg-primary">GET</span></td><td><code>/price/:symbol</code></td><td>Real‑time price for a single symbol (e.g., <code>/price/EUR_USD</code>)</td><td><code>market.read</code></td></tr>
+              <!-- Candles -->
+              <tr class="table-info"><td><span class="badge bg-primary">GET</span></td><td><code>/candles?pair=...&count=...&granularity=...</code></td><td><strong>OHLCV candles</strong> for backtesting (M1, M5, M15, M30, H1, H4, D)</td><td><code>market.read</code></td></tr>
+              <!-- Symbols -->
+              <tr class="table-info"><td><span class="badge bg-primary">GET</span></td><td><code>/symbols</code></td><td><strong>Metadata</strong> for all symbols (pip, leverage, min/max lot)</td><td><code>market.read</code></td></tr>
+              <!-- Capabilities -->
+              <tr class="table-info"><td><span class="badge bg-primary">GET</span></td><td><code>/capabilities</code></td><td><strong>Broker capabilities</strong> (supportsMarketOrders, etc.)</td><td><code>market.read</code></td></tr>
               <!-- History -->
-              <tr>
-                <td><span class="badge bg-primary">GET</span></td>
-                <td><code>/history</code></td>
-                <td>Trade history (closed trades)</td>
-                <td><code>history.read</code></td>
-              </tr>
+              <tr><td><span class="badge bg-primary">GET</span></td><td><code>/history</code></td><td>Trade history (closed trades)</td><td><code>history.read</code></td></tr>
               <!-- Signal (generate) -->
-              <tr>
-                <td><span class="badge bg-primary">GET</span></td>
-                <td><code>/signal?pair=...&strategy=...</code></td>
-                <td>Generate a trading signal based on a strategy (sma, rsi, macd, etc.)</td>
-                <td><code>market.read</code></td>
-              </tr>
+              <tr><td><span class="badge bg-primary">GET</span></td><td><code>/signal?pair=...&strategy=...</code></td><td>Generate a trading signal (sma, rsi, macd, etc.)</td><td><code>market.read</code></td></tr>
               <!-- Signals (submit) -->
-              <tr>
-                <td><span class="badge bg-success">POST</span></td>
-                <td><code>/signals</code></td>
-                <td>Submit a trade signal (store it in the system)</td>
-                <td><code>signals.write</code></td>
-              </tr>
+              <tr><td><span class="badge bg-success">POST</span></td><td><code>/signals</code></td><td>Submit a trade signal (store it)</td><td><code>signals.write</code></td></tr>
               <!-- Orders -->
-              <tr>
-                <td><span class="badge bg-success">POST</span></td>
-                <td><code>/orders</code></td>
-                <td>Place a market order (requires <code>symbol</code>, <code>type</code> = buy/sell, <code>volume</code>)</td>
-                <td><code>orders.write</code></td>
-              </tr>
+              <tr><td><span class="badge bg-success">POST</span></td><td><code>/orders</code></td><td>Place a market order (<code>symbol</code>, <code>type</code>=buy/sell, <code>volume</code>)</td><td><code>orders.write</code></td></tr>
               <!-- Close -->
-              <tr>
-                <td><span class="badge bg-success">POST</span></td>
-                <td><code>/close/:tradeId</code></td>
-                <td>Close an open trade by its ID</td>
-                <td><code>orders.write</code></td>
-              </tr>
+              <tr><td><span class="badge bg-success">POST</span></td><td><code>/close/:tradeId</code></td><td>Close an open trade by ID</td><td><code>orders.write</code></td></tr>
               <!-- Auto-trade -->
-              <tr>
-                <td><span class="badge bg-success">POST</span></td>
-                <td><code>/auto-trade</code></td>
-                <td>Auto‑trade based on a strategy signal (uses risk %)</td>
-                <td><code>orders.write</code></td>
-              </tr>
+              <tr><td><span class="badge bg-success">POST</span></td><td><code>/auto-trade</code></td><td>Auto‑trade based on strategy (uses risk %)</td><td><code>orders.write</code></td></tr>
               <!-- Pending orders -->
-              <tr>
-                <td><span class="badge bg-primary">GET</span></td>
-                <td><code>/pending-orders</code></td>
-                <td>List pending orders (if broker supports them)</td>
-                <td><code>orders.write</code></td>
-              </tr>
+              <tr><td><span class="badge bg-primary">GET</span></td><td><code>/pending-orders</code></td><td>List pending orders</td><td><code>orders.write</code></td></tr>
               <!-- Cancel order -->
-              <tr>
-                <td><span class="badge bg-danger">DELETE</span></td>
-                <td><code>/order/:orderId</code></td>
-                <td>Cancel a pending order</td>
-                <td><code>orders.write</code></td>
-              </tr>
+              <tr><td><span class="badge bg-danger">DELETE</span></td><td><code>/order/:orderId</code></td><td>Cancel a pending order</td><td><code>orders.write</code></td></tr>
               <!-- Delete history -->
-              <tr>
-                <td><span class="badge bg-danger">DELETE</span></td>
-                <td><code>/history</code></td>
-                <td>Delete all closed trades from history (cleanup)</td>
-                <td><code>history.write</code> (admin‑like)</td>
-              </tr>
+              <tr><td><span class="badge bg-danger">DELETE</span></td><td><code>/history</code></td><td>Delete all closed trades (cleanup)</td><td><code>history.write</code></td></tr>
             </tbody>
           </table>
         </div>
 
         <hr>
 
-        <!-- Example cURLs -->
-        <h5>📨 Example Request (cURL)</h5>
-        <pre><code>curl -H "X-API-Key: rts_pk_abc123..." \
-     -H "X-API-Secret: rts_sk_def456..." \
-     https://your-rts-server.com/api/public/account</code></pre>
+        <!-- ===================== PERMISSION MODEL (NEW) ===================== -->
+        <h5>🔑 Permission Model</h5>
+        <p>When creating an API key, you assign a set of permissions. Each permission grants access to a group of endpoints. The following permissions are available:</p>
+        <div class="table-responsive">
+          <table class="table table-sm table-bordered">
+            <thead class="table-light">
+              <tr><th>Permission</th><th>What it allows</th><th>Endpoints affected</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>account.read</code></td>
+                <td>View account balance, equity, margin, etc.</td>
+                <td><code>GET /account</code></td>
+              </tr>
+              <tr>
+                <td><code>positions.read</code></td>
+                <td>View open positions and trades.</td>
+                <td><code>GET /positions</code>, <code>GET /trades</code></td>
+              </tr>
+              <tr>
+                <td><code>market.read</code></td>
+                <td>Access real‑time and historical market data (prices, candles, symbols, capabilities, signals).</td>
+                <td>
+                  <code>GET /prices</code>, <code>GET /price/:symbol</code>,<br>
+                  <code>GET /candles</code>, <code>GET /symbols</code>,<br>
+                  <code>GET /capabilities</code>, <code>GET /signal</code>
+                </td>
+              </tr>
+              <tr>
+                <td><code>history.read</code></td>
+                <td>View trade history (closed trades).</td>
+                <td><code>GET /history</code></td>
+              </tr>
+              <tr>
+                <td><code>signals.write</code></td>
+                <td>Submit new trade signals (store them).</td>
+                <td><code>POST /signals</code></td>
+              </tr>
+              <tr>
+                <td><code>orders.write</code></td>
+                <td>Place, close, modify, and cancel orders. Also list pending orders.</td>
+                <td>
+                  <code>POST /orders</code>, <code>POST /close/:tradeId</code>,<br>
+                  <code>POST /auto-trade</code>, <code>GET /pending-orders</code>,<br>
+                  <code>DELETE /order/:orderId</code>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="text-muted">
+          <strong>Note:</strong> If a key does not have the required permission, the API returns <code>403 Forbidden</code> with an error message. The permission checks are performed <strong>after</strong> authentication, so you'll always get a clear indication if you're missing the right permission.
+        </p>
+        <hr>
 
-        <h5>📥 Example POST /orders</h5>
-        <pre><code>curl -X POST https://your-rts-server.com/api/public/orders \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: rts_pk_..." \
-  -H "X-API-Secret: rts_sk_..." \
-  -d '{"symbol":"EURUSD", "type":"buy", "volume":0.1}'</code></pre>
+        <!-- ===================== COMMON USE CASES ===================== -->
+        <h5>🧩 Common Use Cases (step‑by‑step examples)</h5>
 
-        <h5>📥 Example GET /candles</h5>
-        <pre><code>curl "https://your-rts-server.com/api/public/candles?pair=EUR_USD&count=50&granularity=M5" \
-  -H "X-API-Key: rts_pk_..." \
-  -H "X-API-Secret: rts_sk_..."</code></pre>
+        <!-- Case 1: Account & Positions -->
+        <div class="use-case">
+          <h6>📈 1. Get account balance and open positions</h6>
+          <p>Use this to display your current trading status before making decisions.</p>
+          <pre><code># Get account
+curl -H "X-API-Key: rts_pk_..." -H "X-API-Secret: rts_sk_..." \
+     https://your-rts-server.com/api/public/account
 
-        <h5>📥 Example GET /symbols</h5>
-        <pre><code>curl -H "X-API-Key: rts_pk_..." \
-     -H "X-API-Secret: rts_sk_..." \
+# Get open positions
+curl -H "X-API-Key: rts_pk_..." -H "X-API-Secret: rts_sk_..." \
+     https://your-rts-server.com/api/public/positions</code></pre>
+        </div>
+
+        <!-- Case 2: Real-time prices -->
+        <div class="use-case">
+          <h6>💹 2. Get real‑time prices for multiple symbols</h6>
+          <p>Use this to update your UI or feed into a trading algorithm.</p>
+          <pre><code>curl "https://your-rts-server.com/api/public/prices?instruments=EUR_USD,GBP_USD,USD_JPY" \
+     -H "X-API-Key: rts_pk_..." -H "X-API-Secret: rts_sk_..."</code></pre>
+        </div>
+
+        <!-- Case 3: OHLCV for backtesting -->
+        <div class="use-case">
+          <h6>📉 3. Fetch OHLCV candles for backtesting</h6>
+          <p>Get historical data to test your strategies. Supports M1, M5, M15, M30, H1, H4, D.</p>
+          <pre><code>curl "https://your-rts-server.com/api/public/candles?pair=EUR_USD&count=100&granularity=M5" \
+     -H "X-API-Key: rts_pk_..." -H "X-API-Secret: rts_sk_..."</code></pre>
+        </div>
+
+        <!-- Case 4: Symbol metadata for risk management -->
+        <div class="use-case">
+          <h6>📊 4. Get symbol metadata (pip, leverage, min/max lot)</h6>
+          <p>Use this to calculate position sizes, stop‑loss distances, and manage risk per symbol.</p>
+          <pre><code>curl -H "X-API-Key: rts_pk_..." -H "X-API-Secret: rts_sk_..." \
      https://your-rts-server.com/api/public/symbols</code></pre>
+        </div>
 
-        <p class="text-muted mt-3"><i class="fas fa-globe"></i> Replace the domain with your actual RTS server address. The <code>granularity</code> supports M1, M5, M15, M30, H1, H4, D.</p>
+        <!-- Case 5: Place a market order -->
+        <div class="use-case">
+          <h6>🚀 5. Place a market order</h6>
+          <p>Execute a trade immediately at the current market price.</p>
+          <pre><code>curl -X POST https://your-rts-server.com/api/public/orders \
+     -H "Content-Type: application/json" \
+     -H "X-API-Key: rts_pk_..." \
+     -H "X-API-Secret: rts_sk_..." \
+     -d '{"symbol":"EURUSD", "type":"buy", "volume":0.1}'</code></pre>
+        </div>
+
+        <!-- Case 6: Generate a signal -->
+        <div class="use-case">
+          <h6>🧠 6. Generate a trading signal</h6>
+          <p>Use a strategy to get a signal (BUY/SELL) with entry, SL, TP.</p>
+          <pre><code>curl "https://your-rts-server.com/api/public/signal?pair=EUR_USD&strategy=rsi" \
+     -H "X-API-Key: rts_pk_..." -H "X-API-Secret: rts_sk_..."</code></pre>
+        </div>
+
+        <hr>
+
+        <!-- ===================== ERROR HANDLING ===================== -->
+        <h5>⚠️ Error Handling</h5>
+        <p>The API returns standard HTTP status codes:</p>
+        <ul>
+          <li><code>200</code> – Success (with JSON body).</li>
+          <li><code>400</code> – Bad request (e.g., missing parameters).</li>
+          <li><code>401</code> – Unauthorised (invalid or missing API key/secret).</li>
+          <li><code>403</code> – Forbidden (key disabled or insufficient permissions).</li>
+          <li><code>404</code> – Not found (e.g., unknown symbol).</li>
+          <li><code>429</code> – Too many requests (if rate limiting is enabled).</li>
+          <li><code>500</code> – Internal server error.</li>
+        </ul>
+        <p>Error responses include a JSON <code>error</code> field with a description.</p>
+
+        <hr>
+
+        <!-- ===================== RATE LIMITING ===================== -->
+        <h5>⏱️ Rate Limiting</h5>
+        <p>Currently, there is <strong>no hard rate limit</strong> applied, but we recommend keeping requests under <strong>10 per second</strong> to avoid server overload. In the future, rate limits may be enforced and communicated via the <code>X-RateLimit-*</code> headers.</p>
+
+        <hr>
+
+        <!-- ===================== ADDITIONAL RESOURCES ===================== -->
+        <h5>🔗 Additional Resources</h5>
+        <ul>
+          <li><a href="/developer-api.html" target="_blank">Developer Portal</a> – manage your API keys.</li>
+          <li><a href="/" target="_blank">Dashboard</a> – see live trading and account data.</li>
+          <li><a href="#" onclick="window.open('/api/public/capabilities', '_blank')">Broker Capabilities</a> – view what your current broker supports.</li>
+        </ul>
+
+        <p class="text-muted mt-3"><i class="fas fa-globe"></i> Replace <code>your-rts-server.com</code> with your actual server address.</p>
 
       </div>
       <div class="modal-footer">
