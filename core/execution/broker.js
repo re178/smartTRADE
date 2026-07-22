@@ -1,5 +1,4 @@
-// core/execution/broker.js – Full Deriv broker (final version)
-// FIXED: active_symbols: "full", auto-connect, symbol registry, fallbacks
+// core/execution/broker.js – Stable version for Render (lazy connect, fixed symbol loading)
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -565,7 +564,7 @@ class OptionsExecutor extends BaseExecutor {
 }
 
 // ============================================================
-// MAIN BROKER CLASS – with Auto-Connect & symbol registry
+// MAIN BROKER CLASS – Lazy connect (original behavior)
 // ============================================================
 const BROKER_CAPABILITIES = {
   supportsTrailingStop: false,
@@ -609,10 +608,10 @@ class DerivBroker extends EventEmitter {
       duration: config.duration ? parseInt(config.duration) : 60,
       riskValidator: config.riskValidator || null,
       fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || 3),
-      readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 30000),
-      symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 60000),
+      readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 20000),
+      symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 30000),
       heartbeatTimeout: parseInt(config.heartbeatTimeout || process.env.DERIV_HEARTBEAT_TIMEOUT || 60000),
-      autoConnect: config.autoConnect !== undefined ? config.autoConnect : true,
+      // NO autoConnect – lazy connect like original
     };
 
     const rawProduct = (config.productType || process.env.TRADING_PRODUCT || 'cfd').toLowerCase();
@@ -699,14 +698,7 @@ class DerivBroker extends EventEmitter {
     }
 
     logger.info(`[DerivBroker] Created with product type: ${this.productType}, using ${this.executor.constructor.name}`);
-
-    // ---------- Auto-Connect ----------
-    if (this.config.autoConnect) {
-      logger.info('[DerivBroker] Auto-connect enabled – attempting connection...');
-      this.connect().catch(err => {
-        logger.error('[DerivBroker] Auto-connect failed:', err.message);
-      });
-    }
+    // No auto-connect – wait for first request.
   }
 
   // ============================================================
@@ -758,7 +750,7 @@ class DerivBroker extends EventEmitter {
   }
 
   // ============================================================
-  // CONNECTION
+  // CONNECTION – Lazy (original behavior)
   // ============================================================
   async connect() {
     if (this._state === STATE.READY) return;
@@ -1228,7 +1220,7 @@ class DerivBroker extends EventEmitter {
   }
 
   // ============================================================
-  // SYMBOL LOADING – FIXED: use "brief" and "full"
+  // SYMBOL LOADING – CORRECT: "brief" then "full"
   // ============================================================
   async _loadSymbolsWithTimeout() {
     return Promise.race([
@@ -1339,13 +1331,17 @@ class DerivBroker extends EventEmitter {
   // ============================================================
   async _loadPendingOrders() {
     logger.info('[DerivBroker] Loading pending orders from MongoDB...');
-    const pendingOrders = await Order.find({ status: { $in: ['PENDING', 'ACCEPTED', 'EXECUTING'] } });
-    for (const order of pendingOrders) {
-      this._orders.set(order.clientOrderId, order);
-      if (order.contractId) this._orderMap.set(order.contractId, order.clientOrderId);
-      logger.info(`[DerivBroker] Loaded pending order ${order.clientOrderId} (${order.status})`);
+    try {
+      const pendingOrders = await Order.find({ status: { $in: ['PENDING', 'ACCEPTED', 'EXECUTING'] } });
+      for (const order of pendingOrders) {
+        this._orders.set(order.clientOrderId, order);
+        if (order.contractId) this._orderMap.set(order.contractId, order.clientOrderId);
+        logger.info(`[DerivBroker] Loaded pending order ${order.clientOrderId} (${order.status})`);
+      }
+      logger.info(`[DerivBroker] Loaded ${pendingOrders.length} pending orders.`);
+    } catch (err) {
+      logger.error('[DerivBroker] Failed to load pending orders:', err.message);
     }
-    logger.info(`[DerivBroker] Loaded ${pendingOrders.length} pending orders.`);
   }
 
   async _updateOrderStatus(clientOrderId, status, contractId = null, txData = null) {
@@ -1356,7 +1352,12 @@ class DerivBroker extends EventEmitter {
       update.rejectedAt = new Date();
       update.rejectReason = txData?.error?.message || 'Unknown';
     }
-    await Order.findOneAndUpdate({ clientOrderId }, update, { upsert: true, new: true });
+    try {
+      await Order.findOneAndUpdate({ clientOrderId }, update, { upsert: true, new: true });
+    } catch (err) {
+      logger.error(`[Order] Failed to update status for ${clientOrderId}:`, err.message);
+      return;
+    }
     const order = this._orders.get(clientOrderId);
     if (order) {
       Object.assign(order, update);
@@ -1415,7 +1416,6 @@ class DerivBroker extends EventEmitter {
       logger.info('[Reconcile] Position reconciliation complete.');
     } catch (err) {
       logger.error('[Reconcile] Failed:', err.message);
-      throw err;
     }
   }
 
@@ -1735,7 +1735,7 @@ class DerivBroker extends EventEmitter {
 }
 
 // ============================================================
-// EXPORT – singleton AND class
+// EXPORT – singleton
 // ============================================================
 const brokerInstance = new DerivBroker({
   apiToken: process.env.DERIV_API_TOKEN,
@@ -1756,11 +1756,10 @@ const brokerInstance = new DerivBroker({
   leverage: parseFloat(process.env.DERIV_LEVERAGE) || 100,
   duration: process.env.DERIV_DURATION ? parseInt(process.env.DERIV_DURATION) : 60,
   fatalAfterAuthFailures: parseInt(process.env.DERIV_FATAL_AFTER_AUTH_FAILURES) || 3,
-  readinessTimeout: parseInt(process.env.DERIV_READINESS_TIMEOUT) || 30000,
-  symbolTimeout: parseInt(process.env.DERIV_SYMBOL_TIMEOUT) || 60000,
+  readinessTimeout: parseInt(process.env.DERIV_READINESS_TIMEOUT) || 20000,
+  symbolTimeout: parseInt(process.env.DERIV_SYMBOL_TIMEOUT) || 30000,
   heartbeatTimeout: parseInt(process.env.DERIV_HEARTBEAT_TIMEOUT) || 60000,
   productType: process.env.TRADING_PRODUCT || 'cfd',
-  autoConnect: true,
 });
 
 module.exports = brokerInstance;
