@@ -309,6 +309,19 @@ class HypothesisEngine extends EventEmitter {
 
     logger.info(`[Hypothesis] #${id} resolved: ${hypothesis.status} (conf: ${outcome.confidence})`);
 
+   // In the constructor, listen to own 'knowledgeCandidate' event
+this.on('knowledgeCandidate', async (candidate) => {
+  await knowledgeStore.recordKnowledge({
+    symbol: candidate.symbol,
+    regime: candidate.conditions?.regime || 'unknown',
+    indicator: candidate.type, // e.g., 'trend_continuation'
+    valueRange: 'any', // we can refine later
+    outcome: candidate.outcome.confirmed ? 'success' : 'failure',
+    confidence: candidate.outcome.confidence / 100,
+    session: 'all', // could be enriched from market state
+  });
+}); 
+
     // Emit event for knowledge store / dashboard
     this.emit('hypothesisResolved', hypothesis);
 
