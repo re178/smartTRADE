@@ -22,6 +22,10 @@
     #wsStatus { font-weight: bold; padding: 4px 12px; border-radius: 20px; }
     .ws-connected { color: #28a745; background: #d4edda; }
     .ws-disconnected { color: #dc3545; background: #f8d7da; }
+    /* CTOS Panel Styles */
+    .awareness-metric { font-size: 0.9rem; }
+    .hypothesis-item { font-size: 0.85rem; padding: 6px 12px; margin-bottom: 4px; }
+    .knowledge-item { font-size: 0.9rem; padding: 8px 12px; }
   </style>
 </head>
 <body>
@@ -32,7 +36,6 @@
         <i class="fas fa-chart-line text-primary"></i> RTS Trading Dashboard
         <span id="wsStatus" class="badge bg-secondary ms-3">Connecting...</span>
       </h1>
-      <!-- NEW: Developer Portal Button -->
       <a href="/developer-api.html" class="btn btn-outline-primary">
         <i class="fas fa-key"></i> Developer API
       </a>
@@ -108,6 +111,43 @@
         <div class="card-header"><i class="fas fa-chart-bar"></i> Live Metrics</div>
         <div class="card-body" id="metricsPanel">
           <p class="text-muted">Waiting for metrics...</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== NEW CTOS COGNITIVE PANELS ====== -->
+  <div class="row">
+    <div class="col-md-4">
+      <div class="card">
+        <div class="card-header">
+          <i class="fas fa-eye text-primary"></i> Market Awareness
+          <span class="badge bg-success float-end">Tick‑by‑Tick</span>
+        </div>
+        <div class="card-body" id="awarenessPanel">
+          <p class="text-muted">Waiting for market awareness...</p>
+        </div>
+      </div>
+    </div>
+    <div class="col-md-4">
+      <div class="card">
+        <div class="card-header">
+          <i class="fas fa-flask text-warning"></i> Hypotheses
+          <span class="badge bg-secondary float-end">Research</span>
+        </div>
+        <div class="card-body" id="hypothesisPanel">
+          <p class="text-muted">No active hypotheses.</p>
+        </div>
+      </div>
+    </div>
+    <div class="col-md-4">
+      <div class="card">
+        <div class="card-header">
+          <i class="fas fa-database text-info"></i> Knowledge
+          <span class="badge bg-secondary float-end">Validated</span>
+        </div>
+        <div class="card-body" id="knowledgePanel">
+          <p class="text-muted">No knowledge yet.</p>
         </div>
       </div>
     </div>
