@@ -1,4 +1,4 @@
-// server.js – RTS Entry Point (with MT5 Bridge, Cognitive Intelligence, WebSocket)
+// server.js – RTS Entry Point with CTOS Cognitive Engine (No Legacy)
 
 require('dotenv').config();
 
@@ -14,19 +14,24 @@ const apiRoutes = require('./api/routes');
 const mt5Routes = require('./api/routes/mt5');
 const User = require('./models/User');
 
-// ---------- COGNITIVE MODULES ----------
+// ---------- CTOS COGNITIVE MODULES ----------
 const priceBuffer = require('./core/data/priceBuffer');
-const candleStore = require('./core/data/candleStore');
-const marketIntelligence = require('./core/market/intelligence');
-const regimeEngine = require('./core/market/regime');
-const fusionEngine = require('./core/signal/fusion');
-const selfLearner = require('./core/learning/learner');
-const analyticsDashboard = require('./core/analytics/dashboard');
+const candleStore = require('./core/data/candleStore'); // wrapper for builder + history
+const marketStateCache = require('./core/data/marketStateCache');
+
+// Market Awareness Engine (runs per tick)
+const awarenessEngine = require('./core/awareness/engine');
+
+// Deep Intelligence
+const deepRegime = require('./core/intelligence/deep/regime');
+
+// Research Layer
+const hypothesisEngine = require('./core/research/engine');
+const knowledgeStore = require('./core/research/knowledgeStore');
+
+// (We do NOT import any old fusion, learner, or analytics modules)
+
 const eventBus = require('./infrastructure/eventBus');
-
-// Optional: validation engine, explainability (not started automatically)
-// const validationEngine = require('./core/validation/engine');
-
 const logger = require('./infrastructure/logger') || console;
 
 const app = express();
@@ -210,76 +215,56 @@ function broadcast(type, data) {
   });
 }
 
-// ---------- Connect cognitive events to WebSocket ----------
-// 1. Fusion decisions
-fusionEngine.on('decision', (decision) => {
-  broadcast('decision', decision);
+// ---------- Connect CTOS Events to WebSocket ----------
+
+// 1. Market Awareness (real‑time metrics)
+awarenessEngine.on('marketAwareness', (data) => {
+  broadcast('marketAwareness', data);
 });
 
-// 2. Regime changes
-regimeEngine.on('regime', (regime) => {
+// 2. Deep Regime (regime classification)
+deepRegime.on('regime', (regime) => {
   broadcast('regime', regime);
 });
 
-// 3. Market closed events
-fusionEngine.on('marketClosed', (data) => {
-  broadcast('marketClosed', data);
+// 3. Hypothesis Engine events (research layer)
+hypothesisEngine.on('hypothesisCreated', (hypothesis) => {
+  broadcast('hypothesisCreated', hypothesis);
+});
+hypothesisEngine.on('hypothesisResolved', (hypothesis) => {
+  broadcast('hypothesisResolved', hypothesis);
 });
 
-// 4. Performance metrics (if analyticsDashboard emits)
-analyticsDashboard.on('metrics', (metrics) => {
-  broadcast('metrics', metrics);
+// 4. Knowledge Store (for dashboard "Current Thinking")
+knowledgeStore.on('knowledgeUpdated', (knowledge) => {
+  broadcast('knowledge', knowledge);
 });
 
-// Optional: explanation events
-fusionEngine.on('explanation', (explanation) => {
-  broadcast('explanation', explanation);
+// 5. Trade closed events (for dashboard P&L updates)
+eventBus.on('trade.closed', (data) => {
+  broadcast('tradeClosed', data);
 });
 
-// ---------- Start Cognitive Engines ----------
+// 6. Account updates (for balance/equity)
+eventBus.on('account.fetched', (account) => {
+  broadcast('account', account);
+});
+
+// ---------- Start CTOS Cognitive Engines ----------
 async function startCognitiveEngines() {
   try {
-    // Load historical trades for self‑learner
-    await selfLearner.loadHistory();
-    console.log('[Cognitive] SelfLearner loaded history.');
+    console.log('[CTOS] All cognitive modules loaded and running.');
+    console.log('[CTOS] Market Awareness Engine: active');
+    console.log('[CTOS] Deep Regime Detector: active');
+    console.log('[CTOS] Hypothesis Engine: active');
+    console.log('[CTOS] Knowledge Store: active');
 
-    // Start the fusion engine (which loads weights from learner)
-    await fusionEngine.start();
-    console.log('[Cognitive] FusionEngine started.');
+    // Optionally load initial knowledge into cache (if any)
+    // await knowledgeStore.loadHistory();
 
-    // Start analytics dashboard
-    analyticsDashboard.start();
-    console.log('[Cognitive] AnalyticsDashboard started.');
-
-    // Connect learner to fusion for weight updates
-    selfLearner.on('weightsUpdated', (weights) => {
-      fusionEngine.updateWeights(weights);
-      console.log('[Cognitive] Fusion weights updated.');
-    });
-
-    // Connect trade closure events to the learner
-    eventBus.on('trade.closed', (data) => {
-      if (data.trade) {
-        selfLearner.recordTrade(data.trade);
-        // Also update analytics dashboard (if needed)
-        // analyticsDashboard._addTrade(data.trade); // optional
-      }
-    });
-
-    // Also forward account updates to analytics dashboard
-    eventBus.on('account.fetched', (account) => {
-      const equity = parseFloat(account.equity);
-      const balance = parseFloat(account.balance);
-      // Set initial balance if not set
-      if (analyticsDashboard._initialBalance === 0) {
-        analyticsDashboard.setInitialBalance(balance);
-      }
-      // The dashboard will update equity via its own event listener.
-    });
-
-    console.log('[Cognitive] All cognitive modules initialized.');
+    console.log('[CTOS] All cognitive modules initialized successfully.');
   } catch (err) {
-    console.error('[Cognitive] Initialization error:', err.message);
+    console.error('[CTOS] Initialization error:', err.message);
   }
 }
 
@@ -294,6 +279,7 @@ async function startServer() {
     console.log(`🔌 API base: http://localhost:${PORT}/api`);
     console.log(`🟢 MT5 Bridge endpoints: http://localhost:${PORT}/api/mt5`);
     console.log('📡 WebSocket server ready for real‑time signals.');
+    console.log('🧠 CTOS Cognitive Engine: enabled.');
     console.log('📡 Request logging enabled.');
     console.log('🛠️  JSON repair enabled as fallback.');
     console.log('🧹  Null bytes (\\0) stripped from all incoming JSON.');
