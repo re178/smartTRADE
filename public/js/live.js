@@ -1,233 +1,296 @@
-// public/js/live.js
-// RTS Live WebSocket Client – Real‑time signals, regime, metrics, and market closure status.
+// server.js – RTS Entry Point with CTOS Cognitive Engine (No Legacy)
 
-(function() {
-  'use strict';
+require('dotenv').config();
 
-  // ---- Configuration ----
-  const WS_RECONNECT_DELAY = 2000;
-  const WS_MAX_RECONNECT_DELAY = 30000;
-  let reconnectAttempts = 0;
-  let ws = null;
-  let wsConnected = false;
+const express = require('express');
+const cors = require('cors');
+const path = require('path');
+const mongoose = require('mongoose');
+const WebSocket = require('ws');
+const http = require('http');
 
-  // ---- DOM references ----
-  const liveSignalPanel = document.getElementById('liveSignalPanel');
-  const regimePanel = document.getElementById('regimePanel');
-  const metricsPanel = document.getElementById('metricsPanel');
-  const wsStatus = document.getElementById('wsStatus');
+const connectDB = require('./config/db');
+const apiRoutes = require('./api/routes');
+const mt5Routes = require('./api/routes/mt5');
+const User = require('./models/User');
 
-  // ---- Helper: update WebSocket status indicator ----
-  function updateWsStatus(connected) {
-    wsConnected = connected;
-    if (wsStatus) {
-      wsStatus.textContent = connected ? '🟢 Live' : '🔴 Disconnected';
-      wsStatus.className = connected ? 'badge bg-success' : 'badge bg-danger';
+// ---------- CTOS COGNITIVE MODULES ----------
+const priceBuffer = require('./core/data/priceBuffer');
+const candleStore = require('./core/data/candleStore'); // wrapper for builder + history
+const marketStateCache = require('./core/data/marketStateCache');
+
+// Market Awareness Engine (runs per tick)
+const awarenessEngine = require('./core/awareness/engine');
+
+// Deep Intelligence
+const deepRegime = require('./core/intelligence/deep/regime');
+
+// Research Layer
+const hypothesisEngine = require('./core/research/engine');
+const knowledgeStore = require('./core/research/knowledgeStore');
+
+// (We do NOT import any old fusion, learner, or analytics modules)
+
+const eventBus = require('./infrastructure/eventBus');
+const logger = require('./infrastructure/logger') || console;
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+
+// ---------- Connect to MongoDB ----------
+connectDB();
+
+// ---------- Admin Creation ----------
+async function ensureAdmin() {
+  try {
+    const adminId = 'admin';
+    let admin = await User.findOne({ userId: adminId });
+    if (!admin) {
+      const defaultProduct = process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd';
+      admin = new User({ userId: adminId, tradingProduct: defaultProduct });
+      await admin.save();
+      console.log('✅ Admin user created with product:', defaultProduct);
+    } else {
+      console.log('✅ Admin user already exists.');
     }
+  } catch (err) {
+    console.error('❌ Admin creation failed:', err.message);
   }
+}
 
-  // ---- WebSocket connection ----
-  function connectWebSocket() {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}`;
-    try {
-      ws = new WebSocket(wsUrl);
-    } catch (e) {
-      console.error('[Live] WebSocket creation failed:', e);
-      scheduleReconnect();
-      return;
+// ---------- JSON Repair Helper (fallback) ----------
+function repairJson(raw) {
+  let repaired = raw.trim();
+  if (repaired.endsWith(',')) {
+    repaired = repaired.slice(0, -1);
+  }
+  let openBraces = 0, openBrackets = 0, inString = false, escape = false;
+  for (let i = 0; i < repaired.length; i++) {
+    const ch = repaired[i];
+    if (escape) { escape = false; continue; }
+    if (ch === '\\') { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{') openBraces++;
+    else if (ch === '}') openBraces--;
+    else if (ch === '[') openBrackets++;
+    else if (ch === ']') openBrackets--;
+  }
+  while (openBrackets > 0) { repaired += ']'; openBrackets--; }
+  while (openBraces > 0) { repaired += '}'; openBraces--; }
+  return repaired;
+}
+
+// ---------- Middleware ----------
+app.use(cors());
+
+// ---------- Custom body parser: sanitize null bytes & BOM ----------
+app.use((req, res, next) => {
+  let rawBody = '';
+  req.on('data', chunk => {
+    rawBody += chunk.toString();
+  });
+  req.on('end', () => {
+    if (rawBody.charCodeAt(0) === 0xFEFF) {
+      rawBody = rawBody.slice(1);
     }
+    rawBody = rawBody.replace(/\0/g, '');
+    const trimmed = rawBody.trim();
+    req.rawBody = trimmed;
 
-    ws.onopen = function() {
-      console.log('[Live] WebSocket connected.');
-      reconnectAttempts = 0;
-      updateWsStatus(true);
-    };
-
-    ws.onmessage = function(event) {
+    const contentType = req.headers['content-type'] || '';
+    if (contentType.includes('application/json') && trimmed.length > 0) {
+      let parsed = null;
       try {
-        const msg = JSON.parse(event.data);
-        handleMessage(msg);
-      } catch (e) {
-        console.error('[Live] Message parse error:', e);
+        parsed = JSON.parse(trimmed);
+        req.body = parsed;
+      } catch (err) {
+        if (err instanceof SyntaxError) {
+          const repaired = repairJson(trimmed);
+          try {
+            parsed = JSON.parse(repaired);
+            req.body = parsed;
+            req.repairedRawBody = repaired;
+            console.log('✅ JSON repaired successfully.');
+            console.log('   Original (stringified):', JSON.stringify(trimmed));
+            console.log('   Repaired:', repaired);
+          } catch (err2) {
+            console.error('❌ JSON repair also failed:', err2.message);
+            console.error('   Raw (stringified):', JSON.stringify(trimmed));
+            console.error('   Repaired:', repaired);
+            req.body = {};
+            req.parseError = err2;
+          }
+        } else {
+          throw err;
+        }
       }
-    };
-
-    ws.onclose = function() {
-      console.warn('[Live] WebSocket closed.');
-      updateWsStatus(false);
-      scheduleReconnect();
-    };
-
-    ws.onerror = function(err) {
-      console.error('[Live] WebSocket error:', err);
-      // Will close automatically; we handle reconnect in onclose.
-    };
-  }
-
-  // ---- Reconnection logic (exponential backoff) ----
-  function scheduleReconnect() {
-    if (ws && ws.readyState === WebSocket.OPEN) return;
-    const delay = Math.min(WS_RECONNECT_DELAY * Math.pow(1.5, reconnectAttempts), WS_MAX_RECONNECT_DELAY);
-    reconnectAttempts++;
-    console.log(`[Live] Reconnecting in ${delay}ms (attempt ${reconnectAttempts})`);
-    setTimeout(connectWebSocket, delay);
-  }
-
-  // ---- Message handler ----
-  function handleMessage(msg) {
-    // msg format: { type: 'decision'|'regime'|'metrics'|'marketClosed', data: ... }
-    switch (msg.type) {
-      case 'decision':
-        displayDecision(msg.data);
-        break;
-      case 'regime':
-        displayRegime(msg.data);
-        break;
-      case 'metrics':
-        displayMetrics(msg.data);
-        break;
-      case 'marketClosed':
-        displayMarketClosed(msg.data);
-        break;
-      default:
-        console.debug('[Live] Unknown message type:', msg.type);
-    }
-  }
-
-  // ---- Display a live decision (signal) ----
-  function displayDecision(decision) {
-    if (!liveSignalPanel) return;
-
-    const { symbol, decision: side, confidence, entryPrice, stopLoss, takeProfit, recommendedLotSize, reason, timestamp } = decision;
-    const alertClass = side === 'BUY' ? 'success' : side === 'SELL' ? 'danger' : 'secondary';
-    const sideLabel = side || 'NO TRADE';
-
-    let html = `<div class="alert alert-${alertClass} live-signal-card" data-symbol="${symbol}" data-side="${side}" data-entry="${entryPrice}" data-sl="${stopLoss}" data-tp="${takeProfit}" data-lot="${recommendedLotSize || 0.01}">`;
-    html += `<h5><strong>${sideLabel}</strong> ${symbol} (${confidence}% confidence)</h5>`;
-    if (side && side !== 'NO_TRADE') {
-      html += `<p>Entry: ${formatPrice(entryPrice)} | SL: ${formatPrice(stopLoss)} | TP: ${formatPrice(takeProfit)}</p>`;
-      html += `<p>Lot: ${recommendedLotSize || 'N/A'}</p>`;
-      html += `<p><small>${reason || ''}</small></p>`;
-      html += `<button class="btn btn-sm btn-primary execute-signal-btn" onclick="window.executeSignalFromCard(this)">`;
-      html += `<i class="fas fa-rocket"></i> Execute Trade</button>`;
     } else {
-      html += `<p><em>No trade recommended.</em></p>`;
+      req.body = {};
     }
-    html += `<p class="text-muted small mt-2">${new Date(timestamp).toLocaleString()}</p>`;
-    html += `</div>`;
+    next();
+  });
+  req.on('error', (err) => {
+    console.error('Request body error:', err);
+    next(err);
+  });
+});
 
-    liveSignalPanel.innerHTML = html;
-    // Play sound for new signal if it's a BUY/SELL and the sound function exists
-    if (side && side !== 'NO_TRADE' && typeof window.playSound === 'function') {
-      window.playSound('signal');
+// ---------- Request Logger ----------
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api')) {
+    console.log('\n==============================');
+    console.log(new Date().toISOString());
+    console.log(req.method, req.originalUrl);
+    console.log('Body length:', req.rawBody?.length || 0);
+    if (req.rawBody && req.rawBody.length > 0 && req.rawBody.length < 500) {
+      console.log('Raw Body (stringified):', JSON.stringify(req.rawBody));
     }
-  }
-
-  // ---- Display market closed status ----
-  function displayMarketClosed(data) {
-    if (!liveSignalPanel) return;
-    const { symbol, reason, nextOpen } = data;
-    liveSignalPanel.innerHTML = `
-      <div class="alert alert-warning">
-        <h5><i class="fas fa-hourglass-end"></i> Market Closed</h5>
-        <p><strong>${symbol}</strong></p>
-        <p>${reason}</p>
-        <p><strong>Next open:</strong> ${nextOpen ? new Date(nextOpen).toLocaleString() : 'Unknown'}</p>
-      </div>
-    `;
-  }
-
-  // ---- Display regime ----
-  function displayRegime(regime) {
-    if (!regimePanel) return;
-    const { name, confidence, description, symbol, timestamp } = regime;
-    regimePanel.innerHTML = `
-      <div class="card">
-        <div class="card-body">
-          <h6 class="card-title">Current Regime</h6>
-          <p class="card-text"><strong>${name}</strong> (${confidence}%)</p>
-          <p class="small">${description || ''}</p>
-          <p class="small text-muted">${symbol} | ${new Date(timestamp).toLocaleString()}</p>
-        </div>
-      </div>
-    `;
-  }
-
-  // ---- Display performance metrics ----
-  function displayMetrics(metrics) {
-    if (!metricsPanel) return;
-    const { winRate, profitFactor, sharpe, maxDrawdown, expectancy, totalTrades, dailyPnL, currentDrawdown, timestamp } = metrics;
-    metricsPanel.innerHTML = `
-      <div class="card">
-        <div class="card-body">
-          <h6 class="card-title">Live Performance</h6>
-          <div class="row">
-            <div class="col-6">Win Rate: ${(winRate * 100).toFixed(1)}%</div>
-            <div class="col-6">Profit Factor: ${profitFactor.toFixed(2)}</div>
-          </div>
-          <div class="row">
-            <div class="col-6">Sharpe: ${sharpe.toFixed(2)}</div>
-            <div class="col-6">Max DD: ${(maxDrawdown * 100).toFixed(1)}%</div>
-          </div>
-          <div class="row">
-            <div class="col-6">Expectancy: ${expectancy.toFixed(2)}</div>
-            <div class="col-6">Trades: ${totalTrades}</div>
-          </div>
-          <div class="row">
-            <div class="col-6">Daily P&L: ${dailyPnL.toFixed(2)}</div>
-            <div class="col-6">Current DD: ${(currentDrawdown * 100).toFixed(1)}%</div>
-          </div>
-          <p class="small text-muted mt-2">${new Date(timestamp).toLocaleString()}</p>
-        </div>
-      </div>
-    `;
-  }
-
-  // ---- Global function: Execute trade from the signal card (called by button click) ----
-  window.executeSignalFromCard = function(btn) {
-    const card = btn.closest('.live-signal-card');
-    if (!card) return;
-    const symbol = card.dataset.symbol;
-    const side = card.dataset.side;
-    const entry = parseFloat(card.dataset.entry);
-    const sl = parseFloat(card.dataset.sl) || null;
-    const tp = parseFloat(card.dataset.tp) || null;
-    const lot = parseFloat(card.dataset.lot) || 0.01;
-
-    // Use the existing window.fillTradeForm (from app.js) to fill the form
-    if (typeof window.fillTradeForm === 'function') {
-      window.fillTradeForm(symbol, side, entry, sl, tp, lot);
-      // Optionally auto-submit: uncomment the next line if you want one-click execution
-      // document.getElementById('tradeForm')?.dispatchEvent(new Event('submit'));
-    } else {
-      alert('Trade form fill function not available.');
+    if (req.repairedRawBody) {
+      console.log('Repaired:', req.repairedRawBody);
     }
-  };
-
-  // ---- Helper: formatPrice (reuse from app.js) ----
-  function formatPrice(p) {
-    if (p === undefined || p === null) return 'N/A';
-    return parseFloat(p).toFixed(5);
+    console.log('==============================');
   }
+  next();
+});
 
-  // ---- Start the WebSocket connection ----
-  connectWebSocket();
+app.use(express.static('public'));
 
-  // ---- Expose reconnect for manual reset (optional) ----
-  window.reconnectLive = function() {
-    if (ws) {
-      ws.close();
+// ---------- Admin User Middleware ----------
+app.use(async (req, res, next) => {
+  try {
+    let admin = await User.findOne({ userId: 'admin' });
+    if (!admin) {
+      const defaultProduct = process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd';
+      admin = new User({ userId: 'admin', tradingProduct: defaultProduct });
+      await admin.save();
+      console.log('✅ Admin user auto-created.');
     }
-    reconnectAttempts = 0;
-    connectWebSocket();
-  };
+    req.user = { id: 'admin', tradingProduct: admin.tradingProduct };
+    next();
+  } catch (err) {
+    console.error('❌ Admin middleware error:', err.message);
+    req.user = { id: 'admin', tradingProduct: process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd' };
+    next();
+  }
+});
 
-  // ---- Cleanup on page unload ----
-  window.addEventListener('beforeunload', function() {
-    if (ws) {
-      ws.close();
+// ---------- API Routes ----------
+app.use('/api', apiRoutes);
+app.use('/api/mt5', mt5Routes);
+
+// ---------- Health Check ----------
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'OK', message: 'RTS is running' });
+});
+
+// ---------- SPA Fallback ----------
+app.get('*', (req, res) => {
+  if (!req.path.startsWith('/api')) {
+    res.sendFile('index.html', { root: 'public' });
+  } else {
+    res.status(404).json({ error: 'API endpoint not found' });
+  }
+});
+
+// ---------- Create HTTP server ----------
+const server = http.createServer(app);
+
+// ---------- WebSocket Server ----------
+const wss = new WebSocket.Server({ server });
+
+wss.on('connection', (ws) => {
+  console.log('[WebSocket] Client connected.');
+  ws.on('close', () => console.log('[WebSocket] Client disconnected.'));
+  ws.on('error', (err) => console.error('[WebSocket] Error:', err.message));
+});
+
+// ---------- Broadcast functions ----------
+function broadcast(type, data) {
+  const message = JSON.stringify({ type, data });
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(message);
     }
   });
+}
 
-})();
+// ---------- Connect CTOS Events to WebSocket ----------
+
+// 1. Market Awareness (real‑time metrics)
+awarenessEngine.on('marketAwareness', (data) => {
+  broadcast('marketAwareness', data);
+});
+
+// 2. Deep Regime (regime classification)
+deepRegime.on('regime', (regime) => {
+  broadcast('regime', regime);
+});
+
+// 3. Hypothesis Engine events (research layer)
+hypothesisEngine.on('hypothesisCreated', (hypothesis) => {
+  broadcast('hypothesisCreated', hypothesis);
+});
+hypothesisEngine.on('hypothesisResolved', (hypothesis) => {
+  broadcast('hypothesisResolved', hypothesis);
+});
+
+// 4. Knowledge Store (for dashboard "Current Thinking")
+knowledgeStore.on('knowledgeUpdated', (knowledge) => {
+  broadcast('knowledge', knowledge);
+});
+
+// 5. Trade closed events (for dashboard P&L updates)
+eventBus.on('trade.closed', (data) => {
+  broadcast('tradeClosed', data);
+});
+
+// 6. Account updates (for balance/equity)
+eventBus.on('account.fetched', (account) => {
+  broadcast('account', account);
+});
+
+// ---------- Start CTOS Cognitive Engines ----------
+async function startCognitiveEngines() {
+  try {
+    console.log('[CTOS] All cognitive modules loaded and running.');
+    console.log('[CTOS] Market Awareness Engine: active');
+    console.log('[CTOS] Deep Regime Detector: active');
+    console.log('[CTOS] Hypothesis Engine: active');
+    console.log('[CTOS] Knowledge Store: active');
+
+    // Optionally load initial knowledge into cache (if any)
+    // await knowledgeStore.loadHistory();
+
+    console.log('[CTOS] All cognitive modules initialized successfully.');
+  } catch (err) {
+    console.error('[CTOS] Initialization error:', err.message);
+  }
+}
+
+// ---------- Start Server ----------
+async function startServer() {
+  await ensureAdmin();
+
+  // Start HTTP server
+  server.listen(PORT, () => {
+    console.log(`✅ RTS server running on http://localhost:${PORT}`);
+    console.log(`📊 Dashboard: http://localhost:${PORT}`);
+    console.log(`🔌 API base: http://localhost:${PORT}/api`);
+    console.log(`🟢 MT5 Bridge endpoints: http://localhost:${PORT}/api/mt5`);
+    console.log('📡 WebSocket server ready for real‑time signals.');
+    console.log('🧠 CTOS Cognitive Engine: enabled.');
+    console.log('📡 Request logging enabled.');
+    console.log('🛠️  JSON repair enabled as fallback.');
+    console.log('🧹  Null bytes (\\0) stripped from all incoming JSON.');
+    console.log('💾 MT5 data is persistent (MongoDB).');
+  });
+
+  // Start cognitive engines after server is up
+  setTimeout(startCognitiveEngines, 2000);
+}
+
+startServer().catch(err => {
+  console.error('❌ Server start error:', err);
+  process.exit(1);
+});
