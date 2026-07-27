@@ -6,7 +6,7 @@ const EventEmitter = require('events');
 const marketStateCache = require('../data/marketStateCache');
 const deepRegime = require('../intelligence/deep/regime');
 const awarenessEngine = require('../awareness/engine');
-const KnowledgeStore = require('./knowledgeStore'); // will be created next
+const knowledgeStore = require('./knowledgeStore'); // singleton instance
 const logger = require('../../infrastructure/logger') || console;
 
 // Hypothesis types
@@ -29,7 +29,7 @@ class HypothesisEngine extends EventEmitter {
     this._activeHypotheses = new Map();
     this._hypothesisCounter = 0;
 
-    // Subscribe to market events
+    // ---- Subscribe to market events ----
     awarenessEngine.on('marketAwareness', (data) => {
       this._onAwareness(data);
     });
@@ -38,7 +38,25 @@ class HypothesisEngine extends EventEmitter {
       this._onRegime(regime);
     });
 
-    // Periodic evaluation of active hypotheses
+    // ---- Listen to our own 'knowledgeCandidate' events ----
+    this.on('knowledgeCandidate', async (candidate) => {
+      try {
+        await knowledgeStore.recordKnowledge({
+          symbol: candidate.symbol,
+          regime: candidate.conditions?.regime || 'unknown',
+          indicator: candidate.type,
+          valueRange: 'any', // can be refined later
+          outcome: candidate.outcome.confirmed ? 'success' : 'failure',
+          confidence: candidate.outcome.confidence / 100,
+          session: 'all', // could be enriched from market state
+          volatilityRegime: 'all',
+        });
+      } catch (err) {
+        logger.error('[HypothesisEngine] Failed to record knowledge:', err.message);
+      }
+    });
+
+    // ---- Periodic evaluation of active hypotheses ----
     setInterval(() => this._evaluateHypotheses(), 5000);
 
     logger.info('[HypothesisEngine] Initialized.');
@@ -208,30 +226,23 @@ class HypothesisEngine extends EventEmitter {
    * Evaluate trend continuation hypothesis.
    */
   _evaluateTrendContinuation(hypothesis, state) {
-    const { velocity, liquidity, lastUpdated } = state;
-    // If velocity remains in same direction and liquidity is adequate, continuation likely
+    const { velocity, liquidity } = state;
     const timeElapsed = Date.now() - hypothesis.createdAt;
     if (timeElapsed > 60000) {
-      // After 1 minute, check if price moved in the expected direction
-      const initialPrice = hypothesis.conditions.timestamp;
-      const currentPrice = state.mid;
-      // We need to track price history per hypothesis – simplified.
-      // For now, we'll just assess based on velocity and liquidity.
       if (Math.abs(velocity) > 0.0001 && liquidity > 0.3) {
         return { confirmed: true, confidence: 70 + liquidity * 20 };
       } else {
         return { confirmed: false, confidence: 40 };
       }
     }
-    return null; // still evaluating
+    return null;
   }
 
   /**
    * Evaluate trend reversal hypothesis.
    */
   _evaluateTrendReversal(hypothesis, state) {
-    const { velocity, acceleration, liquidity } = state;
-    // Reversal if velocity reverses and acceleration is negative
+    const { velocity, acceleration } = state;
     if (Math.sign(velocity) !== Math.sign(hypothesis.conditions.confidence) && acceleration < 0) {
       return { confirmed: true, confidence: 65 };
     }
@@ -243,11 +254,9 @@ class HypothesisEngine extends EventEmitter {
    */
   _evaluateBreakout(hypothesis, state) {
     const { velocity, liquidity, spread } = state;
-    // Breakout confirmed if velocity > threshold, liquidity high, spread low
     if (Math.abs(velocity) > 0.0002 && liquidity > 0.5 && spread < 0.0002) {
       return { confirmed: true, confidence: 75 };
     }
-    // False breakout if velocity fails and liquidity drops
     if (Math.abs(velocity) < 0.00005 || liquidity < 0.2) {
       return { confirmed: false, confidence: 30, reason: 'breakout failed' };
     }
@@ -309,19 +318,6 @@ class HypothesisEngine extends EventEmitter {
 
     logger.info(`[Hypothesis] #${id} resolved: ${hypothesis.status} (conf: ${outcome.confidence})`);
 
-   // In the constructor, listen to own 'knowledgeCandidate' event
-this.on('knowledgeCandidate', async (candidate) => {
-  await knowledgeStore.recordKnowledge({
-    symbol: candidate.symbol,
-    regime: candidate.conditions?.regime || 'unknown',
-    indicator: candidate.type, // e.g., 'trend_continuation'
-    valueRange: 'any', // we can refine later
-    outcome: candidate.outcome.confirmed ? 'success' : 'failure',
-    confidence: candidate.outcome.confidence / 100,
-    session: 'all', // could be enriched from market state
-  });
-}); 
-
     // Emit event for knowledge store / dashboard
     this.emit('hypothesisResolved', hypothesis);
 
@@ -330,7 +326,6 @@ this.on('knowledgeCandidate', async (candidate) => {
 
     // Store in knowledge base if confidence is high
     if (outcome.confidence > 70) {
-      // We'll emit a 'knowledge' event that the KnowledgeStore can listen to
       this.emit('knowledgeCandidate', {
         symbol: hypothesis.symbol,
         type: hypothesis.type,
