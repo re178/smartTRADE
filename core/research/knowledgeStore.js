@@ -1,38 +1,29 @@
 // core/research/knowledgeStore.js
 // Knowledge Store – manages validated observations and knowledge.
-// Distinguishes between evidence (current) and knowledge (validated over time).
+// Extends EventEmitter to broadcast updates.
 
 const mongoose = require('mongoose');
+const EventEmitter = require('events');
 const logger = require('../../infrastructure/logger') || console;
 
 // ----- Knowledge Schema -----
 const KnowledgeSchema = new mongoose.Schema({
-  // What was observed
   symbol: { type: String, required: true, index: true },
-  regime: { type: String, required: true }, // e.g., 'STRONG_TREND_BULL'
-  indicator: { type: String, required: true }, // e.g., 'rsi', 'velocity'
-  valueRange: { type: String, required: true }, // e.g., '30-40', '>0.0001'
-  
-  // What happened
-  outcome: { type: String, required: true }, // 'continuation', 'reversal', 'breakout', 'failure'
-  
-  // Statistics
+  regime: { type: String, required: true },
+  indicator: { type: String, required: true },
+  valueRange: { type: String, required: true },
+  outcome: { type: String, required: true },
   observedCount: { type: Number, default: 0 },
   successCount: { type: Number, default: 0 },
-  successRate: { type: Number, default: 0 }, // 0-1
+  successRate: { type: Number, default: 0 },
   confidence: { type: Number, default: 0.5 },
-  
-  // Context
-  session: { type: String, default: 'all' }, // London, New York, Asia, all
-  volatilityRegime: { type: String, default: 'all' }, // high, low, normal, all
-  
-  // Timestamps
+  session: { type: String, default: 'all' },
+  volatilityRegime: { type: String, default: 'all' },
   firstObserved: { type: Date, default: Date.now },
   lastUpdated: { type: Date, default: Date.now },
-  expiresAt: { type: Date, default: null }, // optional expiration for temporary knowledge
+  expiresAt: { type: Date, default: null },
 });
 
-// Compound index for fast lookups
 KnowledgeSchema.index({ symbol: 1, regime: 1, indicator: 1, outcome: 1 });
 KnowledgeSchema.index({ confidence: -1 });
 
@@ -43,29 +34,25 @@ const EvidenceSchema = new mongoose.Schema({
   symbol: { type: String, required: true, index: true },
   indicator: { type: String, required: true },
   value: { type: Number, required: true },
-  timestamp: { type: Date, default: Date.now, expires: 3600 }, // auto-delete after 1 hour
+  timestamp: { type: Date, default: Date.now, expires: 3600 },
   source: { type: String, default: 'awareness' },
 });
 
 const EvidenceModel = mongoose.model('Evidence', EvidenceSchema);
 
-// ----- KnowledgeStore Class -----
-class KnowledgeStore {
+// ----- KnowledgeStore Class (extends EventEmitter) -----
+class KnowledgeStore extends EventEmitter {
   constructor() {
-    // In‑memory cache for frequently accessed knowledge
-    this._cache = new Map(); // key -> knowledge object
-    this._cacheTTL = 60000; // 1 minute
+    super();
+    this._cache = new Map();
+    this._cacheTTL = 60000;
     this._lastCacheRefresh = Date.now();
   }
 
-  /**
-   * Record a new piece of knowledge (validated hypothesis).
-   */
   async recordKnowledge(knowledge) {
     try {
       const { symbol, regime, indicator, valueRange, outcome, confidence, session, volatilityRegime } = knowledge;
 
-      // Check if we already have this knowledge
       const existing = await KnowledgeModel.findOne({
         symbol,
         regime,
@@ -75,17 +62,16 @@ class KnowledgeStore {
       });
 
       if (existing) {
-        // Update statistics
         existing.observedCount += 1;
         existing.successCount += (confidence > 0.6 ? 1 : 0);
         existing.successRate = existing.successCount / existing.observedCount;
-        existing.confidence = (existing.confidence * 0.9) + (confidence * 0.1); // weighted average
+        existing.confidence = (existing.confidence * 0.9) + (confidence * 0.1);
         existing.lastUpdated = new Date();
         await existing.save();
         logger.debug(`[KnowledgeStore] Updated knowledge: ${symbol} ${indicator} ${valueRange} → ${outcome} (${existing.confidence})`);
+        this.emit('knowledgeUpdated', existing);
         return existing;
       } else {
-        // Create new knowledge
         const newKnowledge = new KnowledgeModel({
           symbol,
           regime,
@@ -95,7 +81,7 @@ class KnowledgeStore {
           observedCount: 1,
           successCount: confidence > 0.6 ? 1 : 0,
           successRate: confidence > 0.6 ? 1 : 0,
-          confidence: confidence,
+          confidence,
           session: session || 'all',
           volatilityRegime: volatilityRegime || 'all',
           firstObserved: new Date(),
@@ -103,6 +89,7 @@ class KnowledgeStore {
         });
         await newKnowledge.save();
         logger.info(`[KnowledgeStore] New knowledge: ${symbol} ${indicator} ${valueRange} → ${outcome} (${confidence})`);
+        this.emit('knowledgeUpdated', newKnowledge);
         return newKnowledge;
       }
     } catch (err) {
@@ -110,39 +97,22 @@ class KnowledgeStore {
     }
   }
 
-  /**
-   * Query knowledge base for a given symbol, regime, indicator, and outcome.
-   * Returns the best‑matching knowledge with confidence.
-   */
   async getKnowledge(symbol, regime, indicator, value) {
     try {
-      // Normalize value into a range string
       const valueRange = this._getValueRange(indicator, value);
-
-      // Query for exact match
       const exact = await KnowledgeModel.findOne({
         symbol,
         regime,
         indicator,
         valueRange,
       }).sort({ confidence: -1 });
-
-      if (exact) {
-        return exact;
-      }
-
-      // If no exact match, try to find a broader match (without valueRange)
+      if (exact) return exact;
       const broad = await KnowledgeModel.findOne({
         symbol,
         regime,
         indicator,
-        // valueRange: { $ne: null } // any value range
       }).sort({ confidence: -1 });
-
-      if (broad) {
-        return broad;
-      }
-
+      if (broad) return broad;
       return null;
     } catch (err) {
       logger.error('[KnowledgeStore] getKnowledge error:', err.message);
@@ -150,9 +120,6 @@ class KnowledgeStore {
     }
   }
 
-  /**
-   * Get all knowledge for a symbol (for dashboard/research).
-   */
   async getSymbolKnowledge(symbol, limit = 50) {
     try {
       return await KnowledgeModel.find({ symbol }).sort({ confidence: -1 }).limit(limit);
@@ -162,9 +129,6 @@ class KnowledgeStore {
     }
   }
 
-  /**
-   * Store temporary evidence (for real‑time calibration).
-   */
   async storeEvidence(evidence) {
     try {
       const ev = new EvidenceModel(evidence);
@@ -174,9 +138,6 @@ class KnowledgeStore {
     }
   }
 
-  /**
-   * Get recent evidence for a symbol (for research/learning).
-   */
   async getRecentEvidence(symbol, limit = 50) {
     try {
       return await EvidenceModel.find({ symbol }).sort({ timestamp: -1 }).limit(limit);
@@ -186,28 +147,18 @@ class KnowledgeStore {
     }
   }
 
-  /**
-   * Calculate a confidence score for a given indicator value, based on historical knowledge.
-   */
   async getConfidence(symbol, regime, indicator, value) {
     try {
       const knowledge = await this.getKnowledge(symbol, regime, indicator, value);
-      if (knowledge) {
-        return knowledge.confidence;
-      }
-      // If no knowledge, use a default based on indicator type
+      if (knowledge) return knowledge.confidence;
       return this._defaultConfidence(indicator, value);
     } catch (err) {
       return 0.5;
     }
   }
 
-  /**
-   * Helper: convert a numeric value to a range string.
-   */
   _getValueRange(indicator, value) {
     if (value === undefined || value === null) return 'unknown';
-    // For RSI (0-100)
     if (indicator === 'rsi') {
       if (value < 30) return 'below30';
       if (value < 40) return '30-40';
@@ -215,7 +166,6 @@ class KnowledgeStore {
       if (value < 70) return '60-70';
       return 'above70';
     }
-    // For velocity (price change per tick)
     if (indicator === 'velocity') {
       const absVal = Math.abs(value);
       if (absVal < 0.00005) return 'low';
@@ -223,38 +173,29 @@ class KnowledgeStore {
       if (absVal < 0.0002) return 'high';
       return 'very_high';
     }
-    // For liquidity (0-1)
     if (indicator === 'liquidity') {
       if (value < 0.2) return 'low';
       if (value < 0.5) return 'medium';
       return 'high';
     }
-    // For spread
     if (indicator === 'spread') {
       if (value < 0.0002) return 'low';
       if (value < 0.0005) return 'medium';
       return 'high';
     }
-    // Default
     return 'any';
   }
 
-  /**
-   * Default confidence if no historical knowledge exists.
-   */
   _defaultConfidence(indicator, value) {
-    // For RSI extremes: higher confidence
     if (indicator === 'rsi') {
       if (value < 30 || value > 70) return 0.65;
       if (value < 40 || value > 60) return 0.55;
       return 0.5;
     }
-    // For velocity bursts: higher confidence if large
     if (indicator === 'velocity') {
       if (Math.abs(value) > 0.0002) return 0.6;
       return 0.5;
     }
-    // For liquidity: if low, increases uncertainty
     if (indicator === 'liquidity') {
       if (value < 0.2) return 0.45;
       if (value > 0.7) return 0.55;
@@ -263,9 +204,6 @@ class KnowledgeStore {
     return 0.5;
   }
 
-  /**
-   * Clear all knowledge (for reset/testing).
-   */
   async clearAll() {
     await KnowledgeModel.deleteMany({});
     await EvidenceModel.deleteMany({});
@@ -274,4 +212,5 @@ class KnowledgeStore {
   }
 }
 
+// Export a singleton instance
 module.exports = new KnowledgeStore();
