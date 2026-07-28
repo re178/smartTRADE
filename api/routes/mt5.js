@@ -9,7 +9,10 @@ const Mt5Account = require('../../models/Mt5Account');
 const Mt5Position = require('../../models/Mt5Position');
 const Mt5Price = require('../../models/Mt5Price');
 const Mt5Heartbeat = require('../../models/Mt5Heartbeat');
-const Trade = require('../../models/Trade'); // for history
+const Trade = require('../../models/Trade');
+
+// ---- ADD THIS LINE ----
+const priceBuffer = require('../../core/data/priceBuffer');
 
 // ---------- Authentication ----------
 const API_KEY = process.env.MT5_API_KEY || 'change-me-in-production';
@@ -22,7 +25,6 @@ const authenticate = (req, res, next) => {
   res.status(401).json({ error: 'Unauthorized: Invalid or missing API key' });
 };
 
-// Apply authentication to all routes
 router.use(authenticate);
 
 // ---------- Utility ----------
@@ -167,7 +169,6 @@ router.get('/account/status', async (req, res) => {
   try {
     let account = await Mt5Account.findOne().sort({ updatedAt: -1 }).lean();
     if (!account) {
-      // Fallback to avoid 404
       account = {
         login: 0,
         balance: 0,
@@ -244,26 +245,33 @@ router.get('/heartbeat', async (req, res) => {
   }
 });
 
-// ---------- Price Feed (without cognitive) ----------
+// ---------- Price Feed (with cognitive integration) ----------
 router.post('/price', async (req, res) => {
   try {
     const priceData = req.body;
     if (!priceData.symbol) {
       return res.status(400).json({ error: 'Missing symbol' });
     }
+
+    // ---- CRITICAL: Forward tick to cognitive engine ----
+    priceBuffer.update(priceData.symbol, priceData.bid, priceData.ask, priceData.time);
+
+    // Save to database (existing logic)
     await Mt5Price.findOneAndUpdate(
       { symbol: priceData.symbol },
       priceData,
       { upsert: true, new: true }
     );
-    logger.debug(`[MT5] Price updated for ${priceData.symbol}`);
+
+    logger.debug(`[MT5] Price updated for ${priceData.symbol} (forwarded to cognitive engine)`);
     res.status(201).json({ status: 'accepted' });
   } catch (err) {
+    logger.error('[MT5] Price error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ---- UPDATED: handle underscores in symbol names ----
+// ---- Handle underscores in symbol names ----
 router.get('/price/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
