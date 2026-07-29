@@ -1,4 +1,4 @@
-// server.js – RTS Entry Point with CTOS Cognitive Engine (No Legacy)
+// server.js – RTS Entry Point with CTOS Cognitive Engine (Full Integration)
 
 require('dotenv').config();
 
@@ -16,10 +16,13 @@ const User = require('./models/User');
 
 // ---------- CTOS COGNITIVE MODULES ----------
 const priceBuffer = require('./core/data/priceBuffer');
-const candleStore = require('./core/data/candleStore'); // wrapper for builder + history
+const candleStore = require('./core/data/candleStore'); // wrapper
 const marketStateCache = require('./core/data/marketStateCache');
 
-// Market Awareness Engine (runs per tick)
+// Bootstrapper
+const candleBootstrapper = require('./core/data/candleBootstrapper');
+
+// Market Awareness
 const awarenessEngine = require('./core/awareness/engine');
 
 // Deep Intelligence
@@ -29,8 +32,21 @@ const deepRegime = require('./core/intelligence/deep/regime');
 const hypothesisEngine = require('./core/research/engine');
 const knowledgeStore = require('./core/research/knowledgeStore');
 
-// (We do NOT import any old fusion, learner, or analytics modules)
+// Decision Engine
+const decisionEngine = require('./core/decision/engine');
 
+// Multi-timeframe Intelligence
+const IntelligenceFusion = require('./core/intelligence/fusion');
+const M1Analyzer = require('./core/intelligence/multiTimeframe/m1');
+const M5Analyzer = require('./core/intelligence/multiTimeframe/m5');
+const M15Analyzer = require('./core/intelligence/multiTimeframe/m15');
+const H1Analyzer = require('./core/intelligence/multiTimeframe/h1');
+const H4Analyzer = require('./core/intelligence/multiTimeframe/h4');
+
+// Session
+const session = require('./core/intelligence/session');
+
+// Event bus & logger
 const eventBus = require('./infrastructure/eventBus');
 const logger = require('./infrastructure/logger') || console;
 
@@ -227,7 +243,7 @@ deepRegime.on('regime', (regime) => {
   broadcast('regime', regime);
 });
 
-// 3. Hypothesis Engine events (research layer)
+// 3. Hypothesis Engine events
 hypothesisEngine.on('hypothesisCreated', (hypothesis) => {
   broadcast('hypothesisCreated', hypothesis);
 });
@@ -235,17 +251,27 @@ hypothesisEngine.on('hypothesisResolved', (hypothesis) => {
   broadcast('hypothesisResolved', hypothesis);
 });
 
-// 4. Knowledge Store (for dashboard "Current Thinking")
+// 4. Knowledge Store
 knowledgeStore.on('knowledgeUpdated', (knowledge) => {
   broadcast('knowledge', knowledge);
 });
 
-// 5. Trade closed events (for dashboard P&L updates)
+// 5. Decision Engine
+decisionEngine.on('decision', (decision) => {
+  broadcast('decision', decision);
+});
+
+// 6. Intelligence Fusion
+IntelligenceFusion.on('fusion', (fusion) => {
+  broadcast('intelligenceFusion', fusion);
+});
+
+// 7. Trade closed events
 eventBus.on('trade.closed', (data) => {
   broadcast('tradeClosed', data);
 });
 
-// 6. Account updates (for balance/equity)
+// 8. Account updates
 eventBus.on('account.fetched', (account) => {
   broadcast('account', account);
 });
@@ -253,14 +279,41 @@ eventBus.on('account.fetched', (account) => {
 // ---------- Start CTOS Cognitive Engines ----------
 async function startCognitiveEngines() {
   try {
+    console.log('[CTOS] Starting cognitive engines...');
+
+    // 1. Bootstrap historical candles
+    await candleBootstrapper.bootstrap();
+    console.log('[CTOS] Candle bootstrapping complete.');
+
+    // 2. Initialize multi-timeframe analyzers for all symbols
+    const symbols = ['EUR_USD', 'GBP_USD', 'USD_JPY', 'AUD_USD'];
+    const analyzerClasses = {
+      M1: M1Analyzer,
+      M5: M5Analyzer,
+      M15: M15Analyzer,
+      H1: H1Analyzer,
+      H4: H4Analyzer,
+    };
+
+    for (const symbol of symbols) {
+      for (const [tf, AnalyzerClass] of Object.entries(analyzerClasses)) {
+        const analyzer = new AnalyzerClass(symbol);
+        IntelligenceFusion.registerAnalyzer(tf, analyzer);
+        // Trigger an initial analysis (will fetch history)
+        analyzer.analyze().catch(err => logger.warn(`[CTOS] Initial analysis failed for ${symbol}:${tf}`, err.message));
+      }
+    }
+
+    console.log('[CTOS] Multi-timeframe analyzers initialized.');
+
+    // 3. The rest of the modules are self-starting (awareness, deepRegime, hypothesis, decision)
     console.log('[CTOS] All cognitive modules loaded and running.');
     console.log('[CTOS] Market Awareness Engine: active');
     console.log('[CTOS] Deep Regime Detector: active');
     console.log('[CTOS] Hypothesis Engine: active');
     console.log('[CTOS] Knowledge Store: active');
-
-    // Optionally load initial knowledge into cache (if any)
-    // await knowledgeStore.loadHistory();
+    console.log('[CTOS] Decision Engine: active');
+    console.log('[CTOS] Intelligence Fusion: active');
 
     console.log('[CTOS] All cognitive modules initialized successfully.');
   } catch (err) {
