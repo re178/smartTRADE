@@ -11,7 +11,7 @@ const Mt5Price = require('../../models/Mt5Price');
 const Mt5Heartbeat = require('../../models/Mt5Heartbeat');
 const Trade = require('../../models/Trade');
 
-// ---- ADD THIS LINE ----
+// ---- COGNITIVE: import priceBuffer ----
 const priceBuffer = require('../../core/data/priceBuffer');
 
 // ---------- Authentication ----------
@@ -25,6 +25,7 @@ const authenticate = (req, res, next) => {
   res.status(401).json({ error: 'Unauthorized: Invalid or missing API key' });
 };
 
+// Apply authentication to all routes
 router.use(authenticate);
 
 // ---------- Utility ----------
@@ -253,8 +254,10 @@ router.post('/price', async (req, res) => {
       return res.status(400).json({ error: 'Missing symbol' });
     }
 
-    // ---- CRITICAL: Forward tick to cognitive engine ----
-    priceBuffer.update(priceData.symbol, priceData.bid, priceData.ask, priceData.time);
+    // ---- Forward tick to cognitive engine ----
+    // Convert time to milliseconds if in seconds
+    const timeMs = priceData.time ? Number(priceData.time) * 1000 : Date.now();
+    priceBuffer.update(priceData.symbol, priceData.bid, priceData.ask, timeMs);
 
     // Save to database (existing logic)
     await Mt5Price.findOneAndUpdate(
@@ -263,7 +266,7 @@ router.post('/price', async (req, res) => {
       { upsert: true, new: true }
     );
 
-    logger.debug(`[MT5] Price updated for ${priceData.symbol} (forwarded to cognitive engine)`);
+    logger.debug(`[MT5] Price updated for ${priceData.symbol} (time: ${timeMs})`);
     res.status(201).json({ status: 'accepted' });
   } catch (err) {
     logger.error('[MT5] Price error:', err.message);
@@ -331,6 +334,40 @@ router.post('/sync', async (req, res) => {
   const { login, status } = req.body;
   logger.info(`[MT5] Sync received: login=${login}, status=${status}`);
   res.status(201).json({ status: 'synced' });
+});
+
+// ---------- NEW: Historical candle ingestion (for EA bootstrap) ----------
+router.post('/historical', async (req, res) => {
+  try {
+    const { symbol, timeframe, candles } = req.body;
+    if (!symbol || !timeframe || !candles || !Array.isArray(candles)) {
+      return res.status(400).json({ error: 'Missing required fields (symbol, timeframe, candles array)' });
+    }
+
+    const candleHistory = require('../../core/data/candleHistory');
+    let stored = 0;
+    for (const c of candles) {
+      // Convert time to milliseconds if in seconds
+      const timeMs = (c.time && c.time < 1e12) ? c.time * 1000 : c.time;
+      await candleHistory.store({
+        symbol,
+        timeframe,
+        time: timeMs,
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        volume: c.tick_volume || 0,
+        source: 'broker',
+      });
+      stored++;
+    }
+    logger.info(`[MT5] Stored ${stored} historical candles for ${symbol}:${timeframe}`);
+    res.status(201).json({ status: 'accepted', stored });
+  } catch (err) {
+    logger.error('[MT5] Historical ingest error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 module.exports = router;
