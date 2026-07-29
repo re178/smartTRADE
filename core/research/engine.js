@@ -1,12 +1,13 @@
 // core/research/engine.js
 // Evidence & Hypothesis Engine – the Research Layer.
 // Observes market events, formulates hypotheses, tracks outcomes, builds knowledge.
+// Now queries Knowledge Store to adjust initial confidence (Proposal 5).
 
 const EventEmitter = require('events');
 const marketStateCache = require('../data/marketStateCache');
 const deepRegime = require('../intelligence/deep/regime');
 const awarenessEngine = require('../awareness/engine');
-const knowledgeStore = require('./knowledgeStore'); // singleton instance
+const knowledgeStore = require('./knowledgeStore'); // Knowledge base
 const logger = require('../../infrastructure/logger') || console;
 
 // Hypothesis types
@@ -29,7 +30,7 @@ class HypothesisEngine extends EventEmitter {
     this._activeHypotheses = new Map();
     this._hypothesisCounter = 0;
 
-    // ---- Subscribe to market events ----
+    // Subscribe to market events
     awarenessEngine.on('marketAwareness', (data) => {
       this._onAwareness(data);
     });
@@ -45,10 +46,10 @@ class HypothesisEngine extends EventEmitter {
           symbol: candidate.symbol,
           regime: candidate.conditions?.regime || 'unknown',
           indicator: candidate.type,
-          valueRange: 'any', // can be refined later
+          valueRange: 'any',
           outcome: candidate.outcome.confirmed ? 'success' : 'failure',
           confidence: candidate.outcome.confidence / 100,
-          session: 'all', // could be enriched from market state
+          session: 'all',
           volatilityRegime: 'all',
         });
       } catch (err) {
@@ -56,7 +57,7 @@ class HypothesisEngine extends EventEmitter {
       }
     });
 
-    // ---- Periodic evaluation of active hypotheses ----
+    // Periodic evaluation of active hypotheses
     setInterval(() => this._evaluateHypotheses(), 5000);
 
     logger.info('[HypothesisEngine] Initialized.');
@@ -124,7 +125,7 @@ class HypothesisEngine extends EventEmitter {
       });
     }
 
-    // If regime changes to breakout, hypothesise breakout (or false)
+    // If regime changes to breakout, hypothesise breakout
     if (code === 'BREAKOUT') {
       this._createHypothesis(symbol, HYPOTHESIS_TYPES.BREAKOUT, {
         regime: code,
@@ -136,8 +137,30 @@ class HypothesisEngine extends EventEmitter {
 
   /**
    * Create a new hypothesis.
+   * Now queries Knowledge Store to adjust initial confidence (Proposal 5).
    */
-  _createHypothesis(symbol, type, conditions) {
+  async _createHypothesis(symbol, type, conditions) {
+    // ---- Query knowledge to adjust initial confidence ----
+    let knowledgeConfidence = 0.5;
+    let knowledgeReason = '';
+    try {
+      const regime = conditions.regime || 'unknown';
+      const value = conditions.velocity || 0;
+      const knowledge = await knowledgeStore.getKnowledge(symbol, regime, type, value);
+      if (knowledge) {
+        knowledgeConfidence = knowledge.confidence || 0.5;
+        knowledgeReason = `Knowledge: ${knowledge.indicator} ${knowledge.valueRange} → ${knowledge.outcome} (${(knowledge.confidence * 100).toFixed(0)}%)`;
+        logger.debug(`[Hypothesis] Knowledge applied for ${symbol}: ${knowledgeReason}`);
+      }
+    } catch (err) {
+      logger.warn('[Hypothesis] Knowledge query failed:', err.message);
+    }
+
+    // Compute initial confidence: base 50 + knowledge adjustment (range 0-100)
+    const baseConfidence = 50;
+    const knowledgeAdjust = (knowledgeConfidence - 0.5) * 40; // -20 to +20
+    const initialConfidence = Math.min(100, Math.max(0, baseConfidence + knowledgeAdjust));
+
     const id = ++this._hypothesisCounter;
     const hypothesis = {
       id,
@@ -148,9 +171,14 @@ class HypothesisEngine extends EventEmitter {
       createdAt: Date.now(),
       expiresAt: Date.now() + this._getExpiry(type),
       evidence: [],
+      knowledgeConfidence,
+      knowledgeReason,
+      initialConfidence,
+      confidence: initialConfidence, // current confidence (will update)
     };
+
     this._activeHypotheses.set(id, hypothesis);
-    logger.info(`[Hypothesis] Created #${id} (${type}) for ${symbol}`);
+    logger.info(`[Hypothesis] Created #${id} (${type}) for ${symbol} (init conf: ${initialConfidence}%)`);
     this.emit('hypothesisCreated', hypothesis);
 
     // Schedule auto‑expiry
@@ -321,7 +349,7 @@ class HypothesisEngine extends EventEmitter {
     // Emit event for knowledge store / dashboard
     this.emit('hypothesisResolved', hypothesis);
 
-    // Remove from active (or keep for history)
+    // Remove from active
     this._activeHypotheses.delete(id);
 
     // Store in knowledge base if confidence is high
