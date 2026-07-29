@@ -1,11 +1,10 @@
 // core/data/candleHistory.js
-// Manages historical candles with TTL and count‑based pruning.
-// Uses MongoDB with TTL index and count cap per symbol/timeframe.
+// Manages historical candles with TTL, count‑based pruning, and source tracking.
 
 const mongoose = require('mongoose');
 const logger = require('../../infrastructure/logger') || console;
 
-// Schema for historical candles (time‑series optimized)
+// ----- Schema with source field -----
 const CandleSchema = new mongoose.Schema(
   {
     symbol: { type: String, required: true, index: true },
@@ -16,6 +15,7 @@ const CandleSchema = new mongoose.Schema(
     low: Number,
     close: Number,
     volume: Number,
+    source: { type: String, enum: ['broker', 'live'], default: 'live' }, // NEW: data origin
   },
   { timeseries: { timeField: 'time', metaField: 'symbol', granularity: 'minutes' } }
 );
@@ -38,12 +38,12 @@ class CandleHistory {
   }
 
   /**
-   * Store a closed candle (called by CandleBuilder on close).
+   * Store a closed candle (called by CandleBuilder on close or by bootstrapper).
+   * @param {Object} candle - { symbol, timeframe, time, open, high, low, close, volume, source }
    */
   async store(candle) {
     try {
-      // Save to MongoDB
-      await CandleModel.create({
+      const doc = {
         symbol: candle.symbol,
         timeframe: candle.timeframe,
         time: new Date(candle.time),
@@ -52,10 +52,10 @@ class CandleHistory {
         low: candle.low,
         close: candle.close,
         volume: candle.volume || 0,
-      });
-      // Update in‑memory cache
+        source: candle.source || 'live', // 'broker' or 'live'
+      };
+      await CandleModel.create(doc);
       this._addToCache(candle);
-      // Prune if exceed limit
       await this._prune(candle.symbol, candle.timeframe);
     } catch (err) {
       logger.error('[CandleHistory] Store error:', err.message);
@@ -67,21 +67,18 @@ class CandleHistory {
    * Returns array of candles (oldest first), up to `limit`.
    */
   async getHistory(symbol, timeframe, limit = 500) {
-    // 1. Check cache first
     const cacheKey = `${symbol}:${timeframe}`;
     const cached = this._cache.get(cacheKey);
     if (cached && cached.length >= limit) {
       return cached.slice(-limit);
     }
 
-    // 2. Query MongoDB
     const docs = await CandleModel.find({ symbol, timeframe })
       .sort({ time: -1 })
       .limit(limit)
       .lean();
 
     if (docs && docs.length > 0) {
-      // Convert to standard format (time as milliseconds)
       const candles = docs.map(d => ({
         time: d.time.getTime(),
         open: d.open,
@@ -89,8 +86,8 @@ class CandleHistory {
         low: d.low,
         close: d.close,
         volume: d.volume,
+        source: d.source || 'live',
       }));
-      // Update cache
       this._cache.set(cacheKey, candles);
       return candles.reverse(); // oldest first
     }
@@ -104,7 +101,6 @@ class CandleHistory {
     const count = await CandleModel.countDocuments({ symbol, timeframe });
     if (count > MAX_CANDLES_PER_COMBO) {
       const excess = count - MAX_CANDLES_PER_COMBO;
-      // Find the oldest excess candles and delete them
       const oldest = await CandleModel.find({ symbol, timeframe })
         .sort({ time: 1 })
         .limit(excess)
@@ -131,9 +127,9 @@ class CandleHistory {
       low: candle.low,
       close: candle.close,
       volume: candle.volume,
+      source: candle.source || 'live',
     });
-    // Keep only the last 1000
-    if (arr.length > 1000) arr.shift();
+    if (arr.length > this._cacheSize) arr.shift();
   }
 
   /**
