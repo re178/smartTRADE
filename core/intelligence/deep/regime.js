@@ -1,9 +1,10 @@
 // core/intelligence/deep/regime.js
 // Deep Regime Detection – uses deep market state to classify regimes.
-// Listens to candle closes, emits 'regime' events with confidence.
+// Listens to candle closes, emits 'regime' events with confidence, reason, and session context.
 
 const candleStore = require('../../data/candleStore');
 const deepMarketState = require('./marketState');
+const session = require('../session');
 const logger = require('../../../infrastructure/logger') || console;
 
 // Regime definitions (matching the master prompt)
@@ -19,7 +20,6 @@ const REGIME_TYPES = {
   NEUTRAL: 'Neutral / Mixed',
 };
 
-// Ideal strategies per regime
 const IDEAL_STRATEGIES = {
   STRONG_TREND_BULL: ['SMA', 'EMA', 'SuperTrend', 'Ichimoku'],
   STRONG_TREND_BEAR: ['SMA', 'EMA', 'SuperTrend', 'Ichimoku'],
@@ -39,21 +39,27 @@ class DeepRegimeDetector {
       this._onCandleClose(candle);
     });
 
+    // Also listen to developing state from deepMarketState (incremental)
+    deepMarketState.on('stateDeveloping', (state) => {
+      // We can emit a 'regimeDeveloping' event if needed.
+      // For now, we'll just use it internally.
+    });
+
+    // Store latest regime per symbol
+    this._latestRegime = {};
+
     logger.info('[DeepRegimeDetector] Initialized, listening to candle closes.');
   }
 
   async _onCandleClose(candle) {
     const { symbol, timeframe } = candle;
 
-    // Only process primary timeframes (e.g., M5, H1)
-    // We could filter, but we'll process all to keep flexibility.
-    // However, to avoid duplicate work, we'll only process if it's a timeframe we care about.
-    // We'll use a configurable list.
+    // Only process primary timeframes (M5, M15, H1)
     const supportedTimeframes = ['M5', 'M15', 'H1'];
     if (!supportedTimeframes.includes(timeframe)) return;
 
     try {
-      // Get the deep market state
+      // Get the deep market state (full, confirmed)
       const state = await deepMarketState.compute(symbol, timeframe, 200);
       if (!state) {
         logger.warn(`[DeepRegimeDetector] No deep state for ${symbol}:${timeframe}`);
@@ -63,19 +69,27 @@ class DeepRegimeDetector {
       // Classify the regime
       const regime = this._classifyRegime(state);
 
-      // Add reasoning and confidence
+      // Calculate confidence
       regime.confidence = this._calculateConfidence(state, regime);
 
+      // Add reasoning (human‑readable)
+      regime.reason = this._buildReason(state, regime);
+
+      // Add session context
+      regime.session = state.session || { name: 'unknown', liquidityMultiplier: 1 };
+
       // Add awareness context (if available)
-      const awareness = state.awareness;
-      if (awareness) {
+      if (state.awareness) {
         regime.awareness = {
-          liquidity: awareness.liquidity,
-          velocity: awareness.velocity,
-          acceleration: awareness.acceleration,
-          unusualEvents: awareness.unusualEvents || [],
+          liquidity: state.awareness.liquidity,
+          velocity: state.awareness.velocity,
+          acceleration: state.awareness.acceleration,
+          unusualEvents: state.awareness.unusualEvents || [],
         };
       }
+
+      // Store latest
+      this._latestRegime[symbol] = regime;
 
       // Emit regime event
       this.emit('regime', {
@@ -93,11 +107,12 @@ class DeepRegimeDetector {
 
   /**
    * Classify the regime from the deep state.
+   * @param {Object} state - Deep market state (from deepMarketState.compute)
+   * @returns {Object} Regime object with code, name, family, idealStrategies, riskMultiplier, maxPositions, description.
    */
   _classifyRegime(state) {
     const { trend, momentum, volatility, structure, summary } = state;
 
-    // Extract key metrics
     const adx = trend.strength;
     const rsi = momentum.rsi;
     const bbWidth = volatility.bbWidth;
@@ -129,13 +144,11 @@ class DeepRegimeDetector {
           description: 'Strong bearish trend with high ADX.',
         };
       }
-      // If ADX > 30 but direction unclear, fallback to weak trend
+      // Fallback if direction unclear (should not happen)
     }
 
     // 2. Breakout
     if ((isAtSupport || isAtResistance) && bbWidth > 0.1) {
-      // Check if price just broke a level (we need previous state, but we'll approximate)
-      // For simplicity, assume breakout if at extreme and bbWidth expanding
       return {
         code: 'BREAKOUT',
         name: REGIME_TYPES.BREAKOUT,
@@ -230,7 +243,7 @@ class DeepRegimeDetector {
   _calculateConfidence(state, regime) {
     let confidence = 50; // base
 
-    const { trend, momentum, volatility, structure } = state;
+    const { trend, momentum, volatility, structure, session } = state;
     const adx = trend.strength;
     const rsi = momentum.rsi;
     const bbWidth = volatility.bbWidth;
@@ -255,7 +268,7 @@ class DeepRegimeDetector {
         confidence = 65 + (bbWidth * 10);
         break;
       case 'REVERSAL':
-        const rsiExtreme = Math.abs(rsi - 50) / 50; // 0-1
+        const rsiExtreme = Math.abs(rsi - 50) / 50;
         confidence = 60 + rsiExtreme * 20;
         break;
       case 'WEAK_TREND':
@@ -263,6 +276,13 @@ class DeepRegimeDetector {
         break;
       default:
         confidence = 50;
+    }
+
+    // Adjust for session liquidity
+    if (session && session.liquidityMultiplier) {
+      const liqMult = session.liquidityMultiplier;
+      if (liqMult > 1.2) confidence += 5;
+      else if (liqMult < 0.8) confidence -= 5;
     }
 
     // Adjust for awareness (liquidity, velocity)
@@ -284,6 +304,43 @@ class DeepRegimeDetector {
 
     // Cap at 100
     return Math.min(100, Math.max(0, confidence));
+  }
+
+  /**
+   * Build a human‑readable reason for the regime classification.
+   */
+  _buildReason(state, regime) {
+    const parts = [];
+    const { trend, momentum, volatility, structure, session } = state;
+
+    // Trend
+    parts.push(`ADX: ${trend.strength.toFixed(1)} (${trend.direction})`);
+
+    // Momentum
+    if (momentum.rsi) parts.push(`RSI: ${momentum.rsi.toFixed(1)}`);
+    if (momentum.macdHist !== undefined) parts.push(`MACD: ${momentum.macdHist.toFixed(4)}`);
+
+    // Volatility
+    if (volatility.regime) parts.push(`Vol: ${volatility.regime}`);
+
+    // Structure
+    if (structure.isAtSupport) parts.push('At support');
+    if (structure.isAtResistance) parts.push('At resistance');
+
+    // Session
+    if (session && session.name) parts.push(`Session: ${session.name}`);
+
+    // Regime description
+    parts.push(`=> ${regime.name}`);
+
+    return parts.join(' | ');
+  }
+
+  /**
+   * Get the latest regime for a symbol.
+   */
+  getLatestRegime(symbol) {
+    return this._latestRegime[symbol] || null;
   }
 }
 
