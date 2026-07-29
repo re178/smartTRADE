@@ -1,4 +1,4 @@
-// server.js – RTS Entry Point with CTOS Cognitive Engine (Full Integration)
+// server.js – RTS Entry Point with CTOS Cognitive Engine (Broker Bootstrap)
 
 require('dotenv').config();
 
@@ -18,9 +18,6 @@ const User = require('./models/User');
 const priceBuffer = require('./core/data/priceBuffer');
 const candleStore = require('./core/data/candleStore'); // wrapper
 const marketStateCache = require('./core/data/marketStateCache');
-
-// Bootstrapper – DISABLED (EA now pushes historical candles)
-// const candleBootstrapper = require('./core/data/candleBootstrapper');
 
 // Market Awareness
 const awarenessEngine = require('./core/awareness/engine');
@@ -45,6 +42,9 @@ const H4Analyzer = require('./core/intelligence/multiTimeframe/h4');
 
 // Session
 const session = require('./core/intelligence/session');
+
+// Broker factory for bootstrapping
+const { getBroker } = require('./core/execution/brokerFactory');
 
 // Event bus & logger
 const eventBus = require('./infrastructure/eventBus');
@@ -281,12 +281,41 @@ async function startCognitiveEngines() {
   try {
     console.log('[CTOS] Starting cognitive engines...');
 
-    // ---- Bootstrapping DISABLED (EA now pushes historical candles via /historical) ----
-    // await candleBootstrapper.bootstrap();
-    // console.log('[CTOS] Candle bootstrapping complete.');
+    // ---- Historical Bootstrap using broker ----
+    const broker = getBroker('mt5');
+    const symbols = ['EUR_USD', 'GBP_USD', 'USD_JPY', 'AUD_USD'];
+    const timeframes = ['M5', 'M15', 'H1'];
+    let totalLoaded = 0;
+    for (const symbol of symbols) {
+      for (const tf of timeframes) {
+        try {
+          const candles = await broker.getHistoricalCandles(symbol, 200, tf);
+          if (candles && candles.length > 0) {
+            const candleHistory = require('./core/data/candleHistory');
+            for (const c of candles) {
+              await candleHistory.store({
+                symbol,
+                timeframe: tf,
+                time: c.time * 1000,
+                open: c.open,
+                high: c.high,
+                low: c.low,
+                close: c.close,
+                volume: c.volume || 0,
+                source: 'broker',
+              });
+            }
+            totalLoaded += candles.length;
+            console.log(`[CTOS] Loaded ${candles.length} candles for ${symbol}:${tf}`);
+          }
+        } catch (err) {
+          console.warn(`[CTOS] Failed to load ${symbol}:${tf} via broker:`, err.message);
+        }
+      }
+    }
+    console.log(`[CTOS] Historical bootstrap complete. Loaded ${totalLoaded} candles.`);
 
     // ---- Initialize multi-timeframe analyzers for all symbols ----
-    const symbols = ['EUR_USD', 'GBP_USD', 'USD_JPY', 'AUD_USD'];
     const analyzerClasses = {
       M1: M1Analyzer,
       M5: M5Analyzer,
