@@ -10,7 +10,7 @@ class MT5Broker extends EventEmitter {
     super();
     this.renderUrl = config.renderUrl || process.env.RENDER_URL || 'https://tradermarketopen.onrender.com';
     this.apiKey = config.apiKey || process.env.MT5_API_KEY || '';
-    this.pollInterval = config.pollInterval || 500; // 500ms for faster result polling
+    this.pollInterval = config.pollInterval || 500;
     this._state = 'DISCONNECTED';
     this._pendingCommands = new Map();
     this._pollingTimer = null;
@@ -64,11 +64,10 @@ class MT5Broker extends EventEmitter {
     }
   }
 
-  // ---------- Connection (tolerant – does not fail on missing account status) ----------
+  // ---------- Connection (tolerant) ----------
   async connect() {
     if (this._state === 'READY') return;
     try {
-      // Try to get account status, but don't fail if not available yet
       let accountAvailable = false;
       try {
         const statusResp = await axios.get(`${this.renderUrl}/api/mt5/account/status`, {
@@ -85,7 +84,6 @@ class MT5Broker extends EventEmitter {
         } else {
           logger.warn('[MT5Broker] Account status check failed:', err.message);
         }
-        // Continue – bridge considered reachable even without account yet
       }
 
       this._state = 'READY';
@@ -296,6 +294,36 @@ class MT5Broker extends EventEmitter {
     }
   }
 
+  // ---------- NEW: Get Historical Candles (for bootstrapping) ----------
+  /**
+   * Get historical candles from the MT5 bridge backend.
+   * @param {string} symbol - e.g., 'EUR_USD'
+   * @param {number} count - number of candles
+   * @param {string} timeframe - e.g., 'M5', 'H1'
+   * @returns {Promise<Array>} Array of candles { time, open, high, low, close, volume }
+   */
+  async getHistoricalCandles(symbol, count = 200, timeframe = 'M5') {
+    await this._ensureReady();
+    try {
+      const response = await axios.get(
+        `${this.renderUrl}/api/mt5/candles`,
+        {
+          params: { symbol, count, timeframe },
+          headers: this._getHeaders(),
+          timeout: 15000,
+        }
+      );
+      const data = response.data;
+      if (Array.isArray(data)) return data;
+      if (data && Array.isArray(data.candles)) return data.candles;
+      if (data && Array.isArray(data.data)) return data.data;
+      return [];
+    } catch (err) {
+      logger.warn(`[MT5Broker] getHistoricalCandles failed for ${symbol}:`, err.message);
+      return [];
+    }
+  }
+
   // ---------- Wait for Command Result (Polling) ----------
   _waitForResult(commandId, timeoutMs = 30000) {
     return new Promise((resolve, reject) => {
@@ -349,7 +377,7 @@ class MT5Broker extends EventEmitter {
     this._pendingCommands.clear();
   }
 
-  // ---------- Get Account (with retry and createdTime) ----------
+  // ---------- Get Account (with retry) ----------
   async getAccount() {
     await this._ensureReady();
     const maxAttempts = 5;
@@ -382,7 +410,6 @@ class MT5Broker extends EventEmitter {
             company: data.company || '',
             accountName: data.accountName || '',
             server: data.server || '',
-            // ---- FIX: add createdTime for dashboard ----
             createdTime: data.createdAt || data.updatedAt || data.timestamp || null,
             updatedTime: data.updatedAt || data.timestamp || null,
           };
