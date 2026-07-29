@@ -336,7 +336,37 @@ router.post('/sync', async (req, res) => {
   res.status(201).json({ status: 'synced' });
 });
 
-// ---------- NEW: Historical candle ingestion (for EA bootstrap) ----------
+// ---------- NEW: GET /api/mt5/candles (for broker historical fetch) ----------
+router.get('/candles', async (req, res) => {
+  try {
+    const { symbol, count = 200, timeframe = 'M5' } = req.query;
+    if (!symbol) {
+      return res.status(400).json({ error: 'symbol query param required' });
+    }
+
+    const candleHistory = require('../../core/data/candleHistory');
+    const candles = await candleHistory.getHistory(symbol, timeframe, parseInt(count));
+    if (candles && candles.length > 0) {
+      // Format as expected by the broker (and the rest of the system)
+      const formatted = candles.map(c => ({
+        time: Math.floor(new Date(c.time).getTime() / 1000),
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        volume: c.volume || 0,
+      }));
+      return res.json(formatted);
+    }
+    // If no candles, return empty array (not 404)
+    res.json([]);
+  } catch (err) {
+    logger.error('[MT5] GET /candles error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- Historical candle ingestion (for EA bootstrap) ----------
 router.post('/historical', async (req, res) => {
   try {
     const { symbol, timeframe, candles } = req.body;
