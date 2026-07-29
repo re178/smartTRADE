@@ -19,8 +19,8 @@ const priceBuffer = require('./core/data/priceBuffer');
 const candleStore = require('./core/data/candleStore'); // wrapper
 const marketStateCache = require('./core/data/marketStateCache');
 
-// Bootstrapper
-const candleBootstrapper = require('./core/data/candleBootstrapper');
+// Bootstrapper – DISABLED (EA now pushes historical candles)
+// const candleBootstrapper = require('./core/data/candleBootstrapper');
 
 // Market Awareness
 const awarenessEngine = require('./core/awareness/engine');
@@ -281,11 +281,11 @@ async function startCognitiveEngines() {
   try {
     console.log('[CTOS] Starting cognitive engines...');
 
-    // 1. Bootstrap historical candles
-    await candleBootstrapper.bootstrap();
-    console.log('[CTOS] Candle bootstrapping complete.');
+    // ---- Bootstrapping DISABLED (EA now pushes historical candles via /historical) ----
+    // await candleBootstrapper.bootstrap();
+    // console.log('[CTOS] Candle bootstrapping complete.');
 
-    // 2. Initialize multi-timeframe analyzers for all symbols
+    // ---- Initialize multi-timeframe analyzers for all symbols ----
     const symbols = ['EUR_USD', 'GBP_USD', 'USD_JPY', 'AUD_USD'];
     const analyzerClasses = {
       M1: M1Analyzer,
@@ -299,14 +299,14 @@ async function startCognitiveEngines() {
       for (const [tf, AnalyzerClass] of Object.entries(analyzerClasses)) {
         const analyzer = new AnalyzerClass(symbol);
         IntelligenceFusion.registerAnalyzer(tf, analyzer);
-        // Trigger an initial analysis (will fetch history)
+        // Trigger initial analysis (will fetch history)
         analyzer.analyze().catch(err => logger.warn(`[CTOS] Initial analysis failed for ${symbol}:${tf}`, err.message));
       }
     }
 
     console.log('[CTOS] Multi-timeframe analyzers initialized.');
 
-    // 3. The rest of the modules are self-starting (awareness, deepRegime, hypothesis, decision)
+    // ---- The rest of the modules are self-starting (awareness, deepRegime, hypothesis, decision) ----
     console.log('[CTOS] All cognitive modules loaded and running.');
     console.log('[CTOS] Market Awareness Engine: active');
     console.log('[CTOS] Deep Regime Detector: active');
