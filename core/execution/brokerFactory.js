@@ -93,17 +93,26 @@ function getBroker(product) {
       logger.info('[BrokerFactory] Using existing MT5Broker instance');
     }
   } 
+  // ---------- DERIV BROKER DISABLED TEMPORARILY ----------
+  // To re-enable, uncomment the block below.
+  // else if (key.startsWith('deriv_')) {
+  //   const internalType = key.replace('deriv_', '');
+  //   if (!['cfd', 'multiplier', 'basic'].includes(internalType)) {
+  //     throw new Error(`Invalid Deriv product type: ${internalType}`);
+  //   }
+  //   logger.info(`[BrokerFactory] Creating DerivBroker with productType: ${internalType}`);
+  //   const config = getDerivConfig(internalType);
+  //   // DerivBroker is exported as a class (named export) – import it
+  //   const { DerivBroker } = require('./broker');
+  //   broker = new DerivBroker(config);
+  // } 
   else if (key.startsWith('deriv_')) {
-    const internalType = key.replace('deriv_', '');
-    if (!['cfd', 'multiplier', 'basic'].includes(internalType)) {
-      throw new Error(`Invalid Deriv product type: ${internalType}`);
-    }
-    logger.info(`[BrokerFactory] Creating DerivBroker with productType: ${internalType}`);
-    const config = getDerivConfig(internalType);
-    // DerivBroker is exported as a class (named export) – import it
-    const { DerivBroker } = require('./broker');
-    broker = new DerivBroker(config);
-  } 
+    // Deriv is currently disabled to avoid connection crashes.
+    throw new Error(
+      `Deriv broker is temporarily disabled. Only 'mt5' is available at this time. ` +
+      `To re-enable, uncomment the Deriv block in brokerFactory.js and restart.`
+    );
+  }
   else {
     throw new Error(`Unsupported product: ${product}`);
   }
