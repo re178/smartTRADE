@@ -1,6 +1,6 @@
 // core/decision/engine.js
 // Decision Engine – synthesizes CTOS evidence into a final trading signal.
-// Added debug logs to trace regime receipt and decision generation.
+// Updated to read nested state structure from DeepMarketState.
 
 const EventEmitter = require('events');
 const marketStateCache = require('../data/marketStateCache');
@@ -22,7 +22,6 @@ class DecisionEngine extends EventEmitter {
     this._lastDecision = {};
     this._timer = null;
 
-    // ---- DEBUG: log initialization ----
     console.log('🔧 DecisionEngine: constructor – listening to regime events');
 
     // Listen to regime events
@@ -93,35 +92,38 @@ class DecisionEngine extends EventEmitter {
     // 2. Get regime (from last regime event)
     const regime = deepRegime.getLatestRegime(symbol) || { code: 'NEUTRAL', confidence: 50 };
 
+    // ---- Extract values with fallbacks for nested structure ----
+    const currentPrice = state.price?.current || state.mid || 0;
+    const atr = state.volatility?.atr || state.atr || 0.001;
+    const velocity = state.awareness?.velocity || state.velocity || 0;
+    const liquidity = state.awareness?.liquidity || state.liquidity || 0.5;
+    const trendDirection = state.trend || 'neutral'; // state.trend is a string
+
     // 3. Compute BUY and SELL scores
     let buyScore = 0, sellScore = 0;
 
     // 3a. Regime bias
     if (regime.code === 'STRONG_TREND_BULL' || regime.code === 'WEAK_TREND') {
-      const direction = state.trend || 'neutral';
-      if (direction === 'bullish') buyScore += 30 * (regime.confidence / 100);
-      else if (direction === 'bearish') sellScore += 30 * (regime.confidence / 100);
+      if (trendDirection === 'bullish') buyScore += 30 * (regime.confidence / 100);
+      else if (trendDirection === 'bearish') sellScore += 30 * (regime.confidence / 100);
     } else if (regime.code === 'STRONG_TREND_BEAR') {
       sellScore += 30 * (regime.confidence / 100);
     } else if (regime.code === 'REVERSAL') {
-      // FIX: state.trend is a string, not an object with .direction
-      const trendDir = state.trend || 'neutral';
-      if (trendDir === 'bullish') sellScore += 20;
-      else if (trendDir === 'bearish') buyScore += 20;
+      if (trendDirection === 'bullish') sellScore += 20;
+      else if (trendDirection === 'bearish') buyScore += 20;
     } else if (regime.code === 'BREAKOUT') {
-      if (state.velocity > 0.0001) buyScore += 25;
-      else if (state.velocity < -0.0001) sellScore += 25;
+      if (velocity > 0.0001) buyScore += 25;
+      else if (velocity < -0.0001) sellScore += 25;
     }
 
-    // 3b. Awareness signals
-    const absVel = Math.abs(state.velocity || 0);
+    // 3b. Awareness signals (Velocity)
+    const absVel = Math.abs(velocity);
     const velScore = Math.min(20, absVel / 0.0001 * 10);
-    if (state.velocity > 0) buyScore += velScore;
-    else if (state.velocity < 0) sellScore += velScore;
+    if (velocity > 0) buyScore += velScore;
+    else if (velocity < 0) sellScore += velScore;
 
     // 3c. Liquidity
-    const liq = state.liquidity || 0.5;
-    if (liq > 0.6) {
+    if (liquidity > 0.6) {
       buyScore += 5;
       sellScore += 5;
     }
@@ -129,7 +131,6 @@ class DecisionEngine extends EventEmitter {
     // 4. Determine decision
     let decision = 'NO_TRADE';
     let confidence = 0;
-    const totalScore = Math.abs(buyScore - sellScore);
     if (buyScore > sellScore && buyScore > 20) {
       decision = 'BUY';
       confidence = Math.min(90, 50 + (buyScore - sellScore) / (buyScore + sellScore + 0.001) * 40);
@@ -144,8 +145,6 @@ class DecisionEngine extends EventEmitter {
     }
 
     // 5. Build decision object
-    const currentPrice = state.mid || 0;
-    const atr = state.atr || 0.001;
     const stopDistance = atr * CONFIG.DEFAULT_STOP_DISTANCE_ATR || currentPrice * 0.005;
     const takeDistance = atr * CONFIG.DEFAULT_TP_DISTANCE_ATR || currentPrice * 0.01;
     let stopLoss = 0, takeProfit = 0;
