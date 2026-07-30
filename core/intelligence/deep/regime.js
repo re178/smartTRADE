@@ -1,6 +1,7 @@
 // core/intelligence/deep/regime.js
 // Deep Regime Detection – uses deep market state to classify regimes.
 // Listens to candle closes, emits 'regime' events with confidence, reason, and session context.
+// Added debug logs to trace flow.
 
 const candleStore = require('../../data/candleStore');
 const deepMarketState = require('./marketState');
@@ -34,6 +35,9 @@ const IDEAL_STRATEGIES = {
 
 class DeepRegimeDetector {
   constructor() {
+    // ---- DEBUG: log initialization ----
+    console.log('🔧 DeepRegimeDetector: constructor – listening to candleStore');
+
     // Listen to candle closes from the candle builder/store
     candleStore.on('candleClosed', (candle) => {
       this._onCandleClose(candle);
@@ -54,17 +58,27 @@ class DeepRegimeDetector {
   async _onCandleClose(candle) {
     const { symbol, timeframe } = candle;
 
+    // ---- DEBUG: log when a candle is received ----
+    console.log(`🔔 DeepRegimeDetector: received candle ${symbol} ${timeframe}`);
+
     // Only process primary timeframes (M5, M15, H1)
     const supportedTimeframes = ['M5', 'M15', 'H1'];
     if (!supportedTimeframes.includes(timeframe)) return;
 
     try {
+      // ---- DEBUG: log before compute ----
+      console.log(`🧠 DeepRegimeDetector: calling deepMarketState.compute() for ${symbol} ${timeframe}`);
+
       // Get the deep market state (full, confirmed)
       const state = await deepMarketState.compute(symbol, timeframe, 200);
       if (!state) {
+        console.log(`⚠️ DeepRegimeDetector: deepMarketState.compute() returned null for ${symbol} ${timeframe}`);
         logger.warn(`[DeepRegimeDetector] No deep state for ${symbol}:${timeframe}`);
         return;
       }
+
+      // ---- DEBUG: log compute success ----
+      console.log(`✅ DeepRegimeDetector: deepMarketState.compute() succeeded for ${symbol} ${timeframe}, confidence ${state.confidence}`);
 
       // Classify the regime
       const regime = this._classifyRegime(state);
@@ -91,6 +105,9 @@ class DeepRegimeDetector {
       // Store latest
       this._latestRegime[symbol] = regime;
 
+      // ---- DEBUG: log regime emission ----
+      console.log(`📢 DeepRegimeDetector: emitting regime ${regime.code} for ${symbol} with confidence ${regime.confidence}%`);
+
       // Emit regime event
       this.emit('regime', {
         symbol,
@@ -101,14 +118,13 @@ class DeepRegimeDetector {
 
       logger.debug(`[DeepRegimeDetector] ${symbol}:${timeframe} → ${regime.code} (${Math.round(regime.confidence)}%)`);
     } catch (err) {
+      console.error(`❌ DeepRegimeDetector: error for ${symbol}:${timeframe}`, err.message);
       logger.error(`[DeepRegimeDetector] Error for ${symbol}:${timeframe}`, err.message);
     }
   }
 
   /**
    * Classify the regime from the deep state.
-   * @param {Object} state - Deep market state (from deepMarketState.compute)
-   * @returns {Object} Regime object with code, name, family, idealStrategies, riskMultiplier, maxPositions, description.
    */
   _classifyRegime(state) {
     const { trend, momentum, volatility, structure, summary } = state;
@@ -144,7 +160,6 @@ class DeepRegimeDetector {
           description: 'Strong bearish trend with high ADX.',
         };
       }
-      // Fallback if direction unclear (should not happen)
     }
 
     // 2. Breakout
@@ -288,21 +303,17 @@ class DeepRegimeDetector {
     // Adjust for awareness (liquidity, velocity)
     if (state.awareness) {
       const { liquidity, velocity } = state.awareness;
-      // High liquidity increases confidence in trending regimes
       if (regime.family === 'trend' && liquidity > 0.7) {
         confidence += 10;
       }
-      // Low liquidity reduces confidence in breakout regimes
       if (regime.code === 'BREAKOUT' && liquidity < 0.3) {
         confidence -= 10;
       }
-      // High velocity confirms momentum
       if (Math.abs(velocity) > 0.0001 && (regime.code === 'STRONG_TREND_BULL' || regime.code === 'STRONG_TREND_BEAR')) {
         confidence += 5;
       }
     }
 
-    // Cap at 100
     return Math.min(100, Math.max(0, confidence));
   }
 
@@ -313,24 +324,13 @@ class DeepRegimeDetector {
     const parts = [];
     const { trend, momentum, volatility, structure, session } = state;
 
-    // Trend
     parts.push(`ADX: ${trend.strength.toFixed(1)} (${trend.direction})`);
-
-    // Momentum
     if (momentum.rsi) parts.push(`RSI: ${momentum.rsi.toFixed(1)}`);
     if (momentum.macdHist !== undefined) parts.push(`MACD: ${momentum.macdHist.toFixed(4)}`);
-
-    // Volatility
     if (volatility.regime) parts.push(`Vol: ${volatility.regime}`);
-
-    // Structure
     if (structure.isAtSupport) parts.push('At support');
     if (structure.isAtResistance) parts.push('At resistance');
-
-    // Session
     if (session && session.name) parts.push(`Session: ${session.name}`);
-
-    // Regime description
     parts.push(`=> ${regime.name}`);
 
     return parts.join(' | ');
