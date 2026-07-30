@@ -1,11 +1,9 @@
 // core/intelligence/deep/marketState.js
-// Deep Market State – maintained incrementally from a rolling candle cache.
-// Loads history once on first compute, then updates from candleStore events.
-// Eliminates repeated database queries and reduces latency.
+// Deep Market State – incremental cache, correct mapping for engine indicators.
 
 const EventEmitter = require('events');
-const candleStore = require('../../data/candleStore');    // for live candle events
-const candleHistory = require('../../data/candleHistory'); // for initial load
+const candleStore = require('../../data/candleStore');
+const candleHistory = require('../../data/candleHistory');
 const marketStateCache = require('../../data/marketStateCache');
 const session = require('../session');
 const {
@@ -33,13 +31,12 @@ class DeepMarketState extends EventEmitter {
       supportResistanceLookback: 30,
     };
 
-    // In‑memory candle buffers: symbol:timeframe -> array of candles (oldest first)
-    this._candleBuffers = new Map();
-
-    // Last computed state per symbol (latest timeframe only, e.g., M5)
+    // In‑memory buffers: key = `${symbol}:${timeframe}` -> array of candles (oldest first)
+    this._buffers = new Map();
+    // Last computed state per symbol (for quick access)
     this._lastState = new Map();
 
-    // Subscribe to new candle closes – update the buffer immediately
+    // Subscribe to new candle closes – update the buffer incrementally
     candleStore.on('candleClosed', (candle) => {
       this._addCandleToBuffer(candle);
     });
@@ -49,45 +46,50 @@ class DeepMarketState extends EventEmitter {
 
   /**
    * Add a new candle to the in‑memory buffer for its symbol+timeframe.
-   * Keeps only the last `candleCount` candles (default 200).
+   * Keeps only the last 200 candles.
    */
   _addCandleToBuffer(candle) {
-    const { symbol, timeframe } = candle;
-    const key = this._getKey(symbol, timeframe);
-    if (!this._candleBuffers.has(key)) {
-      // Buffer not yet initialised – we'll load from DB on first compute
-      return;
-    }
-    const buffer = this._candleBuffers.get(key);
-    // Append the new candle (ensure it's valid)
+    const key = this._getKey(candle.symbol, candle.timeframe);
+    if (!this._buffers.has(key)) return; // buffer not yet loaded – ignore
+
+    const buffer = this._buffers.get(key);
+    // Ensure the candle is valid
     if (candle && typeof candle.high === 'number' && typeof candle.low === 'number' && typeof candle.close === 'number') {
       buffer.push(candle);
-      // Keep only last 200
       if (buffer.length > 200) buffer.shift();
     }
   }
 
   /**
    * Ensure the buffer for a symbol+timeframe is loaded from DB.
-   * Returns the buffer (array of candles, oldest first).
+   * Returns the buffer (array of candles, oldest first) or null on failure.
    */
   async _ensureBuffer(symbol, timeframe, candleCount = 200) {
     const key = this._getKey(symbol, timeframe);
-    if (this._candleBuffers.has(key)) {
-      // Already loaded – return it
-      return this._candleBuffers.get(key);
+    if (this._buffers.has(key)) {
+      return this._buffers.get(key);
     }
 
-    // Load from DB
     const candles = await candleHistory.getHistory(symbol, timeframe, candleCount);
     if (!candles || candles.length < 50) {
       logger.warn(`[DeepMarketState] Insufficient candles for ${symbol}:${timeframe} (got ${candles ? candles.length : 0})`);
       return null;
     }
 
-    // Store in cache
-    this._candleBuffers.set(key, candles);
-    return candles;
+    // Filter invalid candles (extra safety)
+    const valid = candles.filter(c =>
+      c && typeof c === 'object' &&
+      typeof c.high === 'number' && !isNaN(c.high) &&
+      typeof c.low === 'number' && !isNaN(c.low) &&
+      typeof c.close === 'number' && !isNaN(c.close)
+    );
+    if (valid.length < 50) {
+      logger.warn(`[DeepMarketState] Not enough valid candles for ${symbol}:${timeframe} (${valid.length})`);
+      return null;
+    }
+
+    this._buffers.set(key, valid);
+    return valid;
   }
 
   _getKey(symbol, timeframe) {
@@ -102,43 +104,41 @@ class DeepMarketState extends EventEmitter {
     console.log(`🧮 DeepMarketState.compute() called for ${symbol} ${timeframe} (count=${candleCount})`);
 
     try {
-      // 1. Ensure buffer is loaded
       const candles = await this._ensureBuffer(symbol, timeframe, candleCount);
       if (!candles) {
         console.log(`⚠️ DeepMarketState: no candle data for ${symbol}:${timeframe}`);
         return null;
       }
 
-      // 2. Filter incomplete candles (extra safety)
+      // We already filtered invalid candles in _ensureBuffer, but filter again for safety
       const validCandles = candles.filter(c =>
         c && typeof c === 'object' &&
-        c.high !== undefined && c.low !== undefined && c.close !== undefined &&
-        !isNaN(c.high) && !isNaN(c.low) && !isNaN(c.close)
+        typeof c.high === 'number' && !isNaN(c.high) &&
+        typeof c.low === 'number' && !isNaN(c.low) &&
+        typeof c.close === 'number' && !isNaN(c.close)
       );
-
       if (validCandles.length < 50) {
-        console.log(`⚠️ DeepMarketState: not enough valid candles for ${symbol}:${timeframe} (valid ${validCandles.length})`);
+        console.log(`⚠️ DeepMarketState: not enough valid candles after filtering for ${symbol}:${timeframe}`);
         return null;
       }
 
-      // 3. Prepare arrays
       const closes = validCandles.map(c => c.close);
       const highs = validCandles.map(c => c.high);
       const lows = validCandles.map(c => c.low);
       const lastIdx = closes.length - 1;
       const currentPrice = closes[lastIdx];
 
-      // 4. Map to indicator format (direct h/l/c, filtered)
+      // ---- CORRECT MAPPING for engine indicators (expect `mid.h`, `mid.l`, `mid.c`) ----
       const candlesForIndicators = validCandles
-        .map(c => ({ h: c.high, l: c.low, c: c.close }))
-        .filter(item => item && typeof item.h === 'number' && typeof item.l === 'number' && typeof item.c === 'number');
+        .map(c => ({ mid: { h: c.high, l: c.low, c: c.close } }))
+        .filter(item => item && item.mid && typeof item.mid.h === 'number');
 
       if (candlesForIndicators.length < 50) {
         console.log(`⚠️ DeepMarketState: not enough valid indicator candles for ${symbol}:${timeframe} (${candlesForIndicators.length})`);
         return null;
       }
 
-      // 5. Compute indicators
+      // ---- Compute indicators with safe fallbacks ----
       let adxData = null, atrArray = null, rsi = null, macd = null, bb = null, sr = null;
       try {
         adxData = ADX(candlesForIndicators, this.indicators.adxPeriod);
@@ -165,7 +165,7 @@ class DeepMarketState extends EventEmitter {
 
       const currentSession = session.getSession();
 
-      // 6. Build state object
+      // Build the deep state object
       const state = {
         symbol,
         timeframe,
@@ -218,7 +218,7 @@ class DeepMarketState extends EventEmitter {
         status: 'confirmed',
       };
 
-      // 7. Incorporate awareness data
+      // Incorporate awareness data if available
       const awareness = marketStateCache.get(symbol);
       if (awareness) {
         state.awareness = {
@@ -234,7 +234,6 @@ class DeepMarketState extends EventEmitter {
       state.confidence = this._calculateConfidence(state);
       state.reason = this._buildReason(state);
 
-      // Cache the last state for this symbol (highest timeframe we used, e.g., M5)
       this._lastState.set(symbol, state);
 
       console.log(`✅ DeepMarketState.compute() succeeded for ${symbol} ${timeframe}, confidence ${state.confidence}`);
@@ -248,7 +247,6 @@ class DeepMarketState extends EventEmitter {
 
   /**
    * Incremental update on every tick – produces a "developing" state.
-   * (Unchanged from original – still useful for real‑time tick‑level awareness.)
    */
   updateIncremental(tick) {
     const { symbol, mid, time } = tick;
@@ -313,7 +311,7 @@ class DeepMarketState extends EventEmitter {
     return state;
   }
 
-  // ---- Helper methods (unchanged, but kept for reference) ----
+  // ---- Helper methods (unchanged from original) ----
   _volatilityRegime(atr, candles) {
     if (candles.length < 20) return 'normal';
     const atrValues = [];
@@ -391,7 +389,6 @@ class DeepMarketState extends EventEmitter {
     return parts.join(' | ');
   }
 
-  // Get the last computed state for a symbol (optional)
   getLastState(symbol) {
     return this._lastState.get(symbol) || null;
   }
