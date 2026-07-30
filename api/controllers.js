@@ -13,7 +13,7 @@ const accountService = require('../core/portfolio/accountService');
 const { PortfolioManager, PerformanceLearner } = require('../core/analytics/performanceSuite');
 const { notifyTrade } = require('../core/notifications/notificationService');
 const { validateOrderInput } = require('../shared/validators');
-const { formatSymbol } = require('../shared/helpers'); // <-- NEW: import formatSymbol
+const { formatSymbol } = require('../shared/helpers');
 const logger = require('../infrastructure/logger') || console;
 
 // ---------- Portfolio Manager Instance ----------
@@ -196,20 +196,34 @@ exports.getTradeHistory = async (req, res) => {
   }
 };
 
-// ---------- Manual Order ----------
+// ---------- Manual Order (with price validation) ----------
 exports.placeOrder = async (req, res) => {
   const { pair, side, lotSize, stopLoss, takeProfit } = req.body;
-  const validation = validateOrderInput({ pair, side, lotSize, stopLoss, takeProfit });
-  if (!validation.valid) {
-    return res.status(400).json({ error: validation.message });
-  }
+
   try {
     const product = getProduct(req);
     const instrument = pair.toUpperCase();
+
+    // Fetch current price for validation
+    const currentPrice = await marketProvider.getCurrentPrice(instrument, product);
+
+    // Validate input with current price
+    const validation = validateOrderInput({
+      pair: instrument,
+      side,
+      lotSize,
+      stopLoss: stopLoss || null,
+      takeProfit: takeProfit || null,
+      currentPrice, // <-- NEW: pass current price for SL/TP validation
+    });
+    if (!validation.valid) {
+      return res.status(400).json({ error: validation.message });
+    }
+
     const broker = getBroker(product);
     const account = await broker.getAccount();
     const currentPositions = await broker.getOpenTrades();
-    const currentPrice = await marketProvider.getCurrentPrice(instrument, product);
+
     const signal = {
       pair: instrument,
       side,
@@ -218,13 +232,16 @@ exports.placeOrder = async (req, res) => {
       takeProfit: takeProfit || null,
       recommendedLotSize: lotSize,
     };
+
     const approval = await portfolioManager.canOpenTrade(signal, parseFloat(account.balance), currentPositions);
     if (!approval.allowed) {
       return res.status(400).json({ error: approval.reason });
     }
+
     const orderResult = await orderService.placeMarketOrder(
       instrument, side, lotSize, stopLoss || null, takeProfit || null, product
     );
+
     const trade = await Trade.findOne({ contractId: orderResult.contractId });
     if (!trade) {
       const fallbackTrade = await Trade.findOne({ instrument }).sort({ openTime: -1 });
@@ -235,6 +252,7 @@ exports.placeOrder = async (req, res) => {
       }
       return res.status(500).json({ error: 'Order placed but trade record not found' });
     }
+
     notifyTrade('OPENED', trade, account).catch(err => logger.error('[Notification] Error:', err.message));
     res.json({ success: true, trade, raw: orderResult });
   } catch (error) {
@@ -289,32 +307,56 @@ exports.getSignal = async (req, res) => {
   }
 };
 
-// ---------- Auto Trade ----------
+// ---------- Auto Trade (with price validation) ----------
 exports.autoTrade = async (req, res) => {
   const { pair, riskPercent = 1, strategy = 'sma', ...params } = req.body;
   if (!pair) return res.status(400).json({ error: 'pair required' });
   try {
     const product = getProduct(req);
     const instrument = pair.toUpperCase();
+
+    // Generate signal
     const signal = await strategyEngine.generateSignal(instrument, strategy, { ...params, product });
     if (!signal) return res.json({ success: false, message: 'No trading signal' });
+
+    // Use signal's entry price as current price for validation
+    const currentPrice = signal.entryPrice;
+
+    // Validate the signal's SL/TP against entry price
+    const validation = validateOrderInput({
+      pair: instrument,
+      side: signal.side,
+      lotSize: signal.recommendedLotSize || 0.01,
+      stopLoss: signal.stopLoss || null,
+      takeProfit: signal.takeProfit || null,
+      currentPrice, // <-- NEW: pass entry price for SL/TP validation
+    });
+    if (!validation.valid) {
+      return res.json({ success: false, message: validation.message });
+    }
+
     const broker = getBroker(product);
     const account = await broker.getAccount();
     const currentPositions = await broker.getOpenTrades();
+
     const approval = await portfolioManager.canOpenTrade(signal, parseFloat(account.balance), currentPositions);
     if (!approval.allowed) return res.json({ success: false, message: approval.reason });
+
     let lotSize = signal.recommendedLotSize;
     if (!lotSize) {
       lotSize = await riskManager.calculateLotSize(instrument, signal.entryPrice, signal.stopLoss, riskPercent, 1000, product);
     }
+
     const orderResult = await orderService.placeMarketOrder(
       instrument, signal.side, lotSize, signal.stopLoss, signal.takeProfit, product
     );
+
     const trade = await Trade.findOne({ contractId: orderResult.contractId });
     if (!trade) {
       logger.warn(`[autoTrade] Trade not found by contractId ${orderResult.contractId}`);
       return res.json({ success: true, raw: orderResult, trade: null });
     }
+
     notifyTrade('OPENED', trade, account).catch(err => logger.error('[Notification] Error:', err.message));
     res.json({ success: true, signal, trade, raw: orderResult });
   } catch (error) {
@@ -323,12 +365,7 @@ exports.autoTrade = async (req, res) => {
   }
 };
 
-// ---------- Execute Live Signal (NEW) ----------
-/**
- * Execute a trade directly from a live signal (no strategy generation).
- * This is used by the auto‑execute toggle in the dashboard.
- * Expects: { pair, side, entryPrice, stopLoss, takeProfit, lotSize }
- */
+// ---------- Execute Live Signal (with price validation) ----------
 exports.executeSignal = async (req, res) => {
   const { pair, side, entryPrice, stopLoss, takeProfit, lotSize } = req.body;
 
@@ -337,7 +374,6 @@ exports.executeSignal = async (req, res) => {
     return res.status(400).json({ error: 'pair, side, and lotSize are required' });
   }
 
-  // Format symbol (e.g., USDJPY → USD_JPY) – use helpers
   const formattedPair = formatSymbol(pair);
   const cleanSide = side.toUpperCase().trim();
   if (!['BUY', 'SELL'].includes(cleanSide)) {
@@ -354,14 +390,14 @@ exports.executeSignal = async (req, res) => {
       currentPrice = await marketProvider.getCurrentPrice(instrument, product);
     }
 
-    // Validate SL/TP against current price (optional but recommended)
-    // We'll trust the signal but can add basic checks
+    // Validate SL/TP against entry price
     const validation = validateOrderInput({
       pair: instrument,
       side: cleanSide,
       lotSize,
       stopLoss: stopLoss || null,
       takeProfit: takeProfit || null,
+      currentPrice, // <-- NEW: pass entry price for SL/TP validation
     });
     if (!validation.valid) {
       return res.status(400).json({ error: validation.message });
@@ -377,14 +413,12 @@ exports.executeSignal = async (req, res) => {
       product
     );
 
-    // Fetch the created trade
     const trade = await Trade.findOne({ contractId: orderResult.contractId });
     if (!trade) {
       logger.warn(`[executeSignal] Trade not found for contractId: ${orderResult.contractId}`);
       return res.json({ success: true, raw: orderResult, trade: null });
     }
 
-    // Send notification (async, non‑blocking)
     const broker = getBroker(product);
     const account = await broker.getAccount();
     notifyTrade('OPENED', trade, account).catch(err => logger.error('[Notification] Error:', err.message));
