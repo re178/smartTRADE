@@ -1,4 +1,4 @@
-// server.js – RTS Entry Point with CTOS Cognitive Engine (Broker Bootstrap)
+// server.js – RTS Entry Point with Debug Routes & CTOS
 
 require('dotenv').config();
 
@@ -14,7 +14,7 @@ const apiRoutes = require('./api/routes');
 const mt5Routes = require('./api/routes/mt5');
 const User = require('./models/User');
 
-// ---------- CTOS COGNITIVE MODULES ----------
+// ---------- COGNITIVE MODULES ----------
 const priceBuffer = require('./core/data/priceBuffer');
 const candleStore = require('./core/data/candleStore'); // wrapper
 const marketStateCache = require('./core/data/marketStateCache');
@@ -25,28 +25,17 @@ const awarenessEngine = require('./core/awareness/engine');
 // Deep Intelligence
 const deepRegime = require('./core/intelligence/deep/regime');
 
-// Research Layer
-const hypothesisEngine = require('./core/research/engine');
-const knowledgeStore = require('./core/research/knowledgeStore');
-
 // Decision Engine
 const decisionEngine = require('./core/decision/engine');
 
-// Multi-timeframe Intelligence
-const IntelligenceFusion = require('./core/intelligence/fusion');
-const M1Analyzer = require('./core/intelligence/multiTimeframe/m1');
-const M5Analyzer = require('./core/intelligence/multiTimeframe/m5');
-const M15Analyzer = require('./core/intelligence/multiTimeframe/m15');
-const H1Analyzer = require('./core/intelligence/multiTimeframe/h1');
-const H4Analyzer = require('./core/intelligence/multiTimeframe/h4');
+// Research & Knowledge (optional, keep if you have them)
+// const hypothesisEngine = require('./core/research/engine');
+// const knowledgeStore = require('./core/research/knowledgeStore');
 
-// Session
-const session = require('./core/intelligence/session');
+// Multi-timeframe (optional – keep only M5)
+// const IntelligenceFusion = require('./core/intelligence/fusion');
+// const M5Analyzer = require('./core/intelligence/multiTimeframe/m5');
 
-// Broker factory for bootstrapping
-const { getBroker } = require('./core/execution/brokerFactory');
-
-// Event bus & logger
 const eventBus = require('./infrastructure/eventBus');
 const logger = require('./infrastructure/logger') || console;
 
@@ -233,117 +222,81 @@ function broadcast(type, data) {
 
 // ---------- Connect CTOS Events to WebSocket ----------
 
-// 1. Market Awareness (real‑time metrics)
+// Market Awareness
 awarenessEngine.on('marketAwareness', (data) => {
   broadcast('marketAwareness', data);
 });
 
-// 2. Deep Regime (regime classification)
+// Deep Regime
 deepRegime.on('regime', (regime) => {
   broadcast('regime', regime);
 });
 
-// 3. Hypothesis Engine events
-hypothesisEngine.on('hypothesisCreated', (hypothesis) => {
-  broadcast('hypothesisCreated', hypothesis);
-});
-hypothesisEngine.on('hypothesisResolved', (hypothesis) => {
-  broadcast('hypothesisResolved', hypothesis);
-});
-
-// 4. Knowledge Store
-knowledgeStore.on('knowledgeUpdated', (knowledge) => {
-  broadcast('knowledge', knowledge);
-});
-
-// 5. Decision Engine
+// Decision Engine
 decisionEngine.on('decision', (decision) => {
   broadcast('decision', decision);
 });
 
-// 6. Intelligence Fusion
-IntelligenceFusion.on('fusion', (fusion) => {
-  broadcast('intelligenceFusion', fusion);
-});
-
-// 7. Trade closed events
-eventBus.on('trade.closed', (data) => {
-  broadcast('tradeClosed', data);
-});
-
-// 8. Account updates
+// Account updates
 eventBus.on('account.fetched', (account) => {
   broadcast('account', account);
 });
 
-// ---------- Start CTOS Cognitive Engines ----------
+// ---------- DEBUG ROUTES (for diagnostics) ----------
+
+// 1. System status
+app.get('/debug/status', (req, res) => {
+  const lastState = marketStateCache.get('EUR_USD') || null;
+  const lastRegime = deepRegime.getLatestRegime('EUR_USD') || null;
+  const lastDecision = decisionEngine.getLastDecision('EUR_USD') || null;
+  const awareness = awarenessEngine._state.get('EUR_USD') || null;
+
+  res.json({
+    engine: {
+      candleBuilder: typeof candleStore !== 'undefined' ? 'running' : 'not loaded',
+      marketAwareness: awarenessEngine ? 'running' : 'not loaded',
+      deepRegime: deepRegime ? 'running' : 'not loaded',
+      decisionEngine: decisionEngine ? 'running' : 'not loaded',
+    },
+    lastCandle: candleStore.getHistory('EUR_USD', 'M5', 1)[0] || null,
+    lastMarketState: lastState,
+    lastRegime: lastRegime,
+    lastDecision: lastDecision,
+    awareness: awareness,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// 2. Force a test candle to trigger analysis
+app.get('/debug/force-candle', (req, res) => {
+  const candle = {
+    symbol: 'EUR_USD',
+    timeframe: 'M5',
+    time: Date.now(),
+    open: 1.1450,
+    high: 1.1460,
+    low: 1.1440,
+    close: 1.1455,
+    volume: 100,
+    source: 'live',
+  };
+  // Emit via candleStore (which forwards to deepRegime)
+  candleStore.emit('candleClosed', candle);
+  res.send('Test candle emitted. Check logs and dashboard.');
+});
+
+// ---------- Start Cognitive Engines ----------
 async function startCognitiveEngines() {
   try {
     console.log('[CTOS] Starting cognitive engines...');
 
-    // ---- Historical Bootstrap using broker ----
-    const broker = getBroker('mt5');
-    const symbols = ['EUR_USD', 'GBP_USD', 'USD_JPY', 'AUD_USD'];
-    const timeframes = ['M5', 'M15', 'H1'];
-    let totalLoaded = 0;
-    for (const symbol of symbols) {
-      for (const tf of timeframes) {
-        try {
-          const candles = await broker.getHistoricalCandles(symbol, 200, tf);
-          if (candles && candles.length > 0) {
-            const candleHistory = require('./core/data/candleHistory');
-            for (const c of candles) {
-              await candleHistory.store({
-                symbol,
-                timeframe: tf,
-                time: c.time * 1000,
-                open: c.open,
-                high: c.high,
-                low: c.low,
-                close: c.close,
-                volume: c.volume || 0,
-                source: 'broker',
-              });
-            }
-            totalLoaded += candles.length;
-            console.log(`[CTOS] Loaded ${candles.length} candles for ${symbol}:${tf}`);
-          }
-        } catch (err) {
-          console.warn(`[CTOS] Failed to load ${symbol}:${tf} via broker:`, err.message);
-        }
-      }
-    }
-    console.log(`[CTOS] Historical bootstrap complete. Loaded ${totalLoaded} candles.`);
+    // The modules are self‑starting (they listen to events on import).
+    // We just need to ensure they are loaded.
+    // Importing them above already starts them.
 
-    // ---- Initialize multi-timeframe analyzers for all symbols ----
-    const analyzerClasses = {
-      M1: M1Analyzer,
-      M5: M5Analyzer,
-      M15: M15Analyzer,
-      H1: H1Analyzer,
-      H4: H4Analyzer,
-    };
-
-    for (const symbol of symbols) {
-      for (const [tf, AnalyzerClass] of Object.entries(analyzerClasses)) {
-        const analyzer = new AnalyzerClass(symbol);
-        IntelligenceFusion.registerAnalyzer(tf, analyzer);
-        // Trigger initial analysis (will fetch history)
-        analyzer.analyze().catch(err => logger.warn(`[CTOS] Initial analysis failed for ${symbol}:${tf}`, err.message));
-      }
-    }
-
-    console.log('[CTOS] Multi-timeframe analyzers initialized.');
-
-    // ---- The rest of the modules are self-starting (awareness, deepRegime, hypothesis, decision) ----
-    console.log('[CTOS] All cognitive modules loaded and running.');
     console.log('[CTOS] Market Awareness Engine: active');
     console.log('[CTOS] Deep Regime Detector: active');
-    console.log('[CTOS] Hypothesis Engine: active');
-    console.log('[CTOS] Knowledge Store: active');
     console.log('[CTOS] Decision Engine: active');
-    console.log('[CTOS] Intelligence Fusion: active');
-
     console.log('[CTOS] All cognitive modules initialized successfully.');
   } catch (err) {
     console.error('[CTOS] Initialization error:', err.message);
@@ -354,7 +307,6 @@ async function startCognitiveEngines() {
 async function startServer() {
   await ensureAdmin();
 
-  // Start HTTP server
   server.listen(PORT, () => {
     console.log(`✅ RTS server running on http://localhost:${PORT}`);
     console.log(`📊 Dashboard: http://localhost:${PORT}`);
@@ -368,7 +320,6 @@ async function startServer() {
     console.log('💾 MT5 data is persistent (MongoDB).');
   });
 
-  // Start cognitive engines after server is up
   setTimeout(startCognitiveEngines, 2000);
 }
 
