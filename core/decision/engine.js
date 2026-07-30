@@ -104,7 +104,8 @@ class DecisionEngine extends EventEmitter {
     } else if (regime.code === 'STRONG_TREND_BEAR') {
       sellScore += 30 * (regime.confidence / 100);
     } else if (regime.code === 'REVERSAL') {
-      const trendDir = state.trend?.direction || 'neutral';
+      // FIX: state.trend is a string, not an object with .direction
+      const trendDir = state.trend || 'neutral';
       if (trendDir === 'bullish') sellScore += 20;
       else if (trendDir === 'bearish') buyScore += 20;
     } else if (regime.code === 'BREAKOUT') {
