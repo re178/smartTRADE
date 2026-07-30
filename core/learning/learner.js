@@ -2,8 +2,10 @@
 // RTS Self‑Learning Engine
 // Purpose: Continuously improve the system based on actual trading results.
 // Answers: "What worked, what didn't, and how should we adapt?"
+// Now with MongoDB persistence for strategy weights and biases.
 
 const Trade = require('../../models/Trade');
+const LearningState = require('../../models/LearningState'); // NEW
 const { EventEmitter } = require('events');
 const logger = require('../../infrastructure/logger') || console;
 
@@ -29,6 +31,15 @@ class SelfLearner extends EventEmitter {
 
     // Listen to trade closure events (from orderService or elsewhere)
     // We'll set up the listener externally.
+
+    // ---- NEW: Load weights from DB on startup ----
+    this._loadWeightsFromDB().then(() => {
+      this._initialized = true;
+      logger.info('[SelfLearner] Weights loaded from DB.');
+    }).catch(err => {
+      logger.error('[SelfLearner] Failed to load weights from DB:', err.message);
+      this._initialized = true; // continue with defaults
+    });
 
     logger.info('[SelfLearner] Initialized.');
   }
@@ -143,6 +154,11 @@ class SelfLearner extends EventEmitter {
     this._strategyWeights = adjustedWeights;
     this._pendingUpdates = true;
     this.emit('weightsUpdated', this._strategyWeights);
+
+    // ---- NEW: Persist weights to DB ----
+    this._saveWeightsToDB().catch(err => {
+      logger.error('[SelfLearner] Failed to save weights to DB:', err.message);
+    });
   }
 
   /**
@@ -167,6 +183,10 @@ class SelfLearner extends EventEmitter {
       this._strategyWeights[strategy] = Math.max(CONFIG.MIN_WEIGHT, Math.min(CONFIG.MAX_WEIGHT, weight));
       this._normalizeWeights();
       this.emit('weightsUpdated', this._strategyWeights);
+      // ---- NEW: Persist after manual update ----
+      this._saveWeightsToDB().catch(err => {
+        logger.error('[SelfLearner] Failed to save weights after manual update:', err.message);
+      });
     }
   }
 
@@ -211,15 +231,97 @@ class SelfLearner extends EventEmitter {
     this.emit('stats', stats);
   }
 
+  // ============================================================
+  // NEW: Persistence methods using LearningState model
+  // ============================================================
+
+  /**
+   * Load weights and biases from MongoDB.
+   */
+  async _loadWeightsFromDB() {
+    try {
+      const docs = await LearningState.find({});
+      if (docs.length === 0) {
+        logger.info('[SelfLearner] No persisted weights found, using defaults.');
+        return;
+      }
+      for (const doc of docs) {
+        this._strategyWeights[doc.strategy] = doc.weight;
+        this._confidenceBiases[doc.strategy] = doc.bias;
+        // Also store winRate/totalTrades for stats (optional)
+        if (!this._strategyStats[doc.strategy]) {
+          this._strategyStats[doc.strategy] = {
+            wins: 0,
+            losses: 0,
+            totalPnL: 0,
+            trades: [],
+            winRate: doc.winRate || 0,
+          };
+        }
+        this._strategyStats[doc.strategy].winRate = doc.winRate || 0;
+        this._strategyStats[doc.strategy].totalTrades = doc.totalTrades || 0;
+      }
+      logger.info(`[SelfLearner] Loaded ${docs.length} strategy weights from DB.`);
+    } catch (err) {
+      logger.error('[SelfLearner] Error loading weights from DB:', err.message);
+      throw err;
+    }
+  }
+
+  /**
+   * Save current weights and biases to MongoDB (upsert).
+   */
+  async _saveWeightsToDB() {
+    try {
+      const operations = [];
+      for (const [strategy, weight] of Object.entries(this._strategyWeights)) {
+        const bias = this._confidenceBiases[strategy] || 0;
+        const stats = this._strategyStats[strategy] || {};
+        const winRate = stats.winRate || 0;
+        const totalTrades = (stats.wins || 0) + (stats.losses || 0);
+        operations.push({
+          updateOne: {
+            filter: { strategy },
+            update: {
+              $set: {
+                weight,
+                bias,
+                winRate,
+                totalTrades,
+                updatedAt: new Date(),
+              },
+            },
+            upsert: true,
+          },
+        });
+      }
+      if (operations.length > 0) {
+        await LearningState.bulkWrite(operations);
+        logger.debug(`[SelfLearner] Saved ${operations.length} strategy weights to DB.`);
+      }
+    } catch (err) {
+      logger.error('[SelfLearner] Error saving weights to DB:', err.message);
+      throw err;
+    }
+  }
+
   /**
    * Reset learning (e.g., for a fresh start).
+   * Also clears persisted data.
    */
-  reset() {
+  async reset() {
     this._tradeHistory = [];
     this._strategyStats = {};
     this._strategyWeights = {};
     this._confidenceBiases = {};
     this._pendingUpdates = false;
+    // Also clear DB
+    try {
+      await LearningState.deleteMany({});
+      logger.info('[SelfLearner] Reset complete, DB cleared.');
+    } catch (err) {
+      logger.error('[SelfLearner] Error clearing DB on reset:', err.message);
+    }
     this.emit('reset');
     logger.info('[SelfLearner] Reset complete.');
   }
