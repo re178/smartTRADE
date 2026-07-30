@@ -13,6 +13,7 @@ const accountService = require('../core/portfolio/accountService');
 const { PortfolioManager, PerformanceLearner } = require('../core/analytics/performanceSuite');
 const { notifyTrade } = require('../core/notifications/notificationService');
 const { validateOrderInput } = require('../shared/validators');
+const { formatSymbol } = require('../shared/helpers'); // <-- NEW: import formatSymbol
 const logger = require('../infrastructure/logger') || console;
 
 // ---------- Portfolio Manager Instance ----------
@@ -318,6 +319,79 @@ exports.autoTrade = async (req, res) => {
     res.json({ success: true, signal, trade, raw: orderResult });
   } catch (error) {
     logger.error('[autoTrade] Error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+// ---------- Execute Live Signal (NEW) ----------
+/**
+ * Execute a trade directly from a live signal (no strategy generation).
+ * This is used by the auto‑execute toggle in the dashboard.
+ * Expects: { pair, side, entryPrice, stopLoss, takeProfit, lotSize }
+ */
+exports.executeSignal = async (req, res) => {
+  const { pair, side, entryPrice, stopLoss, takeProfit, lotSize } = req.body;
+
+  // Basic validation
+  if (!pair || !side || !lotSize) {
+    return res.status(400).json({ error: 'pair, side, and lotSize are required' });
+  }
+
+  // Format symbol (e.g., USDJPY → USD_JPY) – use helpers
+  const formattedPair = formatSymbol(pair);
+  const cleanSide = side.toUpperCase().trim();
+  if (!['BUY', 'SELL'].includes(cleanSide)) {
+    return res.status(400).json({ error: 'Side must be BUY or SELL' });
+  }
+
+  try {
+    const product = getProduct(req);
+    const instrument = formattedPair;
+
+    // Use entry price from signal, or fetch current if not provided
+    let currentPrice = entryPrice;
+    if (!currentPrice) {
+      currentPrice = await marketProvider.getCurrentPrice(instrument, product);
+    }
+
+    // Validate SL/TP against current price (optional but recommended)
+    // We'll trust the signal but can add basic checks
+    const validation = validateOrderInput({
+      pair: instrument,
+      side: cleanSide,
+      lotSize,
+      stopLoss: stopLoss || null,
+      takeProfit: takeProfit || null,
+    });
+    if (!validation.valid) {
+      return res.status(400).json({ error: validation.message });
+    }
+
+    // Place order
+    const orderResult = await orderService.placeMarketOrder(
+      instrument,
+      cleanSide,
+      parseFloat(lotSize),
+      stopLoss || null,
+      takeProfit || null,
+      product
+    );
+
+    // Fetch the created trade
+    const trade = await Trade.findOne({ contractId: orderResult.contractId });
+    if (!trade) {
+      logger.warn(`[executeSignal] Trade not found for contractId: ${orderResult.contractId}`);
+      return res.json({ success: true, raw: orderResult, trade: null });
+    }
+
+    // Send notification (async, non‑blocking)
+    const broker = getBroker(product);
+    const account = await broker.getAccount();
+    notifyTrade('OPENED', trade, account).catch(err => logger.error('[Notification] Error:', err.message));
+
+    res.json({ success: true, trade, raw: orderResult });
+  } catch (error) {
+    logger.error('[executeSignal] Error:', error.message);
     res.status(500).json({ error: error.message });
   }
 };
