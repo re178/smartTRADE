@@ -344,8 +344,16 @@ router.get('/candles', async (req, res) => {
       return res.status(400).json({ error: 'symbol query param required' });
     }
 
+    // ---- Normalize symbol (remove underscores) ----
+    const lookupSymbol = symbol.replace(/_/g, '');
+
     const candleHistory = require('../../core/data/candleHistory');
-    const candles = await candleHistory.getHistory(symbol, timeframe, parseInt(count));
+    let candles = await candleHistory.getHistory(lookupSymbol, timeframe, parseInt(count));
+    // If not found, try the original symbol as fallback
+    if (!candles || candles.length === 0) {
+      candles = await candleHistory.getHistory(symbol, timeframe, parseInt(count));
+    }
+
     if (candles && candles.length > 0) {
       // Format as expected by the broker (and the rest of the system)
       const formatted = candles.map(c => ({
