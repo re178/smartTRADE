@@ -228,6 +228,16 @@ eventBus.on('account.fetched', (account) => {
   broadcast('account', account);
 });
 
+// ---- NEW: Trade closed events ----
+eventBus.on('trade.closed', (data) => {
+  broadcast('tradeClosed', data);
+});
+
+// ---- Optional: Order placed events ----
+eventBus.on('order.placed', (data) => {
+  broadcast('orderPlaced', data);
+});
+
 // ---------- DEBUG ROUTES (Safe, Non‑Breaking) ----------
 
 // 1. EA status – shows last price and heartbeat
