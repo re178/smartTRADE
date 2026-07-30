@@ -1,7 +1,7 @@
 // core/intelligence/deep/marketState.js
 // Deep Market State – computed from historical candles with session context.
 // Supports incremental updates on every tick.
-// Now extends EventEmitter and exports a singleton with compute() method.
+// Added debug logs to trace compute() flow.
 
 const EventEmitter = require('events');
 const candleHistory = require('../../data/candleHistory');
@@ -44,31 +44,42 @@ class DeepMarketState extends EventEmitter {
    * @returns {Promise<Object|null>} Deep market state object.
    */
   async compute(symbol, timeframe = 'M5', candleCount = 200) {
+    // ---- DEBUG: log entry ----
+    console.log(`🧮 DeepMarketState.compute() called for ${symbol} ${timeframe} (count=${candleCount})`);
+
     try {
       const candles = await candleHistory.getHistory(symbol, timeframe, candleCount);
+      // ---- DEBUG: log candle count ----
+      console.log(`📦 DeepMarketState: got ${candles ? candles.length : 0} candles from history for ${symbol} ${timeframe}`);
+
       if (!candles || candles.length < 50) {
+        console.log(`⚠️ DeepMarketState: insufficient candles for ${symbol}:${timeframe} (need 50, got ${candles ? candles.length : 0})`);
         logger.warn(`[DeepMarketState] Insufficient candles for ${symbol}:${timeframe}`);
         return null;
       }
 
-      const closes = candles.map(c => c.close);
-      const highs = candles.map(c => c.high);
-      const lows = candles.map(c => c.low);
+      // Filter out any undefined entries
+      const validCandles = candles.filter(c => c && c.open !== undefined);
+      if (validCandles.length < 50) {
+        console.log(`⚠️ DeepMarketState: not enough valid candles for ${symbol}:${timeframe}`);
+        logger.warn(`[DeepMarketState] Not enough valid candles for ${symbol}:${timeframe}`);
+        return null;
+      }
+
+      const closes = validCandles.map(c => c.close);
+      const highs = validCandles.map(c => c.high);
+      const lows = validCandles.map(c => c.low);
       const lastIdx = closes.length - 1;
       const currentPrice = closes[lastIdx];
 
-      const adxData = ADX(
-        candles.map(c => ({ mid: { h: c.high, l: c.low, c: c.close } })),
-        this.indicators.adxPeriod
-      );
-      const atrArray = ATR(
-        candles.map(c => ({ mid: { h: c.high, l: c.low, c: c.close } })),
-        this.indicators.atrPeriod
-      );
+      const candlesForIndicators = validCandles.map(c => ({ mid: { h: c.high, l: c.low, c: c.close } }));
+
+      const adxData = ADX(candlesForIndicators, this.indicators.adxPeriod);
+      const atrArray = ATR(candlesForIndicators, this.indicators.atrPeriod);
       const rsi = RSI(closes, this.indicators.rsiPeriod);
       const macd = MACD(closes, this.indicators.macdFast, this.indicators.macdSlow, this.indicators.macdSignal);
       const bb = BollingerBands(closes, this.indicators.bbPeriod, this.indicators.bbStd);
-      const sr = findSupportResistance(candles, this.indicators.supportResistanceLookback, 0.001);
+      const sr = findSupportResistance(validCandles, this.indicators.supportResistanceLookback, 0.001);
 
       const atr = atrArray ? atrArray[atrArray.length - 1] : 0;
       const rsiVal = rsi || 50;
@@ -111,7 +122,7 @@ class DeepMarketState extends EventEmitter {
           atr,
           atrPercent: atr / currentPrice,
           bbWidth,
-          regime: this._volatilityRegime(atr, candles),
+          regime: this._volatilityRegime(atr, validCandles),
         },
         structure: {
           support,
@@ -152,8 +163,13 @@ class DeepMarketState extends EventEmitter {
       state.reason = this._buildReason(state);
 
       this._lastState[symbol] = state;
+
+      // ---- DEBUG: log success ----
+      console.log(`✅ DeepMarketState.compute() succeeded for ${symbol} ${timeframe}, confidence ${state.confidence}`);
+
       return state;
     } catch (err) {
+      console.error(`❌ DeepMarketState.compute() error for ${symbol} ${timeframe}:`, err.message);
       logger.error('[DeepMarketState] Compute error:', err.message);
       return null;
     }
@@ -161,8 +177,6 @@ class DeepMarketState extends EventEmitter {
 
   /**
    * Incremental update on every tick – produces a "developing" state.
-   * @param {Object} tick - { symbol, bid, ask, mid, time }
-   * @returns {Object|null} Developing state.
    */
   updateIncremental(tick) {
     const { symbol, mid, time } = tick;
