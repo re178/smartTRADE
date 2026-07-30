@@ -17,6 +17,18 @@
   const metricsPanel = document.getElementById('metricsPanel');
   const wsStatus = document.getElementById('wsStatus');
 
+  // ============================================================
+  // HELPER: formatSymbol (local copy – safe fallback)
+  // ============================================================
+  function formatSymbol(symbol) {
+    if (!symbol || typeof symbol !== 'string') return symbol;
+    const upper = symbol.toUpperCase().trim();
+    if (upper.length === 6 && /^[A-Z]{6}$/.test(upper)) {
+      return upper.slice(0, 3) + '_' + upper.slice(3);
+    }
+    return upper;
+  }
+
   function updateWsStatus(connected) {
     if (wsStatus) {
       wsStatus.textContent = connected ? '🟢 Live' : '🔴 Disconnected';
@@ -96,7 +108,7 @@
         displayMetrics(msg.data);
         break;
       case 'tradeClosed':
-        // Optionally refresh trades
+        // Refresh open trades and history
         if (typeof loadOpenTrades === 'function') loadOpenTrades();
         if (typeof loadTradeHistory === 'function') loadTradeHistory();
         break;
@@ -188,28 +200,81 @@
     `;
   }
 
-  // Display decision (from fusion or future decision engine)
+  // ============================================================
+  // DISPLAY DECISION – with auto‑execute toggle and symbol formatting
+  // ============================================================
   function displayDecision(decision) {
     if (!liveSignalPanel) return;
     const { symbol, decision: side, confidence, entryPrice, stopLoss, takeProfit, recommendedLotSize, reason, timestamp } = decision;
-    const alertClass = side === 'BUY' ? 'success' : side === 'SELL' ? 'danger' : 'secondary';
+
+    // Show NO_TRADE with reason
+    if (!side || side === 'NO_TRADE') {
+      liveSignalPanel.innerHTML = `
+        <div class="alert alert-secondary">
+          <h5>No Trade</h5>
+          <p>${reason || 'No trading opportunity at this time.'}</p>
+          <p class="text-muted small">${new Date(timestamp).toLocaleString()}</p>
+        </div>
+      `;
+      return;
+    }
+
+    const alertClass = side === 'BUY' ? 'success' : 'danger';
     const sideLabel = side || 'NO TRADE';
-    let html = `<div class="alert alert-${alertClass} live-signal-card" data-symbol="${symbol}" data-side="${side}" data-entry="${entryPrice}" data-sl="${stopLoss}" data-tp="${takeProfit}" data-lot="${recommendedLotSize || 0.01}">`;
-    html += `<h5><strong>${sideLabel}</strong> ${symbol} (${confidence}% confidence)</h5>`;
+
+    // Format symbol with underscore if needed
+    const formattedSymbol = formatSymbol(symbol);
+
+    let html = `<div class="alert alert-${alertClass} live-signal-card" data-symbol="${formattedSymbol}" data-side="${side}" data-entry="${entryPrice}" data-sl="${stopLoss}" data-tp="${takeProfit}" data-lot="${recommendedLotSize || 0.01}">`;
+    html += `<h5><strong>${sideLabel}</strong> ${formattedSymbol} (${confidence}% confidence)</h5>`;
     if (side && side !== 'NO_TRADE') {
       html += `<p>Entry: ${formatPrice(entryPrice)} | SL: ${formatPrice(stopLoss)} | TP: ${formatPrice(takeProfit)}</p>`;
       html += `<p>Lot: ${recommendedLotSize || 'N/A'}</p>`;
       html += `<p><small>${reason || ''}</small></p>`;
       html += `<button class="btn btn-sm btn-primary execute-signal-btn" onclick="window.executeSignalFromCard(this)">`;
       html += `<i class="fas fa-rocket"></i> Execute Trade</button>`;
-    } else {
-      html += `<p><em>No trade recommended.</em></p>`;
     }
     html += `<p class="text-muted small mt-2">${new Date(timestamp).toLocaleString()}</p>`;
     html += `</div>`;
     liveSignalPanel.innerHTML = html;
-    if (side && side !== 'NO_TRADE') {
+
+    // ============================================================
+    // AUTO‑EXECUTE: if toggle is ON, send to /execute-signal
+    // ============================================================
+    const toggle = document.getElementById('autoExecuteToggle');
+    if (toggle && toggle.checked && side && side !== 'NO_TRADE') {
+      console.log('[Live] Auto‑executing signal for', formattedSymbol, side);
+      // Play sound if available
       if (typeof playSound === 'function') playSound('signal');
+
+      fetch('/api/execute-signal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          pair: formattedSymbol,
+          side: side,
+          entryPrice: entryPrice,
+          stopLoss: stopLoss,
+          takeProfit: takeProfit,
+          lotSize: recommendedLotSize || 0.01
+        })
+      })
+      .then(res => res.json())
+      .then(data => {
+        if (data.success) {
+          console.log('[Live] Auto‑executed trade:', data);
+          if (typeof playSound === 'function') playSound('open');
+          // Refresh dashboard sections
+          if (typeof loadOpenTrades === 'function') loadOpenTrades();
+          if (typeof loadTradeHistory === 'function') loadTradeHistory();
+          if (typeof loadAccount === 'function') loadAccount();
+        } else {
+          console.error('[Live] Auto‑execute failed:', data.error);
+          // Optionally show an alert
+          // alert('Auto‑execute failed: ' + data.error);
+        }
+      })
+      .catch(err => console.error('[Live] Auto‑execute error:', err));
     }
   }
 
@@ -253,16 +318,20 @@
     `;
   }
 
+  // Utility: format price (safe fallback)
   function formatPrice(p) {
     if (p === undefined || p === null) return 'N/A';
     return parseFloat(p).toFixed(5);
   }
 
-  // Global execute trade function (same as before)
+  // ============================================================
+  // Global function: execute trade from card
+  // (now uses formatSymbol to fix USDJPY → USD_JPY)
+  // ============================================================
   window.executeSignalFromCard = function(btn) {
     const card = btn.closest('.live-signal-card');
     if (!card) return;
-    const symbol = card.dataset.symbol;
+    const symbol = formatSymbol(card.dataset.symbol);   // <-- FIX: format symbol
     const side = card.dataset.side;
     const entry = parseFloat(card.dataset.entry);
     const sl = parseFloat(card.dataset.sl) || null;
@@ -275,7 +344,27 @@
     }
   };
 
+  // ============================================================
+  // Auto‑execute toggle: save state in localStorage
+  // ============================================================
+  document.addEventListener('DOMContentLoaded', function() {
+    const toggle = document.getElementById('autoExecuteToggle');
+    if (toggle) {
+      // Restore saved state
+      const saved = localStorage.getItem('autoExecuteToggle');
+      if (saved === 'true') toggle.checked = true;
+      // Save on change
+      toggle.addEventListener('change', function() {
+        localStorage.setItem('autoExecuteToggle', this.checked);
+        console.log('[Live] Auto‑execute toggle:', this.checked ? 'ON' : 'OFF');
+      });
+    }
+  });
+
+  // Start WebSocket connection
   connectWebSocket();
+
+  // Expose reconnect function
   window.reconnectLive = function() {
     if (ws) ws.close();
     reconnectAttempts = 0;
