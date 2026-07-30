@@ -26,6 +26,9 @@
     .awareness-metric { font-size: 0.9rem; }
     .hypothesis-item { font-size: 0.85rem; padding: 6px 12px; margin-bottom: 4px; }
     .knowledge-item { font-size: 0.9rem; padding: 8px 12px; }
+    /* Auto‑execute toggle */
+    .auto-execute-toggle { margin-left: 20px; }
+    .auto-execute-toggle .form-check-input:checked { background-color: #0d6efd; border-color: #0d6efd; }
   </style>
 </head>
 <body>
@@ -35,6 +38,16 @@
       <h1 class="display-6 mb-4">
         <i class="fas fa-chart-line text-primary"></i> RTS Trading Dashboard
         <span id="wsStatus" class="badge bg-secondary ms-3">Connecting...</span>
+        <!-- ======== NEW: AUTO‑EXECUTE TOGGLE ======== -->
+        <span class="auto-execute-toggle">
+          <div class="form-check form-switch d-inline-block">
+            <input class="form-check-input" type="checkbox" id="autoExecuteToggle" style="width: 3rem; height: 1.5rem;">
+            <label class="form-check-label" for="autoExecuteToggle">
+              <i class="fas fa-robot"></i> Auto‑execute
+            </label>
+          </div>
+          <small class="text-muted" style="font-size: 0.7rem;">(live signals)</small>
+        </span>
       </h1>
       <a href="/developer-api.html" class="btn btn-outline-primary">
         <i class="fas fa-key"></i> Developer API
@@ -116,7 +129,7 @@
     </div>
   </div>
 
-  <!-- ====== NEW CTOS COGNITIVE PANELS ====== -->
+  <!-- ====== CTOS COGNITIVE PANELS ====== -->
   <div class="row">
     <div class="col-md-4">
       <div class="card">
