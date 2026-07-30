@@ -1,12 +1,12 @@
 // core/data/candleBuilder.js
 // Aggregates ticks into OHLCV candles for multiple timeframes.
-// Emits 'candleClosed' with source: 'live'.
+// Emits 'candleClosed' when a candle completes.
+// Added debug logs to trace flow.
 
 const EventEmitter = require('events');
 const priceBuffer = require('./priceBuffer');
 const logger = require('../../infrastructure/logger') || console;
 
-// All supported timeframes (in milliseconds)
 const TIMEFRAMES = {
   M1: 60 * 1000,
   M5: 5 * 60 * 1000,
@@ -17,30 +17,27 @@ const TIMEFRAMES = {
   D1: 24 * 60 * 60 * 1000,
 };
 
-// Maximum number of closed candles to keep per symbol per timeframe (history buffer)
-const MAX_HISTORY = 500;
-
 class CandleBuilder extends EventEmitter {
   constructor() {
     super();
     // Active (open) candles: Map<symbol, Map<timeframe, candle>>
     this._candles = new Map();
-    // Cache for closed candles (to avoid duplicate emits)
+    // Cache to avoid duplicate emits
     this._closed = new Map();
-    // History buffer: Map<symbol, Map<timeframe, Array>>
-    this._history = new Map();
 
-    // Listen to priceBuffer ticks
+    // ---- DEBUG: log initialization ----
+    console.log('🔧 CandleBuilder: constructor – listening to priceBuffer ticks');
+
     priceBuffer.on('tick', (tick) => this._onTick(tick));
-
-    // Force close every second to catch long gaps
-    setInterval(() => this._closeExpiredCandles(), 1000);
-
-    logger.info('[CandleBuilder] Initialized.');
+    setInterval(() => this._closeExpired(), 1000);
   }
 
   _onTick(tick) {
     const { symbol, mid, time } = tick;
+
+    // ---- DEBUG: log every tick received ----
+    console.log(`📥 CandleBuilder: tick received for ${symbol} at ${new Date(time).toISOString()}`);
+
     for (const [tfName, tfMs] of Object.entries(TIMEFRAMES)) {
       this._updateCandle(symbol, tfName, tfMs, mid, time);
     }
@@ -81,7 +78,9 @@ class CandleBuilder extends EventEmitter {
     if (this._closed.has(key)) return;
     this._closed.set(key, true);
 
-    // Prepare the closed candle data with source: 'live'
+    // ---- DEBUG: log candle close event ----
+    console.log(`🔥 CandleBuilder: closing candle ${symbol} ${tfName} startTime=${new Date(candle.startTime).toISOString()}`);
+
     const closedCandle = {
       symbol,
       timeframe: tfName,
@@ -92,14 +91,10 @@ class CandleBuilder extends EventEmitter {
       close: candle.close,
       volume: candle.volume,
       tickCount: candle.tickCount,
-      source: 'live', // NEW: mark as live-built
+      source: 'live',
     };
 
-    // Emit for real‑time consumers
     this.emit('candleClosed', closedCandle);
-
-    // Store in history buffer
-    this._addToHistory(symbol, tfName, closedCandle);
 
     // Remove from active candles
     const symbolCandles = this._candles.get(symbol);
@@ -109,47 +104,7 @@ class CandleBuilder extends EventEmitter {
     }
   }
 
-  /**
-   * Store closed candle in history buffer.
-   */
-  _addToHistory(symbol, timeframe, candle) {
-    if (!this._history.has(symbol)) {
-      this._history.set(symbol, new Map());
-    }
-    const symbolHistory = this._history.get(symbol);
-    if (!symbolHistory.has(timeframe)) {
-      symbolHistory.set(timeframe, []);
-    }
-    const arr = symbolHistory.get(timeframe);
-    arr.push(candle);
-    if (arr.length > MAX_HISTORY) arr.shift();
-  }
-
-  /**
-   * Get history of closed candles for a symbol and timeframe.
-   * Returns an array of candle objects (oldest first).
-   */
-  getHistory(symbol, timeframe, limit = MAX_HISTORY) {
-    const symbolHistory = this._history.get(symbol);
-    if (!symbolHistory) return [];
-    const arr = symbolHistory.get(timeframe);
-    if (!arr) return [];
-    return arr.slice(-limit);
-  }
-
-  /**
-   * Get the current (open) candle for a symbol and timeframe.
-   */
-  getCurrentCandle(symbol, timeframe) {
-    const symbolCandles = this._candles.get(symbol);
-    if (!symbolCandles) return null;
-    return symbolCandles.get(timeframe) || null;
-  }
-
-  /**
-   * Force close all expired candles (called by timer).
-   */
-  _closeExpiredCandles() {
+  _closeExpired() {
     const now = Date.now();
     for (const [symbol, symbolCandles] of this._candles) {
       for (const [tfName, candle] of symbolCandles) {
@@ -161,16 +116,11 @@ class CandleBuilder extends EventEmitter {
     }
   }
 
-  /**
-   * Clear all data (useful for reset).
-   */
-  clear() {
-    this._candles.clear();
-    this._closed.clear();
-    this._history.clear();
-    logger.info('[CandleBuilder] Cleared all data.');
+  getCurrentCandle(symbol, timeframe) {
+    const symbolCandles = this._candles.get(symbol);
+    if (!symbolCandles) return null;
+    return symbolCandles.get(timeframe) || null;
   }
 }
 
-// Singleton
 module.exports = new CandleBuilder();
