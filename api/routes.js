@@ -42,6 +42,9 @@ router.post('/broker/reset-circuit-breaker', (req, res) => {
   }
 });
 
+// ---------- NEW: Execute live signal directly (for auto‑execute toggle) ----------
+router.post('/execute-signal', controllers.executeSignal);
+
 // ---------- User Preferences ----------
 router.get('/user/preferences', controllers.getPreferences);
 router.post('/user/preferences', controllers.updatePreferences);
