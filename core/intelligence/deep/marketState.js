@@ -78,21 +78,35 @@ class DeepMarketState extends EventEmitter {
       const lastIdx = closes.length - 1;
       const currentPrice = closes[lastIdx];
 
-      const candlesForIndicators = validCandles.map(c => ({ mid: { h: c.high, l: c.low, c: c.close } }));
+      // ---- FIX: indicator functions expect direct h/l/c, not mid wrapper ----
+      const candlesForIndicators = validCandles.map(c => ({
+        h: c.high,
+        l: c.low,
+        c: c.close
+      }));
 
-      const adxData = ADX(candlesForIndicators, this.indicators.adxPeriod);
-      const atrArray = ATR(candlesForIndicators, this.indicators.atrPeriod);
-      const rsi = RSI(closes, this.indicators.rsiPeriod);
-      const macd = MACD(closes, this.indicators.macdFast, this.indicators.macdSlow, this.indicators.macdSignal);
-      const bb = BollingerBands(closes, this.indicators.bbPeriod, this.indicators.bbStd);
-      const sr = findSupportResistance(validCandles, this.indicators.supportResistanceLookback, 0.001);
+      // ---- Compute indicators with safe fallbacks ----
+      let adxData = null, atrArray = null, rsi = null, macd = null, bb = null, sr = null;
+      try {
+        adxData = ADX(candlesForIndicators, this.indicators.adxPeriod);
+        atrArray = ATR(candlesForIndicators, this.indicators.atrPeriod);
+        rsi = RSI(closes, this.indicators.rsiPeriod);
+        macd = MACD(closes, this.indicators.macdFast, this.indicators.macdSlow, this.indicators.macdSignal);
+        bb = BollingerBands(closes, this.indicators.bbPeriod, this.indicators.bbStd);
+        sr = findSupportResistance(validCandles, this.indicators.supportResistanceLookback, 0.001);
+      } catch (indicatorErr) {
+        console.error(`❌ DeepMarketState: indicator error for ${symbol}:${timeframe}`, indicatorErr.message);
+        logger.error(`[DeepMarketState] Indicator error for ${symbol}:${timeframe}`, indicatorErr);
+        // Return null to let caller handle gracefully, rather than crashing.
+        return null;
+      }
 
       const atr = atrArray ? atrArray[atrArray.length - 1] : 0;
       const rsiVal = rsi || 50;
       const macdHist = macd ? macd.histogram[macd.histogram.length - 1] : 0;
       const bbWidth = bb ? (bb.upper[bb.upper.length - 1] - bb.lower[bb.lower.length - 1]) / bb.middle[bb.middle.length - 1] : 0;
-      const support = sr.support ? sr.support.price : null;
-      const resistance = sr.resistance ? sr.resistance.price : null;
+      const support = sr && sr.support ? sr.support.price : null;
+      const resistance = sr && sr.resistance ? sr.resistance.price : null;
       const pricePosition = (support && resistance) ? (currentPrice - support) / (resistance - support) : 0.5;
       const isAtSupport = support ? Math.abs(currentPrice - support) / currentPrice < 0.001 : false;
       const isAtResistance = resistance ? Math.abs(currentPrice - resistance) / currentPrice < 0.001 : false;
@@ -126,7 +140,7 @@ class DeepMarketState extends EventEmitter {
         },
         volatility: {
           atr,
-          atrPercent: atr / currentPrice,
+          atrPercent: atr / (currentPrice || 0.0001),
           bbWidth,
           regime: this._volatilityRegime(atr, validCandles),
         },
@@ -143,7 +157,7 @@ class DeepMarketState extends EventEmitter {
         },
         summary: {
           trendConfidence: this._trendConfidence(adxData, rsiVal, macdHist),
-          volatilityScore: Math.min(1, atr / (currentPrice * 0.01)),
+          volatilityScore: Math.min(1, atr / (currentPrice * 0.01 || 0.0001)),
           liquidityScore: 0.5,
           regimeSuggestion: this._suggestRegime(adxData, rsiVal, bbWidth, atr),
         },
