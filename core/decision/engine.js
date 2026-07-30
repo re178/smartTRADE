@@ -98,7 +98,7 @@ class DecisionEngine extends EventEmitter {
 
     // 3a. Regime bias
     if (regime.code === 'STRONG_TREND_BULL' || regime.code === 'WEAK_TREND') {
-      const direction = state.trend?.direction || 'neutral';
+      const direction = state.trend || 'neutral';
       if (direction === 'bullish') buyScore += 30 * (regime.confidence / 100);
       else if (direction === 'bearish') sellScore += 30 * (regime.confidence / 100);
     } else if (regime.code === 'STRONG_TREND_BEAR') {
