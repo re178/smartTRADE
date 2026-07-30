@@ -1,4 +1,4 @@
-// server.js – RTS Entry Point with Debug Routes & CTOS
+// server.js – RTS Entry Point with Debug Routes & CTOS (Non‑Breaking)
 
 require('dotenv').config();
 
@@ -13,31 +13,17 @@ const connectDB = require('./config/db');
 const apiRoutes = require('./api/routes');
 const mt5Routes = require('./api/routes/mt5');
 const User = require('./models/User');
+const Mt5Price = require('./models/Mt5Price');
+const Mt5Heartbeat = require('./models/Mt5Heartbeat');
 
 // ---------- COGNITIVE MODULES ----------
 const priceBuffer = require('./core/data/priceBuffer');
-const candleStore = require('./core/data/candleStore'); // wrapper
+const candleStore = require('./core/data/candleStore');
 const marketStateCache = require('./core/data/marketStateCache');
-
-// Market Awareness
 const awarenessEngine = require('./core/awareness/engine');
-
-// Deep Intelligence
 const deepRegime = require('./core/intelligence/deep/regime');
-
-// Decision Engine
 const decisionEngine = require('./core/decision/engine');
-
-// Research & Knowledge (optional, keep if you have them)
-// const hypothesisEngine = require('./core/research/engine');
-// const knowledgeStore = require('./core/research/knowledgeStore');
-
-// Multi-timeframe (optional – keep only M5)
-// const IntelligenceFusion = require('./core/intelligence/fusion');
-// const M5Analyzer = require('./core/intelligence/multiTimeframe/m5');
-
 const eventBus = require('./infrastructure/eventBus');
-const logger = require('./infrastructure/logger') || console;
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -242,15 +228,57 @@ eventBus.on('account.fetched', (account) => {
   broadcast('account', account);
 });
 
-// ---------- DEBUG ROUTES (for diagnostics) ----------
+// ---------- DEBUG ROUTES (Safe, Non‑Breaking) ----------
 
-// 1. System status
+// 1. EA status – shows last price and heartbeat
+app.get('/debug/ea-status', async (req, res) => {
+  try {
+    const lastPrice = await Mt5Price.findOne().sort({ time: -1 }).lean();
+    const lastHeartbeat = await Mt5Heartbeat.findOne().sort({ updatedAt: -1 }).lean();
+    res.json({
+      lastPriceReceived: lastPrice || null,
+      lastHeartbeat: lastHeartbeat || null,
+      eaOnline: lastHeartbeat && lastHeartbeat.status === 'online',
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2. Force a candle close using the latest stored candle
+app.get('/debug/trigger', async (req, res) => {
+  try {
+    const candleHistory = require('./core/data/candleHistory');
+    const candles = await candleHistory.getHistory('EUR_USD', 'M5', 1);
+    if (!candles || candles.length === 0) {
+      return res.json({ error: 'No candles found in database' });
+    }
+    const candle = candles[0]; // latest
+    const closedCandle = {
+      symbol: candle.symbol,
+      timeframe: candle.timeframe,
+      time: candle.time,
+      open: candle.open,
+      high: candle.high,
+      low: candle.low,
+      close: candle.close,
+      volume: candle.volume,
+      source: candle.source || 'broker',
+    };
+    // Emit via eventBus and candleStore to ensure deepRegime catches it
+    eventBus.emit('candleClosed', closedCandle);
+    candleStore.emit('candleClosed', closedCandle);
+    res.json({ success: true, candle: closedCandle });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 3. System status – shows engine state, last regime, last decision
 app.get('/debug/status', (req, res) => {
   const lastState = marketStateCache.get('EUR_USD') || null;
   const lastRegime = deepRegime.getLatestRegime('EUR_USD') || null;
   const lastDecision = decisionEngine.getLastDecision('EUR_USD') || null;
-  const awareness = awarenessEngine._state.get('EUR_USD') || null;
-
   res.json({
     engine: {
       candleBuilder: typeof candleStore !== 'undefined' ? 'running' : 'not loaded',
@@ -262,38 +290,16 @@ app.get('/debug/status', (req, res) => {
     lastMarketState: lastState,
     lastRegime: lastRegime,
     lastDecision: lastDecision,
-    awareness: awareness,
     timestamp: new Date().toISOString(),
   });
-});
-
-// 2. Force a test candle to trigger analysis
-app.get('/debug/force-candle', (req, res) => {
-  const candle = {
-    symbol: 'EUR_USD',
-    timeframe: 'M5',
-    time: Date.now(),
-    open: 1.1450,
-    high: 1.1460,
-    low: 1.1440,
-    close: 1.1455,
-    volume: 100,
-    source: 'live',
-  };
-  // Emit via candleStore (which forwards to deepRegime)
-  candleStore.emit('candleClosed', candle);
-  res.send('Test candle emitted. Check logs and dashboard.');
 });
 
 // ---------- Start Cognitive Engines ----------
 async function startCognitiveEngines() {
   try {
     console.log('[CTOS] Starting cognitive engines...');
-
-    // The modules are self‑starting (they listen to events on import).
-    // We just need to ensure they are loaded.
-    // Importing them above already starts them.
-
+    // Modules are self‑starting – they listen to events on import.
+    // We just log that they are active.
     console.log('[CTOS] Market Awareness Engine: active');
     console.log('[CTOS] Deep Regime Detector: active');
     console.log('[CTOS] Decision Engine: active');
@@ -320,6 +326,7 @@ async function startServer() {
     console.log('💾 MT5 data is persistent (MongoDB).');
   });
 
+  // Start cognitive engines after server is up
   setTimeout(startCognitiveEngines, 2000);
 }
 
