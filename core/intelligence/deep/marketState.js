@@ -1,7 +1,7 @@
 // core/intelligence/deep/marketState.js
 // Deep Market State – computed from historical candles with session context.
 // Supports incremental updates on every tick.
-// Added debug logs to trace compute() flow.
+// Added debug logs and validation to filter incomplete candles.
 
 const EventEmitter = require('events');
 const candleHistory = require('../../data/candleHistory');
@@ -31,8 +31,7 @@ class DeepMarketState extends EventEmitter {
       bbStd: 2,
       supportResistanceLookback: 30,
     };
-    // For incremental updates
-    this._rollingData = {}; // symbol -> { prices, times, velocity, lastState }
+    this._rollingData = {};
     this._lastState = {};
   }
 
@@ -44,12 +43,10 @@ class DeepMarketState extends EventEmitter {
    * @returns {Promise<Object|null>} Deep market state object.
    */
   async compute(symbol, timeframe = 'M5', candleCount = 200) {
-    // ---- DEBUG: log entry ----
     console.log(`🧮 DeepMarketState.compute() called for ${symbol} ${timeframe} (count=${candleCount})`);
 
     try {
       const candles = await candleHistory.getHistory(symbol, timeframe, candleCount);
-      // ---- DEBUG: log candle count ----
       console.log(`📦 DeepMarketState: got ${candles ? candles.length : 0} candles from history for ${symbol} ${timeframe}`);
 
       if (!candles || candles.length < 50) {
@@ -58,12 +55,21 @@ class DeepMarketState extends EventEmitter {
         return null;
       }
 
-      // Filter out any undefined entries
-      const validCandles = candles.filter(c => c && c.open !== undefined);
+      // ---- FILTER: remove incomplete candles ----
+      const validCandles = candles.filter(c =>
+        c && typeof c === 'object' &&
+        c.high !== undefined && c.low !== undefined && c.close !== undefined &&
+        !isNaN(c.high) && !isNaN(c.low) && !isNaN(c.close)
+      );
+
       if (validCandles.length < 50) {
-        console.log(`⚠️ DeepMarketState: not enough valid candles for ${symbol}:${timeframe}`);
+        console.log(`⚠️ DeepMarketState: not enough valid candles for ${symbol}:${timeframe} (valid ${validCandles.length})`);
         logger.warn(`[DeepMarketState] Not enough valid candles for ${symbol}:${timeframe}`);
         return null;
+      }
+
+      if (validCandles.length < candles.length) {
+        console.log(`⚠️ DeepMarketState: filtered out ${candles.length - validCandles.length} incomplete candles for ${symbol}:${timeframe}`);
       }
 
       const closes = validCandles.map(c => c.close);
@@ -164,9 +170,7 @@ class DeepMarketState extends EventEmitter {
 
       this._lastState[symbol] = state;
 
-      // ---- DEBUG: log success ----
       console.log(`✅ DeepMarketState.compute() succeeded for ${symbol} ${timeframe}, confidence ${state.confidence}`);
-
       return state;
     } catch (err) {
       console.error(`❌ DeepMarketState.compute() error for ${symbol} ${timeframe}:`, err.message);
@@ -177,6 +181,8 @@ class DeepMarketState extends EventEmitter {
 
   /**
    * Incremental update on every tick – produces a "developing" state.
+   * @param {Object} tick - { symbol, bid, ask, mid, time }
+   * @returns {Object|null} Developing state.
    */
   updateIncremental(tick) {
     const { symbol, mid, time } = tick;
