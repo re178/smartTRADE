@@ -1,6 +1,6 @@
-// src/shared/validators.js – Input Validation
+// src/shared/validators.js – Input Validation (with SL/TP price checks)
 
-const { isValidPair } = require('./helpers');
+const { isValidPair, getPipSize } = require('./helpers');
 
 /**
  * Validate the input for placing an order.
@@ -10,9 +10,10 @@ const { isValidPair } = require('./helpers');
  * @param {number} input.lotSize - Lot size (units)
  * @param {number|null} input.stopLoss - Stop loss price (optional)
  * @param {number|null} input.takeProfit - Take profit price (optional)
+ * @param {number|null} input.currentPrice - Current market price (optional, but recommended for SL/TP validation)
  * @returns {Object} { valid: boolean, message: string }
  */
-function validateOrderInput({ pair, side, lotSize, stopLoss = null, takeProfit = null }) {
+function validateOrderInput({ pair, side, lotSize, stopLoss = null, takeProfit = null, currentPrice = null }) {
   // Check pair format
   if (!pair || typeof pair !== 'string') {
     return { valid: false, message: 'Pair must be a string' };
@@ -58,6 +59,52 @@ function validateOrderInput({ pair, side, lotSize, stopLoss = null, takeProfit =
     }
     if (cleanSide === 'SELL' && stopLoss <= takeProfit) {
       return { valid: false, message: 'For SELL, stop loss must be above take profit' };
+    }
+  }
+
+  // ============================================================
+  // NEW: Validate SL/TP against current price (if provided)
+  // ============================================================
+  if (currentPrice !== null && typeof currentPrice === 'number' && !isNaN(currentPrice) && currentPrice > 0) {
+    const pipSize = getPipSize(cleanPair);
+    const minDistance = pipSize * 5; // Minimum 5 pips
+
+    if (cleanSide === 'BUY') {
+      // For BUY: SL must be BELOW entry, TP must be ABOVE entry
+      if (stopLoss !== null) {
+        if (stopLoss >= currentPrice) {
+          return { valid: false, message: 'For BUY, stop loss must be below entry price' };
+        }
+        if (Math.abs(currentPrice - stopLoss) < minDistance) {
+          return { valid: false, message: `Stop loss too close to entry (min ${minDistance.toFixed(5)})` };
+        }
+      }
+      if (takeProfit !== null) {
+        if (takeProfit <= currentPrice) {
+          return { valid: false, message: 'For BUY, take profit must be above entry price' };
+        }
+        if (Math.abs(currentPrice - takeProfit) < minDistance) {
+          return { valid: false, message: `Take profit too close to entry (min ${minDistance.toFixed(5)})` };
+        }
+      }
+    } else if (cleanSide === 'SELL') {
+      // For SELL: SL must be ABOVE entry, TP must be BELOW entry
+      if (stopLoss !== null) {
+        if (stopLoss <= currentPrice) {
+          return { valid: false, message: 'For SELL, stop loss must be above entry price' };
+        }
+        if (Math.abs(currentPrice - stopLoss) < minDistance) {
+          return { valid: false, message: `Stop loss too close to entry (min ${minDistance.toFixed(5)})` };
+        }
+      }
+      if (takeProfit !== null) {
+        if (takeProfit >= currentPrice) {
+          return { valid: false, message: 'For SELL, take profit must be below entry price' };
+        }
+        if (Math.abs(currentPrice - takeProfit) < minDistance) {
+          return { valid: false, message: `Take profit too close to entry (min ${minDistance.toFixed(5)})` };
+        }
+      }
     }
   }
 
