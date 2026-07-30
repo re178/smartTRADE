@@ -49,6 +49,23 @@ function isValidPair(pair) {
 }
 
 /**
+ * Format a symbol to include an underscore (e.g., USDJPY → USD_JPY).
+ * If already in correct format, returns as is.
+ * @param {string} symbol - Symbol string (e.g., 'USDJPY' or 'EUR_USD')
+ * @returns {string} Formatted symbol with underscore.
+ */
+function formatSymbol(symbol) {
+  if (!symbol || typeof symbol !== 'string') return symbol;
+  const upper = symbol.toUpperCase().trim();
+  // If it's exactly 6 uppercase letters, insert underscore after 3
+  if (upper.length === 6 && /^[A-Z]{6}$/.test(upper)) {
+    return upper.slice(0, 3) + '_' + upper.slice(3);
+  }
+  // If it already has underscore or is different length, return as is
+  return upper;
+}
+
+/**
  * Generate a unique ID (simple timestamp-based).
  * @returns {string} Unique ID string.
  */
@@ -147,6 +164,7 @@ module.exports = {
   sleep,
   getPipSize,
   isValidPair,
+  formatSymbol,   // <-- NEW
   generateId,
   roundTo,
   envInt,
