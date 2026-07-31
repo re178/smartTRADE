@@ -4,6 +4,7 @@
 
 const EventEmitter = require('events');
 const marketStateCache = require('../data/marketStateCache');
+const deepMarketState = require('../intelligence/deep/marketState'); // <-- for full nested state
 const deepRegime = require('../intelligence/deep/regime');
 const awarenessEngine = require('../awareness/engine');
 const selfLearner = require('../learning/learner');
@@ -105,21 +106,40 @@ class DecisionEngine extends EventEmitter {
   }
 
   async _evaluateSymbol(symbol) {
-    // 1. Get current state
+    // 1. Get current awareness state (flat, for immediate metrics)
     const state = marketStateCache.get(symbol);
     if (!state) {
       console.log(`❌ DecisionEngine: no market state for ${symbol}`);
       return null;
     }
 
-    // 2. Get regime (from last regime event)
+    // 2. Get deep state (full nested) for logging – this is what HistoricalDecision expects
+    let deepState = deepMarketState.getLastState(symbol);
+    if (!deepState) {
+      // Fallback: construct a minimal nested object from awareness state to avoid validation errors
+      console.warn(`⚠️ DecisionEngine: no deep state for ${symbol}, using awareness state fallback`);
+      deepState = {
+        ...state,
+        trend: { direction: state.trend || 'neutral', strength: 0, adx: 0, plusDI: 0, minusDI: 0 },
+        momentum: { rsi: state.momentum || 50, macdLine: 0, macdSignal: 0, macdHist: 0, velocity: state.velocity || 0, acceleration: state.acceleration || 0 },
+        volatility: { atr: state.atr || 0.001, atrPercent: 0.005, bbWidth: 0.15, regime: 'normal' },
+        liquidity: { score: state.liquidity || 0.5, spread: state.spread || 0, tickFrequency: 0 },
+        structure: { support: null, resistance: null, pricePosition: 0.5, isAtSupport: false, isAtResistance: false },
+        session: { name: state.session || 'Other', liquidityMultiplier: 1, isWeekday: true },
+        regime: { code: 'NEUTRAL', name: 'Neutral', confidence: 50, description: '' },
+        summary: { marketQuality: 50, noiseLevel: 'medium', regimeSuggestion: 'neutral', trendConfidence: 50 },
+        confidence: 50,
+        reason: 'Fallback state',
+      };
+    }
+
+    // 3. Get regime (from last regime event)
     const regime = deepRegime.getLatestRegime(symbol) || { code: 'NEUTRAL', confidence: 50 };
 
-    // 3. Extract features for StateStore (flat) and for logging (full nested)
-    const flatFeatures = this._extractFeatures(state, regime);  // for StateStore
-    const fullFeatures = state;                                 // for HistoricalDecision logging
+    // 4. Extract flat features for StateStore (uses awareness state)
+    const flatFeatures = this._extractFeatures(state, regime);
 
-    // 4. Compute edge (probability and expected value) from historical analogues
+    // 5. Compute edge (probability and expected value) from historical analogues
     let edge = null;
     let similarity = null;
     if (this._isReady && stateStore) {
@@ -144,14 +164,14 @@ class DecisionEngine extends EventEmitter {
       }
     }
 
-    // 5. Determine decision based on edge (if available) or fallback to rule-based
+    // 6. Determine decision based on edge (if available) or fallback to rule-based
     let decision, confidence, expectedValue, probability;
 
     if (edge && edge.sampleSize >= 20) {
       // ---- Use Empirical Edge ----
       const winProb = edge.winRate;
       const avgReturnR = edge.avgReturnR;
-      const ev = avgReturnR; // expected value in R multiples
+      const ev = avgReturnR;
 
       if (ev > CONFIG.MIN_EDGE && winProb > CONFIG.MIN_PROBABILITY) {
         decision = 'BUY';
@@ -182,7 +202,7 @@ class DecisionEngine extends EventEmitter {
       probability = confidence / 100;
     }
 
-    // 6. Build decision object
+    // 7. Build decision object
     const currentPrice = state.price?.current || state.mid || 0;
     const atr = state.volatility?.atr || state.atr || 0.001;
     const stopDistance = atr * CONFIG.DEFAULT_STOP_DISTANCE_ATR || currentPrice * 0.005;
@@ -196,7 +216,7 @@ class DecisionEngine extends EventEmitter {
       takeProfit = currentPrice - takeDistance;
     }
 
-    // 7. Build full decision object
+    // 8. Build full decision object – using deepState for features
     const decisionObj = {
       symbol,
       decision,
@@ -210,7 +230,7 @@ class DecisionEngine extends EventEmitter {
       reason: this._buildReason(decision, confidence, edge, regime),
       timestamp: new Date().toISOString(),
       timeframe: 'M5',
-      features: fullFeatures,              // <-- FIXED: use full nested state
+      features: deepState, // <-- FULL NESTED STATE for HistoricalDecision
       contributions: this._buildContributions(state, regime, edge),
       inputs: {
         regime: regime.confidence / 100,
@@ -223,7 +243,7 @@ class DecisionEngine extends EventEmitter {
       expectedValueModel: 'v2.1',
     };
 
-    // 8. Log decision to HistoricalDecision via selfLearner
+    // 9. Log decision to HistoricalDecision via selfLearner
     try {
       const decisionId = await selfLearner.recordDecision(decisionObj);
       if (decisionId) {
