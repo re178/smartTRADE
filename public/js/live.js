@@ -1,4 +1,4 @@
-// public/js/live.js – Updated for CTOS Real-time Events
+// public/js/live.js – Updated for CTOS Real-time Events (Professional UI)
 
 (function() {
   'use strict';
@@ -8,7 +8,7 @@
   let reconnectAttempts = 0;
   let ws = null;
 
-  // DOM elements (new panels)
+  // DOM elements (new panels – same IDs as before)
   const awarenessPanel = document.getElementById('awarenessPanel');
   const hypothesisPanel = document.getElementById('hypothesisPanel');
   const knowledgePanel = document.getElementById('knowledgePanel');
@@ -29,13 +29,37 @@
     return upper;
   }
 
+  // ============================================================
+  // NOTIFICATION HELPER (uses global addNotification from app.js)
+  // ============================================================
+  function notify(message, type = 'info') {
+    if (typeof window.addNotification === 'function') {
+      window.addNotification(message, type);
+    } else {
+      console.log('[Live]', message);
+    }
+  }
+
+  // ============================================================
+  // API STATUS (sidebar dot)
+  // ============================================================
+  function updateApiStatus(connected) {
+    if (typeof window.updateApiStatus === 'function') {
+      window.updateApiStatus(connected);
+    }
+  }
+
   function updateWsStatus(connected) {
     if (wsStatus) {
       wsStatus.textContent = connected ? '🟢 Live' : '🔴 Disconnected';
       wsStatus.className = connected ? 'badge bg-success' : 'badge bg-danger';
     }
+    updateApiStatus(connected);
   }
 
+  // ============================================================
+  // WEBSOCKET CONNECTION
+  // ============================================================
   function connectWebSocket() {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}`;
@@ -51,6 +75,7 @@
       console.log('[Live] WebSocket connected.');
       reconnectAttempts = 0;
       updateWsStatus(true);
+      notify('WebSocket connected', 'success');
     };
 
     ws.onmessage = function(event) {
@@ -65,11 +90,13 @@
     ws.onclose = function() {
       console.warn('[Live] WebSocket closed.');
       updateWsStatus(false);
+      notify('WebSocket disconnected', 'warning');
       scheduleReconnect();
     };
 
     ws.onerror = function(err) {
       console.error('[Live] WebSocket error:', err);
+      updateWsStatus(false);
     };
   }
 
@@ -81,6 +108,9 @@
     setTimeout(connectWebSocket, delay);
   }
 
+  // ============================================================
+  // MESSAGE DISPATCHER
+  // ============================================================
   function handleMessage(msg) {
     switch (msg.type) {
       case 'marketAwareness':
@@ -111,11 +141,22 @@
         // Refresh open trades and history
         if (typeof loadOpenTrades === 'function') loadOpenTrades();
         if (typeof loadTradeHistory === 'function') loadTradeHistory();
+        // Also add notification
+        if (msg.data && msg.data.result) {
+          const pl = msg.data.result.pl || 0;
+          notify(`Trade closed: P&L ${pl >= 0 ? '+' : ''}${pl.toFixed(2)}`, pl >= 0 ? 'success' : 'danger');
+        } else {
+          notify('Trade closed', 'info');
+        }
         break;
       default:
         console.debug('[Live] Unknown message type:', msg.type);
     }
   }
+
+  // ============================================================
+  // DISPLAY FUNCTIONS
+  // ============================================================
 
   function displayAwareness(data) {
     if (!awarenessPanel) return;
@@ -201,7 +242,7 @@
   }
 
   // ============================================================
-  // DISPLAY DECISION – with auto‑execute toggle and symbol formatting
+  // DISPLAY DECISION – with auto‑execute, symbol formatting, and notifications
   // ============================================================
   function displayDecision(decision) {
     if (!liveSignalPanel) return;
@@ -219,13 +260,12 @@
       return;
     }
 
-    const alertClass = side === 'BUY' ? 'success' : 'danger';
+    const alertClass = side === 'BUY' ? 'buy' : 'sell';
     const sideLabel = side || 'NO TRADE';
-
-    // Format symbol with underscore if needed
     const formattedSymbol = formatSymbol(symbol);
 
-    let html = `<div class="alert alert-${alertClass} live-signal-card" data-symbol="${formattedSymbol}" data-side="${side}" data-entry="${entryPrice}" data-sl="${stopLoss}" data-tp="${takeProfit}" data-lot="${recommendedLotSize || 0.01}">`;
+    // Build the card with new styling
+    let html = `<div class="live-signal-card ${alertClass}" data-symbol="${formattedSymbol}" data-side="${side}" data-entry="${entryPrice}" data-sl="${stopLoss}" data-tp="${takeProfit}" data-lot="${recommendedLotSize || 0.01}">`;
     html += `<h5><strong>${sideLabel}</strong> ${formattedSymbol} (${confidence}% confidence)</h5>`;
     if (side && side !== 'NO_TRADE') {
       html += `<p>Entry: ${formatPrice(entryPrice)} | SL: ${formatPrice(stopLoss)} | TP: ${formatPrice(takeProfit)}</p>`;
@@ -238,13 +278,13 @@
     html += `</div>`;
     liveSignalPanel.innerHTML = html;
 
-    // ============================================================
-    // AUTO‑EXECUTE: if toggle is ON, send to /execute-signal
-    // ============================================================
+    // ---- Notification ----
+    notify(`${side} signal for ${formattedSymbol} at ${entryPrice} (${confidence}% confidence)`, side === 'BUY' ? 'success' : 'danger');
+
+    // ---- Auto‑execute: if toggle is ON, send to /execute-signal ----
     const toggle = document.getElementById('autoExecuteToggle');
     if (toggle && toggle.checked && side && side !== 'NO_TRADE') {
       console.log('[Live] Auto‑executing signal for', formattedSymbol, side);
-      // Play sound if available
       if (typeof playSound === 'function') playSound('signal');
 
       fetch('/api/execute-signal', {
@@ -268,13 +308,16 @@
           if (typeof loadOpenTrades === 'function') loadOpenTrades();
           if (typeof loadTradeHistory === 'function') loadTradeHistory();
           if (typeof loadAccount === 'function') loadAccount();
+          notify(`Auto‑executed ${side} ${formattedSymbol}`, 'success');
         } else {
           console.error('[Live] Auto‑execute failed:', data.error);
-          // Optionally show an alert
-          // alert('Auto‑execute failed: ' + data.error);
+          notify(`Auto‑execute failed: ${data.error}`, 'danger');
         }
       })
-      .catch(err => console.error('[Live] Auto‑execute error:', err));
+      .catch(err => {
+        console.error('[Live] Auto‑execute error:', err);
+        notify(`Auto‑execute error: ${err.message}`, 'danger');
+      });
     }
   }
 
@@ -326,12 +369,11 @@
 
   // ============================================================
   // Global function: execute trade from card
-  // (now uses formatSymbol to fix USDJPY → USD_JPY)
   // ============================================================
   window.executeSignalFromCard = function(btn) {
     const card = btn.closest('.live-signal-card');
     if (!card) return;
-    const symbol = formatSymbol(card.dataset.symbol);   // <-- FIX: format symbol
+    const symbol = formatSymbol(card.dataset.symbol);
     const side = card.dataset.side;
     const entry = parseFloat(card.dataset.entry);
     const sl = parseFloat(card.dataset.sl) || null;
@@ -357,6 +399,7 @@
       toggle.addEventListener('change', function() {
         localStorage.setItem('autoExecuteToggle', this.checked);
         console.log('[Live] Auto‑execute toggle:', this.checked ? 'ON' : 'OFF');
+        notify(`Auto‑execute ${this.checked ? 'enabled' : 'disabled'}`, 'info');
       });
     }
   });
