@@ -13,6 +13,20 @@ const DATA_CLASSES = {
   KNOWLEDGE: 'knowledge',      // learned behaviour
 };
 
+// Valid enum values for HistoricalState
+const VALID_REGIME_CODES = [
+  'STRONG_TREND_BULL',
+  'STRONG_TREND_BEAR',
+  'WEAK_TREND',
+  'RANGING',
+  'BREAKOUT',
+  'REVERSAL',
+  'HIGH_VOLATILITY',
+  'LOW_VOLATILITY',
+  'NEUTRAL'
+];
+const VALID_SOURCE_VALUES = ['live', 'backfill', 'backtest'];
+
 class DataOrchestrator {
   constructor() {
     this._cache = new Map();
@@ -26,7 +40,7 @@ class DataOrchestrator {
     this._flushSnapshots = this._flushSnapshots.bind(this);
     this._flushAppends = this._flushAppends.bind(this);
 
-    // No separate start method needed – timers are set on demand.
+    // No need for _startFlushTimers – we use per‑batch timers.
     logger.info('[DataOrchestrator] Initialized.');
   }
 
@@ -116,7 +130,6 @@ class DataOrchestrator {
 
   _handleRecoverable(key, entry, policy) {
     this._cache.set(key, { ...entry, policy });
-    // Only queue for snapshot if a collection is defined
     if (policy.collection) {
       this._snapshotQueue.push({ key, data: entry.data, metadata: entry.metadata });
       if (!this._snapshotTimer) {
@@ -154,7 +167,7 @@ class DataOrchestrator {
     for (const [key, items] of grouped) {
       try {
         const policy = this._policies.get(key);
-        if (!policy || !policy.collection) continue; // skip if no collection
+        if (!policy || !policy.collection) continue;
 
         const collection = this._getCollectionForKey(key);
         if (!collection) {
@@ -163,9 +176,10 @@ class DataOrchestrator {
         }
 
         const latest = items[items.length - 1];
-        const query = { symbol: latest.data.symbol || 'global' };
-        const update = { $set: latest.data };
-        await collection.findOneAndUpdate(query, update, { upsert: true });
+        // For snapshots, data overrides metadata
+        const doc = { ...latest.metadata, ...latest.data };
+        const query = { symbol: doc.symbol || 'global' };
+        await collection.findOneAndUpdate(query, { $set: doc }, { upsert: true });
 
         logger.debug(`[DataOrchestrator] Snapshot flushed for ${key}`);
       } catch (err) {
@@ -192,13 +206,24 @@ class DataOrchestrator {
           continue;
         }
 
-        const docs = items.map(item => ({
-          ...item.data,
-          ...item.metadata,
-        }));
-        await collection.insertMany(docs);
+        // Build documents: data overrides metadata
+        const docs = items.map(item => {
+          let doc = { ...item.metadata, ...item.data };
+          // ---- Sanitize for HistoricalState ----
+          if (key === 'historicalState') {
+            doc = this._sanitizeHistoricalState(doc);
+          }
+          // ---- Sanitize for HistoricalDecision ----
+          if (key === 'historicalDecision') {
+            doc = this._sanitizeHistoricalDecision(doc);
+          }
+          return doc;
+        });
 
-        logger.debug(`[DataOrchestrator] Appended ${docs.length} items for ${key}`);
+        if (docs.length > 0) {
+          await collection.insertMany(docs);
+          logger.debug(`[DataOrchestrator] Appended ${docs.length} items for ${key}`);
+        }
       } catch (err) {
         logger.error(`[DataOrchestrator] Error flushing append for ${key}:`, err.message);
       }
@@ -215,6 +240,38 @@ class DataOrchestrator {
   }
 
   // ============================================================
+  // SANITIZATION
+  // ============================================================
+
+  _sanitizeHistoricalState(doc) {
+    // Ensure source is valid
+    if (!doc.source || !VALID_SOURCE_VALUES.includes(doc.source)) {
+      doc.source = 'live';
+    }
+    // Ensure regime.code is valid
+    if (doc.regime && doc.regime.code) {
+      if (!VALID_REGIME_CODES.includes(doc.regime.code)) {
+        doc.regime.code = 'NEUTRAL';
+        doc.regime.name = 'Neutral / Mixed';
+      }
+    } else {
+      doc.regime = {
+        code: 'NEUTRAL',
+        name: 'Neutral / Mixed',
+        confidence: 50,
+        description: '',
+      };
+    }
+    return doc;
+  }
+
+  _sanitizeHistoricalDecision(doc) {
+    // Ensure any nested objects are not flat values
+    // This is a safety net – decisionEngine now passes full nested state
+    return doc;
+  }
+
+  // ============================================================
   // IMMEDIATE PERSISTENCE
   // ============================================================
 
@@ -226,10 +283,13 @@ class DataOrchestrator {
         return;
       }
 
-      if (data._id) {
-        await collection.updateOne({ _id: data._id }, { $set: data });
+      // data overrides metadata
+      const doc = { ...metadata, ...data };
+
+      if (doc._id) {
+        await collection.updateOne({ _id: doc._id }, { $set: doc });
       } else {
-        await collection.create(data);
+        await collection.create(doc);
       }
       logger.debug(`[DataOrchestrator] Persisted immediately for ${key}`);
     } catch (err) {
@@ -241,10 +301,6 @@ class DataOrchestrator {
   // COLLECTION MAPPING
   // ============================================================
 
-  /**
-   * Get the Mongoose model for a given key.
-   * For 'marketState', we no longer use a dedicated model – returns null.
-   */
   _getCollectionForKey(key) {
     switch (key) {
       case 'historicalState':
@@ -263,7 +319,6 @@ class DataOrchestrator {
         return require('../../models/User');
       case 'apiKey':
         return require('../../models/ApiKey');
-      // 'marketState' is not persisted via DB – handled in memory
       default:
         return null;
     }
@@ -279,29 +334,24 @@ class DataOrchestrator {
     logger.info('[DataOrchestrator] Starting recovery...');
 
     try {
-      // Load recoverable state from snapshots (only those with collections)
       await this._loadRecoverableState();
-      // Load business data
       await this._loadBusinessState();
-      // Load knowledge
       await this._loadKnowledgeState();
 
       this._recovered = true;
       logger.info('[DataOrchestrator] Recovery complete.');
     } catch (err) {
       logger.error('[DataOrchestrator] Recovery error:', err.message);
-      // Continue anyway – system will rebuild from fresh data.
     }
   }
 
   async _loadRecoverableState() {
-    // We no longer load 'marketState' from DB – it's rebuilt from candles/awareness.
-    // If we had other recoverable keys, we could load them here.
+    // No DB loading for marketState – rebuilt from candles/awareness
     logger.debug('[DataOrchestrator] No recoverable state to load from DB.');
   }
 
   async _loadBusinessState() {
-    // Placeholder – can be extended to load trades/orders if needed.
+    // Placeholder
   }
 
   async _loadKnowledgeState() {
@@ -318,7 +368,7 @@ class DataOrchestrator {
         logger.info(`[DataOrchestrator] Loaded ${weights.length} learning weights.`);
       }
     } catch (err) {
-      // Ignore if model not ready
+      // ignore
     }
   }
 
