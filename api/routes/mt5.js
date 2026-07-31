@@ -14,7 +14,7 @@ const Trade = require('../../models/Trade');
 // ---- COGNITIVE: import priceBuffer ----
 const priceBuffer = require('../../core/data/priceBuffer');
 
-// ---- IMPORT selfLearner for decision outcome updates (additive) ----
+// ---- IMPORT selfLearner for decision outcome updates ----
 const selfLearner = require('../../core/learning/learner');
 
 // ---------- Authentication ----------
@@ -94,7 +94,7 @@ router.get('/orders/pending', async (req, res) => {
   }
 });
 
-// ---------- ✅ ENHANCED: POST /orders/result ----------
+// ---------- ENHANCED: POST /orders/result ----------
 router.post('/orders/result', async (req, res) => {
   try {
     const result = req.body;
@@ -110,7 +110,7 @@ router.post('/orders/result', async (req, res) => {
       { upsert: true, new: true }
     );
 
-    // 2. Update command state (existing behavior)
+    // 2. Update command state
     const successFlag = success === true;
     await Mt5Command.findOneAndUpdate(
       { commandId },
@@ -123,29 +123,28 @@ router.post('/orders/result', async (req, res) => {
     );
     logger.info(`[MT5] Result stored for ${commandId}, success=${successFlag}`);
 
-    // 3. 🔥 NEW: If this was a successful CLOSE, finalize the Trade
+    // 3. If this was a successful CLOSE, finalize the Trade
     const command = await Mt5Command.findOne({ commandId }).lean();
     const action = command?.action;
 
     if (successFlag && action === 'CLOSE' && ticket && price) {
       const trade = await Trade.findOne({ contractId: ticket });
       if (trade) {
-        // Only update if not already closed
         if (trade.status !== 'CLOSED') {
           trade.status = 'CLOSED';
           trade.closePrice = price;
           trade.dealId = deal;
           trade.closeTime = new Date(time ? time * 1000 : Date.now());
           trade.pendingClose = false;
-          // Calculate realized profit if possible
           if (trade.openPrice && trade.lotSize) {
             const multiplier = trade.side === 'buy' ? 1 : -1;
             trade.realizedProfit = (price - trade.openPrice) * trade.lotSize * multiplier;
+            trade.pnl = trade.realizedProfit; // sync with pnl field
           }
           await trade.save();
           logger.info(`[MT5] Trade ${ticket} finalized as CLOSED at ${price}`);
 
-          // 🔥 NEW: Update decision outcome if this trade has a decisionId
+          // Update decision outcome
           if (trade.decisionId) {
             try {
               await selfLearner.updateDecisionOutcome(trade.decisionId, trade);
@@ -243,7 +242,7 @@ router.get('/account/status', async (req, res) => {
   }
 });
 
-// ---------- ✅ ENHANCED: POST /positions ----------
+// ---------- ENHANCED: POST /positions ----------
 router.post('/positions', async (req, res) => {
   try {
     const { login, positions, timestamp, magic } = req.body;
@@ -256,15 +255,13 @@ router.post('/positions', async (req, res) => {
     }
     logger.debug(`[MT5] Positions updated for login ${login}: ${positions?.length || 0} open`);
 
-    // 2. 🔥 NEW: Synchronize Trade collection
+    // 2. Synchronize Trade collection
     const incomingTickets = new Set(positions.map(p => p.ticket));
 
-    // Process each incoming position
     for (const pos of positions) {
       let trade = await Trade.findOne({ contractId: pos.ticket });
 
       if (!trade) {
-        // Create new open trade
         trade = new Trade({
           contractId: pos.ticket,
           instrument: pos.symbol,
@@ -283,17 +280,12 @@ router.post('/positions', async (req, res) => {
           login: login,
           pendingClose: false,
           floatingProfit: pos.profit || 0,
-          // decisionId is not sent by EA; it will be set by orderService when placing the trade.
-          // If orderService created it, the decisionId is already there and we are just updating.
         });
       } else {
-        // Update existing open trade
         trade.currentPrice = pos.current_price;
         trade.floatingProfit = pos.profit;
         trade.lotSize = pos.volume;
-        // If it was pendingClose but now appears again, clear that flag
         trade.pendingClose = false;
-        // Only update if status is OPEN (do not reopen closed trades)
         if (trade.status === 'OPEN') {
           trade.stopLoss = pos.stop_loss || 0;
           trade.takeProfit = pos.take_profit || 0;
@@ -308,7 +300,7 @@ router.post('/positions', async (req, res) => {
       await trade.save();
     }
 
-    // 3. Mark open trades that are missing from incoming as pendingClose
+    // 3. Mark open trades missing from incoming as pendingClose
     const openTrades = await Trade.find({ status: 'OPEN', login: login });
     for (const trade of openTrades) {
       if (!incomingTickets.has(trade.contractId)) {
@@ -367,11 +359,9 @@ router.post('/price', async (req, res) => {
       return res.status(400).json({ error: 'Missing symbol' });
     }
 
-    // ---- Forward tick to cognitive engine ----
     const timeMs = priceData.time ? Number(priceData.time) * 1000 : Date.now();
     priceBuffer.update(priceData.symbol, priceData.bid, priceData.ask, timeMs);
 
-    // Save to database
     await Mt5Price.findOneAndUpdate(
       { symbol: priceData.symbol },
       priceData,
@@ -386,7 +376,6 @@ router.post('/price', async (req, res) => {
   }
 });
 
-// ---- Handle underscores in symbol names ----
 router.get('/price/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
@@ -425,7 +414,7 @@ router.get('/trade/:ticket', async (req, res) => {
   }
 });
 
-// ---------- History (using Trade model) ----------
+// ---------- UPDATED: History (with field mapping for dashboard) ----------
 router.get('/history', async (req, res) => {
   try {
     const { from, to, symbol } = req.query;
@@ -433,8 +422,24 @@ router.get('/history', async (req, res) => {
     if (symbol) filter.instrument = symbol;
     if (from) filter.closeTime = { $gte: new Date(Number(from)) };
     if (to) filter.closeTime = { ...filter.closeTime, $lte: new Date(Number(to)) };
+
     const trades = await Trade.find(filter).sort({ closeTime: -1 }).lean();
-    res.json({ history: trades });
+
+    // Map fields to dashboard expectations
+    const history = trades.map(t => ({
+      pair: t.instrument,
+      side: t.side,
+      entry: t.openPrice,
+      exit: t.closePrice,
+      lot: t.lotSize,
+      pl: t.realizedProfit || t.pnl || 0,
+      status: t.status,
+      date: t.closeTime,
+      // keep original fields for any other consumer
+      ...t,
+    }));
+
+    res.json({ history });
   } catch (err) {
     logger.warn('[MT5] History error:', err.message);
     res.json({ history: [] });
