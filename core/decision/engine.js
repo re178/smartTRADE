@@ -1,10 +1,10 @@
 // core/decision/engine.js
 // Decision Engine – probability/EV based with empirical edge from StateStore.
-// Every decision is logged to HistoricalDecision for lineage and calibration.
+// Every emitted decision is logged to HistoricalDecision for lineage and calibration.
 
 const EventEmitter = require('events');
 const marketStateCache = require('../data/marketStateCache');
-const deepMarketState = require('../intelligence/deep/marketState'); // <-- for full nested state
+const deepMarketState = require('../intelligence/deep/marketState');
 const deepRegime = require('../intelligence/deep/regime');
 const awarenessEngine = require('../awareness/engine');
 const selfLearner = require('../learning/learner');
@@ -32,19 +32,16 @@ class DecisionEngine extends EventEmitter {
 
     console.log('🔧 DecisionEngine: constructor – listening to regime events');
 
-    // Listen to regime events
     deepRegime.on('regime', (regime) => {
       console.log(`⚖️ DecisionEngine: received regime event for ${regime.symbol} (${regime.code})`);
       this._onRegime(regime);
     });
 
-    // Also evaluate periodically
     this._timer = setInterval(() => {
       console.log('⏰ DecisionEngine: timer tick – evaluating all symbols');
       this._evaluate();
     }, CONFIG.DECISION_INTERVAL_MS);
 
-    // Initialise StateStore safely
     if (stateStore && typeof stateStore.init === 'function') {
       stateStore.init()
         .then(() => {
@@ -70,6 +67,15 @@ class DecisionEngine extends EventEmitter {
       const prev = this._lastDecision[regime.symbol];
       if (!prev || prev.decision !== decision.decision || Math.abs(prev.confidence - decision.confidence) > 5) {
         this._lastDecision[regime.symbol] = decision;
+        // ---- LOG decision only when emitted ----
+        try {
+          const decisionId = await selfLearner.recordDecision(decision);
+          if (decisionId) {
+            decision.decisionId = decisionId;
+          }
+        } catch (err) {
+          console.error(`❌ DecisionEngine: Failed to log decision:`, err.message);
+        }
         console.log(`📢 DecisionEngine: emitting decision for ${regime.symbol}: ${decision.decision} (${decision.confidence}%)`);
         this.emit('decision', decision);
       } else {
@@ -94,6 +100,15 @@ class DecisionEngine extends EventEmitter {
           const prev = this._lastDecision[symbol];
           if (!prev || prev.decision !== decision.decision || Math.abs(prev.confidence - decision.confidence) > 5) {
             this._lastDecision[symbol] = decision;
+            // ---- LOG decision only when emitted ----
+            try {
+              const decisionId = await selfLearner.recordDecision(decision);
+              if (decisionId) {
+                decision.decisionId = decisionId;
+              }
+            } catch (err) {
+              console.error(`❌ DecisionEngine: Failed to log decision:`, err.message);
+            }
             console.log(`📢 DecisionEngine: emitting decision for ${symbol}: ${decision.decision} (${decision.confidence}%)`);
             this.emit('decision', decision);
           }
@@ -113,10 +128,10 @@ class DecisionEngine extends EventEmitter {
       return null;
     }
 
-    // 2. Get deep state (full nested) for logging – this is what HistoricalDecision expects
+    // 2. Get deep state (full nested) for logging
     let deepState = deepMarketState.getLastState(symbol);
     if (!deepState) {
-      // Fallback: construct a minimal nested object from awareness state to avoid validation errors
+      // Fallback: construct a minimal nested object from awareness state
       console.warn(`⚠️ DecisionEngine: no deep state for ${symbol}, using awareness state fallback`);
       deepState = {
         ...state,
@@ -230,7 +245,7 @@ class DecisionEngine extends EventEmitter {
       reason: this._buildReason(decision, confidence, edge, regime),
       timestamp: new Date().toISOString(),
       timeframe: 'M5',
-      features: deepState, // <-- FULL NESTED STATE for HistoricalDecision
+      features: deepState, // full nested state
       contributions: this._buildContributions(state, regime, edge),
       inputs: {
         regime: regime.confidence / 100,
@@ -243,17 +258,8 @@ class DecisionEngine extends EventEmitter {
       expectedValueModel: 'v2.1',
     };
 
-    // 9. Log decision to HistoricalDecision via selfLearner
-    try {
-      const decisionId = await selfLearner.recordDecision(decisionObj);
-      if (decisionId) {
-        decisionObj.decisionId = decisionId;
-      }
-    } catch (err) {
-      console.error(`❌ DecisionEngine: Failed to log decision:`, err.message);
-    }
-
-    console.log(`📊 DecisionEngine: ${symbol} decision=${decision}, conf=${confidence.toFixed(1)}%`);
+    // ---- DO NOT LOG HERE – logging is done only when we emit ----
+    // The caller (_onRegime or _evaluate) will log and emit after checking changes.
 
     return decisionObj;
   }
