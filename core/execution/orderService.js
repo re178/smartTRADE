@@ -1,4 +1,4 @@
-// core/execution/orderService.js – Order Management (with Order & Trade models)
+// core/execution/orderService.js – Order Management (with Decision Lineage)
 
 const { getBroker } = require('./brokerFactory');
 const eventBus = require('../../infrastructure/eventBus');
@@ -6,6 +6,7 @@ const { validateOrderInput } = require('../../shared/validators');
 const { ExecutionAnalytics } = require('../analytics/performanceSuite');
 const Order = require('../../models/Order');
 const Trade = require('../../models/Trade');
+const selfLearner = require('../learning/learner'); // For decision outcome updates
 const logger = require('../../infrastructure/logger') || console;
 
 // Singleton Execution Analytics instance
@@ -21,9 +22,10 @@ const executionAnalytics = new ExecutionAnalytics({
  * @param {number|null} stopLoss - Stop loss price (optional)
  * @param {number|null} takeProfit - Take profit price (optional)
  * @param {string} [product] - Trading product (optional, default from env)
+ * @param {string} [decisionId] - ID of the HistoricalDecision that generated this trade (optional)
  * @returns {Promise<Object>} { contractId, price, raw }
  */
-async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, takeProfit = null, product) {
+async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, takeProfit = null, product, decisionId = null) {
   const validation = validateOrderInput({ pair: instrument, side, lotSize, stopLoss, takeProfit });
   if (!validation.valid) {
     throw new Error(validation.message);
@@ -80,10 +82,12 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
       status: 'OPEN',
       openTime: new Date(),
       product,
+      decisionId: decisionId || null, // Store decision lineage
+      strategy: null, // Will be filled later if needed
     });
     await newTrade.save();
 
-    // ---- Record analytics with extended fields ----
+    // ---- Record analytics ----
     const spread = await broker.getSpread(instrument).catch(() => 0);
     executionAnalytics.recordExecution({
       orderId: contractId,
@@ -107,8 +111,24 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
       takeProfit,
       contractId,
       price,
+      decisionId: decisionId || null,
       timestamp: new Date().toISOString(),
     });
+
+    // ---- If decisionId provided, update HistoricalDecision to mark as executed ----
+    if (decisionId) {
+      try {
+        const decision = await require('../../models/HistoricalDecision').findById(decisionId);
+        if (decision) {
+          decision.outcome.executed = true;
+          decision.outcome.tradeId = newTrade._id;
+          await decision.save();
+          logger.debug(`[orderService] Decision ${decisionId} marked as executed with trade ${newTrade._id}`);
+        }
+      } catch (err) {
+        logger.warn(`[orderService] Failed to update decision ${decisionId}:`, err.message);
+      }
+    }
 
     return { contractId, price, raw: result };
   } catch (err) {
@@ -182,6 +202,7 @@ async function closeTrade(contractId, product) {
         closeTime: new Date(),
         closePrice: result.price || null,
         pnl: result.pl || 0,
+        // MAE/MFE could be computed if available; placeholder
       },
       { new: true }
     );
@@ -194,6 +215,16 @@ async function closeTrade(contractId, product) {
         { status: 'CLOSED', updatedAt: new Date() },
         { upsert: false }
       );
+
+      // ---- If decisionId is stored, update HistoricalDecision outcome ----
+      if (updatedTrade.decisionId) {
+        try {
+          await selfLearner.updateDecisionOutcome(updatedTrade.decisionId, updatedTrade);
+          logger.debug(`[orderService] Decision ${updatedTrade.decisionId} outcome updated from trade ${contractId}`);
+        } catch (err) {
+          logger.warn(`[orderService] Failed to update decision outcome for ${updatedTrade.decisionId}:`, err.message);
+        }
+      }
     }
 
     // ---- Record analytics for close ----
