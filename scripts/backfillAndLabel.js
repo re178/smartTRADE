@@ -1,6 +1,5 @@
 // scripts/backfillAndLabel.js
-// One‑script backfill + outcome labelling.
-// Run with: node scripts/backfillAndLabel.js
+// One‑script backfill + outcome labelling (fixed timestamp matching).
 
 const mongoose = require('mongoose');
 const connectDB = require('../config/db');
@@ -12,16 +11,16 @@ const logger = require('../infrastructure/logger') || console;
 
 const SYMBOLS = ['EUR_USD', 'GBP_USD', 'USD_JPY', 'AUD_USD'];
 const TIMEFRAMES = ['M5', 'M15', 'H1'];
-const CANDLE_COUNT = 200;
+const CANDLE_COUNT = 500; // increased to ensure enough future candles
 const LOOKAHEADS = [5, 10, 20, 40];
 const BATCH_SIZE = 10;
+const TOLERANCE_MS = 60000; // 1 minute
 
 async function run() {
   try {
     await connectDB();
     logger.info('✅ Connected to MongoDB.');
 
-    // Skip if HistoricalState already has data
     const existingCount = await HistoricalState.countDocuments();
     if (existingCount > 100) {
       logger.info(`⏭️ HistoricalState already has ${existingCount} records. Skipping backfill.`);
@@ -36,15 +35,17 @@ async function run() {
       for (const tf of TIMEFRAMES) {
         logger.info(`📥 Processing ${symbol} ${tf}...`);
         const candles = await candleHistory.getHistory(symbol, tf, CANDLE_COUNT);
-        if (!candles || candles.length < 10) {
+        if (!candles || candles.length < 50) {
           logger.warn(`⚠️ Not enough candles for ${symbol} ${tf}. Skipping.`);
           continue;
         }
 
-        // ---- Phase 1: Create states (skip last few candles to ensure outcomes exist) ----
-        for (let i = 0; i < candles.length - Math.max(...LOOKAHEADS); i += BATCH_SIZE) {
-          const batch = candles.slice(i, i + BATCH_SIZE);
-          const promises = batch.map(async (candle, idx) => {
+        // ---- Phase 1: Create states (skip last 50 candles to ensure outcomes exist) ----
+        const maxLookahead = Math.max(...LOOKAHEADS);
+        const endIndex = candles.length - maxLookahead - 5; // leave extra buffer
+        for (let i = 0; i < endIndex; i += BATCH_SIZE) {
+          const batch = candles.slice(i, Math.min(i + BATCH_SIZE, endIndex));
+          const promises = batch.map(async () => {
             try {
               await deepMarketState.compute(symbol, tf, CANDLE_COUNT);
             } catch (err) {
@@ -63,16 +64,40 @@ async function run() {
         let labelled = 0;
         for (const state of states) {
           const stateTime = new Date(state.timestamp).getTime();
-          const startIdx = candles.findIndex(c => new Date(c.time).getTime() >= stateTime);
-          if (startIdx === -1) continue;
+
+          // Find the closest candle index within tolerance
+          let startIdx = -1;
+          for (let idx = 0; idx < candles.length; idx++) {
+            const candleTime = new Date(candles[idx].time).getTime();
+            if (Math.abs(candleTime - stateTime) <= TOLERANCE_MS) {
+              startIdx = idx;
+              break;
+            }
+          }
+
+          if (startIdx === -1) {
+            // Try to find the first candle AFTER the state time
+            for (let idx = 0; idx < candles.length; idx++) {
+              if (new Date(candles[idx].time).getTime() >= stateTime) {
+                startIdx = idx;
+                break;
+              }
+            }
+          }
+
+          if (startIdx === -1 || startIdx + maxLookahead >= candles.length) {
+            logger.warn(`   ⚠️ Cannot label state ${state._id}: no future candles.`);
+            continue;
+          }
+
+          const startPrice = candles[startIdx].close;
+          const atr = state.volatility?.atr || 0.001;
 
           for (const lookahead of LOOKAHEADS) {
             const endIdx = startIdx + lookahead;
             if (endIdx >= candles.length) continue;
 
-            const startPrice = candles[startIdx].close;
             const endPrice = candles[endIdx].close;
-            const atr = state.volatility?.atr || 0.001;
             const returnVal = endPrice - startPrice;
             const returnR = returnVal / atr;
             const win = returnVal > 0;
@@ -93,7 +118,7 @@ async function run() {
               filledAt: new Date(),
             };
 
-            // Create HistoricalOutcome record for training
+            // Create HistoricalOutcome record
             await HistoricalOutcome.create({
               stateId: state._id,
               symbol: state.symbol,
