@@ -1,5 +1,5 @@
 // core/intelligence/lab/stateStore.js
-// With debug logging to inspect outcome fields.
+// Similarity search using HistoricalState, outcomes from HistoricalOutcome.
 
 const HistoricalState = require('../../../models/HistoricalState');
 const HistoricalOutcome = require('../../../models/HistoricalOutcome');
@@ -15,8 +15,7 @@ function getSymbolVariants(symbol) {
   if (!symbol) return [];
   const clean = symbol.replace(/_/g, '').toUpperCase();
   const withUnderscore = clean.slice(0, 3) + '_' + clean.slice(3);
-  const variants = [clean, withUnderscore];
-  return [...new Set(variants)];
+  return [...new Set([clean, withUnderscore])];
 }
 
 class FeatureNormalizer {
@@ -52,12 +51,11 @@ class FeatureNormalizer {
             pricePositionMax: { $max: '$structure.pricePosition' },
             marketQualityMin: { $min: '$summary.marketQuality' },
             marketQualityMax: { $max: '$summary.marketQuality' },
-          },
-        },
+          }
+        }}
       ]);
-      if (sample.length === 0) {
-        this.featureStats = this._getDefaultStats();
-      } else {
+      if (sample.length === 0) this.featureStats = this._getDefaultStats();
+      else {
         const stats = sample[0];
         this.featureStats = {
           adx: { min: stats.adxMin || 0, max: stats.adxMax || 100 },
@@ -73,7 +71,6 @@ class FeatureNormalizer {
         };
       }
       this.isLoaded = true;
-      logger.debug('[StateStore] Feature stats loaded.');
     } catch (err) {
       logger.warn('[StateStore] Failed to load stats, using defaults.', err.message);
       this.featureStats = this._getDefaultStats();
@@ -136,14 +133,9 @@ class StateStore {
 
     const filter = {};
     if (timeframe) filter.timeframe = timeframe;
-
     if (symbol) {
       const variants = getSymbolVariants(symbol);
-      if (variants.length === 1) {
-        filter.symbol = variants[0];
-      } else {
-        filter.$or = variants.map(sym => ({ symbol: sym }));
-      }
+      filter.$or = variants.map(sym => ({ symbol: sym }));
     }
 
     logger.info(`[StateStore] findSimilar filter: ${JSON.stringify(filter)}`);
@@ -159,13 +151,7 @@ class StateStore {
       return { states: [], stats: { count: 0, winRate: 0, avgReturnR: 0, maxDrawdown: 0, profitFactor: 0 } };
     }
 
-    // ---- DEBUG: log the first state's outcome5 ----
-    if (states.length > 0) {
-      const first = states[0];
-      logger.info(`[StateStore] DEBUG: first state outcome5: ${JSON.stringify(first.outcome5)}`);
-    }
-
-    // ---- Compute distances ----
+    // Compute distances
     const withDistances = states.map(state => {
       const stateFeatures = {
         adx: state.trend.adx,
@@ -187,26 +173,41 @@ class StateStore {
         squaredSum += (q - s) ** 2;
       }
       const distance = Math.sqrt(squaredSum);
-      const outcomeKey = `outcome${lookahead}`;
-      const outcome = state[outcomeKey] || { return: null, returnR: null, win: null, maxDrawdown: null };
-      return { state, distance, outcome };
+      return { state, distance };
     });
 
     withDistances.sort((a, b) => a.distance - b.distance);
     const topK = withDistances.slice(0, k);
 
-    // ---- FIX: Check BOTH return and returnR ----
-    const labelled = topK.filter(item => {
-      const out = item.outcome;
-      return out !== null && (out.return !== null || out.returnR !== null);
+    // ---- Get outcomes from HistoricalOutcome for these state IDs ----
+    const stateIds = topK.map(item => item.state._id);
+    const outcomes = await HistoricalOutcome.find({
+      stateId: { $in: stateIds },
+      lookahead: lookahead
+    }).lean();
+
+    // Create a map: stateId -> outcome
+    const outcomeMap = {};
+    outcomes.forEach(o => {
+      outcomeMap[o.stateId.toString()] = o.outcome;
     });
+
+    // Build result with outcomes
+    const resultStates = topK.map(item => ({
+      state: item.state,
+      distance: item.distance,
+      outcome: outcomeMap[item.state._id.toString()] || null
+    }));
+
+    // Filter only labelled outcomes (where returnR is a number)
+    const labelled = resultStates.filter(item => item.outcome && item.outcome.returnR !== null && typeof item.outcome.returnR === 'number' && !isNaN(item.outcome.returnR));
 
     const stats = this._computeStats(labelled.map(item => item.outcome));
 
     logger.info(`[StateStore] Similarity stats: sampleSize=${stats.count}, winRate=${stats.winRate}, avgReturnR=${stats.avgReturnR}`);
 
     return {
-      states: topK.map(item => ({ state: item.state, distance: item.distance, outcome: item.outcome })),
+      states: resultStates,
       stats,
     };
   }
@@ -215,15 +216,12 @@ class StateStore {
     const cacheKey = `edge:${symbol || '*'}:${timeframe}:${lookahead}:${k}:${JSON.stringify(features)}`;
     if (this._edgeCache.has(cacheKey)) {
       const cached = this._edgeCache.get(cacheKey);
-      if (Date.now() - cached.timestamp < 300000) {
-        return cached.data;
-      }
+      if (Date.now() - cached.timestamp < 300000) return cached.data;
       this._edgeCache.delete(cacheKey);
     }
 
     const similarityResult = await this.findSimilar(features, symbol, timeframe, k, lookahead);
     const stats = similarityResult.stats;
-
     const result = {
       edge: stats.avgReturnR || 0,
       winRate: stats.winRate || 0,
@@ -232,7 +230,6 @@ class StateStore {
       sampleSize: stats.count || 0,
       profitFactor: stats.profitFactor || 0,
     };
-
     this._edgeCache.set(cacheKey, { data: result, timestamp: Date.now() });
     return result;
   }
@@ -271,6 +268,5 @@ class StateStore {
   }
 }
 
-// ---- Singleton ----
 const stateStore = new StateStore();
 module.exports = stateStore;
