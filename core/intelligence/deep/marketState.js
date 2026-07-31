@@ -18,6 +18,19 @@ const {
 } = require('../../strategy/engine');
 const logger = require('../../../infrastructure/logger') || console;
 
+// ---- Valid regime codes (for safety) ----
+const VALID_REGIME_CODES = [
+  'STRONG_TREND_BULL',
+  'STRONG_TREND_BEAR',
+  'WEAK_TREND',
+  'RANGING',
+  'BREAKOUT',
+  'REVERSAL',
+  'HIGH_VOLATILITY',
+  'LOW_VOLATILITY',
+  'NEUTRAL'
+];
+
 class DeepMarketState extends EventEmitter {
   constructor() {
     super();
@@ -53,7 +66,7 @@ class DeepMarketState extends EventEmitter {
       batchSize: 50,
     });
     dataOrchestrator.register('regimeChange', DATA_CLASSES.RESEARCH, {
-      collection: 'historicalstates', // We'll store regime changes as part of historical state, but can also separate
+      collection: 'historicalstates',
     });
 
     logger.info('[DeepMarketState] Initialized with DataOrchestrator.');
@@ -61,10 +74,8 @@ class DeepMarketState extends EventEmitter {
 
   _addCandleToBuffer(candle) {
     const key = this._getKey(candle.symbol, candle.timeframe);
-    if (!this._buffers.has(key)) return; // buffer not yet loaded – ignore
-
+    if (!this._buffers.has(key)) return;
     const buffer = this._buffers.get(key);
-    // Ensure the candle is valid
     if (candle && typeof candle.high === 'number' && typeof candle.low === 'number' && typeof candle.close === 'number') {
       buffer.push(candle);
       if (buffer.length > 200) buffer.shift();
@@ -226,7 +237,7 @@ class DeepMarketState extends EventEmitter {
           macdHist: macdHist,
           macdLine: macd ? macd.macd[macd.macd.length - 1] : 0,
           macdSignal: macd ? macd.signal[macd.signal.length - 1] : 0,
-          velocity: 0, // Will be updated by awareness engine separately
+          velocity: 0,
           acceleration: 0,
         },
         volatility: {
@@ -258,7 +269,7 @@ class DeepMarketState extends EventEmitter {
         confidence: 0,
         reason: '',
         status: 'confirmed',
-        // Additional fields for HistoricalState
+        // ---- Ensure regime is always valid ----
         regime: {
           code: 'NEUTRAL',
           name: 'Neutral / Mixed',
@@ -271,7 +282,7 @@ class DeepMarketState extends EventEmitter {
         },
       };
 
-      // Incorporate awareness data if available
+      // ---- Incorporate awareness data if available ----
       const awareness = marketStateCache.get(symbol);
       if (awareness) {
         state.awareness = {
@@ -293,8 +304,19 @@ class DeepMarketState extends EventEmitter {
         state.summary.noiseLevel = state.summary.marketQuality > 70 ? 'low' : (state.summary.marketQuality > 40 ? 'medium' : 'high');
       }
 
+      // ---- Calculate confidence and reason ----
       state.confidence = this._calculateConfidence(state);
       state.reason = this._buildReason(state);
+
+      // ---- Ensure regime.code is valid before publishing ----
+      if (!state.regime || !state.regime.code || !VALID_REGIME_CODES.includes(state.regime.code)) {
+        state.regime = {
+          code: 'NEUTRAL',
+          name: 'Neutral / Mixed',
+          confidence: 50,
+          description: '',
+        };
+      }
 
       // ---- PUBLISH TO DATAORCHESTRATOR ----
       // 1. Recoverable state (marketState) – for current snapshot
@@ -305,8 +327,6 @@ class DeepMarketState extends EventEmitter {
       }, { source: 'deepMarketState' });
 
       // 2. Research state (historicalState) – append‑only
-      // Ensure we have all fields required by HistoricalState model
-      // We can use state as is; it matches the schema (features are flattened)
       dataOrchestrator.publish('historicalState', {
         symbol,
         timeframe,
@@ -318,18 +338,18 @@ class DeepMarketState extends EventEmitter {
         liquidity: {
           score: state.summary.liquidityScore,
           spread: state.awareness?.spread || 0,
-          tickFrequency: 0, // Not tracked here
+          tickFrequency: 0,
         },
         structure: state.structure,
         session: state.session,
-        regime: state.regime,
+        regime: state.regime,                       // <-- now guaranteed valid
         awareness: state.awareness,
         summary: state.summary,
         confidence: state.confidence,
         reason: state.reason,
-        source: 'live',
+        source: 'live',                             // <-- explicitly set (not overridden)
         version: '2.0',
-      }, { source: 'deepMarketState' });
+      }, {}); // <-- empty metadata to avoid overriding source
 
       this._lastState.set(symbol, state);
 
