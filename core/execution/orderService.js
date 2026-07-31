@@ -1,12 +1,12 @@
-// core/execution/orderService.js – Order Management (with Decision Lineage)
+// core/execution/orderService.js – Order Management (Execution Layer only)
+// ⚠️ Trade persistence is now handled by the MT5 sync (POST /positions and POST /orders/result)
+// This service remains responsible for: sending commands, analytics, and event emission.
 
 const { getBroker } = require('./brokerFactory');
 const eventBus = require('../../infrastructure/eventBus');
 const { validateOrderInput } = require('../../shared/validators');
 const { ExecutionAnalytics } = require('../analytics/performanceSuite');
-const Order = require('../../models/Order');
-const Trade = require('../../models/Trade');
-const selfLearner = require('../learning/learner'); // For decision outcome updates
+const Order = require('../../models/Order'); // optional internal tracking (kept for compatibility)
 const logger = require('../../infrastructure/logger') || console;
 
 // Singleton Execution Analytics instance
@@ -22,7 +22,7 @@ const executionAnalytics = new ExecutionAnalytics({
  * @param {number|null} stopLoss - Stop loss price (optional)
  * @param {number|null} takeProfit - Take profit price (optional)
  * @param {string} [product] - Trading product (optional, default from env)
- * @param {string} [decisionId] - ID of the HistoricalDecision that generated this trade (optional)
+ * @param {string} [decisionId] - ID of the HistoricalDecision that generated this trade (for audit)
  * @returns {Promise<Object>} { contractId, price, raw }
  */
 async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, takeProfit = null, product, decisionId = null) {
@@ -57,7 +57,8 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
       throw new Error('Broker did not return a trade ID');
     }
 
-    // ---- Create Order document ----
+    // ---- (Optional) Create an internal Order record for tracking the request ----
+    // This is kept for compatibility; the actual trade state comes from MT5 sync.
     const newOrder = new Order({
       contractId,
       instrument,
@@ -69,23 +70,9 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
       product,
       filledPrice: price,
       placedAt: new Date(),
+      decisionId: decisionId || null,
     });
-    await newOrder.save();
-
-    // ---- Create Trade record (open trade) ----
-    const newTrade = new Trade({
-      contractId,
-      instrument,
-      side: side.toUpperCase(),
-      lotSize,
-      openPrice: price,
-      status: 'OPEN',
-      openTime: new Date(),
-      product,
-      decisionId: decisionId || null, // Store decision lineage
-      strategy: null, // Will be filled later if needed
-    });
-    await newTrade.save();
+    await newOrder.save().catch(err => logger.warn('[orderService] Order save failed (non‑critical):', err.message));
 
     // ---- Record analytics ----
     const spread = await broker.getSpread(instrument).catch(() => 0);
@@ -115,20 +102,8 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
       timestamp: new Date().toISOString(),
     });
 
-    // ---- If decisionId provided, update HistoricalDecision to mark as executed ----
-    if (decisionId) {
-      try {
-        const decision = await require('../../models/HistoricalDecision').findById(decisionId);
-        if (decision) {
-          decision.outcome.executed = true;
-          decision.outcome.tradeId = newTrade._id;
-          await decision.save();
-          logger.debug(`[orderService] Decision ${decisionId} marked as executed with trade ${newTrade._id}`);
-        }
-      } catch (err) {
-        logger.warn(`[orderService] Failed to update decision ${decisionId}:`, err.message);
-      }
-    }
+    // ⚠️ Trade persistence is now handled by POST /positions sync.
+    // Decision outcome updates are handled in POST /orders/result.
 
     return { contractId, price, raw: result };
   } catch (err) {
@@ -164,18 +139,18 @@ async function cancelOrder(contractId, product) {
     await broker.connect();
   }
   const result = await broker.cancelOrder(contractId);
-  // Update Order status to CANCELLED
+  // Update internal Order status (optional, non‑critical)
   await Order.findOneAndUpdate(
     { contractId },
     { status: 'CANCELLED', updatedAt: new Date() },
     { upsert: false }
-  );
+  ).catch(err => logger.warn('[orderService] Order update failed:', err.message));
   eventBus.emit('order.cancelled', { contractId, result, timestamp: new Date().toISOString() });
   return result;
 }
 
 /**
- * Close an open trade by its contract ID (updates Trade and Order models).
+ * Close an open trade by its contract ID.
  * @param {string} contractId - Trade ID (contract ID)
  * @param {string} [product] - Trading product (optional)
  * @returns {Promise<Object>} Result from broker.
@@ -194,44 +169,11 @@ async function closeTrade(contractId, product) {
     const result = await broker.closeTrade(contractId);
     const latency = Date.now() - startTime;
 
-    // ---- Update Trade record ----
-    const updatedTrade = await Trade.findOneAndUpdate(
-      { contractId },
-      {
-        status: 'CLOSED',
-        closeTime: new Date(),
-        closePrice: result.price || null,
-        pnl: result.pl || 0,
-        // MAE/MFE could be computed if available; placeholder
-      },
-      { new: true }
-    );
-    if (!updatedTrade) {
-      logger.warn(`[closeTrade] No Trade found with contractId: ${contractId}`);
-    } else {
-      // ---- Also update Order status to CLOSED ----
-      await Order.findOneAndUpdate(
-        { contractId },
-        { status: 'CLOSED', updatedAt: new Date() },
-        { upsert: false }
-      );
-
-      // ---- If decisionId is stored, update HistoricalDecision outcome ----
-      if (updatedTrade.decisionId) {
-        try {
-          await selfLearner.updateDecisionOutcome(updatedTrade.decisionId, updatedTrade);
-          logger.debug(`[orderService] Decision ${updatedTrade.decisionId} outcome updated from trade ${contractId}`);
-        } catch (err) {
-          logger.warn(`[orderService] Failed to update decision outcome for ${updatedTrade.decisionId}:`, err.message);
-        }
-      }
-    }
-
     // ---- Record analytics for close ----
     executionAnalytics.recordExecution({
       orderId: contractId,
-      instrument: updatedTrade?.instrument || 'unknown',
-      side: updatedTrade?.side || 'unknown',
+      instrument: 'unknown', // could be fetched from Trade if needed, but not critical
+      side: 'unknown',
       requestedPrice: 0,
       filledPrice: result.price || 0,
       latency,
@@ -242,6 +184,10 @@ async function closeTrade(contractId, product) {
     });
 
     eventBus.emit('trade.closed', { contractId, result, timestamp: new Date().toISOString() });
+
+    // ⚠️ Trade finalization is handled by POST /orders/result when the command completes.
+    // We do NOT update Trade model here.
+
     return result;
   } catch (err) {
     logger.error('[closeTrade] Error:', err.message);
@@ -267,17 +213,13 @@ async function modifyTrade(contractId, stopLoss, takeProfit, product) {
     await broker.connect();
   }
   const result = await broker.modifySLTP(contractId, stopLoss, takeProfit);
-  // Update the Order and Trade records with new SL/TP
+  // Update internal Order/Trade records (non‑critical, MT5 sync will catch up)
   await Order.findOneAndUpdate(
     { contractId },
     { stopLoss, takeProfit, updatedAt: new Date() },
     { upsert: false }
-  );
-  await Trade.findOneAndUpdate(
-    { contractId },
-    { stopLoss, takeProfit, updatedAt: new Date() },
-    { upsert: false }
-  );
+  ).catch(err => logger.warn('[orderService] Order update failed:', err.message));
+  // We no longer update Trade here – the MT5 sync will pick up the new SL/TP.
   eventBus.emit('order.modified', { contractId, stopLoss, takeProfit, result, timestamp: new Date().toISOString() });
   return result;
 }
@@ -317,10 +259,12 @@ function getExecutionAnalytics() {
 }
 
 /**
- * Delete all closed trades from the Trade collection.
+ * Delete all closed trades from the Trade collection (utility, if needed).
+ * NOTE: This operates on the Trade model, which is now synced from MT5.
  * @returns {Promise<number>} Number of deleted records.
  */
 async function deleteClosedTrades() {
+  const Trade = require('../../models/Trade'); // lazy require to avoid circular
   const result = await Trade.deleteMany({ status: 'CLOSED' });
   logger.info(`Deleted ${result.deletedCount} closed trades from history.`);
   return result.deletedCount;
