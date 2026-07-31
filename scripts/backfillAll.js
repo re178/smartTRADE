@@ -1,6 +1,5 @@
 // scripts/backfillAll.js
-// Robust backfill with debugging – will log every failure reason.
-// Forces state creation even with partial indicators.
+// Corrected: summary.regimeSuggestion uses allowed enum values.
 
 const mongoose = require('mongoose');
 const connectDB = require('../config/db');
@@ -22,10 +21,9 @@ const SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD'];
 const TIMEFRAMES = ['M5', 'M15', 'H1'];
 const LOOKAHEADS = [5, 10, 20, 40];
 const MAX_CANDLES = 5000;
-const BATCH_SIZE = 10; // smaller for debugging
+const BATCH_SIZE = 10;
 const INDICATOR_LOOKBACK = 200;
 
-// Helper: try both symbol formats
 function normalizeSymbol(sym) {
   if (sym.includes('_')) return sym;
   return sym.slice(0, 3) + '_' + sym.slice(3);
@@ -45,7 +43,6 @@ async function run() {
   await connectDB();
   logger.info('✅ Connected to MongoDB.');
 
-  // Drop old collections to start fresh
   await HistoricalState.deleteMany({});
   await HistoricalOutcome.deleteMany({});
   logger.info('🧹 Dropped existing HistoricalState and HistoricalOutcome.');
@@ -68,7 +65,6 @@ async function run() {
       const totalCandles = candles.length;
       const maxLookahead = Math.max(...LOOKAHEADS);
       const usableEnd = totalCandles - maxLookahead - 5;
-
       if (usableEnd < INDICATOR_LOOKBACK + 10) {
         logger.warn(`⚠️ Not enough usable candles for ${symbol} ${tf}`);
         continue;
@@ -76,15 +72,12 @@ async function run() {
 
       logger.info(`   Total candles: ${totalCandles}, usable until: ${usableEnd}`);
 
-      // Process in batches
       for (let startIdx = INDICATOR_LOOKBACK; startIdx < usableEnd; startIdx += BATCH_SIZE) {
         const endIdx = Math.min(startIdx + BATCH_SIZE, usableEnd);
         const batchPromises = [];
-
         for (let idx = startIdx; idx < endIdx; idx++) {
           batchPromises.push(processCandle(candles, idx, symbol, tf));
         }
-
         const results = await Promise.allSettled(batchPromises);
         for (const r of results) {
           if (r.status === 'fulfilled' && r.value) {
@@ -109,20 +102,14 @@ async function run() {
   process.exit(0);
 }
 
-// ---- Process a single candle with detailed logging ----
 async function processCandle(candles, idx, symbol, timeframe) {
   const currentCandle = candles[idx];
   const currentPrice = currentCandle.close;
 
-  // 1. Slice for indicators
   const startSlice = Math.max(0, idx - INDICATOR_LOOKBACK + 1);
   const slice = candles.slice(startSlice, idx + 1);
-  if (slice.length < 50) {
-    logger.debug(`   ⏭️ Skipping idx ${idx}: slice length ${slice.length} < 50`);
-    return { created: false };
-  }
+  if (slice.length < 50) return { created: false };
 
-  // 2. Compute indicators with error handling
   let indicators;
   try {
     indicators = computeIndicators(slice);
@@ -131,27 +118,22 @@ async function processCandle(candles, idx, symbol, timeframe) {
     return { created: false };
   }
 
-  if (!indicators) {
-    logger.debug(`   ⏭️ Skipping idx ${idx}: computeIndicators returned null`);
-    return { created: false };
-  }
+  if (!indicators) return { created: false };
 
-  // If some indicators are missing, fill with defaults
-  const defaultIndicators = {
-    adx: 0, rsi: 50, atr: 0.001, bbWidth: 0.15,
-    macdHist: 0, support: null, resistance: null,
-    pricePosition: 0.5, isAtSupport: false, isAtResistance: false,
-    trendDirection: 'neutral', slope: 0, volatilityRegime: 'normal',
-    regimeCode: 'NEUTRAL', regimeSuggestion: 'neutral',
-    plusDI: 0, minusDI: 0, macdLine: 0, macdSignal: 0,
+  // ---- Fix: map regimeSuggestion to allowed enum ----
+  const allowedSuggestions = {
+    'trending': 'trending',
+    'ranging': 'ranging',
+    'volatile': 'volatile',
+    'quiet': 'quiet',
+    'reversal': 'reversal',
+    'neutral': 'neutral',
   };
-  Object.keys(defaultIndicators).forEach(k => {
-    if (indicators[k] === undefined || indicators[k] === null) {
-      indicators[k] = defaultIndicators[k];
-    }
-  });
+  // Default to 'neutral' if mapping fails
+  const suggestionKey = indicators.regimeSuggestion || 'neutral';
+  const regimeSuggestion = allowedSuggestions[suggestionKey] || 'neutral';
 
-  // 3. Build HistoricalState document
+  // Build state document with corrected summary.regimeSuggestion
   const state = new HistoricalState({
     symbol,
     timeframe,
@@ -207,7 +189,8 @@ async function processCandle(candles, idx, symbol, timeframe) {
     summary: {
       marketQuality: 50,
       noiseLevel: 'medium',
-      regimeSuggestion: indicators.regimeSuggestion || 'neutral',
+      // ---- Fix: use mapped value ----
+      regimeSuggestion: regimeSuggestion,
       trendConfidence: indicators.adx || 0,
     },
     confidence: 50,
@@ -216,7 +199,6 @@ async function processCandle(candles, idx, symbol, timeframe) {
     version: '2.0',
   });
 
-  // 4. Compute outcomes for each lookahead
   let outcomesCreated = 0;
   for (const lookahead of LOOKAHEADS) {
     const endIdx = idx + lookahead;
@@ -244,7 +226,6 @@ async function processCandle(candles, idx, symbol, timeframe) {
       filledAt: new Date(),
     };
 
-    // Also create HistoricalOutcome record
     await HistoricalOutcome.create({
       stateId: state._id,
       symbol,
@@ -276,7 +257,6 @@ async function processCandle(candles, idx, symbol, timeframe) {
   return { created: true, outcomesCreated };
 }
 
-// ---- Compute indicators from a slice of candles ----
 function computeIndicators(candles) {
   try {
     const closes = candles.map(c => c.close);
@@ -284,31 +264,15 @@ function computeIndicators(candles) {
     const lows = candles.map(c => c.low);
     const candlesForInd = candles.map(c => ({ mid: { h: c.high, l: c.low, c: c.close } }));
 
-    // Check that we have enough data
-    if (closes.length < 50) {
-      return null;
-    }
+    if (closes.length < 50) return null;
 
-    // Compute each indicator; if one fails, log but continue with defaults
     let adxData = null, atrArray = null, rsi = null, macd = null, bb = null, sr = null;
-    try {
-      adxData = ADX(candlesForInd, 14);
-    } catch (e) { /* ignore */ }
-    try {
-      atrArray = ATR(candlesForInd, 14);
-    } catch (e) { /* ignore */ }
-    try {
-      rsi = RSI(closes, 14);
-    } catch (e) { /* ignore */ }
-    try {
-      macd = MACD(closes, 12, 26, 9);
-    } catch (e) { /* ignore */ }
-    try {
-      bb = BollingerBands(closes, 20, 2);
-    } catch (e) { /* ignore */ }
-    try {
-      sr = findSupportResistance(candlesForInd, 30, 0.001);
-    } catch (e) { /* ignore */ }
+    try { adxData = ADX(candlesForInd, 14); } catch(e) {}
+    try { atrArray = ATR(candlesForInd, 14); } catch(e) {}
+    try { rsi = RSI(closes, 14); } catch(e) {}
+    try { macd = MACD(closes, 12, 26, 9); } catch(e) {}
+    try { bb = BollingerBands(closes, 20, 2); } catch(e) {}
+    try { sr = findSupportResistance(candlesForInd, 30, 0.001); } catch(e) {}
 
     const adx = adxData ? adxData.adx : 0;
     const plusDI = adxData ? adxData.plusDI : 0;
@@ -331,12 +295,21 @@ function computeIndicators(candles) {
     if (atrPercent > 0.015) volRegime = 'high';
     else if (atrPercent < 0.005) volRegime = 'low';
 
+    // ---- Determine regime code ----
     let regimeCode = 'NEUTRAL';
     if (adx > 30) regimeCode = direction === 'bullish' ? 'STRONG_TREND_BULL' : 'STRONG_TREND_BEAR';
     else if (adx > 20) regimeCode = 'WEAK_TREND';
     else if (bbWidth < 0.15 && adx < 20) regimeCode = 'RANGING';
     else if (volRegime === 'high') regimeCode = 'HIGH_VOLATILITY';
     else if (volRegime === 'low') regimeCode = 'LOW_VOLATILITY';
+
+    // ---- Map to allowed summary.regimeSuggestion ----
+    let suggestion = 'neutral';
+    if (adx > 30) suggestion = 'trending';
+    else if (bbWidth < 0.15 && adx < 20) suggestion = 'ranging';
+    else if (volRegime === 'high') suggestion = 'volatile';
+    else if (volRegime === 'low') suggestion = 'quiet';
+    else if ((rsi || 50) > 70 || (rsi || 50) < 30) suggestion = 'reversal';
 
     return {
       adx,
@@ -356,11 +329,10 @@ function computeIndicators(candles) {
       trendDirection: direction,
       slope: (closes[lastIdx] - closes[0]) / (closes[0] || 0.0001),
       volatilityRegime: volRegime,
-      regimeCode,
-      regimeSuggestion: regimeCode,
+      regimeCode: regimeCode,
+      regimeSuggestion: suggestion, // now always one of the allowed values
     };
   } catch (err) {
-    // If anything fails, log and return null
     logger.error(`computeIndicators error: ${err.message}`);
     return null;
   }
