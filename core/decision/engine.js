@@ -14,12 +14,12 @@ const logger = require('../../infrastructure/logger') || console;
 const CONFIG = {
   DECISION_INTERVAL_MS: 30000,
   MIN_CONFIDENCE: 60,
-  MIN_EDGE: 0.2,               // Minimum expected value in R multiples
-  MIN_PROBABILITY: 0.52,       // Minimum win probability
+  MIN_EDGE: 0.2,
+  MIN_PROBABILITY: 0.52,
   DEFAULT_STOP_DISTANCE_ATR: 1.5,
   DEFAULT_TP_DISTANCE_ATR: 3.0,
-  EDGE_LOOKAHEAD: 5,           // Number of candles for outcome
-  EDGE_K: 100,                 // Number of analogues for edge computation
+  EDGE_LOOKAHEAD: 5,
+  EDGE_K: 100,
 };
 
 class DecisionEngine extends EventEmitter {
@@ -29,7 +29,6 @@ class DecisionEngine extends EventEmitter {
     this._timer = null;
     this._isReady = false;
 
-    // ---- DEBUG: log initialization ----
     console.log('🔧 DecisionEngine: constructor – listening to regime events');
 
     // Listen to regime events
@@ -44,20 +43,24 @@ class DecisionEngine extends EventEmitter {
       this._evaluate();
     }, CONFIG.DECISION_INTERVAL_MS);
 
-    // Initialise StateStore
-    stateStore.init().then(() => {
-      this._isReady = true;
-      console.log('✅ DecisionEngine: StateStore ready for edge computation.');
-    }).catch(err => {
-      console.warn('⚠️ DecisionEngine: StateStore init failed, using fallback.', err.message);
-    });
+    // ---- Initialise StateStore safely ----
+    if (stateStore && typeof stateStore.init === 'function') {
+      stateStore.init()
+        .then(() => {
+          this._isReady = true;
+          console.log('✅ DecisionEngine: StateStore ready for edge computation.');
+        })
+        .catch(err => {
+          console.warn('⚠️ DecisionEngine: StateStore init failed, using fallback.', err.message);
+          this._isReady = false;
+        });
+    } else {
+      console.warn('⚠️ DecisionEngine: StateStore not available, using fallback.');
+      this._isReady = false;
+    }
 
     logger.info('[DecisionEngine] Initialized with probability/EV framework.');
   }
-
-  // ============================================================
-  // EVENT HANDLERS
-  // ============================================================
 
   async _onRegime(regime) {
     console.log(`⚖️ DecisionEngine: processing regime for ${regime.symbol} (${regime.code}, conf: ${regime.confidence})`);
@@ -101,10 +104,6 @@ class DecisionEngine extends EventEmitter {
     }
   }
 
-  // ============================================================
-  // CORE DECISION LOGIC – Probability/EV Based
-  // ============================================================
-
   async _evaluateSymbol(symbol) {
     // 1. Get current state
     const state = marketStateCache.get(symbol);
@@ -122,7 +121,7 @@ class DecisionEngine extends EventEmitter {
     // 4. Compute edge (probability and expected value) from historical analogues
     let edge = null;
     let similarity = null;
-    if (this._isReady) {
+    if (this._isReady && stateStore) {
       try {
         edge = await stateStore.computeEdge(
           features,
@@ -141,7 +140,6 @@ class DecisionEngine extends EventEmitter {
         );
       } catch (err) {
         console.warn(`⚠️ DecisionEngine: StateStore error for ${symbol}:`, err.message);
-        // Fallback to rule-based
         edge = null;
       }
     }
@@ -212,7 +210,6 @@ class DecisionEngine extends EventEmitter {
       recommendedLotSize: 0.01,
       reason: this._buildReason(decision, confidence, edge, regime),
       timestamp: new Date().toISOString(),
-      // Additional fields for HistoricalDecision logging
       timeframe: 'M5',
       features: features,
       contributions: this._buildContributions(state, regime, edge),
@@ -314,7 +311,6 @@ class DecisionEngine extends EventEmitter {
       acceleration: state.awareness?.acceleration || state.acceleration || 0,
       pricePosition: state.structure?.pricePosition || 0.5,
       marketQuality: state.summary?.marketQuality || 50,
-      // Additional features from regime
       trendDirection: state.trend === 'bullish' ? 1 : (state.trend === 'bearish' ? -1 : 0),
       trendStrength: state.trend?.strength || 0,
       volatilityRegime: state.volatility?.regime === 'high' ? 1 : (state.volatility?.regime === 'low' ? -1 : 0),
