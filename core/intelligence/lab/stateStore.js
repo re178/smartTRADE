@@ -1,5 +1,5 @@
 // core/intelligence/lab/stateStore.js
-// Similarity search using HistoricalState, outcomes from HistoricalOutcome.
+// Final version with correct aggregation syntax.
 
 const HistoricalState = require('../../../models/HistoricalState');
 const HistoricalOutcome = require('../../../models/HistoricalOutcome');
@@ -29,7 +29,8 @@ class FeatureNormalizer {
     try {
       const sample = await HistoricalState.aggregate([
         { $sample: { size: 1000 } },
-        { $group: {
+        {
+          $group: {
             _id: null,
             adxMin: { $min: '$trend.adx' },
             adxMax: { $max: '$trend.adx' },
@@ -51,11 +52,12 @@ class FeatureNormalizer {
             pricePositionMax: { $max: '$structure.pricePosition' },
             marketQualityMin: { $min: '$summary.marketQuality' },
             marketQualityMax: { $max: '$summary.marketQuality' },
-          }
-        }}
+          },
+        },
       ]);
-      if (sample.length === 0) this.featureStats = this._getDefaultStats();
-      else {
+      if (sample.length === 0) {
+        this.featureStats = this._getDefaultStats();
+      } else {
         const stats = sample[0];
         this.featureStats = {
           adx: { min: stats.adxMin || 0, max: stats.adxMax || 100 },
@@ -71,6 +73,7 @@ class FeatureNormalizer {
         };
       }
       this.isLoaded = true;
+      logger.debug('[StateStore] Feature stats loaded.');
     } catch (err) {
       logger.warn('[StateStore] Failed to load stats, using defaults.', err.message);
       this.featureStats = this._getDefaultStats();
@@ -151,7 +154,13 @@ class StateStore {
       return { states: [], stats: { count: 0, winRate: 0, avgReturnR: 0, maxDrawdown: 0, profitFactor: 0 } };
     }
 
-    // Compute distances
+    // ---- DEBUG: log first 5 outcome5 values ----
+    if (states.length > 0) {
+      const samples = states.slice(0, 5).map(s => s.outcome5);
+      logger.info(`[StateStore] DEBUG: first 5 outcome5: ${JSON.stringify(samples)}`);
+    }
+
+    // ---- Compute distances ----
     const withDistances = states.map(state => {
       const stateFeatures = {
         adx: state.trend.adx,
@@ -173,41 +182,25 @@ class StateStore {
         squaredSum += (q - s) ** 2;
       }
       const distance = Math.sqrt(squaredSum);
-      return { state, distance };
+      const outcomeKey = `outcome${lookahead}`;
+      const outcome = state[outcomeKey] || { return: null, returnR: null, win: null, maxDrawdown: null };
+      return { state, distance, outcome };
     });
 
     withDistances.sort((a, b) => a.distance - b.distance);
     const topK = withDistances.slice(0, k);
 
-    // ---- Get outcomes from HistoricalOutcome for these state IDs ----
-    const stateIds = topK.map(item => item.state._id);
-    const outcomes = await HistoricalOutcome.find({
-      stateId: { $in: stateIds },
-      lookahead: lookahead
-    }).lean();
-
-    // Create a map: stateId -> outcome
-    const outcomeMap = {};
-    outcomes.forEach(o => {
-      outcomeMap[o.stateId.toString()] = o.outcome;
+    // ---- Labelled if returnR is a number (including 0) ----
+    const labelled = topK.filter(item => {
+      const out = item.outcome;
+      return out && out.returnR !== null && typeof out.returnR === 'number' && !isNaN(out.returnR);
     });
 
-    // Build result with outcomes
-    const resultStates = topK.map(item => ({
-      state: item.state,
-      distance: item.distance,
-      outcome: outcomeMap[item.state._id.toString()] || null
-    }));
-
-    // Filter only labelled outcomes (where returnR is a number)
-    const labelled = resultStates.filter(item => item.outcome && item.outcome.returnR !== null && typeof item.outcome.returnR === 'number' && !isNaN(item.outcome.returnR));
-
     const stats = this._computeStats(labelled.map(item => item.outcome));
-
     logger.info(`[StateStore] Similarity stats: sampleSize=${stats.count}, winRate=${stats.winRate}, avgReturnR=${stats.avgReturnR}`);
 
     return {
-      states: resultStates,
+      states: topK.map(item => ({ state: item.state, distance: item.distance, outcome: item.outcome })),
       stats,
     };
   }
