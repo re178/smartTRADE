@@ -2,8 +2,9 @@
 // Market State Store – similarity search and edge computation.
 // Provides empirical edge measurement based on historical analogues.
 
-const HistoricalState = require('../../models/HistoricalState');
-const HistoricalOutcome = require('../../models/HistoricalOutcome');
+const path = require('path');
+const HistoricalState = require(path.resolve(__dirname, '../../models/HistoricalState'));
+const HistoricalOutcome = require(path.resolve(__dirname, '../../models/HistoricalOutcome'));
 const logger = require('../../../infrastructure/logger') || console;
 
 // ---- Configuration ----
