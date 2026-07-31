@@ -1,4 +1,4 @@
-// shared/helpers.js – Utility Functions (with fixed pair validation)
+// shared/helpers.js – Utility Functions (with fixed pair validation & research helpers)
 
 /**
  * Format a number as a price with fixed decimals.
@@ -29,11 +29,8 @@ function sleep(ms) {
 function getPipSize(instrument) {
   if (!instrument) return 0.0001;
   const upper = instrument.toUpperCase();
-  // JPY pairs have pip at 0.01
   if (upper.includes('JPY')) return 0.01;
-  // XAU (gold) has pip at 0.01
   if (upper.includes('XAU')) return 0.01;
-  // Default for most pairs
   return 0.0001;
 }
 
@@ -44,24 +41,20 @@ function getPipSize(instrument) {
  */
 function isValidPair(pair) {
   if (!pair || typeof pair !== 'string') return false;
-  // Must be 3 letters, underscore, 3 letters (e.g., EUR_USD)
   return /^[A-Z]{3}_[A-Z]{3}$/.test(pair.toUpperCase().trim());
 }
 
 /**
  * Format a symbol to include an underscore (e.g., USDJPY → USD_JPY).
- * If already in correct format, returns as is.
- * @param {string} symbol - Symbol string (e.g., 'USDJPY' or 'EUR_USD')
- * @returns {string} Formatted symbol with underscore.
+ * @param {string} symbol - Symbol string.
+ * @returns {string} Formatted symbol.
  */
 function formatSymbol(symbol) {
   if (!symbol || typeof symbol !== 'string') return symbol;
   const upper = symbol.toUpperCase().trim();
-  // If it's exactly 6 uppercase letters, insert underscore after 3
   if (upper.length === 6 && /^[A-Z]{6}$/.test(upper)) {
     return upper.slice(0, 3) + '_' + upper.slice(3);
   }
-  // If it already has underscore or is different length, return as is
   return upper;
 }
 
@@ -159,12 +152,151 @@ function timestampNow() {
   return Math.floor(Date.now() / 1000);
 }
 
+// ============================================================
+// RESEARCH / SIMILARITY HELPERS (NEW)
+// ============================================================
+
+/**
+ * Get the list of feature names used for similarity search.
+ * @returns {string[]} Array of feature names.
+ */
+function getFeatureKeys() {
+  return [
+    'adx',
+    'rsi',
+    'atrPercent',
+    'bbWidth',
+    'macdHist',
+    'liquidity',
+    'velocity',
+    'acceleration',
+    'pricePosition',
+    'marketQuality',
+  ];
+}
+
+/**
+ * Get a default feature vector with reasonable values.
+ * @returns {Object} Default feature vector.
+ */
+function getDefaultFeatures() {
+  return {
+    adx: 25,
+    rsi: 50,
+    atrPercent: 0.005,
+    bbWidth: 0.15,
+    macdHist: 0,
+    liquidity: 0.5,
+    velocity: 0,
+    acceleration: 0,
+    pricePosition: 0.5,
+    marketQuality: 50,
+  };
+}
+
+/**
+ * Normalize a feature vector using min-max scaling.
+ * @param {Object} features - Feature vector with numeric values.
+ * @param {Object} stats - Min/max stats for each feature.
+ * @returns {Object} Normalised feature vector (values 0–1).
+ */
+function normalizeFeatures(features, stats) {
+  const result = {};
+  const keys = getFeatureKeys();
+  for (const key of keys) {
+    const val = features[key] !== undefined ? features[key] : 0;
+    const stat = stats && stats[key];
+    if (stat && stat.max !== undefined && stat.min !== undefined && stat.max !== stat.min) {
+      result[key] = (val - stat.min) / (stat.max - stat.min);
+    } else {
+      // Fallback: default scaling if no stats
+      if (key === 'adx') result[key] = val / 100;
+      else if (key === 'rsi') result[key] = val / 100;
+      else if (key === 'atrPercent') result[key] = Math.min(1, val / 0.05);
+      else if (key === 'bbWidth') result[key] = Math.min(1, val / 0.5);
+      else if (key === 'macdHist') result[key] = (val + 0.01) / 0.02;
+      else if (key === 'liquidity') result[key] = val;
+      else if (key === 'velocity') result[key] = (val + 0.001) / 0.002;
+      else if (key === 'acceleration') result[key] = (val + 0.0001) / 0.0002;
+      else if (key === 'pricePosition') result[key] = val;
+      else if (key === 'marketQuality') result[key] = val / 100;
+      else result[key] = 0.5;
+    }
+    // Clamp to [0, 1]
+    result[key] = Math.max(0, Math.min(1, result[key]));
+  }
+  return result;
+}
+
+/**
+ * Compute Euclidean distance between two feature vectors.
+ * @param {Object} a - First feature vector.
+ * @param {Object} b - Second feature vector.
+ * @param {string[]} keys - Optional subset of keys to use.
+ * @returns {number} Euclidean distance.
+ */
+function euclideanDistance(a, b, keys = null) {
+  const featureKeys = keys || getFeatureKeys();
+  let sum = 0;
+  for (const key of featureKeys) {
+    const va = a[key] !== undefined ? a[key] : 0;
+    const vb = b[key] !== undefined ? b[key] : 0;
+    sum += Math.pow(va - vb, 2);
+  }
+  return Math.sqrt(sum);
+}
+
+/**
+ * Compute cosine similarity between two feature vectors.
+ * @param {Object} a - First feature vector.
+ * @param {Object} b - Second feature vector.
+ * @param {string[]} keys - Optional subset of keys to use.
+ * @returns {number} Cosine similarity (-1 to 1).
+ */
+function cosineSimilarity(a, b, keys = null) {
+  const featureKeys = keys || getFeatureKeys();
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (const key of featureKeys) {
+    const va = a[key] !== undefined ? a[key] : 0;
+    const vb = b[key] !== undefined ? b[key] : 0;
+    dot += va * vb;
+    normA += va * va;
+    normB += vb * vb;
+  }
+  if (normA === 0 || normB === 0) return 0;
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+/**
+ * Create a deterministic hash from a feature object for caching.
+ * @param {Object} features - Feature vector.
+ * @param {string} prefix - Optional prefix for the hash.
+ * @returns {string} Hash string.
+ */
+function hashFeatures(features, prefix = '') {
+  const keys = getFeatureKeys();
+  const sorted = keys
+    .filter(k => features[k] !== undefined)
+    .sort()
+    .map(k => `${k}:${features[k]}`)
+    .join('|');
+  const hash = require('crypto')
+    .createHash('sha256')
+    .update(sorted)
+    .digest('hex')
+    .slice(0, 16);
+  return prefix ? `${prefix}:${hash}` : hash;
+}
+
 module.exports = {
+  // Existing exports
   formatPrice,
   sleep,
   getPipSize,
   isValidPair,
-  formatSymbol,   // <-- NEW
+  formatSymbol,
   generateId,
   roundTo,
   envInt,
@@ -174,4 +306,11 @@ module.exports = {
   truncate,
   toISOString,
   timestampNow,
+  // New research helpers
+  getFeatureKeys,
+  getDefaultFeatures,
+  normalizeFeatures,
+  euclideanDistance,
+  cosineSimilarity,
+  hashFeatures,
 };
