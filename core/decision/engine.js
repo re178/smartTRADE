@@ -43,7 +43,7 @@ class DecisionEngine extends EventEmitter {
       this._evaluate();
     }, CONFIG.DECISION_INTERVAL_MS);
 
-    // ---- Initialise StateStore safely ----
+    // Initialise StateStore safely
     if (stateStore && typeof stateStore.init === 'function') {
       stateStore.init()
         .then(() => {
@@ -115,8 +115,9 @@ class DecisionEngine extends EventEmitter {
     // 2. Get regime (from last regime event)
     const regime = deepRegime.getLatestRegime(symbol) || { code: 'NEUTRAL', confidence: 50 };
 
-    // 3. Extract features for StateStore
-    const features = this._extractFeatures(state, regime);
+    // 3. Extract features for StateStore (flat) and for logging (full nested)
+    const flatFeatures = this._extractFeatures(state, regime);  // for StateStore
+    const fullFeatures = state;                                 // for HistoricalDecision logging
 
     // 4. Compute edge (probability and expected value) from historical analogues
     let edge = null;
@@ -124,15 +125,14 @@ class DecisionEngine extends EventEmitter {
     if (this._isReady && stateStore) {
       try {
         edge = await stateStore.computeEdge(
-          features,
+          flatFeatures,
           symbol,
           'M5',
           CONFIG.EDGE_LOOKAHEAD,
           CONFIG.EDGE_K
         );
-        // Also get similarity details for logging
         similarity = await stateStore.findSimilar(
-          features,
+          flatFeatures,
           symbol,
           'M5',
           CONFIG.EDGE_K,
@@ -153,7 +153,6 @@ class DecisionEngine extends EventEmitter {
       const avgReturnR = edge.avgReturnR;
       const ev = avgReturnR; // expected value in R multiples
 
-      // Determine side based on expected value
       if (ev > CONFIG.MIN_EDGE && winProb > CONFIG.MIN_PROBABILITY) {
         decision = 'BUY';
         confidence = Math.min(90, 50 + (winProb - 0.5) * 80);
@@ -211,7 +210,7 @@ class DecisionEngine extends EventEmitter {
       reason: this._buildReason(decision, confidence, edge, regime),
       timestamp: new Date().toISOString(),
       timeframe: 'M5',
-      features: features,
+      features: fullFeatures,              // <-- FIXED: use full nested state
       contributions: this._buildContributions(state, regime, edge),
       inputs: {
         regime: regime.confidence / 100,
@@ -299,6 +298,7 @@ class DecisionEngine extends EventEmitter {
   // HELPER METHODS
   // ============================================================
 
+  // This method returns a FLAT feature vector for StateStore (similarity search)
   _extractFeatures(state, regime) {
     return {
       adx: state.trend?.adx || state.trend?.strength || 25,
