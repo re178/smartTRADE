@@ -14,6 +14,9 @@ const Trade = require('../../models/Trade');
 // ---- COGNITIVE: import priceBuffer ----
 const priceBuffer = require('../../core/data/priceBuffer');
 
+// ---- IMPORT selfLearner for decision outcome updates (additive) ----
+const selfLearner = require('../../core/learning/learner');
+
 // ---------- Authentication ----------
 const API_KEY = process.env.MT5_API_KEY || 'change-me-in-production';
 
@@ -91,31 +94,75 @@ router.get('/orders/pending', async (req, res) => {
   }
 });
 
+// ---------- ✅ ENHANCED: POST /orders/result ----------
 router.post('/orders/result', async (req, res) => {
   try {
     const result = req.body;
-    const { commandId } = result;
+    const { commandId, success, ticket, deal, price, symbol, side, time } = result;
     if (!commandId) {
       return res.status(400).json({ error: 'Missing commandId' });
     }
+
+    // 1. Save the result (existing behavior)
     await Mt5CommandResult.findOneAndUpdate(
       { commandId },
       result,
       { upsert: true, new: true }
     );
-    const success = result.success === true;
+
+    // 2. Update command state (existing behavior)
+    const successFlag = success === true;
     await Mt5Command.findOneAndUpdate(
       { commandId },
       {
         $set: {
-          state: success ? 'COMPLETED' : 'FAILED',
-          error: success ? null : (result.error || 'Execution failed'),
+          state: successFlag ? 'COMPLETED' : 'FAILED',
+          error: successFlag ? null : (result.error || 'Execution failed'),
         },
       }
     );
-    logger.info(`[MT5] Result stored for ${commandId}, success=${success}`);
+    logger.info(`[MT5] Result stored for ${commandId}, success=${successFlag}`);
+
+    // 3. 🔥 NEW: If this was a successful CLOSE, finalize the Trade
+    const command = await Mt5Command.findOne({ commandId }).lean();
+    const action = command?.action;
+
+    if (successFlag && action === 'CLOSE' && ticket && price) {
+      const trade = await Trade.findOne({ contractId: ticket });
+      if (trade) {
+        // Only update if not already closed
+        if (trade.status !== 'CLOSED') {
+          trade.status = 'CLOSED';
+          trade.closePrice = price;
+          trade.dealId = deal;
+          trade.closeTime = new Date(time ? time * 1000 : Date.now());
+          trade.pendingClose = false;
+          // Calculate realized profit if possible
+          if (trade.openPrice && trade.lotSize) {
+            const multiplier = trade.side === 'buy' ? 1 : -1;
+            trade.realizedProfit = (price - trade.openPrice) * trade.lotSize * multiplier;
+          }
+          await trade.save();
+          logger.info(`[MT5] Trade ${ticket} finalized as CLOSED at ${price}`);
+
+          // 🔥 NEW: Update decision outcome if this trade has a decisionId
+          if (trade.decisionId) {
+            try {
+              await selfLearner.updateDecisionOutcome(trade.decisionId, trade);
+              logger.info(`[MT5] Decision ${trade.decisionId} outcome updated via close result`);
+            } catch (err) {
+              logger.warn(`[MT5] Failed to update decision outcome for ${trade.decisionId}:`, err.message);
+            }
+          }
+        }
+      } else {
+        logger.warn(`[MT5] Trade with ticket ${ticket} not found for closing; will be created on next positions sync.`);
+      }
+    }
+
     res.status(201).json({ status: 'accepted' });
   } catch (err) {
+    logger.error('[MT5] Error in /orders/result:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -196,18 +243,84 @@ router.get('/account/status', async (req, res) => {
   }
 });
 
-// ---------- Positions ----------
+// ---------- ✅ ENHANCED: POST /positions ----------
 router.post('/positions', async (req, res) => {
   try {
-    const { login, positions, timestamp } = req.body;
+    const { login, positions, timestamp, magic } = req.body;
+
+    // 1. Store raw snapshot in Mt5Position (existing behavior)
     await Mt5Position.deleteMany({ login });
     if (positions && positions.length) {
       const docs = positions.map(p => ({ ...p, login, updatedAt: new Date() }));
       await Mt5Position.insertMany(docs);
     }
     logger.debug(`[MT5] Positions updated for login ${login}: ${positions?.length || 0} open`);
+
+    // 2. 🔥 NEW: Synchronize Trade collection
+    const incomingTickets = new Set(positions.map(p => p.ticket));
+
+    // Process each incoming position
+    for (const pos of positions) {
+      let trade = await Trade.findOne({ contractId: pos.ticket });
+
+      if (!trade) {
+        // Create new open trade
+        trade = new Trade({
+          contractId: pos.ticket,
+          instrument: pos.symbol,
+          side: pos.type === 'BUY' ? 'buy' : 'sell',
+          lotSize: pos.volume,
+          openPrice: pos.price,
+          openTime: new Date(pos.open_time * 1000),
+          status: 'OPEN',
+          magic: pos.magic || magic,
+          comment: pos.comment || '',
+          stopLoss: pos.stop_loss || 0,
+          takeProfit: pos.take_profit || 0,
+          swap: pos.swap || 0,
+          commission: pos.commission || 0,
+          margin: pos.margin || 0,
+          login: login,
+          pendingClose: false,
+          floatingProfit: pos.profit || 0,
+          // decisionId is not sent by EA; it will be set by orderService when placing the trade.
+          // If orderService created it, the decisionId is already there and we are just updating.
+        });
+      } else {
+        // Update existing open trade
+        trade.currentPrice = pos.current_price;
+        trade.floatingProfit = pos.profit;
+        trade.lotSize = pos.volume;
+        // If it was pendingClose but now appears again, clear that flag
+        trade.pendingClose = false;
+        // Only update if status is OPEN (do not reopen closed trades)
+        if (trade.status === 'OPEN') {
+          trade.stopLoss = pos.stop_loss || 0;
+          trade.takeProfit = pos.take_profit || 0;
+          trade.swap = pos.swap || 0;
+          trade.commission = pos.commission || 0;
+          trade.margin = pos.margin || 0;
+          trade.magic = pos.magic || magic;
+          trade.comment = pos.comment || '';
+          trade.login = login;
+        }
+      }
+      await trade.save();
+    }
+
+    // 3. Mark open trades that are missing from incoming as pendingClose
+    const openTrades = await Trade.find({ status: 'OPEN', login: login });
+    for (const trade of openTrades) {
+      if (!incomingTickets.has(trade.contractId)) {
+        trade.pendingClose = true;
+        await trade.save();
+        logger.debug(`[MT5] Marked trade ${trade.contractId} as pendingClose`);
+      }
+    }
+
     res.status(201).json({ status: 'accepted' });
   } catch (err) {
+    logger.error('[MT5] Error in /positions:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -255,11 +368,10 @@ router.post('/price', async (req, res) => {
     }
 
     // ---- Forward tick to cognitive engine ----
-    // Convert time to milliseconds if in seconds
     const timeMs = priceData.time ? Number(priceData.time) * 1000 : Date.now();
     priceBuffer.update(priceData.symbol, priceData.bid, priceData.ask, timeMs);
 
-    // Save to database (existing logic)
+    // Save to database
     await Mt5Price.findOneAndUpdate(
       { symbol: priceData.symbol },
       priceData,
@@ -336,7 +448,7 @@ router.post('/sync', async (req, res) => {
   res.status(201).json({ status: 'synced' });
 });
 
-// ---------- NEW: GET /api/mt5/candles (for broker historical fetch) ----------
+// ---------- GET /api/mt5/candles ----------
 router.get('/candles', async (req, res) => {
   try {
     const { symbol, count = 200, timeframe = 'M5' } = req.query;
@@ -344,18 +456,14 @@ router.get('/candles', async (req, res) => {
       return res.status(400).json({ error: 'symbol query param required' });
     }
 
-    // ---- Normalize symbol (remove underscores) ----
     const lookupSymbol = symbol.replace(/_/g, '');
-
     const candleHistory = require('../../core/data/candleHistory');
     let candles = await candleHistory.getHistory(lookupSymbol, timeframe, parseInt(count));
-    // If not found, try the original symbol as fallback
     if (!candles || candles.length === 0) {
       candles = await candleHistory.getHistory(symbol, timeframe, parseInt(count));
     }
 
     if (candles && candles.length > 0) {
-      // Format as expected by the broker (and the rest of the system)
       const formatted = candles.map(c => ({
         time: Math.floor(new Date(c.time).getTime() / 1000),
         open: c.open,
@@ -366,7 +474,6 @@ router.get('/candles', async (req, res) => {
       }));
       return res.json(formatted);
     }
-    // If no candles, return empty array (not 404)
     res.json([]);
   } catch (err) {
     logger.error('[MT5] GET /candles error:', err.message);
@@ -374,7 +481,7 @@ router.get('/candles', async (req, res) => {
   }
 });
 
-// ---------- Historical candle ingestion (for EA bootstrap) ----------
+// ---------- Historical candle ingestion ----------
 router.post('/historical', async (req, res) => {
   try {
     const { symbol, timeframe, candles } = req.body;
@@ -385,7 +492,6 @@ router.post('/historical', async (req, res) => {
     const candleHistory = require('../../core/data/candleHistory');
     let stored = 0;
     for (const c of candles) {
-      // Convert time to milliseconds if in seconds
       const timeMs = (c.time && c.time < 1e12) ? c.time * 1000 : c.time;
       await candleHistory.store({
         symbol,
