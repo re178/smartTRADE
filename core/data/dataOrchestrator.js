@@ -1,11 +1,5 @@
 // core/data/dataOrchestrator.js
 // Centralised persistence with class‑based data lifecycle policies.
-// Five data classes:
-//   EPHEMERAL  – never persist (recomputed on restart)
-//   RECOVERABLE – cached + periodic snapshots (survives restart)
-//   RESEARCH   – append‑only (never overwritten)
-//   BUSINESS   – transactional (immediate persistence)
-//   KNOWLEDGE  – learned behaviour (persisted on change)
 
 const mongoose = require('mongoose');
 const logger = require('../../infrastructure/logger') || console;
@@ -19,38 +13,20 @@ const DATA_CLASSES = {
   KNOWLEDGE: 'knowledge',      // learned behaviour
 };
 
-// ---- Default Policies ----
-const DEFAULT_POLICIES = {
-  // Key: { class, ttl (ms), snapshotInterval (ms), batchSize, collection }
-  // These will be registered by modules that use the orchestrator.
-};
-
 class DataOrchestrator {
   constructor() {
-    // In‑memory cache for ephemeral and recoverable data
-    this._cache = new Map(); // key → { data, metadata, timestamp, policy }
-
-    // Queues for batched writes
-    this._snapshotQueue = [];    // recoverable data (upsert)
-    this._appendQueue = [];      // research data (insert)
-
-    // Policies registry
-    this._policies = new Map();  // key → policy
-
-    // Scheduling timers
+    this._cache = new Map();
+    this._snapshotQueue = [];
+    this._appendQueue = [];
+    this._policies = new Map();
     this._snapshotTimer = null;
     this._appendTimer = null;
-
-    // Recovery state
     this._recovered = false;
 
-    // Bind methods
     this._flushSnapshots = this._flushSnapshots.bind(this);
     this._flushAppends = this._flushAppends.bind(this);
 
-    // Start flush timers
     this._startFlushTimers();
-
     logger.info('[DataOrchestrator] Initialized.');
   }
 
@@ -58,17 +34,6 @@ class DataOrchestrator {
   // REGISTRATION
   // ============================================================
 
-  /**
-   * Register a data stream with its lifecycle policy.
-   * @param {string} key - Unique identifier (e.g., 'marketState', 'historicalState')
-   * @param {string} dataClass - One of DATA_CLASSES values
-   * @param {Object} options - Additional options
-   * @param {number} options.ttl - Time‑to‑live in cache (ms)
-   * @param {number} options.snapshotInterval - How often to snapshot (ms)
-   * @param {number} options.batchSize - Max items per batch write
-   * @param {string} options.collection - MongoDB collection name (if applicable)
-   * @param {Function} options.transform - Optional transform function before storage
-   */
   register(key, dataClass, options = {}) {
     if (!Object.values(DATA_CLASSES).includes(dataClass)) {
       throw new Error(`Invalid data class: ${dataClass}`);
@@ -89,19 +54,16 @@ class DataOrchestrator {
 
   _defaultTTL(dataClass) {
     switch (dataClass) {
-      case DATA_CLASSES.EPHEMERAL: return 60000;     // 1 minute
-      case DATA_CLASSES.RECOVERABLE: return 3600000; // 1 hour
-      case DATA_CLASSES.RESEARCH: return Infinity;
-      case DATA_CLASSES.BUSINESS: return Infinity;
-      case DATA_CLASSES.KNOWLEDGE: return Infinity;
-      default: return 60000;
+      case DATA_CLASSES.EPHEMERAL: return 60000;
+      case DATA_CLASSES.RECOVERABLE: return 3600000;
+      default: return Infinity;
     }
   }
 
   _defaultSnapshotInterval(dataClass) {
     switch (dataClass) {
-      case DATA_CLASSES.RECOVERABLE: return 5000;   // 5 seconds
-      default: return 30000;                        // 30 seconds
+      case DATA_CLASSES.RECOVERABLE: return 5000;
+      default: return 30000;
     }
   }
 
@@ -116,12 +78,6 @@ class DataOrchestrator {
   // PUBLISH
   // ============================================================
 
-  /**
-   * Publish a state update.
-   * @param {string} key - Registered key
-   * @param {*} data - The data to store
-   * @param {Object} metadata - Additional metadata (timestamp, source, etc.)
-   */
   publish(key, data, metadata = {}) {
     const policy = this._policies.get(key);
     if (!policy) {
@@ -136,67 +92,56 @@ class DataOrchestrator {
       case DATA_CLASSES.EPHEMERAL:
         this._handleEphemeral(key, entry, policy);
         break;
-
       case DATA_CLASSES.RECOVERABLE:
         this._handleRecoverable(key, entry, policy);
         break;
-
       case DATA_CLASSES.RESEARCH:
         this._handleResearch(key, entry, policy);
         break;
-
       case DATA_CLASSES.BUSINESS:
         this._handleBusiness(key, entry, policy);
         break;
-
       case DATA_CLASSES.KNOWLEDGE:
         this._handleKnowledge(key, entry, policy);
         break;
-
       default:
         logger.warn(`[DataOrchestrator] Unknown class for key ${key}`);
     }
   }
 
-  // ---- Handlers ----
   _handleEphemeral(key, entry, policy) {
-    // Store in cache with TTL
     this._cache.set(key, { ...entry, policy });
     // No persistence
   }
 
   _handleRecoverable(key, entry, policy) {
-    // Store in cache
     this._cache.set(key, { ...entry, policy });
-    // Queue for snapshot
-    this._snapshotQueue.push({ key, data: entry.data, metadata: entry.metadata });
-    // Schedule flush if not already scheduled
-    if (!this._snapshotTimer) {
-      this._snapshotTimer = setTimeout(this._flushSnapshots, policy.snapshotInterval);
+    // Only queue for snapshot if a collection is defined
+    if (policy.collection) {
+      this._snapshotQueue.push({ key, data: entry.data, metadata: entry.metadata });
+      if (!this._snapshotTimer) {
+        this._snapshotTimer = setTimeout(this._flushSnapshots, policy.snapshotInterval);
+      }
     }
   }
 
   _handleResearch(key, entry, policy) {
-    // Append to queue
     this._appendQueue.push({ key, data: entry.data, metadata: entry.metadata });
-    // Schedule flush
     if (!this._appendTimer) {
-      this._appendTimer = setTimeout(this._flushAppends, 2000); // flush every 2 seconds for research data
+      this._appendTimer = setTimeout(this._flushAppends, 2000);
     }
   }
 
   _handleBusiness(key, entry, policy) {
-    // Immediate persistence
     this._persistImmediately(key, entry.data, entry.metadata, policy);
   }
 
   _handleKnowledge(key, entry, policy) {
-    // Similar to business – immediate persistence (or upsert)
     this._persistImmediately(key, entry.data, entry.metadata, policy);
   }
 
   // ============================================================
-  // FLUSH METHODS (Batched Writes)
+  // FLUSH METHODS
   // ============================================================
 
   async _flushSnapshots() {
@@ -209,18 +154,14 @@ class DataOrchestrator {
     for (const [key, items] of grouped) {
       try {
         const policy = this._policies.get(key);
-        if (!policy) continue;
+        if (!policy || !policy.collection) continue; // skip if no collection
 
-        // We need to know which collection to write to.
-        // For recoverable data, we use the model mapped by key.
-        // We'll use a switch based on key for now, but this should be configurable.
         const collection = this._getCollectionForKey(key);
         if (!collection) {
           logger.warn(`[DataOrchestrator] No collection for recoverable key: ${key}`);
           continue;
         }
 
-        // Use the latest item (most recent) – recoverable data is a snapshot.
         const latest = items[items.length - 1];
         const query = { symbol: latest.data.symbol || 'global' };
         const update = { $set: latest.data };
@@ -229,7 +170,6 @@ class DataOrchestrator {
         logger.debug(`[DataOrchestrator] Snapshot flushed for ${key}`);
       } catch (err) {
         logger.error(`[DataOrchestrator] Error flushing snapshot for ${key}:`, err.message);
-        // Re‑queue if failed? For now, just log.
       }
     }
   }
@@ -252,7 +192,6 @@ class DataOrchestrator {
           continue;
         }
 
-        // Insert all items
         const docs = items.map(item => ({
           ...item.data,
           ...item.metadata,
@@ -262,7 +201,6 @@ class DataOrchestrator {
         logger.debug(`[DataOrchestrator] Appended ${docs.length} items for ${key}`);
       } catch (err) {
         logger.error(`[DataOrchestrator] Error flushing append for ${key}:`, err.message);
-        // Re‑queue? For now, just log.
       }
     }
   }
@@ -288,9 +226,6 @@ class DataOrchestrator {
         return;
       }
 
-      // For business data, we assume data is ready to be saved.
-      // If it's an update, we need to know the query.
-      // We'll use a generic approach: if data has _id, update; else insert.
       if (data._id) {
         await collection.updateOne({ _id: data._id }, { $set: data });
       } else {
@@ -308,13 +243,10 @@ class DataOrchestrator {
 
   /**
    * Get the Mongoose model for a given key.
-   * This is a simple mapping – can be extended.
+   * For 'marketState', we no longer use a dedicated model – returns null.
    */
   _getCollectionForKey(key) {
-    // Import models lazily to avoid circular dependencies
     switch (key) {
-      case 'marketState':
-        return require('../../models/MarketState')?.default || require('../../models/MarketState');
       case 'historicalState':
         return require('../../models/HistoricalState');
       case 'historicalDecision':
@@ -331,6 +263,7 @@ class DataOrchestrator {
         return require('../../models/User');
       case 'apiKey':
         return require('../../models/ApiKey');
+      // 'marketState' is not persisted via DB – handled in memory
       default:
         return null;
     }
@@ -340,24 +273,17 @@ class DataOrchestrator {
   // RECOVERY
   // ============================================================
 
-  /**
-   * Recover state on startup.
-   * @returns {Promise<void>}
-   */
   async recover() {
     if (this._recovered) return;
 
     logger.info('[DataOrchestrator] Starting recovery...');
 
     try {
-      // 1. Load recoverable state from snapshots (latest per key)
-      // We'll load marketState, etc.
+      // Load recoverable state from snapshots (only those with collections)
       await this._loadRecoverableState();
-
-      // 2. Load business data (trades, orders, etc.)
+      // Load business data
       await this._loadBusinessState();
-
-      // 3. Load knowledge (learning weights)
+      // Load knowledge
       await this._loadKnowledgeState();
 
       this._recovered = true;
@@ -369,32 +295,16 @@ class DataOrchestrator {
   }
 
   async _loadRecoverableState() {
-    // Load marketState from MarketState model
-    try {
-      const MarketState = require('../../models/MarketState');
-      const states = await MarketState.find({});
-      for (const state of states) {
-        this._cache.set(`marketState:${state.symbol}`, {
-          data: state.toObject(),
-          metadata: { restored: true },
-          timestamp: Date.now(),
-          policy: this._policies.get('marketState'),
-        });
-      }
-      logger.info(`[DataOrchestrator] Loaded ${states.length} market states from DB.`);
-    } catch (err) {
-      // If model doesn't exist yet, skip.
-      logger.debug('[DataOrchestrator] MarketState model not ready.');
-    }
+    // We no longer load 'marketState' from DB – it's rebuilt from candles/awareness.
+    // If we had other recoverable keys, we could load them here.
+    logger.debug('[DataOrchestrator] No recoverable state to load from DB.');
   }
 
   async _loadBusinessState() {
-    // Load trades, orders if needed – not required for basic recovery.
-    // This can be extended.
+    // Placeholder – can be extended to load trades/orders if needed.
   }
 
   async _loadKnowledgeState() {
-    // Load learning weights
     try {
       const LearningState = require('../../models/LearningState');
       const weights = await LearningState.find({});
@@ -416,15 +326,9 @@ class DataOrchestrator {
   // CACHE ACCESS
   // ============================================================
 
-  /**
-   * Get data from cache.
-   * @param {string} key - Cache key
-   * @returns {*} Data or null
-   */
   get(key) {
     const entry = this._cache.get(key);
     if (!entry) return null;
-    // Check TTL
     const policy = this._policies.get(key);
     if (policy && policy.ttl < Infinity) {
       const age = Date.now() - entry.timestamp;
@@ -436,9 +340,6 @@ class DataOrchestrator {
     return entry.data;
   }
 
-  /**
-   * Get all cached keys for debugging.
-   */
   getCacheStats() {
     const stats = {};
     for (const [key, entry] of this._cache) {
@@ -451,21 +352,9 @@ class DataOrchestrator {
   }
 
   // ============================================================
-  // FLUSH TIMERS
+  // SHUTDOWN
   // ============================================================
 
-  _startFlushTimers() {
-    // We use setInterval to flush snapshots periodically, but we already use setTimeout per batch.
-    // We'll just rely on the per‑batch timers.
-  }
-
-  // ============================================================
-  // SHUTDOWN / CLEANUP
-  // ============================================================
-
-  /**
-   * Graceful shutdown – flush remaining queues.
-   */
   async shutdown() {
     logger.info('[DataOrchestrator] Shutting down...');
     if (this._snapshotTimer) {
