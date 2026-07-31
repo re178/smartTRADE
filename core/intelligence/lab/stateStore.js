@@ -3,8 +3,8 @@
 // Provides empirical edge measurement based on historical analogues.
 
 const path = require('path');
-const HistoricalState = require(path.resolve(__dirname, '../../models/HistoricalState'));
-const HistoricalOutcome = require(path.resolve(__dirname, '../../models/HistoricalOutcome'));
+const HistoricalState = require(path.resolve(__dirname, '../../../models/HistoricalState'));
+const HistoricalOutcome = require(path.resolve(__dirname, '../../../models/HistoricalOutcome'));
 const logger = require('../../../infrastructure/logger') || console;
 
 // ---- Configuration ----
