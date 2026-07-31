@@ -1,11 +1,12 @@
 // core/intelligence/deep/regime.js
 // Deep Regime Detection – uses deep market state to classify regimes.
 // Listens to candle closes, emits 'regime' events with confidence, reason, and session context.
-// Added debug logs to trace flow.
+// Publishes regime changes to DataOrchestrator for research/historical logging.
 
 const candleStore = require('../../data/candleStore');
 const deepMarketState = require('./marketState');
 const session = require('../session');
+const { dataOrchestrator, DATA_CLASSES } = require('../../data/dataOrchestrator');
 const logger = require('../../../infrastructure/logger') || console;
 
 // Regime definitions (matching the master prompt)
@@ -51,6 +52,13 @@ class DeepRegimeDetector {
 
     // Store latest regime per symbol
     this._latestRegime = {};
+    this._lastRegimeCode = {}; // For tracking changes
+
+    // ---- Register with DataOrchestrator ----
+    dataOrchestrator.register('regimeChange', DATA_CLASSES.RESEARCH, {
+      collection: 'historicalstates',
+      batchSize: 50,
+    });
 
     logger.info('[DeepRegimeDetector] Initialized, listening to candle closes.');
   }
@@ -116,6 +124,39 @@ class DeepRegimeDetector {
         timestamp: new Date().toISOString(),
       });
 
+      // ---- PUBLISH TO DATAORCHESTRATOR (if regime changed) ----
+      const prevCode = this._lastRegimeCode[symbol] || null;
+      if (prevCode !== regime.code) {
+        this._lastRegimeCode[symbol] = regime.code;
+        dataOrchestrator.publish('regimeChange', {
+          symbol,
+          timeframe,
+          timestamp: new Date().toISOString(),
+          regime: {
+            code: regime.code,
+            name: regime.name,
+            confidence: regime.confidence,
+            description: regime.description,
+            family: regime.family,
+          },
+          previousRegime: prevCode,
+          state: {
+            price: state.price,
+            trend: state.trend,
+            momentum: state.momentum,
+            volatility: state.volatility,
+            structure: state.structure,
+            session: state.session,
+            summary: state.summary,
+            awareness: state.awareness || {},
+          },
+          reason: regime.reason,
+          source: 'deepRegimeDetector',
+        }, { source: 'regimeChange' });
+
+        logger.debug(`[DeepRegimeDetector] ${symbol} regime change: ${prevCode || 'None'} → ${regime.code}`);
+      }
+
       logger.debug(`[DeepRegimeDetector] ${symbol}:${timeframe} → ${regime.code} (${Math.round(regime.confidence)}%)`);
     } catch (err) {
       console.error(`❌ DeepRegimeDetector: error for ${symbol}:${timeframe}`, err.message);
@@ -127,7 +168,7 @@ class DeepRegimeDetector {
    * Classify the regime from the deep state.
    */
   _classifyRegime(state) {
-    const { trend, momentum, volatility, structure, summary } = state;
+    const { trend, momentum, volatility, structure } = state;
 
     const adx = trend.strength;
     const rsi = momentum.rsi;
@@ -135,7 +176,6 @@ class DeepRegimeDetector {
     const atrPercent = volatility.atrPercent;
     const isAtSupport = structure.isAtSupport;
     const isAtResistance = structure.isAtResistance;
-    const pricePosition = structure.pricePosition;
 
     // 1. Strong Trend (Bullish / Bearish)
     if (adx > 30) {
@@ -256,15 +296,14 @@ class DeepRegimeDetector {
    * Calculate confidence for the regime classification.
    */
   _calculateConfidence(state, regime) {
-    let confidence = 50; // base
+    let confidence = 50;
 
-    const { trend, momentum, volatility, structure, session } = state;
+    const { trend, momentum, volatility, session } = state;
     const adx = trend.strength;
     const rsi = momentum.rsi;
     const bbWidth = volatility.bbWidth;
     const atrPercent = volatility.atrPercent;
 
-    // Adjust confidence based on regime type
     switch (regime.code) {
       case 'STRONG_TREND_BULL':
       case 'STRONG_TREND_BEAR':
@@ -293,14 +332,12 @@ class DeepRegimeDetector {
         confidence = 50;
     }
 
-    // Adjust for session liquidity
     if (session && session.liquidityMultiplier) {
       const liqMult = session.liquidityMultiplier;
       if (liqMult > 1.2) confidence += 5;
       else if (liqMult < 0.8) confidence -= 5;
     }
 
-    // Adjust for awareness (liquidity, velocity)
     if (state.awareness) {
       const { liquidity, velocity } = state.awareness;
       if (regime.family === 'trend' && liquidity > 0.7) {
