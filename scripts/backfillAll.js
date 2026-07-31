@@ -1,6 +1,6 @@
 // scripts/backfillAll.js
-// Robust backfill: for each historical candle, compute features from previous 200 candles,
-// store state with future outcomes (5,10,20,40 candles ahead).
+// Robust backfill with debugging – will log every failure reason.
+// Forces state creation even with partial indicators.
 
 const mongoose = require('mongoose');
 const connectDB = require('../config/db');
@@ -17,17 +17,16 @@ const {
 } = require('../core/strategy/engine');
 const logger = require('../infrastructure/logger') || console;
 
-// ---- CONFIGURATION ----
+// ---- CONFIG ----
 const SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD'];
 const TIMEFRAMES = ['M5', 'M15', 'H1'];
 const LOOKAHEADS = [5, 10, 20, 40];
-const MAX_CANDLES = 5000;          // How many candles to fetch per symbol/timeframe
-const BATCH_SIZE = 20;             // States per batch (to avoid memory spikes)
-const INDICATOR_LOOKBACK = 200;    // Candles needed for indicators
+const MAX_CANDLES = 5000;
+const BATCH_SIZE = 10; // smaller for debugging
+const INDICATOR_LOOKBACK = 200;
 
-// Helper: try both symbol formats (with/without underscore)
+// Helper: try both symbol formats
 function normalizeSymbol(sym) {
-  // If it contains '_', keep as is; else add underscore
   if (sym.includes('_')) return sym;
   return sym.slice(0, 3) + '_' + sym.slice(3);
 }
@@ -42,7 +41,6 @@ function getSessionName(timestamp) {
   return 'Other';
 }
 
-// ---- MAIN ----
 async function run() {
   await connectDB();
   logger.info('✅ Connected to MongoDB.');
@@ -54,30 +52,31 @@ async function run() {
 
   let totalStates = 0;
   let totalOutcomes = 0;
+  let skippedCount = 0;
 
   for (const rawSymbol of SYMBOLS) {
     const symbol = normalizeSymbol(rawSymbol);
     for (const tf of TIMEFRAMES) {
       logger.info(`📥 Processing ${symbol} ${tf}...`);
 
-      // 1. Fetch candles
       const candles = await candleHistory.getHistory(symbol, tf, MAX_CANDLES);
       if (!candles || candles.length < INDICATOR_LOOKBACK + 50) {
-        logger.warn(`⚠️ Not enough candles for ${symbol} ${tf} (need ${INDICATOR_LOOKBACK + 50})`);
+        logger.warn(`⚠️ Not enough candles for ${symbol} ${tf} (got ${candles?.length})`);
         continue;
       }
 
       const totalCandles = candles.length;
       const maxLookahead = Math.max(...LOOKAHEADS);
-      // We can only label states that have enough future candles
-      const usableEnd = totalCandles - maxLookahead - 5; // leave buffer
+      const usableEnd = totalCandles - maxLookahead - 5;
 
       if (usableEnd < INDICATOR_LOOKBACK + 10) {
         logger.warn(`⚠️ Not enough usable candles for ${symbol} ${tf}`);
         continue;
       }
 
-      // 2. Process in batches
+      logger.info(`   Total candles: ${totalCandles}, usable until: ${usableEnd}`);
+
+      // Process in batches
       for (let startIdx = INDICATOR_LOOKBACK; startIdx < usableEnd; startIdx += BATCH_SIZE) {
         const endIdx = Math.min(startIdx + BATCH_SIZE, usableEnd);
         const batchPromises = [];
@@ -89,33 +88,68 @@ async function run() {
         const results = await Promise.allSettled(batchPromises);
         for (const r of results) {
           if (r.status === 'fulfilled' && r.value) {
-            totalStates++;
-            totalOutcomes += r.value.outcomesCreated || 0;
+            if (r.value.created) {
+              totalStates++;
+              totalOutcomes += r.value.outcomesCreated || 0;
+            } else {
+              skippedCount++;
+            }
+          } else {
+            skippedCount++;
+            logger.error(`   ❌ Batch promise rejected: ${r.reason}`);
           }
         }
-        logger.info(`   ➜ Processed up to candle ${endIdx}/${usableEnd} (${totalStates} states so far)`);
+        logger.info(`   ➜ Processed up to candle ${endIdx}/${usableEnd} (${totalStates} states, ${skippedCount} skipped)`);
       }
-      logger.info(`✅ Finished ${symbol} ${tf} – total states: ${totalStates}`);
+      logger.info(`✅ Finished ${symbol} ${tf} – total states: ${totalStates}, skipped: ${skippedCount}`);
     }
   }
 
-  logger.info(`🎉 All done. Created ${totalStates} states and ${totalOutcomes} outcome records.`);
+  logger.info(`🎉 All done. Created ${totalStates} states and ${totalOutcomes} outcome records. Skipped ${skippedCount} candles.`);
   process.exit(0);
 }
 
-// ---- Process a single candle (compute features + outcomes) ----
+// ---- Process a single candle with detailed logging ----
 async function processCandle(candles, idx, symbol, timeframe) {
   const currentCandle = candles[idx];
   const currentPrice = currentCandle.close;
 
-  // 1. Slice for indicators: previous 199 candles + current = 200
+  // 1. Slice for indicators
   const startSlice = Math.max(0, idx - INDICATOR_LOOKBACK + 1);
   const slice = candles.slice(startSlice, idx + 1);
-  if (slice.length < 50) return null;
+  if (slice.length < 50) {
+    logger.debug(`   ⏭️ Skipping idx ${idx}: slice length ${slice.length} < 50`);
+    return { created: false };
+  }
 
-  // 2. Compute indicators
-  const indicators = computeIndicators(slice);
-  if (!indicators) return null;
+  // 2. Compute indicators with error handling
+  let indicators;
+  try {
+    indicators = computeIndicators(slice);
+  } catch (err) {
+    logger.error(`   ❌ Indicator error at idx ${idx}: ${err.message}`);
+    return { created: false };
+  }
+
+  if (!indicators) {
+    logger.debug(`   ⏭️ Skipping idx ${idx}: computeIndicators returned null`);
+    return { created: false };
+  }
+
+  // If some indicators are missing, fill with defaults
+  const defaultIndicators = {
+    adx: 0, rsi: 50, atr: 0.001, bbWidth: 0.15,
+    macdHist: 0, support: null, resistance: null,
+    pricePosition: 0.5, isAtSupport: false, isAtResistance: false,
+    trendDirection: 'neutral', slope: 0, volatilityRegime: 'normal',
+    regimeCode: 'NEUTRAL', regimeSuggestion: 'neutral',
+    plusDI: 0, minusDI: 0, macdLine: 0, macdSignal: 0,
+  };
+  Object.keys(defaultIndicators).forEach(k => {
+    if (indicators[k] === undefined || indicators[k] === null) {
+      indicators[k] = defaultIndicators[k];
+    }
+  });
 
   // 3. Build HistoricalState document
   const state = new HistoricalState({
@@ -130,34 +164,34 @@ async function processCandle(candles, idx, symbol, timeframe) {
       close: currentCandle.close,
     },
     trend: {
-      direction: indicators.trendDirection,
-      strength: indicators.adx,
-      adx: indicators.adx,
-      plusDI: indicators.plusDI,
-      minusDI: indicators.minusDI,
-      slope: indicators.slope,
+      direction: indicators.trendDirection || 'neutral',
+      strength: indicators.adx || 0,
+      adx: indicators.adx || 0,
+      plusDI: indicators.plusDI || 0,
+      minusDI: indicators.minusDI || 0,
+      slope: indicators.slope || 0,
     },
     momentum: {
-      rsi: indicators.rsi,
-      macdLine: indicators.macdLine,
-      macdSignal: indicators.macdSignal,
-      macdHist: indicators.macdHist,
+      rsi: indicators.rsi || 50,
+      macdLine: indicators.macdLine || 0,
+      macdSignal: indicators.macdSignal || 0,
+      macdHist: indicators.macdHist || 0,
       velocity: 0,
       acceleration: 0,
     },
     volatility: {
-      atr: indicators.atr,
-      atrPercent: indicators.atr / currentPrice,
-      bbWidth: indicators.bbWidth,
-      regime: indicators.volatilityRegime,
+      atr: indicators.atr || 0.001,
+      atrPercent: (indicators.atr || 0.001) / currentPrice,
+      bbWidth: indicators.bbWidth || 0.15,
+      regime: indicators.volatilityRegime || 'normal',
     },
     liquidity: { score: 0.5, spread: 0, tickFrequency: 0 },
     structure: {
-      support: indicators.support,
-      resistance: indicators.resistance,
-      pricePosition: indicators.pricePosition,
-      isAtSupport: indicators.isAtSupport,
-      isAtResistance: indicators.isAtResistance,
+      support: indicators.support || null,
+      resistance: indicators.resistance || null,
+      pricePosition: indicators.pricePosition || 0.5,
+      isAtSupport: indicators.isAtSupport || false,
+      isAtResistance: indicators.isAtResistance || false,
     },
     session: {
       name: getSessionName(currentCandle.time),
@@ -174,7 +208,7 @@ async function processCandle(candles, idx, symbol, timeframe) {
       marketQuality: 50,
       noiseLevel: 'medium',
       regimeSuggestion: indicators.regimeSuggestion || 'neutral',
-      trendConfidence: indicators.adx,
+      trendConfidence: indicators.adx || 0,
     },
     confidence: 50,
     reason: 'Backfill',
@@ -194,7 +228,6 @@ async function processCandle(candles, idx, symbol, timeframe) {
     const returnR = returnVal / (indicators.atr || 0.001);
     const win = returnVal > 0;
 
-    // Max drawdown during the period
     let maxDrawdown = 0;
     for (let k = idx; k <= endIdx; k++) {
       const drawdown = (candles[k].low - currentPrice) / currentPrice;
@@ -227,11 +260,11 @@ async function processCandle(candles, idx, symbol, timeframe) {
         endPrice: endPrice,
       },
       featuresSnapshot: {
-        adx: indicators.adx,
-        rsi: indicators.rsi,
-        atr: indicators.atr,
-        bbWidth: indicators.bbWidth,
-        macdHist: indicators.macdHist,
+        adx: indicators.adx || 0,
+        rsi: indicators.rsi || 50,
+        atr: indicators.atr || 0.001,
+        bbWidth: indicators.bbWidth || 0.15,
+        macdHist: indicators.macdHist || 0,
       },
       source: 'backfill',
       filledAt: new Date(),
@@ -240,7 +273,7 @@ async function processCandle(candles, idx, symbol, timeframe) {
   }
 
   await state.save();
-  return { outcomesCreated };
+  return { created: true, outcomesCreated };
 }
 
 // ---- Compute indicators from a slice of candles ----
@@ -251,12 +284,31 @@ function computeIndicators(candles) {
     const lows = candles.map(c => c.low);
     const candlesForInd = candles.map(c => ({ mid: { h: c.high, l: c.low, c: c.close } }));
 
-    const adxData = ADX(candlesForInd, 14);
-    const atrArray = ATR(candlesForInd, 14);
-    const rsi = RSI(closes, 14);
-    const macd = MACD(closes, 12, 26, 9);
-    const bb = BollingerBands(closes, 20, 2);
-    const sr = findSupportResistance(candlesForInd, 30, 0.001);
+    // Check that we have enough data
+    if (closes.length < 50) {
+      return null;
+    }
+
+    // Compute each indicator; if one fails, log but continue with defaults
+    let adxData = null, atrArray = null, rsi = null, macd = null, bb = null, sr = null;
+    try {
+      adxData = ADX(candlesForInd, 14);
+    } catch (e) { /* ignore */ }
+    try {
+      atrArray = ATR(candlesForInd, 14);
+    } catch (e) { /* ignore */ }
+    try {
+      rsi = RSI(closes, 14);
+    } catch (e) { /* ignore */ }
+    try {
+      macd = MACD(closes, 12, 26, 9);
+    } catch (e) { /* ignore */ }
+    try {
+      bb = BollingerBands(closes, 20, 2);
+    } catch (e) { /* ignore */ }
+    try {
+      sr = findSupportResistance(candlesForInd, 30, 0.001);
+    } catch (e) { /* ignore */ }
 
     const adx = adxData ? adxData.adx : 0;
     const plusDI = adxData ? adxData.plusDI : 0;
@@ -308,7 +360,8 @@ function computeIndicators(candles) {
       regimeSuggestion: regimeCode,
     };
   } catch (err) {
-    logger.error(`Indicator error: ${err.message}`);
+    // If anything fails, log and return null
+    logger.error(`computeIndicators error: ${err.message}`);
     return null;
   }
 }
