@@ -12,6 +12,7 @@ const http = require('http');
 const connectDB = require('./config/db');
 const apiRoutes = require('./api/routes');
 const mt5Routes = require('./api/routes/mt5');
+const researchRoutes = require('./api/routes/research'); // NEW: research endpoints
 const User = require('./models/User');
 const Mt5Price = require('./models/Mt5Price');
 const Mt5Heartbeat = require('./models/Mt5Heartbeat');
@@ -24,6 +25,10 @@ const awarenessEngine = require('./core/awareness/engine');
 const deepRegime = require('./core/intelligence/deep/regime');
 const decisionEngine = require('./core/decision/engine');
 const eventBus = require('./infrastructure/eventBus');
+
+// ---------- DATA ORCHESTRATOR & STATE STORE ----------
+const { dataOrchestrator } = require('./core/data/dataOrchestrator');
+const stateStore = require('./core/intelligence/lab/stateStore');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -169,6 +174,7 @@ app.use(async (req, res, next) => {
 // ---------- API Routes ----------
 app.use('/api', apiRoutes);
 app.use('/api/mt5', mt5Routes);
+app.use('/api/research', researchRoutes); // NEW: research endpoints
 
 // ---------- Health Check ----------
 app.get('/health', (req, res) => {
@@ -228,12 +234,12 @@ eventBus.on('account.fetched', (account) => {
   broadcast('account', account);
 });
 
-// ---- NEW: Trade closed events ----
+// Trade closed events
 eventBus.on('trade.closed', (data) => {
   broadcast('tradeClosed', data);
 });
 
-// ---- Optional: Order placed events ----
+// Order placed events
 eventBus.on('order.placed', (data) => {
   broadcast('orderPlaced', data);
 });
@@ -275,7 +281,6 @@ app.get('/debug/trigger', async (req, res) => {
       volume: candle.volume,
       source: candle.source || 'broker',
     };
-    // Emit via eventBus and candleStore to ensure deepRegime catches it
     eventBus.emit('candleClosed', closedCandle);
     candleStore.emit('candleClosed', closedCandle);
     res.json({ success: true, candle: closedCandle });
@@ -328,16 +333,50 @@ async function startServer() {
     console.log(`📊 Dashboard: http://localhost:${PORT}`);
     console.log(`🔌 API base: http://localhost:${PORT}/api`);
     console.log(`🟢 MT5 Bridge endpoints: http://localhost:${PORT}/api/mt5`);
+    console.log(`🔬 Research endpoints: http://localhost:${PORT}/api/research`);
     console.log('📡 WebSocket server ready for real‑time signals.');
     console.log('🧠 CTOS Cognitive Engine: enabled.');
     console.log('📡 Request logging enabled.');
     console.log('🛠️  JSON repair enabled as fallback.');
     console.log('🧹  Null bytes (\\0) stripped from all incoming JSON.');
     console.log('💾 MT5 data is persistent (MongoDB).');
+
+    // ---- Initialise Data Orchestrator and State Store ----
+    Promise.all([
+      dataOrchestrator.recover(),
+      stateStore.init(),
+    ]).then(() => {
+      console.log('✅ Data Orchestrator and State Store initialised.');
+    }).catch(err => {
+      console.warn('⚠️ Failed to initialise Data Orchestrator/State Store:', err.message);
+    });
+
+    // Start cognitive engines after server is up
+    setTimeout(startCognitiveEngines, 2000);
   });
 
-  // Start cognitive engines after server is up
-  setTimeout(startCognitiveEngines, 2000);
+  // ---- Graceful shutdown ----
+  process.on('SIGINT', async () => {
+    console.log('\n🛑 Received SIGINT, shutting down gracefully...');
+    try {
+      await dataOrchestrator.shutdown();
+      console.log('✅ Data Orchestrator flushed.');
+    } catch (err) {
+      console.error('Error during shutdown:', err.message);
+    }
+    process.exit(0);
+  });
+
+  process.on('SIGTERM', async () => {
+    console.log('\n🛑 Received SIGTERM, shutting down gracefully...');
+    try {
+      await dataOrchestrator.shutdown();
+      console.log('✅ Data Orchestrator flushed.');
+    } catch (err) {
+      console.error('Error during shutdown:', err.message);
+    }
+    process.exit(0);
+  });
 }
 
 startServer().catch(err => {
