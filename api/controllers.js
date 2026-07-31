@@ -14,6 +14,13 @@ const { PortfolioManager, PerformanceLearner } = require('../core/analytics/perf
 const { notifyTrade } = require('../core/notifications/notificationService');
 const { validateOrderInput } = require('../shared/validators');
 const { formatSymbol } = require('../shared/helpers');
+
+// ---- Research Imports ----
+const HistoricalState = require('../models/HistoricalState');
+const HistoricalDecision = require('../models/HistoricalDecision');
+const HistoricalOutcome = require('../models/HistoricalOutcome');
+const stateStore = require('../core/intelligence/lab/stateStore');
+
 const logger = require('../infrastructure/logger') || console;
 
 // ---------- Portfolio Manager Instance ----------
@@ -196,25 +203,22 @@ exports.getTradeHistory = async (req, res) => {
   }
 };
 
-// ---------- Manual Order (with price validation) ----------
+// ---------- Manual Order ----------
 exports.placeOrder = async (req, res) => {
   const { pair, side, lotSize, stopLoss, takeProfit } = req.body;
 
   try {
     const product = getProduct(req);
     const instrument = pair.toUpperCase();
-
-    // Fetch current price for validation
     const currentPrice = await marketProvider.getCurrentPrice(instrument, product);
 
-    // Validate input with current price
     const validation = validateOrderInput({
       pair: instrument,
       side,
       lotSize,
       stopLoss: stopLoss || null,
       takeProfit: takeProfit || null,
-      currentPrice, // <-- NEW: pass current price for SL/TP validation
+      currentPrice,
     });
     if (!validation.valid) {
       return res.status(400).json({ error: validation.message });
@@ -307,7 +311,7 @@ exports.getSignal = async (req, res) => {
   }
 };
 
-// ---------- Auto Trade (with price validation) ----------
+// ---------- Auto Trade ----------
 exports.autoTrade = async (req, res) => {
   const { pair, riskPercent = 1, strategy = 'sma', ...params } = req.body;
   if (!pair) return res.status(400).json({ error: 'pair required' });
@@ -315,21 +319,18 @@ exports.autoTrade = async (req, res) => {
     const product = getProduct(req);
     const instrument = pair.toUpperCase();
 
-    // Generate signal
     const signal = await strategyEngine.generateSignal(instrument, strategy, { ...params, product });
     if (!signal) return res.json({ success: false, message: 'No trading signal' });
 
-    // Use signal's entry price as current price for validation
     const currentPrice = signal.entryPrice;
 
-    // Validate the signal's SL/TP against entry price
     const validation = validateOrderInput({
       pair: instrument,
       side: signal.side,
       lotSize: signal.recommendedLotSize || 0.01,
       stopLoss: signal.stopLoss || null,
       takeProfit: signal.takeProfit || null,
-      currentPrice, // <-- NEW: pass entry price for SL/TP validation
+      currentPrice,
     });
     if (!validation.valid) {
       return res.json({ success: false, message: validation.message });
@@ -365,11 +366,10 @@ exports.autoTrade = async (req, res) => {
   }
 };
 
-// ---------- Execute Live Signal (with price validation) ----------
+// ---------- Execute Live Signal ----------
 exports.executeSignal = async (req, res) => {
   const { pair, side, entryPrice, stopLoss, takeProfit, lotSize } = req.body;
 
-  // Basic validation
   if (!pair || !side || !lotSize) {
     return res.status(400).json({ error: 'pair, side, and lotSize are required' });
   }
@@ -384,26 +384,23 @@ exports.executeSignal = async (req, res) => {
     const product = getProduct(req);
     const instrument = formattedPair;
 
-    // Use entry price from signal, or fetch current if not provided
     let currentPrice = entryPrice;
     if (!currentPrice) {
       currentPrice = await marketProvider.getCurrentPrice(instrument, product);
     }
 
-    // Validate SL/TP against entry price
     const validation = validateOrderInput({
       pair: instrument,
       side: cleanSide,
       lotSize,
       stopLoss: stopLoss || null,
       takeProfit: takeProfit || null,
-      currentPrice, // <-- NEW: pass entry price for SL/TP validation
+      currentPrice,
     });
     if (!validation.valid) {
       return res.status(400).json({ error: validation.message });
     }
 
-    // Place order
     const orderResult = await orderService.placeMarketOrder(
       instrument,
       cleanSide,
@@ -461,6 +458,214 @@ exports.deleteHistory = async (req, res) => {
     res.json({ success: true, deletedCount: count });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+};
+
+// ============================================================
+// NEW RESEARCH CONTROLLERS
+// ============================================================
+
+/**
+ * GET /api/research/decision/:id
+ * Full decision context – features, contributions, lineage, similarity.
+ */
+exports.getDecisionContext = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const lookahead = parseInt(req.query.lookahead) || 5;
+
+    const decision = await HistoricalDecision.findById(id).lean();
+    if (!decision) {
+      return res.status(404).json({ error: 'Decision not found' });
+    }
+
+    let similarity = null;
+    try {
+      const features = decision.features || {};
+      const result = await stateStore.findSimilar(
+        features,
+        decision.symbol,
+        decision.timeframe,
+        50,
+        lookahead
+      );
+      similarity = result;
+    } catch (err) {
+      logger.warn('[Research] Similarity search failed:', err.message);
+    }
+
+    let outcomeStats = null;
+    if (decision.outcome && decision.outcome.tradeId) {
+      try {
+        const stats = await HistoricalOutcome.getAggregatedStats(
+          [decision._id],
+          'decision',
+          lookahead
+        );
+        outcomeStats = stats;
+      } catch (err) {
+        logger.warn('[Research] Outcome stats failed:', err.message);
+      }
+    }
+
+    let calibration = null;
+    try {
+      calibration = await stateStore.calibrateConfidence(decision, lookahead, 100);
+    } catch (err) {
+      logger.warn('[Research] Confidence calibration failed:', err.message);
+    }
+
+    res.json({
+      decision,
+      similarity,
+      outcomeStats,
+      calibration,
+    });
+  } catch (err) {
+    logger.error('[Research] Decision inspector error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+};
+
+/**
+ * GET /api/research/similarity
+ * Search for historical states similar to a feature vector.
+ */
+exports.getSimilaritySearch = async (req, res) => {
+  try {
+    const {
+      symbol,
+      timeframe = 'M5',
+      lookahead = 5,
+      k = 100,
+      adx,
+      rsi,
+      atrPercent,
+      bbWidth,
+      macdHist,
+      liquidity,
+      velocity,
+      acceleration,
+      pricePosition,
+      marketQuality,
+    } = req.query;
+
+    const features = {
+      adx: adx !== undefined ? parseFloat(adx) : 25,
+      rsi: rsi !== undefined ? parseFloat(rsi) : 50,
+      atrPercent: atrPercent !== undefined ? parseFloat(atrPercent) : 0.005,
+      bbWidth: bbWidth !== undefined ? parseFloat(bbWidth) : 0.15,
+      macdHist: macdHist !== undefined ? parseFloat(macdHist) : 0,
+      liquidity: liquidity !== undefined ? parseFloat(liquidity) : 0.5,
+      velocity: velocity !== undefined ? parseFloat(velocity) : 0,
+      acceleration: acceleration !== undefined ? parseFloat(acceleration) : 0,
+      pricePosition: pricePosition !== undefined ? parseFloat(pricePosition) : 0.5,
+      marketQuality: marketQuality !== undefined ? parseFloat(marketQuality) : 50,
+    };
+
+    const lookaheadInt = parseInt(lookahead);
+    const kInt = parseInt(k);
+
+    const result = await stateStore.findSimilar(
+      features,
+      symbol || null,
+      timeframe,
+      kInt,
+      !isNaN(lookaheadInt) && [5, 10, 20, 40].includes(lookaheadInt) ? lookaheadInt : 5
+    );
+
+    res.json({
+      query: { features, symbol, timeframe, lookahead: lookaheadInt, k: kInt },
+      ...result,
+    });
+  } catch (err) {
+    logger.error('[Research] Similarity search error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+};
+
+/**
+ * GET /api/research/historical-states
+ * Paginated historical states with filters.
+ */
+exports.getHistoricalStates = async (req, res) => {
+  try {
+    const {
+      symbol,
+      timeframe = 'M5',
+      from,
+      to,
+      limit = 100,
+      skip = 0,
+      hasOutcome = 'false',
+      lookahead = 5,
+    } = req.query;
+
+    const filter = {};
+    if (symbol) filter.symbol = symbol;
+    if (timeframe) filter.timeframe = timeframe;
+    if (from) filter.timestamp = { $gte: new Date(parseInt(from)) };
+    if (to) filter.timestamp = { ...filter.timestamp, $lte: new Date(parseInt(to)) };
+
+    const lookaheadInt = parseInt(lookahead);
+    const outcomeKey = `outcome${[5, 10, 20, 40].includes(lookaheadInt) ? lookaheadInt : 5}`;
+
+    if (hasOutcome === 'true') {
+      filter[`${outcomeKey}.return`] = { $ne: null };
+    }
+
+    const total = await HistoricalState.countDocuments(filter);
+    const states = await HistoricalState.find(filter)
+      .sort({ timestamp: -1 })
+      .skip(parseInt(skip))
+      .limit(parseInt(limit))
+      .lean();
+
+    res.json({
+      total,
+      skip: parseInt(skip),
+      limit: parseInt(limit),
+      states,
+    });
+  } catch (err) {
+    logger.error('[Research] Historical states error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+};
+
+/**
+ * POST /api/research/label-outcomes
+ * Trigger outcome labelling for unlabelled states/decisions.
+ */
+exports.postLabelOutcomes = async (req, res) => {
+  try {
+    const { symbol, timeframe, lookahead = 5, limit = 1000 } = req.body;
+
+    const lookaheadInt = parseInt(lookahead);
+    if (![5, 10, 20, 40].includes(lookaheadInt)) {
+      return res.status(400).json({ error: 'Invalid lookahead. Must be 5, 10, 20, or 40.' });
+    }
+
+    const outcomeKey = `outcome${lookaheadInt}`;
+    const filter = {
+      symbol: symbol || { $exists: true },
+      timeframe: timeframe || 'M5',
+      [`${outcomeKey}.return`]: null,
+    };
+
+    const count = await HistoricalState.countDocuments(filter);
+
+    res.json({
+      message: `Outcome labelling triggered for ${count} states. This is a background job.`,
+      count,
+      filter,
+      lookahead: lookaheadInt,
+    });
+
+    logger.info(`[Research] Outcome labelling triggered for ${count} states (lookahead: ${lookaheadInt})`);
+  } catch (err) {
+    logger.error('[Research] Label outcomes error:', err.message);
+    res.status(500).json({ error: err.message });
   }
 };
 
