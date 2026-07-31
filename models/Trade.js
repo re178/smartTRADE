@@ -1,117 +1,175 @@
-// models/Trade.js – Mongoose Schema for Trade Records
-
 const mongoose = require('mongoose');
 
 const TradeSchema = new mongoose.Schema(
   {
-    // Instrument traded (e.g., "EUR_USD")
-    pair: {
+    // ---- MT5 core fields ----
+    contractId: {
+      type: Number,
+      required: true,
+      unique: true,
+      index: true,
+      description: 'MT5 ticket number (unique per trade)',
+    },
+    instrument: {
       type: String,
       required: true,
-      uppercase: true,
-      trim: true,
+      index: true,
+      description: 'Symbol, e.g., EURUSD',
     },
-
-    // Trade direction: BUY or SELL
     side: {
       type: String,
-      enum: ['BUY', 'SELL'],
+      enum: ['buy', 'sell'],
       required: true,
+      description: 'Trade direction',
     },
-
-    // Entry price (executed price)
-    entryPrice: {
-      type: Number,
-      required: true,
-    },
-
-    // Stop Loss level (optional)
-    stopLoss: {
-      type: Number,
-      default: null,
-    },
-
-    // Take Profit level (optional)
-    takeProfit: {
-      type: Number,
-      default: null,
-    },
-
-    // Lot size (units)
     lotSize: {
       type: Number,
       required: true,
-      min: 0.001,
+      min: 0,
+      description: 'Trade volume in lots',
     },
-
-    // Trade status: OPEN, CLOSED, PENDING, CANCELLED
+    openPrice: {
+      type: Number,
+      required: true,
+      description: 'Price at which the trade was opened',
+    },
+    closePrice: {
+      type: Number,
+      default: null,
+      description: 'Price at which the trade was closed (null if still open)',
+    },
     status: {
       type: String,
       enum: ['OPEN', 'CLOSED', 'PENDING', 'CANCELLED'],
       default: 'OPEN',
+      required: true,
+      index: true,
+      description: 'Current trade status',
     },
-
-    // When the trade was opened
     openTime: {
       type: Date,
-      default: Date.now,
+      required: true,
+      description: 'Timestamp when the trade was opened',
     },
-
-    // When the trade was closed (if closed)
     closeTime: {
       type: Date,
       default: null,
+      description: 'Timestamp when the trade was closed (null if still open)',
     },
 
-    // Price at which the trade was closed
-    closePrice: {
+    // ---- P&L ----
+    floatingProfit: {
       type: Number,
-      default: null,
+      default: 0,
+      description: 'Current unrealised profit/loss',
     },
-
-    // Profit / Loss in account currency
+    realizedProfit: {
+      type: Number,
+      default: 0,
+      description: 'Final realised profit/loss after close',
+    },
     pnl: {
       type: Number,
       default: 0,
+      description: 'Alias for realised profit (used by orderService)',
     },
 
-    // OANDA trade ID (for reference)
-    oandaTradeId: {
-      type: String,
-      default: null,
+    // ---- MT5 extra fields ----
+    stopLoss: {
+      type: Number,
+      default: 0,
     },
-
-    // OANDA order ID (for reference)
-    oandaOrderId: {
-      type: String,
-      default: null,
+    takeProfit: {
+      type: Number,
+      default: 0,
     },
-
-    // Additional notes (e.g., "Auto-trade from strategy")
-    notes: {
+    swap: {
+      type: Number,
+      default: 0,
+    },
+    commission: {
+      type: Number,
+      default: 0,
+    },
+    margin: {
+      type: Number,
+      default: 0,
+    },
+    magic: {
+      type: Number,
+      default: 0,
+    },
+    comment: {
       type: String,
       default: '',
     },
-
-    // Broker name (for multi-broker support)
-    broker: {
-      type: String,
-      default: 'OANDA',
+    dealId: {
+      type: Number,
+      default: null,
+      description: 'MT5 deal ID for the closing transaction',
     },
 
-    // Strategy that generated this trade (for analytics later)
+    // ---- Strategy & decision lineage ----
+    decisionId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'HistoricalDecision',
+      default: null,
+      index: true,
+      description: 'Reference to the decision that generated this trade',
+    },
     strategy: {
       type: String,
-      default: 'MA_Crossover',
+      default: null,
+      description: 'Strategy name (if any)',
+    },
+    product: {
+      type: String,
+      default: 'FX',
+      description: 'Product type (e.g., FX, CFD)',
+    },
+
+    // ---- Internal sync state ----
+    pendingClose: {
+      type: Boolean,
+      default: false,
+      index: true,
+      description: 'True if the trade is no longer reported by MT5 but not yet closed in DB',
+    },
+
+    // ---- Account linkage ----
+    login: {
+      type: Number,
+      index: true,
+      description: 'MT5 login number for filtering',
+    },
+
+    // ---- Current price (convenience) ----
+    currentPrice: {
+      type: Number,
+      default: null,
+      description: 'Last known current price from MT5',
+    },
+
+    // ---- MAE/MFE (optional, for analytics) ----
+    mae: {
+      type: Number,
+      default: 0,
+    },
+    mfe: {
+      type: Number,
+      default: 0,
     },
   },
   {
-    timestamps: true, // Automatically adds createdAt and updatedAt
+    timestamps: true,
   }
 );
 
-// Index for faster queries
-TradeSchema.index({ pair: 1, status: 1 });
-TradeSchema.index({ createdAt: -1 });
+// ---- Indexes for fast lookups ----
+TradeSchema.index({ login: 1, status: 1 });
+TradeSchema.index({ contractId: 1, status: 1 });
+TradeSchema.index({ decisionId: 1 });
+TradeSchema.index({ openTime: -1 });
+TradeSchema.index({ closeTime: -1 });
 
 module.exports = mongoose.model('Trade', TradeSchema);
