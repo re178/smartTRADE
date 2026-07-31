@@ -6,8 +6,8 @@ const router = express.Router();
 const HistoricalState = require('../../models/HistoricalState');
 const HistoricalDecision = require('../../models/HistoricalDecision');
 const HistoricalOutcome = require('../../models/HistoricalOutcome');
-const stateStore = require('../core/intelligence/lab/stateStore');
-const { dataOrchestrator } = require('../core/data/dataOrchestrator');
+const stateStore = require('../../core/intelligence/lab/stateStore');
+const { dataOrchestrator } = require('../../core/data/dataOrchestrator');
 const logger = require('../infrastructure/logger') || console;
 
 // ---- Helper to validate lookahead ----
