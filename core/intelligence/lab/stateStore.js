@@ -1,8 +1,10 @@
 // core/intelligence/lab/stateStore.js
 // Similarity search, edge computation, and outcome retrieval.
+// Handles both symbol formats (with/without underscore).
 
 const HistoricalState = require('../../../models/HistoricalState');
 const HistoricalOutcome = require('../../../models/HistoricalOutcome');
+const { dataOrchestrator, DATA_CLASSES } = require('../../data/dataOrchestrator');
 const logger = require('../../../infrastructure/logger') || console;
 
 const CONFIG = {
@@ -10,6 +12,17 @@ const CONFIG = {
   DEFAULT_K: 100,
   MIN_SAMPLES_FOR_EDGE: 20,
 };
+
+// ---- Helper: try both symbol formats ----
+function getSymbolVariants(symbol) {
+  if (!symbol) return [];
+  const clean = symbol.replace(/_/g, '').toUpperCase();
+  const withUnderscore = clean.slice(0, 3) + '_' + clean.slice(3);
+  // Return unique variants
+  const variants = [clean, withUnderscore];
+  // Remove duplicates if clean === withUnderscore (unlikely)
+  return [...new Set(variants)];
+}
 
 class FeatureNormalizer {
   constructor() {
@@ -120,14 +133,35 @@ class StateStore {
     logger.info('[StateStore] Initialized.');
   }
 
+  // ---- findSimilar: handles both symbol formats ----
   async findSimilar(queryFeatures, symbol = null, timeframe = 'M5', k = CONFIG.DEFAULT_K, lookahead = CONFIG.DEFAULT_LOOKAHEAD) {
+    const cacheKey = this._getCacheKey(queryFeatures, symbol, timeframe, k, lookahead);
+    if (this._similarityCache.has(cacheKey)) {
+      const cached = this._similarityCache.get(cacheKey);
+      if (Date.now() - cached.timestamp < 300000) {
+        return cached.data;
+      }
+      this._similarityCache.delete(cacheKey);
+    }
+
     await this.init();
     const normalizedQuery = this.normalizer.normalizeVector(queryFeatures);
     const featureFields = Object.keys(normalizedQuery);
-    const filter = {};
-    if (symbol) filter.symbol = symbol;
+
+    // ---- Build filter with both symbol variants ----
+    let filter = {};
     if (timeframe) filter.timeframe = timeframe;
 
+    if (symbol) {
+      const variants = getSymbolVariants(symbol);
+      if (variants.length === 1) {
+        filter.symbol = variants[0];
+      } else {
+        filter.$or = variants.map(sym => ({ symbol: sym }));
+      }
+    }
+
+    // ---- Fetch states ----
     const states = await HistoricalState.find(filter)
       .sort({ timestamp: -1 })
       .limit(50000)
@@ -137,6 +171,7 @@ class StateStore {
       return { states: [], stats: { count: 0, winRate: 0, avgReturnR: 0, maxDrawdown: 0, profitFactor: 0 } };
     }
 
+    // ---- Compute distances ----
     const withDistances = states.map(state => {
       const stateFeatures = {
         adx: state.trend.adx,
@@ -167,16 +202,29 @@ class StateStore {
     const topK = withDistances.slice(0, k);
     const validOutcomes = topK.filter(item => item.outcome.return !== null).map(item => item.outcome);
     const stats = this._computeStats(validOutcomes);
-    return {
+
+    const result = {
       states: topK.map(item => ({ state: item.state, distance: item.distance, outcome: item.outcome })),
       stats,
     };
+
+    this._similarityCache.set(cacheKey, { data: result, timestamp: Date.now() });
+    return result;
   }
 
   async computeEdge(features, symbol = null, timeframe = 'M5', lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = CONFIG.DEFAULT_K) {
+    const cacheKey = `edge:${symbol || '*'}:${timeframe}:${lookahead}:${k}:${JSON.stringify(features)}`;
+    if (this._edgeCache.has(cacheKey)) {
+      const cached = this._edgeCache.get(cacheKey);
+      if (Date.now() - cached.timestamp < 300000) {
+        return cached.data;
+      }
+      this._edgeCache.delete(cacheKey);
+    }
+
     const similarityResult = await this.findSimilar(features, symbol, timeframe, k, lookahead);
     const stats = similarityResult.stats;
-    return {
+    const result = {
       edge: stats.avgReturnR || 0,
       winRate: stats.winRate || 0,
       avgReturnR: stats.avgReturnR || 0,
@@ -184,6 +232,9 @@ class StateStore {
       sampleSize: stats.count || 0,
       profitFactor: stats.profitFactor || 0,
     };
+
+    this._edgeCache.set(cacheKey, { data: result, timestamp: Date.now() });
+    return result;
   }
 
   _computeStats(outcomes) {
@@ -217,6 +268,11 @@ class StateStore {
     this._similarityCache.clear();
     this._edgeCache.clear();
     logger.debug('[StateStore] Cache invalidated.');
+  }
+
+  _getCacheKey(features, symbol, timeframe, k, lookahead) {
+    const featureStr = Object.keys(features).sort().map(k => `${k}:${features[k]}`).join('|');
+    return `similarity:${symbol || '*'}:${timeframe}:${lookahead}:${k}:${featureStr}`;
   }
 }
 
