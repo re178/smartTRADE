@@ -1,5 +1,5 @@
 // core/intelligence/lab/stateStore.js
-// Similarity search, edge computation – production ready.
+// With debug logging to inspect outcome fields.
 
 const HistoricalState = require('../../../models/HistoricalState');
 const HistoricalOutcome = require('../../../models/HistoricalOutcome');
@@ -11,7 +11,6 @@ const CONFIG = {
   MIN_SAMPLES_FOR_EDGE: 20,
 };
 
-// ---- Symbol variants (with and without underscore) ----
 function getSymbolVariants(symbol) {
   if (!symbol) return [];
   const clean = symbol.replace(/_/g, '').toUpperCase();
@@ -20,7 +19,6 @@ function getSymbolVariants(symbol) {
   return [...new Set(variants)];
 }
 
-// ---- Feature normalizer ----
 class FeatureNormalizer {
   constructor() {
     this.featureStats = {};
@@ -115,7 +113,6 @@ class FeatureNormalizer {
   }
 }
 
-// ---- Main StateStore ----
 class StateStore {
   constructor() {
     this.normalizer = new FeatureNormalizer();
@@ -160,6 +157,12 @@ class StateStore {
 
     if (states.length === 0) {
       return { states: [], stats: { count: 0, winRate: 0, avgReturnR: 0, maxDrawdown: 0, profitFactor: 0 } };
+    }
+
+    // ---- DEBUG: log the first state's outcome5 ----
+    if (states.length > 0) {
+      const first = states[0];
+      logger.info(`[StateStore] DEBUG: first state outcome5: ${JSON.stringify(first.outcome5)}`);
     }
 
     // ---- Compute distances ----
