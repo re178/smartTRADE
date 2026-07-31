@@ -1,5 +1,5 @@
 // core/intelligence/lab/stateStore.js
-// Similarity search, edge computation – handles symbol variants and logs diagnostics.
+// Similarity search, edge computation – production ready.
 
 const HistoricalState = require('../../../models/HistoricalState');
 const HistoricalOutcome = require('../../../models/HistoricalOutcome');
@@ -131,33 +131,12 @@ class StateStore {
     logger.info('[StateStore] Initialized.');
   }
 
-  // ---- Get total state count for a symbol (for debugging) ----
-  async getStateCount(symbol) {
-    const variants = getSymbolVariants(symbol);
-    const counts = {};
-    for (const sym of variants) {
-      counts[sym] = await HistoricalState.countDocuments({ symbol: sym });
-    }
-    return counts;
-  }
-
-  // ---- Main similarity search ----
   async findSimilar(queryFeatures, symbol = null, timeframe = 'M5', k = CONFIG.DEFAULT_K, lookahead = CONFIG.DEFAULT_LOOKAHEAD) {
-    const cacheKey = this._getCacheKey(queryFeatures, symbol, timeframe, k, lookahead);
-    if (this._similarityCache.has(cacheKey)) {
-      const cached = this._similarityCache.get(cacheKey);
-      if (Date.now() - cached.timestamp < 300000) {
-        return cached.data;
-      }
-      this._similarityCache.delete(cacheKey);
-    }
-
     await this.init();
 
     const normalizedQuery = this.normalizer.normalizeVector(queryFeatures);
     const featureFields = Object.keys(normalizedQuery);
 
-    // Build filter with symbol variants
     const filter = {};
     if (timeframe) filter.timeframe = timeframe;
 
@@ -170,10 +149,8 @@ class StateStore {
       }
     }
 
-    // ---- Log filter ----
     logger.info(`[StateStore] findSimilar filter: ${JSON.stringify(filter)}`);
 
-    // ---- Fetch states ----
     const states = await HistoricalState.find(filter)
       .sort({ timestamp: -1 })
       .limit(50000)
@@ -182,28 +159,10 @@ class StateStore {
     logger.info(`[StateStore] Found ${states.length} states for ${symbol || 'any'} ${timeframe}`);
 
     if (states.length === 0) {
-      // Try a case-insensitive regex fallback
-      const regexFilter = {
-        timeframe,
-        symbol: { $regex: new RegExp(symbol.replace(/_/g, ''), 'i') }
-      };
-      const regexStates = await HistoricalState.find(regexFilter)
-        .sort({ timestamp: -1 })
-        .limit(50000)
-        .lean();
-      if (regexStates.length > 0) {
-        logger.info(`[StateStore] Regex fallback found ${regexStates.length} states`);
-        // Continue with regexStates
-        return this._computeFromStates(regexStates, normalizedQuery, featureFields, lookahead, k);
-      }
       return { states: [], stats: { count: 0, winRate: 0, avgReturnR: 0, maxDrawdown: 0, profitFactor: 0 } };
     }
 
-    return this._computeFromStates(states, normalizedQuery, featureFields, lookahead, k);
-  }
-
-  // ---- Helper to compute distances and stats from a state array ----
-  _computeFromStates(states, normalizedQuery, featureFields, lookahead, k) {
+    // ---- Compute distances ----
     const withDistances = states.map(state => {
       const stateFeatures = {
         adx: state.trend.adx,
@@ -233,26 +192,22 @@ class StateStore {
     withDistances.sort((a, b) => a.distance - b.distance);
     const topK = withDistances.slice(0, k);
 
-    // Count how many have labelled outcomes
-    const labelled = topK.filter(item => item.outcome.return !== null);
+    // ---- FIX: Check BOTH return and returnR ----
+    const labelled = topK.filter(item => {
+      const out = item.outcome;
+      return out !== null && (out.return !== null || out.returnR !== null);
+    });
+
     const stats = this._computeStats(labelled.map(item => item.outcome));
 
-    // Log stats
     logger.info(`[StateStore] Similarity stats: sampleSize=${stats.count}, winRate=${stats.winRate}, avgReturnR=${stats.avgReturnR}`);
 
-    const result = {
+    return {
       states: topK.map(item => ({ state: item.state, distance: item.distance, outcome: item.outcome })),
       stats,
     };
-
-    // Cache
-    const cacheKey = this._getCacheKeyFromQuery(...arguments);
-    this._similarityCache.set(cacheKey, { data: result, timestamp: Date.now() });
-
-    return result;
   }
 
-  // ---- Edge computation ----
   async computeEdge(features, symbol = null, timeframe = 'M5', lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = CONFIG.DEFAULT_K) {
     const cacheKey = `edge:${symbol || '*'}:${timeframe}:${lookahead}:${k}:${JSON.stringify(features)}`;
     if (this._edgeCache.has(cacheKey)) {
@@ -279,7 +234,6 @@ class StateStore {
     return result;
   }
 
-  // ---- Stats calculator ----
   _computeStats(outcomes) {
     if (!outcomes || outcomes.length === 0) {
       return { count: 0, winRate: 0, avgReturnR: 0, maxDrawdown: 0, profitFactor: 0 };
@@ -295,7 +249,6 @@ class StateStore {
     return { count: total, winRate, avgReturnR, maxDrawdown, profitFactor };
   }
 
-  // ---- Calibration ----
   async calibrateConfidence(decision, lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = CONFIG.DEFAULT_K) {
     const features = decision.features || decision;
     const similarityResult = await this.findSimilar(features, decision.symbol, decision.timeframe, k, lookahead);
@@ -312,11 +265,6 @@ class StateStore {
     this._similarityCache.clear();
     this._edgeCache.clear();
     logger.debug('[StateStore] Cache invalidated.');
-  }
-
-  _getCacheKey(...args) {
-    // simplified for caching
-    return JSON.stringify(args);
   }
 }
 
