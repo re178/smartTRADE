@@ -26,7 +26,7 @@ class DataOrchestrator {
     this._flushSnapshots = this._flushSnapshots.bind(this);
     this._flushAppends = this._flushAppends.bind(this);
 
-    this._startFlushTimers();
+    // No separate start method needed – timers are set on demand.
     logger.info('[DataOrchestrator] Initialized.');
   }
 
