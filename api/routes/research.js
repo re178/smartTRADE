@@ -8,7 +8,7 @@ const HistoricalDecision = require('../../models/HistoricalDecision');
 const HistoricalOutcome = require('../../models/HistoricalOutcome');
 const stateStore = require('../../core/intelligence/lab/stateStore');
 const { dataOrchestrator } = require('../../core/data/dataOrchestrator');
-const logger = require('../infrastructure/logger') || console;
+const logger = require('../../infrastructure/logger') || console;
 
 // ---- Helper to validate lookahead ----
 const VALID_LOOKAHEADS = [5, 10, 20, 40];
