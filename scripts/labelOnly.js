@@ -1,19 +1,18 @@
-// scripts/backfillAndLabel.js
-// One‑script backfill + outcome labelling (fixed timestamp matching).
+// scripts/labelOnly.js
+// Labels outcomes for existing HistoricalState records.
+// Run with: node scripts/labelOnly.js
 
 const mongoose = require('mongoose');
 const connectDB = require('../config/db');
 const candleHistory = require('../core/data/candleHistory');
-const deepMarketState = require('../core/intelligence/deep/marketState');
 const HistoricalState = require('../models/HistoricalState');
 const HistoricalOutcome = require('../models/HistoricalOutcome');
 const logger = require('../infrastructure/logger') || console;
 
 const SYMBOLS = ['EUR_USD', 'GBP_USD', 'USD_JPY', 'AUD_USD'];
 const TIMEFRAMES = ['M5', 'M15', 'H1'];
-const CANDLE_COUNT = 500; // increased to ensure enough future candles
 const LOOKAHEADS = [5, 10, 20, 40];
-const BATCH_SIZE = 10;
+const CANDLE_COUNT = 500;
 const TOLERANCE_MS = 60000; // 1 minute
 
 async function run() {
@@ -21,51 +20,39 @@ async function run() {
     await connectDB();
     logger.info('✅ Connected to MongoDB.');
 
-    const existingCount = await HistoricalState.countDocuments();
-    if (existingCount > 100) {
-      logger.info(`⏭️ HistoricalState already has ${existingCount} records. Skipping backfill.`);
-      logger.info('   To force re‑run, delete the HistoricalState and HistoricalOutcome collections.');
-      process.exit(0);
-    }
-
-    let totalStates = 0;
     let totalOutcomes = 0;
 
     for (const symbol of SYMBOLS) {
       for (const tf of TIMEFRAMES) {
         logger.info(`📥 Processing ${symbol} ${tf}...`);
-        const candles = await candleHistory.getHistory(symbol, tf, CANDLE_COUNT);
-        if (!candles || candles.length < 50) {
-          logger.warn(`⚠️ Not enough candles for ${symbol} ${tf}. Skipping.`);
+
+        // Get states that still need labelling
+        const states = await HistoricalState.find({
+          symbol,
+          timeframe: tf,
+          'outcome5.return': null
+        });
+
+        if (states.length === 0) {
+          logger.info(`   ⏭️ No unlabelled states for ${symbol} ${tf}.`);
           continue;
         }
 
-        // ---- Phase 1: Create states (skip last 50 candles to ensure outcomes exist) ----
-        const maxLookahead = Math.max(...LOOKAHEADS);
-        const endIndex = candles.length - maxLookahead - 5; // leave extra buffer
-        for (let i = 0; i < endIndex; i += BATCH_SIZE) {
-          const batch = candles.slice(i, Math.min(i + BATCH_SIZE, endIndex));
-          const promises = batch.map(async () => {
-            try {
-              await deepMarketState.compute(symbol, tf, CANDLE_COUNT);
-            } catch (err) {
-              // ignore per‑candle errors
-            }
-          });
-          await Promise.allSettled(promises);
-          totalStates += batch.length;
-          logger.info(`   ➜ Created ${totalStates} states so far...`);
+        logger.info(`   📊 Found ${states.length} unlabelled states.`);
+
+        // Fetch candles for this symbol/timeframe
+        const candles = await candleHistory.getHistory(symbol, tf, CANDLE_COUNT);
+        if (!candles || candles.length < 50) {
+          logger.warn(`   ⚠️ Not enough candles for ${symbol} ${tf}. Skipping.`);
+          continue;
         }
 
-        // ---- Phase 2: Label outcomes ----
-        const states = await HistoricalState.find({ symbol, timeframe: tf, 'outcome5.return': null });
-        logger.info(`   📊 Labelling ${states.length} states for ${symbol} ${tf}...`);
-
         let labelled = 0;
+
         for (const state of states) {
           const stateTime = new Date(state.timestamp).getTime();
 
-          // Find the closest candle index within tolerance
+          // Find the closest matching candle
           let startIdx = -1;
           for (let idx = 0; idx < candles.length; idx++) {
             const candleTime = new Date(candles[idx].time).getTime();
@@ -76,7 +63,7 @@ async function run() {
           }
 
           if (startIdx === -1) {
-            // Try to find the first candle AFTER the state time
+            // Fallback: find first candle AFTER state time
             for (let idx = 0; idx < candles.length; idx++) {
               if (new Date(candles[idx].time).getTime() >= stateTime) {
                 startIdx = idx;
@@ -85,6 +72,7 @@ async function run() {
             }
           }
 
+          const maxLookahead = Math.max(...LOOKAHEADS);
           if (startIdx === -1 || startIdx + maxLookahead >= candles.length) {
             logger.warn(`   ⚠️ Cannot label state ${state._id}: no future candles.`);
             continue;
@@ -138,16 +126,18 @@ async function run() {
               filledAt: new Date(),
             });
           }
+
           await state.save();
           labelled++;
           totalOutcomes += LOOKAHEADS.length;
           if (labelled % 5 === 0) logger.info(`      ➜ Labelled ${labelled} states...`);
         }
+
         logger.info(`✅ Finished ${symbol} ${tf} – ${labelled} states labelled.`);
       }
     }
 
-    logger.info(`🎉 All done. Created ${totalStates} states and ${totalOutcomes} outcome records.`);
+    logger.info(`🎉 All done. Created ${totalOutcomes} outcome records.`);
     process.exit(0);
   } catch (err) {
     logger.error('❌ Script failed:', err.message);
