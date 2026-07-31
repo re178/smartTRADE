@@ -6,311 +6,986 @@
   <title>RTS Trading Dashboard</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet" />
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <style>
-    body { background: #f8f9fa; padding: 20px; }
-    .card { margin-bottom: 20px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
-    .card-header { background: #fff; font-weight: 600; border-bottom: 1px solid #e9ecef; }
-    .signal-badge { font-size: 1.1rem; padding: 8px 16px; }
-    .price-up { color: #28a745; }
-    .price-down { color: #dc3545; }
-    .loading { opacity: 0.6; pointer-events: none; }
-    #tradesTable td { vertical-align: middle; }
-    .product-toggle .btn { border-radius: 20px; }
-    .product-toggle .btn.active { background: #0d6efd; color: white; }
-    .live-signal-card { position: relative; }
-    .live-signal-card .btn-execute { margin-top: 8px; }
-    #wsStatus { font-weight: bold; padding: 4px 12px; border-radius: 20px; }
-    .ws-connected { color: #28a745; background: #d4edda; }
-    .ws-disconnected { color: #dc3545; background: #f8d7da; }
-    /* CTOS Panel Styles */
-    .awareness-metric { font-size: 0.9rem; }
-    .hypothesis-item { font-size: 0.85rem; padding: 6px 12px; margin-bottom: 4px; }
-    .knowledge-item { font-size: 0.9rem; padding: 8px 12px; }
-    /* Auto‑execute toggle */
-    .auto-execute-toggle { margin-left: 20px; }
-    .auto-execute-toggle .form-check-input:checked { background-color: #0d6efd; border-color: #0d6efd; }
+    /* ──────────── ROOT VARIABLES ──────────── */
+    :root {
+      --sidebar-width: 260px;
+      --header-height: 64px;
+      --primary: #0d6efd;
+      --primary-dark: #0a58ca;
+      --bg-dark: #0f172a;
+      --bg-sidebar: #111827;
+      --bg-card: #ffffff;
+      --text-muted: #6b7280;
+      --border-light: #e5e7eb;
+    }
+
+    * { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
+
+    body {
+      background: #f1f5f9;
+      margin: 0;
+      padding: 0;
+      overflow-x: hidden;
+    }
+
+    /* ──────────── SIDEBAR ──────────── */
+    .sidebar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: var(--sidebar-width);
+      height: 100vh;
+      background: var(--bg-sidebar);
+      color: #e2e8f0;
+      z-index: 1050;
+      transition: transform 0.3s ease;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+    }
+    .sidebar-brand {
+      padding: 20px 24px;
+      font-size: 1.25rem;
+      font-weight: 700;
+      color: #fff;
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+    .sidebar-brand i { color: var(--primary); font-size: 1.5rem; }
+    .sidebar-brand span { color: #94a3b8; font-weight: 400; font-size: 0.75rem; }
+
+    .sidebar-nav {
+      flex: 1;
+      padding: 16px 12px;
+      overflow-y: auto;
+    }
+    .sidebar-nav .nav-label {
+      font-size: 0.65rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #64748b;
+      padding: 12px 12px 6px;
+      font-weight: 600;
+    }
+    .sidebar-nav .nav-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 14px;
+      border-radius: 8px;
+      color: #cbd5e1;
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 500;
+      transition: all 0.15s;
+      cursor: pointer;
+      margin-bottom: 2px;
+      border: none;
+      background: transparent;
+      width: 100%;
+      text-align: left;
+    }
+    .sidebar-nav .nav-item:hover,
+    .sidebar-nav .nav-item.active {
+      background: rgba(255,255,255,0.06);
+      color: #fff;
+    }
+    .sidebar-nav .nav-item i { width: 20px; font-size: 1rem; color: #64748b; }
+    .sidebar-nav .nav-item:hover i,
+    .sidebar-nav .nav-item.active i { color: var(--primary); }
+    .sidebar-nav .nav-item .badge {
+      margin-left: auto;
+      background: var(--primary);
+      color: #fff;
+      font-size: 0.65rem;
+      padding: 2px 8px;
+      border-radius: 12px;
+    }
+
+    .sidebar-footer {
+      padding: 16px 20px;
+      border-top: 1px solid rgba(255,255,255,0.06);
+      font-size: 0.75rem;
+      color: #64748b;
+      flex-shrink: 0;
+    }
+    .sidebar-footer .api-status {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .sidebar-footer .api-status .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .dot.connected { background: #22c55e; }
+    .dot.disconnected { background: #ef4444; }
+
+    /* ──────────── MAIN CONTENT ──────────── */
+    .main-content {
+      margin-left: var(--sidebar-width);
+      padding: 20px 28px 40px;
+      min-height: 100vh;
+    }
+
+    /* ──────────── TOP HEADER ──────────── */
+    .top-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 0 20px;
+      flex-wrap: wrap;
+      gap: 12px;
+      border-bottom: 1px solid var(--border-light);
+      margin-bottom: 24px;
+    }
+    .top-header h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      margin: 0;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .top-header h1 small {
+      font-size: 0.85rem;
+      font-weight: 400;
+      color: var(--text-muted);
+    }
+    .top-header .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    /* ──────────── NOTIFICATION CENTRE ──────────── */
+    .notif-btn {
+      position: relative;
+      background: transparent;
+      border: none;
+      font-size: 1.25rem;
+      color: #475569;
+      padding: 8px 10px;
+      border-radius: 8px;
+      transition: background 0.15s;
+      cursor: pointer;
+    }
+    .notif-btn:hover { background: #f1f5f9; }
+    .notif-btn .notif-dot {
+      position: absolute;
+      top: 4px;
+      right: 4px;
+      width: 8px;
+      height: 8px;
+      background: #ef4444;
+      border-radius: 50%;
+      border: 2px solid #fff;
+    }
+
+    .notif-dropdown {
+      position: absolute;
+      top: 100%;
+      right: 0;
+      width: 380px;
+      max-height: 420px;
+      overflow-y: auto;
+      background: #fff;
+      border-radius: 12px;
+      box-shadow: 0 12px 48px rgba(0,0,0,0.15);
+      padding: 0;
+      display: none;
+      z-index: 1060;
+      margin-top: 6px;
+    }
+    .notif-dropdown.open { display: block; }
+    .notif-dropdown .notif-header {
+      padding: 14px 20px;
+      font-weight: 600;
+      border-bottom: 1px solid var(--border-light);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .notif-dropdown .notif-item {
+      padding: 12px 20px;
+      border-bottom: 1px solid #f1f5f9;
+      font-size: 0.875rem;
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+      transition: background 0.1s;
+    }
+    .notif-dropdown .notif-item:hover { background: #f8fafc; }
+    .notif-dropdown .notif-item .notif-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      font-size: 0.75rem;
+    }
+    .notif-icon.bg-success-light { background: #dcfce7; color: #22c55e; }
+    .notif-icon.bg-danger-light { background: #fee2e2; color: #ef4444; }
+    .notif-icon.bg-warning-light { background: #fef3c7; color: #f59e0b; }
+    .notif-icon.bg-info-light { background: #dbeafe; color: #3b82f6; }
+    .notif-dropdown .notif-time {
+      font-size: 0.65rem;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+
+    /* ──────────── CARDS ──────────── */
+    .card {
+      border: none;
+      border-radius: 12px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 4px 16px rgba(0,0,0,0.04);
+      margin-bottom: 20px;
+      transition: box-shadow 0.2s;
+      background: var(--bg-card);
+    }
+    .card:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.06), 0 8px 24px rgba(0,0,0,0.06); }
+    .card-header {
+      background: transparent;
+      font-weight: 600;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border-light);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .card-header .card-title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 0.95rem;
+    }
+    .card-header .card-title i { color: var(--primary); }
+    .card-body { padding: 20px; }
+
+    /* ──────────── STATS ROW ──────────── */
+    .stat-card {
+      background: var(--bg-card);
+      border-radius: 12px;
+      padding: 16px 20px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+      border: 1px solid var(--border-light);
+      transition: border-color 0.2s;
+      height: 100%;
+    }
+    .stat-card:hover { border-color: var(--primary); }
+    .stat-card .stat-label {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+    .stat-card .stat-value {
+      font-size: 1.5rem;
+      font-weight: 700;
+      margin-top: 4px;
+    }
+    .stat-card .stat-change {
+      font-size: 0.75rem;
+      font-weight: 500;
+      margin-top: 2px;
+    }
+    .stat-change.positive { color: #22c55e; }
+    .stat-change.negative { color: #ef4444; }
+
+    /* ──────────── LIVE SIGNAL ──────────── */
+    .live-signal-card {
+      padding: 16px 20px;
+      border-radius: 10px;
+      border-left: 4px solid var(--primary);
+      background: #f8fafc;
+      transition: background 0.2s;
+    }
+    .live-signal-card.buy { border-left-color: #22c55e; background: #f0fdf4; }
+    .live-signal-card.sell { border-left-color: #ef4444; background: #fef2f2; }
+    .live-signal-card.neutral { border-left-color: #94a3b8; background: #f8fafc; }
+
+    /* ──────────── TRADE HISTORY ──────────── */
+    .history-filters {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+    .history-filters .filter-group {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .history-filters label {
+      font-size: 0.8rem;
+      font-weight: 500;
+      color: var(--text-muted);
+      margin: 0;
+    }
+    .history-filters input,
+    .history-filters select {
+      padding: 4px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border-light);
+      font-size: 0.8rem;
+      background: #fff;
+    }
+    .history-filters .btn-sm {
+      padding: 4px 12px;
+      font-size: 0.75rem;
+    }
+    #historyContainer .table-responsive {
+      max-height: 400px;
+      overflow-y: auto;
+    }
+    #historyContainer .table thead th {
+      position: sticky;
+      top: 0;
+      background: #fff;
+      z-index: 2;
+      border-bottom: 2px solid var(--border-light);
+    }
+    .pagination-wrapper {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .pagination-wrapper .page-info {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+    }
+
+    /* ──────────── RESPONSIVE ──────────── */
+    .sidebar-toggle {
+      display: none;
+      background: transparent;
+      border: none;
+      font-size: 1.25rem;
+      padding: 6px 10px;
+      border-radius: 6px;
+      color: #475569;
+    }
+    .sidebar-toggle:hover { background: #f1f5f9; }
+
+    @media (max-width: 992px) {
+      .sidebar {
+        transform: translateX(-100%);
+        width: 280px;
+      }
+      .sidebar.open { transform: translateX(0); }
+      .sidebar-toggle { display: inline-block; }
+      .main-content { margin-left: 0; padding: 16px; }
+      .top-header h1 { font-size: 1.2rem; }
+      .top-header h1 small { display: none; }
+      .notif-dropdown { width: calc(100vw - 32px); right: -10px; }
+      .stat-card .stat-value { font-size: 1.2rem; }
+    }
+
+    @media (max-width: 576px) {
+      .top-header { flex-direction: column; align-items: stretch; }
+      .top-header .header-actions { justify-content: flex-start; flex-wrap: wrap; }
+      .history-filters { flex-direction: column; align-items: stretch; }
+      .history-filters .filter-group { flex-wrap: wrap; }
+      .history-filters .filter-group input,
+      .history-filters .filter-group select { width: 100%; }
+    }
+
+    /* ──────────── SCROLLBAR ──────────── */
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 8px; }
+    ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+    /* ──────────── UTILITY ──────────── */
+    .text-truncate-2 {
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .gap-2 { gap: 0.5rem; }
+    .gap-3 { gap: 1rem; }
+    .fw-600 { font-weight: 600; }
   </style>
 </head>
 <body>
-<div class="container-fluid">
-  <div class="row">
-    <div class="col-12 d-flex justify-content-between align-items-center">
-      <h1 class="display-6 mb-4">
-        <i class="fas fa-chart-line text-primary"></i> RTS Trading Dashboard
-        <span id="wsStatus" class="badge bg-secondary ms-3">Connecting...</span>
-        <!-- ======== NEW: AUTO‑EXECUTE TOGGLE ======== -->
-        <span class="auto-execute-toggle">
-          <div class="form-check form-switch d-inline-block">
-            <input class="form-check-input" type="checkbox" id="autoExecuteToggle" style="width: 3rem; height: 1.5rem;">
-            <label class="form-check-label" for="autoExecuteToggle">
-              <i class="fas fa-robot"></i> Auto‑execute
-            </label>
-          </div>
-          <small class="text-muted" style="font-size: 0.7rem;">(live signals)</small>
-        </span>
+
+<!-- ──────────────────────────────────────────────── -->
+<!-- SIDEBAR                                        -->
+<!-- ──────────────────────────────────────────────── -->
+<nav class="sidebar" id="sidebar">
+  <div class="sidebar-brand">
+    <i class="fas fa-chart-line"></i>
+    <div>
+      RTS
+      <span>v2.0</span>
+    </div>
+  </div>
+
+  <div class="sidebar-nav">
+    <div class="nav-label">Main</div>
+    <button class="nav-item active" data-section="dashboard">
+      <i class="fas fa-th-large"></i> Dashboard
+    </button>
+    <button class="nav-item" data-section="trading">
+      <i class="fas fa-rocket"></i> Trading
+      <span class="badge">Live</span>
+    </button>
+    <button class="nav-item" data-section="positions">
+      <i class="fas fa-list-ul"></i> Positions
+      <span class="badge" id="positionCount">0</span>
+    </button>
+    <button class="nav-item" data-section="history">
+      <i class="fas fa-history"></i> History
+    </button>
+
+    <div class="nav-label">Intelligence</div>
+    <button class="nav-item" data-section="signals">
+      <i class="fas fa-bolt"></i> Live Signals
+    </button>
+    <button class="nav-item" data-section="regime">
+      <i class="fas fa-flag"></i> Market Regime
+    </button>
+    <button class="nav-item" data-section="research">
+      <i class="fas fa-flask"></i> Research Lab
+    </button>
+
+    <div class="nav-label">System</div>
+    <button class="nav-item" data-section="notifications">
+      <i class="fas fa-bell"></i> Notifications
+    </button>
+    <a href="/developer-api.html" class="nav-item">
+      <i class="fas fa-key"></i> Developer API
+    </a>
+  </div>
+
+  <div class="sidebar-footer">
+    <div class="api-status">
+      <span class="dot connected" id="apiStatusDot"></span>
+      <span id="apiStatusText">Connected</span>
+      <span style="margin-left:auto; font-size:0.7rem;" id="sessionUser">admin</span>
+    </div>
+  </div>
+</nav>
+
+<!-- ──────────────────────────────────────────────── -->
+<!-- MAIN CONTENT                                   -->
+<!-- ──────────────────────────────────────────────── -->
+<div class="main-content">
+
+  <!-- ===== TOP HEADER ===== -->
+  <header class="top-header">
+    <div>
+      <button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar">
+        <i class="fas fa-bars"></i>
+      </button>
+      <h1>
+        <span id="pageTitle">Dashboard</span>
+        <small id="wsStatus" class="badge bg-secondary">Connecting...</small>
       </h1>
-      <a href="/developer-api.html" class="btn btn-outline-primary">
-        <i class="fas fa-key"></i> Developer API
-      </a>
     </div>
-  </div>
+    <div class="header-actions">
+      <!-- Auto-execute toggle -->
+      <div class="form-check form-switch d-inline-flex align-items-center gap-2 me-2">
+        <input class="form-check-input" type="checkbox" id="autoExecuteToggle" style="width:2.5rem; height:1.3rem;">
+        <label class="form-check-label fw-600" for="autoExecuteToggle" style="font-size:0.85rem;">
+          <i class="fas fa-robot"></i> Auto
+        </label>
+      </div>
 
-  <!-- Account & Prices -->
-  <div class="row">
-    <div class="col-md-4">
-      <div class="card">
-        <div class="card-header"><i class="fas fa-user-circle"></i> Account</div>
-        <div class="card-body" id="accountInfo"><p class="text-muted">Loading...</p></div>
-      </div>
-    </div>
-    <div class="col-md-4">
-      <div class="card">
-        <div class="card-header"><i class="fas fa-dollar-sign"></i> Balance & Equity</div>
-        <div class="card-body" id="balanceInfo"><p class="text-muted">Loading...</p></div>
-      </div>
-    </div>
-    <div class="col-md-4">
-      <div class="card">
-        <div class="card-header"><i class="fas fa-exchange-alt"></i> Prices</div>
-        <div class="card-body" id="priceInfo"><p class="text-muted">Loading...</p></div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Notifications -->
-  <div class="row">
-    <div class="col-12">
-      <div class="card">
-        <div class="card-header"><i class="fas fa-bell"></i> Notifications</div>
-        <div class="card-body">
-          <div class="row">
-            <div class="col-6">
-              <p><strong>Email</strong> <span id="emailStatus" class="badge bg-secondary">Checking...</span></p>
-              <p>Email: <span id="emailAddress">-</span></p>
-            </div>
-            <div class="col-6">
-              <p><strong>Instagram</strong> <span id="instagramStatus" class="badge bg-secondary">Checking...</span></p>
-              <button class="btn btn-sm btn-outline-primary" id="testNotificationBtn">Test Notification</button>
-            </div>
+      <!-- Notification Centre -->
+      <div style="position:relative;">
+        <button class="notif-btn" id="notifToggle" aria-label="Notifications">
+          <i class="fas fa-bell"></i>
+          <span class="notif-dot" id="notifDot" style="display:none;"></span>
+        </button>
+        <div class="notif-dropdown" id="notifDropdown">
+          <div class="notif-header">
+            <span>Notifications</span>
+            <button class="btn btn-sm btn-link text-decoration-none text-muted" id="clearNotifs">Clear all</button>
           </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Cognitive Intelligence Panels -->
-  <div class="row">
-    <div class="col-md-6">
-      <div class="card">
-        <div class="card-header">
-          <i class="fas fa-bolt text-warning"></i> Live Signal
-          <span class="badge bg-info float-end">Real‑time</span>
-        </div>
-        <div class="card-body" id="liveSignalPanel">
-          <p class="text-muted">Waiting for live signals...</p>
-        </div>
-      </div>
-    </div>
-    <div class="col-md-3">
-      <div class="card">
-        <div class="card-header"><i class="fas fa-flag"></i> Market Regime</div>
-        <div class="card-body" id="regimePanel">
-          <p class="text-muted">Waiting for regime data...</p>
-        </div>
-      </div>
-    </div>
-    <div class="col-md-3">
-      <div class="card">
-        <div class="card-header"><i class="fas fa-chart-bar"></i> Live Metrics</div>
-        <div class="card-body" id="metricsPanel">
-          <p class="text-muted">Waiting for metrics...</p>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- ====== CTOS COGNITIVE PANELS ====== -->
-  <div class="row">
-    <div class="col-md-4">
-      <div class="card">
-        <div class="card-header">
-          <i class="fas fa-eye text-primary"></i> Market Awareness
-          <span class="badge bg-success float-end">Tick‑by‑Tick</span>
-        </div>
-        <div class="card-body" id="awarenessPanel">
-          <p class="text-muted">Waiting for market awareness...</p>
-        </div>
-      </div>
-    </div>
-    <div class="col-md-4">
-      <div class="card">
-        <div class="card-header">
-          <i class="fas fa-flask text-warning"></i> Hypotheses
-          <span class="badge bg-secondary float-end">Research</span>
-        </div>
-        <div class="card-body" id="hypothesisPanel">
-          <p class="text-muted">No active hypotheses.</p>
-        </div>
-      </div>
-    </div>
-    <div class="col-md-4">
-      <div class="card">
-        <div class="card-header">
-          <i class="fas fa-database text-info"></i> Knowledge
-          <span class="badge bg-secondary float-end">Validated</span>
-        </div>
-        <div class="card-body" id="knowledgePanel">
-          <p class="text-muted">No knowledge yet.</p>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Trading Product Toggle -->
-  <div class="row">
-    <div class="col-12">
-      <div class="card">
-        <div class="card-header">
-          <i class="fas fa-exchange-alt"></i> Trading Product
-          <span class="badge bg-secondary float-end" id="currentProduct">deriv_cfd</span>
-        </div>
-        <div class="card-body">
-          <div class="btn-group btn-group-toggle d-flex flex-wrap product-toggle" data-toggle="buttons">
-            <label class="btn btn-outline-primary flex-fill m-1">
-              <input type="radio" name="product" value="mt5" onchange="window.handleProductChange(event)"> MT5
-            </label>
-            <label class="btn btn-outline-primary flex-fill m-1">
-              <input type="radio" name="product" value="deriv_cfd" onchange="window.handleProductChange(event)" checked> Deriv CFD
-            </label>
-            <label class="btn btn-outline-primary flex-fill m-1">
-              <input type="radio" name="product" value="deriv_multiplier" onchange="window.handleProductChange(event)"> Deriv Multiplier
-            </label>
-            <label class="btn btn-outline-primary flex-fill m-1">
-              <input type="radio" name="product" value="deriv_basic" onchange="window.handleProductChange(event)"> Deriv Basic
-            </label>
-          </div>
-          <small class="text-muted">Switching will apply to all subsequent trades and account data.</small>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Signal & Trading -->
-  <div class="row">
-    <div class="col-md-6">
-      <div class="card">
-        <div class="card-header"><i class="fas fa-lightbulb"></i> Signal Generator</div>
-        <div class="card-body">
-          <div class="input-group mb-3">
-            <input type="text" id="signalPair" class="form-control" placeholder="Pair e.g. EUR_USD" value="EUR_USD" />
-            <select id="signalStrategy" class="form-select" style="max-width: 150px;">
-              <option value="sma">SMA</option>
-              <option value="ema">EMA</option>
-              <option value="rsi">RSI</option>
-              <option value="macd">MACD</option>
-              <option value="bollinger">Bollinger</option>
-              <option value="atrbreakout">ATR Breakout</option>
-              <option value="supertrend">SuperTrend</option>
-              <option value="ichimoku">Ichimoku</option>
-              <option value="ai">AI</option>
-              <option value="weightedvote">Weighted Vote</option>
-            </select>
-            <button class="btn btn-primary" id="getSignalBtn"><i class="fas fa-search"></i> Get Signal</button>
-          </div>
-          <div id="signalResult" class="mt-3"><p class="text-muted">Enter a pair and click "Get Signal".</p></div>
-        </div>
-      </div>
-    </div>
-    <div class="col-md-6">
-      <div class="card">
-        <div class="card-header"><i class="fas fa-rocket"></i> Execute Trade</div>
-        <div class="card-body">
-          <form id="tradeForm">
-            <div class="row">
-              <div class="col-6"><label>Pair</label><input type="text" class="form-control" id="tradePair" value="EUR_USD" required /></div>
-              <div class="col-6"><label>Side</label>
-                <select class="form-select" id="tradeSide">
-                  <option value="BUY">BUY</option>
-                  <option value="SELL">SELL</option>
-                </select>
-              </div>
-              <div class="col-4 mt-2"><label>Lot Size</label><input type="number" step="0.01" class="form-control" id="tradeLot" value="0.01" required /></div>
-              <div class="col-4 mt-2"><label>Stop Loss</label><input type="number" step="0.00001" class="form-control" id="tradeSL" placeholder="Optional" /></div>
-              <div class="col-4 mt-2"><label>Take Profit</label><input type="number" step="0.00001" class="form-control" id="tradeTP" placeholder="Optional" /></div>
-            </div>
-            <button type="submit" class="btn btn-success mt-3 w-100"><i class="fas fa-paper-plane"></i> Place Order</button>
-          </form>
-          <hr />
-          <form id="autoTradeForm">
-            <div class="row">
-              <div class="col-5"><label>Pair</label><input type="text" class="form-control" id="autoPair" value="EUR_USD" required /></div>
-              <div class="col-3"><label>Risk %</label><input type="number" step="0.1" class="form-control" id="autoRisk" value="1" required /></div>
-              <div class="col-4"><label>Strategy</label>
-                <select class="form-select" id="autoStrategy">
-                  <option value="sma">SMA</option>
-                  <option value="ema">EMA</option>
-                  <option value="rsi">RSI</option>
-                  <option value="macd">MACD</option>
-                  <option value="bollinger">Bollinger</option>
-                  <option value="atrbreakout">ATR Breakout</option>
-                  <option value="supertrend">SuperTrend</option>
-                  <option value="ichimoku">Ichimoku</option>
-                  <option value="ai">AI</option>
-                  <option value="weightedvote">Weighted Vote</option>
-                </select>
+          <div id="notifList">
+            <div class="notif-item">
+              <div class="notif-icon bg-info-light"><i class="fas fa-info-circle"></i></div>
+              <div>
+                <div>System initialised successfully.</div>
+                <div class="notif-time">Just now</div>
               </div>
             </div>
-            <button type="submit" class="btn btn-warning mt-3 w-100"><i class="fas fa-robot"></i> Auto-Trade</button>
-          </form>
+          </div>
+        </div>
+      </div>
+
+      <!-- Export / Download -->
+      <div class="btn-group" role="group">
+        <button class="btn btn-outline-secondary btn-sm" id="exportReportBtn" title="Download Report">
+          <i class="fas fa-file-export"></i> Report
+        </button>
+        <button class="btn btn-outline-secondary btn-sm" id="exportCSVBtn" title="Export CSV">
+          <i class="fas fa-file-csv"></i>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- ===== DASHBOARD SECTION (Default) ===== -->
+  <div id="section-dashboard" class="section-content">
+
+    <!-- Stats Row -->
+    <div class="row g-3 mb-4">
+      <div class="col-6 col-md-3">
+        <div class="stat-card">
+          <div class="stat-label">Balance</div>
+          <div class="stat-value" id="statBalance">—</div>
+          <div class="stat-change" id="statBalanceChange"></div>
+        </div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="stat-card">
+          <div class="stat-label">Equity</div>
+          <div class="stat-value" id="statEquity">—</div>
+          <div class="stat-change" id="statEquityChange"></div>
+        </div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="stat-card">
+          <div class="stat-label">Open Trades</div>
+          <div class="stat-value" id="statOpenTrades">0</div>
+          <div class="stat-change" id="statOpenPL">—</div>
+        </div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="stat-card">
+          <div class="stat-label">Win Rate</div>
+          <div class="stat-value" id="statWinRate">—</div>
+          <div class="stat-change" id="statProfitFactor">PF: —</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Live Signal & Regime -->
+    <div class="row g-3">
+      <div class="col-lg-6">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title"><i class="fas fa-bolt text-warning"></i> Live Signal</span>
+            <span class="badge bg-info">Real‑time</span>
+          </div>
+          <div class="card-body" id="liveSignalPanel">
+            <p class="text-muted">Waiting for live signals...</p>
+          </div>
+        </div>
+      </div>
+      <div class="col-lg-3 col-md-6">
+        <div class="card">
+          <div class="card-header"><span class="card-title"><i class="fas fa-flag"></i> Market Regime</span></div>
+          <div class="card-body" id="regimePanel">
+            <p class="text-muted">Waiting for regime data...</p>
+          </div>
+        </div>
+      </div>
+      <div class="col-lg-3 col-md-6">
+        <div class="card">
+          <div class="card-header"><span class="card-title"><i class="fas fa-chart-bar"></i> Live Metrics</span></div>
+          <div class="card-body" id="metricsPanel">
+            <p class="text-muted">Waiting for metrics...</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Awareness & Knowledge -->
+    <div class="row g-3 mt-2">
+      <div class="col-md-4">
+        <div class="card">
+          <div class="card-header"><span class="card-title"><i class="fas fa-eye text-primary"></i> Market Awareness</span></div>
+          <div class="card-body" id="awarenessPanel">
+            <p class="text-muted">Waiting for market awareness...</p>
+          </div>
+        </div>
+      </div>
+      <div class="col-md-4">
+        <div class="card">
+          <div class="card-header"><span class="card-title"><i class="fas fa-flask text-warning"></i> Hypotheses</span></div>
+          <div class="card-body" id="hypothesisPanel">
+            <p class="text-muted">No active hypotheses.</p>
+          </div>
+        </div>
+      </div>
+      <div class="col-md-4">
+        <div class="card">
+          <div class="card-header"><span class="card-title"><i class="fas fa-database text-info"></i> Knowledge</span></div>
+          <div class="card-body" id="knowledgePanel">
+            <p class="text-muted">No knowledge yet.</p>
+          </div>
         </div>
       </div>
     </div>
   </div>
 
-  <!-- Open Trades -->
-  <div class="row">
-    <div class="col-12">
-      <div class="card">
-        <div class="card-header">
-          <i class="fas fa-list-ul"></i> Open Trades
-          <button class="btn btn-sm btn-outline-primary float-end" id="refreshTrades"><i class="fas fa-sync-alt"></i> Refresh</button>
+  <!-- ===== TRADING SECTION ===== -->
+  <div id="section-trading" class="section-content" style="display:none;">
+    <div class="row g-3">
+      <div class="col-lg-6">
+        <div class="card">
+          <div class="card-header"><span class="card-title"><i class="fas fa-lightbulb"></i> Signal Generator</span></div>
+          <div class="card-body">
+            <div class="input-group mb-3">
+              <input type="text" id="signalPair" class="form-control" placeholder="Pair e.g. EUR_USD" value="EUR_USD" />
+              <select id="signalStrategy" class="form-select" style="max-width:150px;">
+                <option value="sma">SMA</option><option value="ema">EMA</option>
+                <option value="rsi">RSI</option><option value="macd">MACD</option>
+                <option value="bollinger">Bollinger</option>
+                <option value="atrbreakout">ATR Breakout</option>
+                <option value="supertrend">SuperTrend</option>
+                <option value="ichimoku">Ichimoku</option>
+                <option value="ai">AI</option>
+                <option value="weightedvote">Weighted Vote</option>
+              </select>
+              <button class="btn btn-primary" id="getSignalBtn"><i class="fas fa-search"></i> Get Signal</button>
+            </div>
+            <div id="signalResult"><p class="text-muted">Enter a pair and click "Get Signal".</p></div>
+          </div>
         </div>
-        <div class="card-body" id="openTradesContainer"><p class="text-muted">Loading...</p></div>
+      </div>
+      <div class="col-lg-6">
+        <div class="card">
+          <div class="card-header"><span class="card-title"><i class="fas fa-rocket"></i> Execute Trade</span></div>
+          <div class="card-body">
+            <form id="tradeForm">
+              <div class="row g-2">
+                <div class="col-6"><label class="form-label small">Pair</label><input type="text" class="form-control" id="tradePair" value="EUR_USD" required /></div>
+                <div class="col-6"><label class="form-label small">Side</label>
+                  <select class="form-select" id="tradeSide"><option value="BUY">BUY</option><option value="SELL">SELL</option></select>
+                </div>
+                <div class="col-4"><label class="form-label small">Lot Size</label><input type="number" step="0.01" class="form-control" id="tradeLot" value="0.01" required /></div>
+                <div class="col-4"><label class="form-label small">Stop Loss</label><input type="number" step="0.00001" class="form-control" id="tradeSL" placeholder="Optional" /></div>
+                <div class="col-4"><label class="form-label small">Take Profit</label><input type="number" step="0.00001" class="form-control" id="tradeTP" placeholder="Optional" /></div>
+              </div>
+              <button type="submit" class="btn btn-success w-100 mt-3"><i class="fas fa-paper-plane"></i> Place Order</button>
+            </form>
+            <hr />
+            <form id="autoTradeForm">
+              <div class="row g-2">
+                <div class="col-5"><label class="form-label small">Pair</label><input type="text" class="form-control" id="autoPair" value="EUR_USD" required /></div>
+                <div class="col-3"><label class="form-label small">Risk %</label><input type="number" step="0.1" class="form-control" id="autoRisk" value="1" required /></div>
+                <div class="col-4"><label class="form-label small">Strategy</label>
+                  <select class="form-select" id="autoStrategy">
+                    <option value="sma">SMA</option><option value="ema">EMA</option>
+                    <option value="rsi">RSI</option><option value="macd">MACD</option>
+                    <option value="bollinger">Bollinger</option>
+                    <option value="atrbreakout">ATR Breakout</option>
+                    <option value="supertrend">SuperTrend</option>
+                    <option value="ichimoku">Ichimoku</option>
+                    <option value="ai">AI</option>
+                    <option value="weightedvote">Weighted Vote</option>
+                  </select>
+                </div>
+              </div>
+              <button type="submit" class="btn btn-warning w-100 mt-3"><i class="fas fa-robot"></i> Auto-Trade</button>
+            </form>
+          </div>
+        </div>
+      </div>
+      <div class="col-12">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title"><i class="fas fa-exchange-alt"></i> Trading Product</span>
+            <span class="badge bg-secondary" id="currentProduct">deriv_cfd</span>
+          </div>
+          <div class="card-body">
+            <div class="btn-group btn-group-toggle d-flex flex-wrap product-toggle" data-toggle="buttons">
+              <label class="btn btn-outline-primary flex-fill m-1"><input type="radio" name="product" value="mt5" onchange="window.handleProductChange(event)" /> MT5</label>
+              <label class="btn btn-outline-primary flex-fill m-1"><input type="radio" name="product" value="deriv_cfd" onchange="window.handleProductChange(event)" checked /> Deriv CFD</label>
+              <label class="btn btn-outline-primary flex-fill m-1"><input type="radio" name="product" value="deriv_multiplier" onchange="window.handleProductChange(event)" /> Deriv Multiplier</label>
+              <label class="btn btn-outline-primary flex-fill m-1"><input type="radio" name="product" value="deriv_basic" onchange="window.handleProductChange(event)" /> Deriv Basic</label>
+            </div>
+            <small class="text-muted">Switching applies to all subsequent trades and account data.</small>
+          </div>
+        </div>
       </div>
     </div>
   </div>
 
-  <!-- Pending Orders -->
-  <div class="row">
-    <div class="col-12">
-      <div class="card">
-        <div class="card-header">
-          <i class="fas fa-clock"></i> Pending Orders
-          <button class="btn btn-sm btn-outline-secondary float-end" id="refreshPending"><i class="fas fa-sync-alt"></i> Refresh</button>
+  <!-- ===== POSITIONS SECTION ===== -->
+  <div id="section-positions" class="section-content" style="display:none;">
+    <div class="row">
+      <div class="col-12">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title"><i class="fas fa-list-ul"></i> Open Trades</span>
+            <button class="btn btn-sm btn-outline-primary" id="refreshTrades"><i class="fas fa-sync-alt"></i> Refresh</button>
+          </div>
+          <div class="card-body" id="openTradesContainer"><p class="text-muted">Loading...</p></div>
         </div>
-        <div class="card-body" id="pendingOrdersContainer"><p class="text-muted">Loading...</p></div>
+      </div>
+      <div class="col-12">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title"><i class="fas fa-clock"></i> Pending Orders</span>
+            <button class="btn btn-sm btn-outline-secondary" id="refreshPending"><i class="fas fa-sync-alt"></i> Refresh</button>
+          </div>
+          <div class="card-body" id="pendingOrdersContainer"><p class="text-muted">Loading...</p></div>
+        </div>
       </div>
     </div>
   </div>
 
-  <!-- Trade History -->
-  <div class="row">
-    <div class="col-12">
-      <div class="card">
-        <div class="card-header">
-          <i class="fas fa-history"></i> Trade History
-          <button class="btn btn-sm btn-outline-danger float-end ms-2" id="deleteHistoryBtn"><i class="fas fa-trash"></i> Clear History</button>
-          <button class="btn btn-sm btn-outline-secondary float-end" id="refreshHistory"><i class="fas fa-sync-alt"></i> Refresh</button>
+  <!-- ===== HISTORY SECTION (Searchable & Filterable) ===== -->
+  <div id="section-history" class="section-content" style="display:none;">
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title"><i class="fas fa-history"></i> Trade History</span>
+        <div>
+          <button class="btn btn-sm btn-outline-danger" id="deleteHistoryBtn"><i class="fas fa-trash"></i> Clear</button>
+          <button class="btn btn-sm btn-outline-secondary" id="refreshHistory"><i class="fas fa-sync-alt"></i> Refresh</button>
         </div>
-        <div class="card-body table-responsive" id="historyContainer"><p class="text-muted">Loading...</p></div>
+      </div>
+      <div class="card-body">
+        <!-- Filters -->
+        <div class="history-filters">
+          <div class="filter-group">
+            <label>From</label>
+            <input type="date" id="historyFrom" />
+          </div>
+          <div class="filter-group">
+            <label>To</label>
+            <input type="date" id="historyTo" />
+          </div>
+          <div class="filter-group">
+            <label>Symbol</label>
+            <input type="text" id="historySymbol" placeholder="EUR_USD" style="width:100px;" />
+          </div>
+          <div class="filter-group">
+            <label>Side</label>
+            <select id="historySide"><option value="">All</option><option value="BUY">BUY</option><option value="SELL">SELL</option></select>
+          </div>
+          <div class="filter-group">
+            <label>Status</label>
+            <select id="historyStatus"><option value="">All</option><option value="OPEN">Open</option><option value="CLOSED">Closed</option></select>
+          </div>
+          <button class="btn btn-sm btn-primary" id="applyHistoryFilter"><i class="fas fa-filter"></i> Apply</button>
+          <button class="btn btn-sm btn-outline-secondary" id="resetHistoryFilter"><i class="fas fa-undo"></i> Reset</button>
+          <span style="margin-left:auto; font-size:0.85rem; color:var(--text-muted);">
+            <span id="historyCount">0</span> records
+          </span>
+        </div>
+
+        <!-- Table -->
+        <div id="historyContainer"><p class="text-muted">Loading...</p></div>
+
+        <!-- Pagination -->
+        <div class="pagination-wrapper">
+          <div class="page-info">Showing <span id="pageStart">0</span>–<span id="pageEnd">0</span> of <span id="pageTotal">0</span></div>
+          <div>
+            <button class="btn btn-sm btn-outline-secondary" id="prevPage" disabled><i class="fas fa-chevron-left"></i></button>
+            <span class="mx-2" id="pageInfo">Page 1</span>
+            <button class="btn btn-sm btn-outline-secondary" id="nextPage"><i class="fas fa-chevron-right"></i></button>
+          </div>
+        </div>
       </div>
     </div>
   </div>
-</div>
 
-<!-- JavaScript includes -->
+  <!-- ===== RESEARCH LAB SECTION ===== -->
+  <div id="section-research" class="section-content" style="display:none;">
+    <div class="card">
+      <div class="card-header"><span class="card-title"><i class="fas fa-flask"></i> Knowledge Explorer</span></div>
+      <div class="card-body">
+        <div class="row g-2 mb-3">
+          <div class="col-md-2"><label class="form-label small">Symbol</label><input type="text" id="knowledgeSymbol" class="form-control" value="EUR_USD" /></div>
+          <div class="col-md-2"><label class="form-label small">Timeframe</label>
+            <select id="knowledgeTimeframe" class="form-select"><option value="M5">M5</option><option value="M15">M15</option><option value="H1">H1</option></select>
+          </div>
+          <div class="col-md-2"><label class="form-label small">Regime</label>
+            <select id="knowledgeRegime" class="form-select"><option value="">Any</option><option value="STRONG_TREND_BULL">Bull Trend</option><option value="STRONG_TREND_BEAR">Bear Trend</option><option value="RANGING">Ranging</option><option value="BREAKOUT">Breakout</option></select>
+          </div>
+          <div class="col-md-2"><label class="form-label small">Session</label>
+            <select id="knowledgeSession" class="form-select"><option value="">Any</option><option value="London">London</option><option value="New York">NY</option><option value="Asia">Asia</option></select>
+          </div>
+          <div class="col-md-2"><label class="form-label small">Lookahead</label>
+            <select id="knowledgeLookahead" class="form-select"><option value="5">5</option><option value="10">10</option><option value="20">20</option><option value="40">40</option></select>
+          </div>
+          <div class="col-md-2 d-flex align-items-end">
+            <button class="btn btn-primary w-100" id="knowledgeSearchBtn"><i class="fas fa-search"></i> Search</button>
+          </div>
+        </div>
+        <div id="knowledgeResults"><p class="text-muted">Enter filters and click Search to explore historical market states.</p></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== NOTIFICATIONS SECTION ===== -->
+  <div id="section-notifications" class="section-content" style="display:none;">
+    <div class="card">
+      <div class="card-header"><span class="card-title"><i class="fas fa-bell"></i> Notification Settings</span></div>
+      <div class="card-body">
+        <div class="row">
+          <div class="col-md-6">
+            <p><strong>Email</strong> <span id="emailStatus" class="badge bg-secondary">Checking...</span></p>
+            <p>Email: <span id="emailAddress">-</span></p>
+            <button class="btn btn-sm btn-outline-primary" id="testNotificationBtn">Test Notification</button>
+          </div>
+          <div class="col-md-6">
+            <p><strong>Instagram</strong> <span id="instagramStatus" class="badge bg-secondary">Checking...</span></p>
+            <div class="form-check form-switch mt-2">
+              <input class="form-check-input" type="checkbox" id="notifEmailToggle" checked />
+              <label class="form-check-label" for="notifEmailToggle">Email alerts</label>
+            </div>
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" id="notifSoundToggle" checked />
+              <label class="form-check-label" for="notifSoundToggle">Sound alerts</label>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /.main-content -->
+
+<!-- ──────────────────────────────────────────────── -->
+<!-- SCRIPTS                                       -->
+<!-- ──────────────────────────────────────────────── -->
 <script src="js/config.js"></script>
 <script src="js/app.js"></script>
 <script src="js/live.js"></script>
+
+<!-- ──── Dashboard navigation ──── -->
+<script>
+(function() {
+  // Sidebar toggle
+  const sidebar = document.getElementById('sidebar');
+  const toggleBtn = document.getElementById('sidebarToggle');
+  if (toggleBtn) {
+    toggleBtn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      sidebar.classList.toggle('open');
+    });
+  }
+  // Close sidebar on outside click (mobile)
+  document.addEventListener('click', function(e) {
+    if (window.innerWidth <= 992 && sidebar.classList.contains('open')) {
+      if (!sidebar.contains(e.target) && !toggleBtn.contains(e.target)) {
+        sidebar.classList.remove('open');
+      }
+    }
+  });
+
+  // Navigation switching
+  const navItems = document.querySelectorAll('.sidebar-nav .nav-item[data-section]');
+  const sections = {
+    dashboard: document.getElementById('section-dashboard'),
+    trading: document.getElementById('section-trading'),
+    positions: document.getElementById('section-positions'),
+    history: document.getElementById('section-history'),
+    research: document.getElementById('section-research'),
+    signals: document.getElementById('section-dashboard'), // signals are in dashboard
+    regime: document.getElementById('section-dashboard'),
+    notifications: document.getElementById('section-notifications'),
+  };
+  const pageTitle = document.getElementById('pageTitle');
+  const sectionNames = {
+    dashboard: 'Dashboard',
+    trading: 'Trading',
+    positions: 'Positions',
+    history: 'Trade History',
+    research: 'Research Lab',
+    signals: 'Dashboard',
+    regime: 'Dashboard',
+    notifications: 'Notifications',
+  };
+
+  navItems.forEach(item => {
+    item.addEventListener('click', function() {
+      const section = this.dataset.section;
+      // Update active state
+      navItems.forEach(n => n.classList.remove('active'));
+      this.classList.add('active');
+      // Show section
+      Object.keys(sections).forEach(key => {
+        if (sections[key]) {
+          sections[key].style.display = key === section ? 'block' : 'none';
+        }
+      });
+      // Update title
+      pageTitle.textContent = sectionNames[section] || section.charAt(0).toUpperCase() + section.slice(1);
+      // Close sidebar on mobile
+      if (window.innerWidth <= 992) {
+        sidebar.classList.remove('open');
+      }
+      // Scroll to top
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+  });
+
+  // Notification dropdown
+  const notifToggle = document.getElementById('notifToggle');
+  const notifDropdown = document.getElementById('notifDropdown');
+  if (notifToggle) {
+    notifToggle.addEventListener('click', function(e) {
+      e.stopPropagation();
+      notifDropdown.classList.toggle('open');
+    });
+    document.addEventListener('click', function(e) {
+      if (!notifToggle.contains(e.target) && !notifDropdown.contains(e.target)) {
+        notifDropdown.classList.remove('open');
+      }
+    });
+  }
+
+  // Clear notifications
+  document.getElementById('clearNotifs')?.addEventListener('click', function() {
+    document.getElementById('notifList').innerHTML = '<div class="notif-item"><div class="text-muted">No notifications</div></div>';
+    document.getElementById('notifDot').style.display = 'none';
+    notifDropdown.classList.remove('open');
+  });
+
+  // Position count badge update (expose function)
+  window.updatePositionBadge = function(count) {
+    const badge = document.getElementById('positionCount');
+    if (badge) badge.textContent = count || 0;
+  };
+
+  // Export report
+  document.getElementById('exportReportBtn')?.addEventListener('click', function() {
+    alert('📊 Report download initiated.\n\nThis would generate a PDF/HTML performance report.\n(Feature: Downloadable Performance Report)');
+  });
+
+  // Export CSV
+  document.getElementById('exportCSVBtn')?.addEventListener('click', function() {
+    alert('📄 CSV export initiated.\n\nThis would export trade history as CSV.\n(Feature: CSV Export)');
+  });
+
+  // API status
+  window.updateApiStatus = function(connected) {
+    const dot = document.getElementById('apiStatusDot');
+    const text = document.getElementById('apiStatusText');
+    if (dot) {
+      dot.className = 'dot ' + (connected ? 'connected' : 'disconnected');
+    }
+    if (text) {
+      text.textContent = connected ? 'Connected' : 'Disconnected';
+    }
+  };
+})();
+</script>
 </body>
 </html>
