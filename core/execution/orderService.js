@@ -1,12 +1,13 @@
-// core/execution/orderService.js – Order Management (Execution Layer only)
-// ⚠️ Trade persistence is now handled by the MT5 sync (POST /positions and POST /orders/result)
-// This service remains responsible for: sending commands, analytics, and event emission.
+// core/execution/orderService.js – Order Management (with Portfolio Risk Integration)
 
 const { getBroker } = require('./brokerFactory');
 const eventBus = require('../../infrastructure/eventBus');
 const { validateOrderInput } = require('../../shared/validators');
 const { ExecutionAnalytics } = require('../analytics/performanceSuite');
-const Order = require('../../models/Order'); // optional internal tracking (kept for compatibility)
+const portfolioIntelligence = require('../portfolio/intelligence');
+const Order = require('../../models/Order');
+const Trade = require('../../models/Trade');
+const selfLearner = require('../learning/learner');
 const logger = require('../../infrastructure/logger') || console;
 
 // Singleton Execution Analytics instance
@@ -14,42 +15,111 @@ const executionAnalytics = new ExecutionAnalytics({
   slippageTolerance: parseFloat(process.env.SLIPPAGE_TOLERANCE) || 1,
 });
 
+// Minimum confidence for auto‑trade
+const MIN_CONFIDENCE = 60;
+const MIN_EDGE = 0.2;
+
 /**
- * Place a market order (BUY/SELL)
+ * Pre‑flight validation for auto‑trade (checks confidence and edge)
+ * @param {Object} signal - signal object from decision engine
+ * @returns {Object} { valid: boolean, reason: string }
+ */
+function validateAutoTradeSignal(signal) {
+  if (!signal || !signal.side) {
+    return { valid: false, reason: 'No valid signal side' };
+  }
+  if (signal.confidence < MIN_CONFIDENCE) {
+    return { valid: false, reason: `Confidence ${signal.confidence}% below minimum ${MIN_CONFIDENCE}%` };
+  }
+  if (signal.expectedValue < MIN_EDGE) {
+    return { valid: false, reason: `Expected value ${signal.expectedValue} below minimum ${MIN_EDGE}R` };
+  }
+  return { valid: true, reason: 'Signal passes pre‑flight checks' };
+}
+
+/**
+ * Place a market order (BUY/SELL) with portfolio risk checks.
  * @param {string} instrument - e.g., 'EUR_USD'
  * @param {string} side - 'BUY' or 'SELL'
  * @param {number} lotSize - Number of units (positive)
  * @param {number|null} stopLoss - Stop loss price (optional)
  * @param {number|null} takeProfit - Take profit price (optional)
  * @param {string} [product] - Trading product (optional, default from env)
- * @param {string} [decisionId] - ID of the HistoricalDecision that generated this trade (for audit)
+ * @param {string} [decisionId] - HistoricalDecision ID (optional)
+ * @param {boolean} [autoTrade=false] - Whether this is an auto‑trade (for additional checks)
  * @returns {Promise<Object>} { contractId, price, raw }
  */
-async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, takeProfit = null, product, decisionId = null) {
+async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, takeProfit = null, product, decisionId = null, autoTrade = false) {
+  // 1. Validate input
   const validation = validateOrderInput({ pair: instrument, side, lotSize, stopLoss, takeProfit });
   if (!validation.valid) {
     throw new Error(validation.message);
   }
 
+  // 2. Portfolio risk assessment
   const broker = getBroker(product);
-  const startTime = Date.now();
+  const account = await broker.getAccount();
+  const currentPositions = await broker.getOpenTrades();
+  const signal = {
+    symbol: instrument,
+    side,
+    entryPrice: 0, // will be filled by broker
+    stopLoss,
+    takeProfit,
+    recommendedLotSize: lotSize,
+  };
 
-  // ---- Capability check ----
+  // Get current price for exposure calculation
+  const currentPrice = await broker.getCurrentPrice(instrument);
+  signal.entryPrice = currentPrice;
+
+  const portfolioApproval = await portfolioIntelligence.assessNewTrade(signal, parseFloat(account.balance), currentPositions);
+  if (!portfolioApproval.approved) {
+    logger.warn(`[orderService] Portfolio risk rejected ${instrument} ${side}: ${portfolioApproval.reason}`);
+    eventBus.emit('order.rejected', { instrument, side, reason: portfolioApproval.reason });
+    throw new Error(`Portfolio risk rejection: ${portfolioApproval.reason}`);
+  }
+
+  // Use adjusted lot size from portfolio assessment
+  const finalLotSize = portfolioApproval.adjustedLotSize || lotSize;
+
+  // 3. If auto‑trade, perform extra pre‑flight checks (if decisionId is provided, we can check confidence/edge from decision)
+  // The caller (autoTrade controller) should pass the decision object; for now, we rely on the controller to have validated.
+  // If decisionId is provided and autoTrade is true, we could fetch the decision and check confidence/edge.
+  // We'll trust the controller to have done that, but we add a safety check.
+  if (autoTrade && decisionId) {
+    try {
+      const Decision = require('../../models/HistoricalDecision');
+      const decision = await Decision.findById(decisionId);
+      if (decision) {
+        const autoCheck = validateAutoTradeSignal(decision);
+        if (!autoCheck.valid) {
+          logger.warn(`[orderService] Auto‑trade signal invalid: ${autoCheck.reason}`);
+          eventBus.emit('order.rejected', { instrument, side, reason: autoCheck.reason });
+          throw new Error(`Auto‑trade rejected: ${autoCheck.reason}`);
+        }
+      }
+    } catch (err) {
+      // If we can't fetch the decision, log but proceed (the controller should have validated)
+      logger.warn(`[orderService] Could not validate auto‑trade signal: ${err.message}`);
+    }
+  }
+
+  // 4. Execute order
+  const startTime = Date.now();
   if (!broker.capabilities?.supportsMarketOrders) {
     throw new Error('Broker does not support market orders');
   }
-
   if (!broker.isConnected()) {
     await broker.connect();
   }
 
-  const units = side.toUpperCase() === 'BUY' ? lotSize : -lotSize;
+  const units = side.toUpperCase() === 'BUY' ? finalLotSize : -finalLotSize;
 
   try {
     const result = await broker.placeMarketOrder(instrument, units, stopLoss, takeProfit);
     const latency = Date.now() - startTime;
 
-    // ---- Extract contractId and price from result ----
     const contractId = result.tradeID || result.id || null;
     const price = result.price || result.averagePrice || null;
 
@@ -57,24 +127,45 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
       throw new Error('Broker did not return a trade ID');
     }
 
-    // ---- (Optional) Create an internal Order record for tracking the request ----
-    // This is kept for compatibility; the actual trade state comes from MT5 sync.
+    // 5. Create Order document
     const newOrder = new Order({
       contractId,
       instrument,
       side: side.toUpperCase(),
-      lotSize,
+      lotSize: finalLotSize,
       stopLoss,
       takeProfit,
       status: 'FILLED',
       product,
       filledPrice: price,
       placedAt: new Date(),
-      decisionId: decisionId || null,
     });
-    await newOrder.save().catch(err => logger.warn('[orderService] Order save failed (non‑critical):', err.message));
+    await newOrder.save();
 
-    // ---- Record analytics ----
+    // 6. Create Trade record (with fallback if creation fails)
+    let trade = null;
+    try {
+      const newTrade = new Trade({
+        contractId,
+        instrument,
+        side: side.toUpperCase(),
+        lotSize: finalLotSize,
+        openPrice: price,
+        status: 'OPEN',
+        openTime: new Date(),
+        product,
+        decisionId: decisionId || null,
+        currentPrice: price,
+        floatingProfit: 0,
+      });
+      trade = await newTrade.save();
+      logger.debug(`[orderService] Trade created for ${contractId}`);
+    } catch (tradeErr) {
+      logger.warn(`[orderService] Could not create Trade for ${contractId}, but order placed:`, tradeErr.message);
+      // We'll still continue; the positions sync will create the Trade later.
+    }
+
+    // 7. Record analytics
     const spread = await broker.getSpread(instrument).catch(() => 0);
     executionAnalytics.recordExecution({
       orderId: contractId,
@@ -90,10 +181,11 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
       broker: product || 'default',
     });
 
+    // 8. Emit events
     eventBus.emit('order.placed', {
       instrument,
       side,
-      lotSize,
+      lotSize: finalLotSize,
       stopLoss,
       takeProfit,
       contractId,
@@ -101,12 +193,26 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
       decisionId: decisionId || null,
       timestamp: new Date().toISOString(),
     });
+    eventBus.emit('trade.placed', { instrument, side, contractId, price }); // for sound alerts
 
-    // ⚠️ Trade persistence is now handled by POST /positions sync.
-    // Decision outcome updates are handled in POST /orders/result.
+    // 9. Update HistoricalDecision if decisionId provided
+    if (decisionId) {
+      try {
+        const Decision = require('../../models/HistoricalDecision');
+        const decision = await Decision.findById(decisionId);
+        if (decision) {
+          decision.outcome.executed = true;
+          decision.outcome.tradeId = newTrade?._id || contractId;
+          await decision.save();
+        }
+      } catch (err) {
+        logger.warn(`[orderService] Could not update decision ${decisionId}:`, err.message);
+      }
+    }
 
     return { contractId, price, raw: result };
   } catch (err) {
+    eventBus.emit('order.rejected', { instrument, side, reason: err.message });
     executionAnalytics.recordExecution({
       orderId: 'N/A',
       instrument,
@@ -139,19 +245,19 @@ async function cancelOrder(contractId, product) {
     await broker.connect();
   }
   const result = await broker.cancelOrder(contractId);
-  // Update internal Order status (optional, non‑critical)
+  // Update Order status to CANCELLED
   await Order.findOneAndUpdate(
     { contractId },
     { status: 'CANCELLED', updatedAt: new Date() },
     { upsert: false }
-  ).catch(err => logger.warn('[orderService] Order update failed:', err.message));
+  );
   eventBus.emit('order.cancelled', { contractId, result, timestamp: new Date().toISOString() });
   return result;
 }
 
 /**
  * Close an open trade by its contract ID.
- * @param {string} contractId - Trade ID (contract ID)
+ * @param {string} contractId - Trade ID (ticket)
  * @param {string} [product] - Trading product (optional)
  * @returns {Promise<Object>} Result from broker.
  */
@@ -161,38 +267,59 @@ async function closeTrade(contractId, product) {
   if (!broker.capabilities?.supportsClose) {
     throw new Error('Broker does not support closing trades');
   }
-  const startTime = Date.now();
   if (!broker.isConnected()) {
     await broker.connect();
   }
-  try {
-    const result = await broker.closeTrade(contractId);
-    const latency = Date.now() - startTime;
-
-    // ---- Record analytics for close ----
-    executionAnalytics.recordExecution({
-      orderId: contractId,
-      instrument: 'unknown', // could be fetched from Trade if needed, but not critical
-      side: 'unknown',
-      requestedPrice: 0,
-      filledPrice: result.price || 0,
-      latency,
-      spread: 0,
+  const result = await broker.closeTrade(contractId);
+  // Update Trade record
+  const updatedTrade = await Trade.findOneAndUpdate(
+    { contractId },
+    {
       status: 'CLOSED',
-      ticket: contractId,
-      broker: product || 'default',
-    });
-
-    eventBus.emit('trade.closed', { contractId, result, timestamp: new Date().toISOString() });
-
-    // ⚠️ Trade finalization is handled by POST /orders/result when the command completes.
-    // We do NOT update Trade model here.
-
-    return result;
-  } catch (err) {
-    logger.error('[closeTrade] Error:', err.message);
-    throw err;
+      closeTime: new Date(),
+      closePrice: result.price || null,
+      pnl: result.pl || 0,
+      realizedProfit: result.pl || 0,
+    },
+    { new: true }
+  );
+  if (!updatedTrade) {
+    logger.warn(`[closeTrade] No Trade found with contractId: ${contractId}`);
+  } else {
+    // Update Order status to CLOSED
+    await Order.findOneAndUpdate(
+      { contractId },
+      { status: 'CLOSED', updatedAt: new Date() },
+      { upsert: false }
+    );
+    // If decisionId is stored, update HistoricalDecision outcome
+    if (updatedTrade.decisionId) {
+      try {
+        await selfLearner.updateDecisionOutcome(updatedTrade.decisionId, updatedTrade);
+        logger.debug(`[orderService] Decision ${updatedTrade.decisionId} outcome updated from trade ${contractId}`);
+      } catch (err) {
+        logger.warn(`[orderService] Failed to update decision outcome for ${updatedTrade.decisionId}:`, err.message);
+      }
+    }
   }
+
+  // Record analytics for close
+  executionAnalytics.recordExecution({
+    orderId: contractId,
+    instrument: updatedTrade?.instrument || 'unknown',
+    side: updatedTrade?.side || 'unknown',
+    requestedPrice: 0,
+    filledPrice: result.price || 0,
+    latency: 0,
+    spread: 0,
+    status: 'CLOSED',
+    ticket: contractId,
+    broker: product || 'default',
+  });
+
+  eventBus.emit('trade.closed', { contractId, result, timestamp: new Date().toISOString() });
+  eventBus.emit('trade.closed.sound', { contractId }); // for sound alerts
+  return result;
 }
 
 /**
@@ -213,13 +340,17 @@ async function modifyTrade(contractId, stopLoss, takeProfit, product) {
     await broker.connect();
   }
   const result = await broker.modifySLTP(contractId, stopLoss, takeProfit);
-  // Update internal Order/Trade records (non‑critical, MT5 sync will catch up)
+  // Update Order and Trade records
   await Order.findOneAndUpdate(
     { contractId },
     { stopLoss, takeProfit, updatedAt: new Date() },
     { upsert: false }
-  ).catch(err => logger.warn('[orderService] Order update failed:', err.message));
-  // We no longer update Trade here – the MT5 sync will pick up the new SL/TP.
+  );
+  await Trade.findOneAndUpdate(
+    { contractId },
+    { stopLoss, takeProfit, updatedAt: new Date() },
+    { upsert: false }
+  );
   eventBus.emit('order.modified', { contractId, stopLoss, takeProfit, result, timestamp: new Date().toISOString() });
   return result;
 }
@@ -259,12 +390,10 @@ function getExecutionAnalytics() {
 }
 
 /**
- * Delete all closed trades from the Trade collection (utility, if needed).
- * NOTE: This operates on the Trade model, which is now synced from MT5.
+ * Delete all closed trades from the Trade collection.
  * @returns {Promise<number>} Number of deleted records.
  */
 async function deleteClosedTrades() {
-  const Trade = require('../../models/Trade'); // lazy require to avoid circular
   const result = await Trade.deleteMany({ status: 'CLOSED' });
   logger.info(`Deleted ${result.deletedCount} closed trades from history.`);
   return result.deletedCount;
