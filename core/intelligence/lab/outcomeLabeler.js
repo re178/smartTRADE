@@ -4,7 +4,7 @@
 
 const HistoricalState = require('../../../models/HistoricalState');
 const HistoricalOutcome = require('../../../models/HistoricalOutcome');
-const candleHistory = require('../../../data/candleHistory');
+const candleHistory = require('../../data/candleHistory');
 const logger = require('../../../infrastructure/logger') || console;
 
 const LOOKAHEADS = [5, 10, 20, 40];
