@@ -1,4 +1,4 @@
-// public/js/live.js – Updated for CTOS Real-time Events (Professional UI)
+// public/js/live.js – Updated for CTOS Real-time Events with Sound Alerts
 
 (function() {
   'use strict';
@@ -8,7 +8,7 @@
   let reconnectAttempts = 0;
   let ws = null;
 
-  // DOM elements (new panels – same IDs as before)
+  // DOM elements
   const awarenessPanel = document.getElementById('awarenessPanel');
   const hypothesisPanel = document.getElementById('hypothesisPanel');
   const knowledgePanel = document.getElementById('knowledgePanel');
@@ -17,9 +17,27 @@
   const metricsPanel = document.getElementById('metricsPanel');
   const wsStatus = document.getElementById('wsStatus');
 
-  // ============================================================
-  // HELPER: formatSymbol (local copy – safe fallback)
-  // ============================================================
+  // ---- SoundManager (global from app.js) ----
+  function playSound(type) {
+    if (window.SoundManager && typeof window.SoundManager[type] === 'function') {
+      window.SoundManager[type]();
+    } else {
+      // Fallback: play simple beep
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.frequency.value = type === 'tradeOpen' ? 600 : (type === 'reject' ? 300 : 800);
+        gain.gain.value = 0.3;
+        osc.start();
+        osc.stop(ctx.currentTime + 0.3);
+      } catch (e) {}
+    }
+  }
+
+  // ---- Helper: formatSymbol ----
   function formatSymbol(symbol) {
     if (!symbol || typeof symbol !== 'string') return symbol;
     const upper = symbol.toUpperCase().trim();
@@ -29,37 +47,16 @@
     return upper;
   }
 
-  // ============================================================
-  // NOTIFICATION HELPER (uses global addNotification from app.js)
-  // ============================================================
-  function notify(message, type = 'info') {
-    if (typeof window.addNotification === 'function') {
-      window.addNotification(message, type);
-    } else {
-      console.log('[Live]', message);
-    }
-  }
-
-  // ============================================================
-  // API STATUS (sidebar dot)
-  // ============================================================
-  function updateApiStatus(connected) {
-    if (typeof window.updateApiStatus === 'function') {
-      window.updateApiStatus(connected);
-    }
-  }
-
   function updateWsStatus(connected) {
     if (wsStatus) {
       wsStatus.textContent = connected ? '🟢 Live' : '🔴 Disconnected';
       wsStatus.className = connected ? 'badge bg-success' : 'badge bg-danger';
     }
-    updateApiStatus(connected);
+    if (window.updateApiStatus) {
+      window.updateApiStatus(connected);
+    }
   }
 
-  // ============================================================
-  // WEBSOCKET CONNECTION
-  // ============================================================
   function connectWebSocket() {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}`;
@@ -75,7 +72,6 @@
       console.log('[Live] WebSocket connected.');
       reconnectAttempts = 0;
       updateWsStatus(true);
-      notify('WebSocket connected', 'success');
     };
 
     ws.onmessage = function(event) {
@@ -90,13 +86,11 @@
     ws.onclose = function() {
       console.warn('[Live] WebSocket closed.');
       updateWsStatus(false);
-      notify('WebSocket disconnected', 'warning');
       scheduleReconnect();
     };
 
     ws.onerror = function(err) {
       console.error('[Live] WebSocket error:', err);
-      updateWsStatus(false);
     };
   }
 
@@ -108,9 +102,6 @@
     setTimeout(connectWebSocket, delay);
   }
 
-  // ============================================================
-  // MESSAGE DISPATCHER
-  // ============================================================
   function handleMessage(msg) {
     switch (msg.type) {
       case 'marketAwareness':
@@ -141,23 +132,26 @@
         // Refresh open trades and history
         if (typeof loadOpenTrades === 'function') loadOpenTrades();
         if (typeof loadTradeHistory === 'function') loadTradeHistory();
-        // Also add notification
-        if (msg.data && msg.data.result) {
-          const pl = msg.data.result.pl || 0;
-          notify(`Trade closed: P&L ${pl >= 0 ? '+' : ''}${pl.toFixed(2)}`, pl >= 0 ? 'success' : 'danger');
-        } else {
-          notify('Trade closed', 'info');
-        }
+        if (typeof addNotification === 'function') addNotification('Trade closed', 'info');
+        playSound('tradeClose');
+        break;
+      case 'trade.placed':
+        // Trade opened (from orderService)
+        if (typeof loadOpenTrades === 'function') loadOpenTrades();
+        if (typeof loadTradeHistory === 'function') loadTradeHistory();
+        playSound('tradeOpen');
+        if (typeof addNotification === 'function') addNotification('Trade opened', 'success');
+        break;
+      case 'order.rejected':
+        playSound('reject');
+        if (typeof addNotification === 'function') addNotification('Order rejected: ' + (msg.data.reason || ''), 'danger');
         break;
       default:
         console.debug('[Live] Unknown message type:', msg.type);
     }
   }
 
-  // ============================================================
-  // DISPLAY FUNCTIONS
-  // ============================================================
-
+  // ---- Display functions (unchanged) ----
   function displayAwareness(data) {
     if (!awarenessPanel) return;
     const { symbol, spread, velocity, acceleration, liquidity, unusualEvents, lastUpdated } = data;
@@ -203,7 +197,6 @@
       Created: ${new Date(createdAt).toLocaleString()}
     `;
     hypothesisPanel.prepend(el);
-    // Keep only last 10 hypotheses
     while (hypothesisPanel.children.length > 10) {
       hypothesisPanel.removeChild(hypothesisPanel.lastChild);
     }
@@ -241,14 +234,13 @@
     `;
   }
 
-  // ============================================================
-  // DISPLAY DECISION – with auto‑execute, symbol formatting, and notifications
-  // ============================================================
   function displayDecision(decision) {
     if (!liveSignalPanel) return;
     const { symbol, decision: side, confidence, entryPrice, stopLoss, takeProfit, recommendedLotSize, reason, timestamp } = decision;
 
-    // Show NO_TRADE with reason
+    // Play signal sound
+    playSound('signal');
+
     if (!side || side === 'NO_TRADE') {
       liveSignalPanel.innerHTML = `
         <div class="alert alert-secondary">
@@ -260,12 +252,11 @@
       return;
     }
 
-    const alertClass = side === 'BUY' ? 'buy' : 'sell';
+    const alertClass = side === 'BUY' ? 'success' : 'danger';
     const sideLabel = side || 'NO TRADE';
     const formattedSymbol = formatSymbol(symbol);
 
-    // Build the card with new styling
-    let html = `<div class="live-signal-card ${alertClass}" data-symbol="${formattedSymbol}" data-side="${side}" data-entry="${entryPrice}" data-sl="${stopLoss}" data-tp="${takeProfit}" data-lot="${recommendedLotSize || 0.01}">`;
+    let html = `<div class="alert alert-${alertClass} live-signal-card" data-symbol="${formattedSymbol}" data-side="${side}" data-entry="${entryPrice}" data-sl="${stopLoss}" data-tp="${takeProfit}" data-lot="${recommendedLotSize || 0.01}">`;
     html += `<h5><strong>${sideLabel}</strong> ${formattedSymbol} (${confidence}% confidence)</h5>`;
     if (side && side !== 'NO_TRADE') {
       html += `<p>Entry: ${formatPrice(entryPrice)} | SL: ${formatPrice(stopLoss)} | TP: ${formatPrice(takeProfit)}</p>`;
@@ -278,15 +269,10 @@
     html += `</div>`;
     liveSignalPanel.innerHTML = html;
 
-    // ---- Notification ----
-    notify(`${side} signal for ${formattedSymbol} at ${entryPrice} (${confidence}% confidence)`, side === 'BUY' ? 'success' : 'danger');
-
     // ---- Auto‑execute: if toggle is ON, send to /execute-signal ----
     const toggle = document.getElementById('autoExecuteToggle');
     if (toggle && toggle.checked && side && side !== 'NO_TRADE') {
       console.log('[Live] Auto‑executing signal for', formattedSymbol, side);
-      if (typeof playSound === 'function') playSound('signal');
-
       fetch('/api/execute-signal', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -303,20 +289,18 @@
       .then(data => {
         if (data.success) {
           console.log('[Live] Auto‑executed trade:', data);
-          if (typeof playSound === 'function') playSound('open');
-          // Refresh dashboard sections
           if (typeof loadOpenTrades === 'function') loadOpenTrades();
           if (typeof loadTradeHistory === 'function') loadTradeHistory();
           if (typeof loadAccount === 'function') loadAccount();
-          notify(`Auto‑executed ${side} ${formattedSymbol}`, 'success');
+          playSound('tradeOpen');
         } else {
           console.error('[Live] Auto‑execute failed:', data.error);
-          notify(`Auto‑execute failed: ${data.error}`, 'danger');
+          playSound('reject');
         }
       })
       .catch(err => {
         console.error('[Live] Auto‑execute error:', err);
-        notify(`Auto‑execute error: ${err.message}`, 'danger');
+        playSound('reject');
       });
     }
   }
@@ -361,15 +345,11 @@
     `;
   }
 
-  // Utility: format price (safe fallback)
   function formatPrice(p) {
     if (p === undefined || p === null) return 'N/A';
     return parseFloat(p).toFixed(5);
   }
 
-  // ============================================================
-  // Global function: execute trade from card
-  // ============================================================
   window.executeSignalFromCard = function(btn) {
     const card = btn.closest('.live-signal-card');
     if (!card) return;
@@ -386,20 +366,15 @@
     }
   };
 
-  // ============================================================
-  // Auto‑execute toggle: save state in localStorage
-  // ============================================================
+  // ---- Auto‑execute toggle: save state in localStorage ----
   document.addEventListener('DOMContentLoaded', function() {
     const toggle = document.getElementById('autoExecuteToggle');
     if (toggle) {
-      // Restore saved state
       const saved = localStorage.getItem('autoExecuteToggle');
       if (saved === 'true') toggle.checked = true;
-      // Save on change
       toggle.addEventListener('change', function() {
         localStorage.setItem('autoExecuteToggle', this.checked);
         console.log('[Live] Auto‑execute toggle:', this.checked ? 'ON' : 'OFF');
-        notify(`Auto‑execute ${this.checked ? 'enabled' : 'disabled'}`, 'info');
       });
     }
   });
@@ -407,7 +382,6 @@
   // Start WebSocket connection
   connectWebSocket();
 
-  // Expose reconnect function
   window.reconnectLive = function() {
     if (ws) ws.close();
     reconnectAttempts = 0;
