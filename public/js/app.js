@@ -1,4 +1,4 @@
-// public/js/app.js – Dashboard Logic (Full Original + Sound Alerts + Report Generation + Trade History Fix)
+// public/js/app.js – Dashboard Logic (Full with Stats Update, P&L Fix, Sounds, Report)
 
 // ---- Configuration ----
 const REFRESH_INTERVAL = 3000; // 3 seconds – real‑time P&L updates
@@ -104,10 +104,14 @@ window.handleProductChange = async function(e) {
   }
 };
 
-// ---- Load Account ----
+// ---- Load Account (updates Balance & Equity stats) ----
 async function loadAccount() {
   try {
     const acc = await fetchJson(`${CONFIG.API_BASE}/api/account`);
+    // Update stats cards
+    document.getElementById('statBalance').textContent = `${acc.balance} ${acc.currency}`;
+    document.getElementById('statEquity').textContent = `${acc.equity} ${acc.currency}`;
+    // Update legacy panels
     const created = acc.createdTime || acc.createdAt || acc.updatedAt || null;
     document.getElementById('accountInfo').innerHTML = `
       <p><strong>ID:</strong> ${acc.id}</p>
@@ -120,12 +124,7 @@ async function loadAccount() {
       <p><strong>Margin Used:</strong> ${acc.marginUsed} ${acc.currency}</p>
       <p><strong>Margin Available:</strong> ${acc.marginAvailable} ${acc.currency}</p>
     `;
-    // Update stats cards
-    document.getElementById('statBalance').textContent = `${acc.balance} ${acc.currency}`;
-    document.getElementById('statEquity').textContent = `${acc.equity} ${acc.currency}`;
   } catch (e) {
-    document.getElementById('accountInfo').innerHTML = `<p class="text-danger">Error: ${e.message}</p>`;
-    document.getElementById('balanceInfo').innerHTML = `<p class="text-danger">Error: ${e.message}</p>`;
     document.getElementById('statBalance').textContent = 'Error';
     document.getElementById('statEquity').textContent = 'Error';
   }
@@ -291,7 +290,7 @@ document.getElementById('autoTradeForm').addEventListener('submit', async functi
   }
 });
 
-// ---- Load Open Trades ----
+// ---- Load Open Trades (updates Open Trades count and P&L) ----
 let openTradesInterval = null;
 
 async function loadOpenTrades() {
@@ -345,13 +344,36 @@ window.closeTrade = async function(tradeId) {
     loadOpenTrades();
     loadTradeHistory();
     loadAccount();
+    updateStatsFromHistory(); // refresh win rate / PF
   } catch (e) {
     alert('Error closing trade: ' + e.message);
     SoundManager.reject();
   }
 };
 
-// ---- Load Trade History (with proper field mapping) ----
+// ---- Update Win Rate and Profit Factor from Trade History ----
+async function updateStatsFromHistory() {
+  try {
+    const trades = await fetchJson(`${CONFIG.API_BASE}/api/trade-history`);
+    if (trades && trades.length > 0) {
+      const wins = trades.filter(t => t.pnl > 0).length;
+      const total = trades.length;
+      const winRate = total > 0 ? (wins / total) * 100 : 0;
+      document.getElementById('statWinRate').textContent = winRate.toFixed(1) + '%';
+      const totalWins = trades.filter(t => t.pnl > 0).reduce((sum, t) => sum + t.pnl, 0);
+      const totalLosses = trades.filter(t => t.pnl < 0).reduce((sum, t) => sum + Math.abs(t.pnl), 0);
+      const pf = totalLosses > 0 ? (totalWins / totalLosses) : (totalWins > 0 ? Infinity : 0);
+      document.getElementById('statProfitFactor').textContent = `PF: ${pf === Infinity ? '∞' : pf.toFixed(2)}`;
+    } else {
+      document.getElementById('statWinRate').textContent = '—';
+      document.getElementById('statProfitFactor').textContent = 'PF: —';
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+
+// ---- Load Trade History (with proper P&L display) ----
 async function loadTradeHistory(page = 1) {
   const container = document.getElementById('historyContainer');
   if (!container) return;
@@ -367,6 +389,7 @@ async function loadTradeHistory(page = 1) {
       document.getElementById('pageTotal').textContent = '0';
       historyData = [];
       historyFiltered = [];
+      updateStatsFromHistory();
       return;
     }
 
@@ -409,6 +432,7 @@ async function loadTradeHistory(page = 1) {
 
     if (pageItems.length === 0) {
       container.innerHTML = '<p class="text-muted">No matching records.</p>';
+      updateStatsFromHistory();
       return;
     }
 
@@ -430,6 +454,7 @@ async function loadTradeHistory(page = 1) {
     });
     html += '</tbody></table></div>';
     container.innerHTML = html;
+    updateStatsFromHistory();
   } catch (e) {
     container.innerHTML = `<p class="text-danger">Error loading history: ${e.message}</p>`;
   }
@@ -486,6 +511,7 @@ document.getElementById('deleteHistoryBtn')?.addEventListener('click', async fun
     const result = await fetchJson(`${CONFIG.API_BASE}/api/history`, { method: 'DELETE' });
     alert(`Deleted ${result.deletedCount} closed trades.`);
     loadTradeHistory(1);
+    updateStatsFromHistory();
   } catch (e) {
     alert('Error deleting history: ' + e.message);
   }
@@ -522,6 +548,8 @@ loadPendingOrders();
 loadNotificationStatus();
 startLiveUpdates();
 setInterval(loadPrices, CONFIG.PRICE_REFRESH_INTERVAL);
+// Update win rate periodically
+setInterval(updateStatsFromHistory, 30000);
 
 // ---- Cleanup on page unload ----
 window.addEventListener('beforeunload', function() {
@@ -529,7 +557,7 @@ window.addEventListener('beforeunload', function() {
 });
 
 // ============================================================
-// EXPORT HISTORY CSV (Original)
+// EXPORT HISTORY CSV
 // ============================================================
 function exportHistoryCSV() {
   if (!historyFiltered || historyFiltered.length === 0) {
@@ -562,7 +590,7 @@ function exportHistoryCSV() {
 document.getElementById('exportCSVBtn')?.addEventListener('click', exportHistoryCSV);
 
 // ============================================================
-// DECISION INSPECTOR (Original)
+// DECISION INSPECTOR
 // ============================================================
 async function openDecisionInspector(decisionId) {
   if (!decisionId) {
@@ -663,7 +691,7 @@ Win rate: ${(data.similarity?.stats?.winRate * 100).toFixed(1)}%
 window.openDecisionInspector = openDecisionInspector;
 
 // ============================================================
-// BELIEF PANEL (Original)
+// BELIEF PANEL
 // ============================================================
 function updateBeliefPanel(beliefData) {
   const panel = document.getElementById('beliefPanel');
@@ -685,7 +713,7 @@ function updateBeliefPanel(beliefData) {
 window.updateBeliefPanel = updateBeliefPanel;
 
 // ============================================================
-// KNOWLEDGE EXPLORER (Original)
+// KNOWLEDGE EXPLORER
 // ============================================================
 async function submitKnowledgeQuery() {
   const symbol = document.getElementById('knowledgeSymbol')?.value || 'EUR_USD';
@@ -741,7 +769,7 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 
 // ============================================================
-// REPORT GENERATION (New)
+// REPORT GENERATION
 // ============================================================
 async function generateReport() {
   const from = document.getElementById('reportFrom')?.value || '';
@@ -758,7 +786,7 @@ async function generateReport() {
     const response = await fetch(`${CONFIG.API_BASE}/api/report`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from, to, format: 'pdf', includeTrades })
+      body: JSON.stringify({ from, to, includeTrades })
     });
 
     if (!response.ok) {
@@ -808,10 +836,11 @@ window.updateApiStatus = function(connected) {
   if (dot) dot.className = 'dot ' + (connected ? 'connected' : 'disconnected');
   if (text) text.textContent = connected ? 'Connected' : 'Disconnected';
 };
+window.exportHistoryCSV = exportHistoryCSV;
 
 // ---- Listen for danger signals (from live.js) ----
 window.addEventListener('dangerSignal', function() {
   SoundManager.danger();
 });
 
-console.log('✅ App.js loaded with all original functions + sound alerts + report generation.');
+console.log('✅ App.js loaded with all fixes.');
