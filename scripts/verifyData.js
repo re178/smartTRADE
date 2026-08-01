@@ -5,18 +5,18 @@ require('dotenv').config();
 const mongoose = require('mongoose');
 
 // ----- Import your models (using the same paths as your system) -----
-const HistoricalState = require('./models/HistoricalState');
-const HistoricalOutcome = require('./models/HistoricalOutcome');
-const HistoricalDecision = require('./models/HistoricalDecision');
-const LearningState = require('./models/LearningState');
-const Trade = require('./models/Trade');
-const Order = require('./models/Order');
-const Mt5Command = require('./models/Mt5Command');
-const Mt5Account = require('./models/Mt5Account');
-const Mt5Position = require('./models/Mt5Position');
-const Mt5Price = require('./models/Mt5Price');
-const User = require('./models/User');
-const ApiKey = require('./models/ApiKey');
+const HistoricalState = require('../models/HistoricalState');
+const HistoricalOutcome = require('../models/HistoricalOutcome');
+const HistoricalDecision = require('../models/HistoricalDecision');
+const LearningState = require('../models/LearningState');
+const Trade = require('../models/Trade');
+const Order = require('../models/Order');
+const Mt5Command = require('../models/Mt5Command');
+const Mt5Account = require('../models/Mt5Account');
+const Mt5Position = require('../models/Mt5Position');
+const Mt5Price = require('../models/Mt5Price');
+const User = require('../models/User');
+const ApiKey = require('../models/ApiKey');
 
 // ----- Connect to MongoDB -----
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/rts';
