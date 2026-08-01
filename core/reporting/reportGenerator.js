@@ -1,29 +1,17 @@
 // core/reporting/reportGenerator.js
-// Professional PDF report generator with colors, borders, pagination.
+// Professional PDF report generator with safe number parsing.
 
 const PDFDocument = require('pdfkit');
 
-/**
- * Generate a professional PDF report.
- * @param {Object} data - Report data.
- * @param {Date} data.fromDate - Start date.
- * @param {Date} data.toDate - End date.
- * @param {Array} data.trades - Array of trade objects (mapped).
- * @param {Object} data.metrics - Performance metrics.
- * @param {Object} data.account - Account info.
- * @param {string} data.verificationCode - Unique verification code.
- * @param {string} data.systemName - System name.
- * @returns {Promise<Buffer>} PDF buffer.
- */
+function safeNumber(val, fallback = 0) {
+  const num = parseFloat(val);
+  return isNaN(num) ? fallback : num;
+}
+
 function generateReport(data) {
   return new Promise((resolve, reject) => {
     try {
-      const doc = new PDFDocument({
-        margin: 50,
-        size: 'A4',
-        bufferPages: true,
-        autoFirstPage: true,
-      });
+      const doc = new PDFDocument({ margin: 50, size: 'A4', bufferPages: true });
       const buffers = [];
       doc.on('data', buffers.push.bind(buffers));
       doc.on('end', () => {
@@ -32,7 +20,6 @@ function generateReport(data) {
       });
       doc.on('error', reject);
 
-      // ---- Colors ----
       const primaryColor = '#0d6efd';
       const primaryLight = '#e7f1ff';
       const secondaryLight = '#f8f9fa';
@@ -56,9 +43,9 @@ function generateReport(data) {
       doc.fontSize(14).font('Helvetica-Bold').fillColor(textColor).text('Account Summary');
       doc.fontSize(10).font('Helvetica').fillColor(textColor);
       const account = data.account || {};
-      const balance = account.balance || 0;
-      const equity = account.equity || 0;
-      const freeMargin = account.free_margin || 0;
+      const balance = safeNumber(account.balance);
+      const equity = safeNumber(account.equity);
+      const freeMargin = safeNumber(account.free_margin);
       const currency = account.currency || 'USD';
       doc.text(`Balance: ${balance.toFixed(2)} ${currency}`, { continued: true })
         .text(`  Equity: ${equity.toFixed(2)} ${currency}`, { continued: true })
@@ -86,7 +73,6 @@ function generateReport(data) {
       const tableWidth = 150;
 
       doc.fontSize(9).font('Helvetica');
-      // Header
       doc.fillColor(primaryLight).rect(col1, tableTop, tableWidth, rowHeight).fill();
       doc.fillColor(textColor).text('Metric', col1 + 5, tableTop + 4, { width: tableWidth - 10 });
       doc.fillColor(primaryLight).rect(col2, tableTop, tableWidth, rowHeight).fill();
@@ -100,14 +86,12 @@ function generateReport(data) {
         doc.fillColor(textColor).text(label, col1 + 5, yPos + 4, { width: tableWidth - 10 });
         doc.fillColor(bgColor).rect(col2, yPos, tableWidth, rowHeight).fill();
         doc.fillColor(textColor).text(String(value), col2 + 5, yPos + 4, { width: tableWidth - 10 });
-        // Grid lines
         doc.strokeColor(borderColor).lineWidth(0.5)
           .rect(col1, yPos, tableWidth, rowHeight).stroke()
           .rect(col2, yPos, tableWidth, rowHeight).stroke();
         yPos += rowHeight;
         rowIndex++;
       }
-      // outer border
       doc.strokeColor(borderColor).lineWidth(1)
         .rect(col1, tableTop, 2 * tableWidth, yPos - tableTop).stroke();
       doc.moveDown(0.5);
@@ -123,7 +107,6 @@ function generateReport(data) {
         const totalWidth = colWidths.reduce((a, b) => a + b, 0);
         const startX = 50;
 
-        // Draw header
         let x = startX;
         doc.fillColor(primaryColor).rect(startX, tableTop2, totalWidth, 15).fill();
         doc.fillColor('#ffffff');
@@ -134,22 +117,21 @@ function generateReport(data) {
 
         let yPos2 = tableTop2 + 15;
         const maxRowsPerPage = 35;
-        const displayTrades = data.trades.slice(0, 1000); // safety limit
+        const displayTrades = data.trades.slice(0, 1000);
 
         for (let i = 0; i < displayTrades.length; i++) {
           const t = displayTrades[i];
-          const pnl = t.pnl || 0;
+          const pnl = safeNumber(t.pnl);
           const row = [
             t.pair || 'N/A',
             (t.side || 'N/A').toUpperCase(),
-            t.entryPrice !== null ? t.entryPrice.toFixed(5) : 'N/A',
-            t.exitPrice !== null ? t.exitPrice.toFixed(5) : 'N/A',
-            (t.lotSize || 0).toFixed(2),
+            t.entryPrice !== null ? safeNumber(t.entryPrice).toFixed(5) : 'N/A',
+            t.exitPrice !== null ? safeNumber(t.exitPrice).toFixed(5) : 'N/A',
+            (safeNumber(t.lotSize)).toFixed(2),
             (pnl > 0 ? '+' : '') + pnl.toFixed(2),
             t.date ? new Date(t.date).toLocaleDateString() : 'N/A',
           ];
 
-          // Alternate row colors
           const bgColor = i % 2 === 0 ? secondaryLight : '#ffffff';
           doc.fillColor(bgColor).rect(startX, yPos2, totalWidth, 12).fill();
           doc.fillColor(textColor);
@@ -160,19 +142,15 @@ function generateReport(data) {
             x += colWidths[idx];
           });
 
-          // Horizontal line
           doc.strokeColor(borderColor).lineWidth(0.3)
             .moveTo(startX, yPos2 + 12).lineTo(startX + totalWidth, yPos2 + 12).stroke();
 
           yPos2 += 12;
 
-          // Pagination
           if (yPos2 > doc.page.height - 60 && i < displayTrades.length - 1) {
-            // draw bottom border
             doc.strokeColor(borderColor).lineWidth(0.5)
               .rect(startX, tableTop2, totalWidth, yPos2 - tableTop2).stroke();
             doc.addPage();
-            // redraw header on new page
             yPos2 = 50;
             doc.fillColor(primaryColor).rect(startX, yPos2, totalWidth, 15).fill();
             doc.fillColor('#ffffff');
@@ -185,7 +163,6 @@ function generateReport(data) {
           }
         }
 
-        // Final table border
         doc.strokeColor(borderColor).lineWidth(0.5)
           .rect(startX, tableTop2, totalWidth, yPos2 - tableTop2).stroke();
 
@@ -198,7 +175,6 @@ function generateReport(data) {
           .text('No trades in this period.', 50, doc.y + 10);
       }
 
-      // ---- Footer ----
       doc.fontSize(8).font('Helvetica').fillColor(mutedColor)
         .text(`This report is automatically generated by RTS/CTOS v2.0. Verification code: ${data.verificationCode || 'N/A'}`, {
           align: 'center',
