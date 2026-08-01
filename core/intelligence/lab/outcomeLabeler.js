@@ -2,9 +2,9 @@
 // Background job to label outcomes for unlabelled HistoricalState records.
 // Runs periodically and updates states with outcomes.
 
-const HistoricalState = require('../../models/HistoricalState');
-const HistoricalOutcome = require('../../models/HistoricalOutcome');
-const candleHistory = require('../../data/candleHistory');
+const HistoricalState = require('../../../models/HistoricalState');
+const HistoricalOutcome = require('../../../models/HistoricalOutcome');
+const candleHistory = require('../../../data/candleHistory');
 const logger = require('../../../infrastructure/logger') || console;
 
 const LOOKAHEADS = [5, 10, 20, 40];
