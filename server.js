@@ -1,4 +1,5 @@
 // server.js – RTS Entry Point with Debug Routes & CTOS (Non‑Breaking)
+// Added: Outcome labeler scheduler.
 
 require('dotenv').config();
 
@@ -12,7 +13,7 @@ const http = require('http');
 const connectDB = require('./config/db');
 const apiRoutes = require('./api/routes');
 const mt5Routes = require('./api/routes/mt5');
-const researchRoutes = require('./api/routes/research'); // NEW: research endpoints
+const researchRoutes = require('./api/routes/research');
 const User = require('./models/User');
 const Mt5Price = require('./models/Mt5Price');
 const Mt5Heartbeat = require('./models/Mt5Heartbeat');
@@ -29,6 +30,9 @@ const eventBus = require('./infrastructure/eventBus');
 // ---------- DATA ORCHESTRATOR & STATE STORE ----------
 const { dataOrchestrator } = require('./core/data/dataOrchestrator');
 const stateStore = require('./core/intelligence/lab/stateStore');
+
+// ---------- OUTCOME LABELER ----------
+const { startScheduler } = require('./core/intelligence/lab/outcomeLabeler');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -174,7 +178,7 @@ app.use(async (req, res, next) => {
 // ---------- API Routes ----------
 app.use('/api', apiRoutes);
 app.use('/api/mt5', mt5Routes);
-app.use('/api/research', researchRoutes); // NEW: research endpoints
+app.use('/api/research', researchRoutes);
 
 // ---------- Health Check ----------
 app.get('/health', (req, res) => {
@@ -213,40 +217,26 @@ function broadcast(type, data) {
 }
 
 // ---------- Connect CTOS Events to WebSocket ----------
-
-// Market Awareness
 awarenessEngine.on('marketAwareness', (data) => {
   broadcast('marketAwareness', data);
 });
-
-// Deep Regime
 deepRegime.on('regime', (regime) => {
   broadcast('regime', regime);
 });
-
-// Decision Engine
 decisionEngine.on('decision', (decision) => {
   broadcast('decision', decision);
 });
-
-// Account updates
 eventBus.on('account.fetched', (account) => {
   broadcast('account', account);
 });
-
-// Trade closed events
 eventBus.on('trade.closed', (data) => {
   broadcast('tradeClosed', data);
 });
-
-// Order placed events
 eventBus.on('order.placed', (data) => {
   broadcast('orderPlaced', data);
 });
 
-// ---------- DEBUG ROUTES (Safe, Non‑Breaking) ----------
-
-// 1. EA status – shows last price and heartbeat
+// ---------- DEBUG ROUTES ----------
 app.get('/debug/ea-status', async (req, res) => {
   try {
     const lastPrice = await Mt5Price.findOne().sort({ time: -1 }).lean();
@@ -261,7 +251,6 @@ app.get('/debug/ea-status', async (req, res) => {
   }
 });
 
-// 2. Force a candle close using the latest stored candle
 app.get('/debug/trigger', async (req, res) => {
   try {
     const candleHistory = require('./core/data/candleHistory');
@@ -269,7 +258,7 @@ app.get('/debug/trigger', async (req, res) => {
     if (!candles || candles.length === 0) {
       return res.json({ error: 'No candles found in database' });
     }
-    const candle = candles[0]; // latest
+    const candle = candles[0];
     const closedCandle = {
       symbol: candle.symbol,
       timeframe: candle.timeframe,
@@ -289,7 +278,6 @@ app.get('/debug/trigger', async (req, res) => {
   }
 });
 
-// 3. System status – shows engine state, last regime, last decision
 app.get('/debug/status', (req, res) => {
   const lastState = marketStateCache.get('EUR_USD') || null;
   const lastRegime = deepRegime.getLatestRegime('EUR_USD') || null;
@@ -313,8 +301,6 @@ app.get('/debug/status', (req, res) => {
 async function startCognitiveEngines() {
   try {
     console.log('[CTOS] Starting cognitive engines...');
-    // Modules are self‑starting – they listen to events on import.
-    // We just log that they are active.
     console.log('[CTOS] Market Awareness Engine: active');
     console.log('[CTOS] Deep Regime Detector: active');
     console.log('[CTOS] Decision Engine: active');
@@ -351,8 +337,18 @@ async function startServer() {
       console.warn('⚠️ Failed to initialise Data Orchestrator/State Store:', err.message);
     });
 
-    // Start cognitive engines after server is up
+    // ---- Start Cognitive Engines ----
     setTimeout(startCognitiveEngines, 2000);
+
+    // ---- Start Outcome Labeler Scheduler (every hour) ----
+    try {
+      const labeler = require('./core/intelligence/lab/outcomeLabeler');
+      const interval = parseInt(process.env.OUTCOME_LABEL_INTERVAL_MS) || 60 * 60 * 1000; // default 1 hour
+      labeler.startScheduler(interval);
+      console.log(`✅ Outcome labeler scheduler started (interval: ${interval}ms)`);
+    } catch (err) {
+      console.warn('⚠️ Outcome labeler scheduler could not be started:', err.message);
+    }
   });
 
   // ---- Graceful shutdown ----
