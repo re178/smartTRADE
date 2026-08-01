@@ -108,28 +108,34 @@ window.handleProductChange = async function(e) {
 async function loadAccount() {
   try {
     const acc = await fetchJson(`${CONFIG.API_BASE}/api/account`);
-    // Update stats cards – use direct fields
-    const balance = acc.balance !== undefined ? acc.balance : 0;
-    const equity = acc.equity !== undefined ? acc.equity : 0;
+    // Ensure numeric values
+    const balance = typeof acc.balance === 'number' ? acc.balance : parseFloat(acc.balance) || 0;
+    const equity = typeof acc.equity === 'number' ? acc.equity : parseFloat(acc.equity) || 0;
     const currency = acc.currency || 'USD';
+    // Update stats cards
     document.getElementById('statBalance').textContent = `${balance} ${currency}`;
     document.getElementById('statEquity').textContent = `${equity} ${currency}`;
     // Update legacy panels
     const created = acc.createdTime || acc.createdAt || acc.updatedAt || null;
-    document.getElementById('accountInfo').innerHTML = `
-      <p><strong>ID:</strong> ${acc.id}</p>
-      <p><strong>Currency:</strong> ${currency}</p>
-      <p><strong>Created:</strong> ${created ? new Date(created).toLocaleDateString() : 'N/A'}</p>
-    `;
-    document.getElementById('balanceInfo').innerHTML = `
-      <p><strong>Balance:</strong> ${balance} ${currency}</p>
-      <p><strong>Equity:</strong> ${equity} ${currency}</p>
-      <p><strong>Margin Used:</strong> ${acc.marginUsed || 0} ${currency}</p>
-      <p><strong>Margin Available:</strong> ${acc.marginAvailable || 0} ${currency}</p>
-    `;
+    const accountInfo = document.getElementById('accountInfo');
+    if (accountInfo) {
+      accountInfo.innerHTML = `
+        <p><strong>ID:</strong> ${acc.id || 'N/A'}</p>
+        <p><strong>Currency:</strong> ${currency}</p>
+        <p><strong>Created:</strong> ${created ? new Date(created).toLocaleDateString() : 'N/A'}</p>
+      `;
+    }
+    const balanceInfo = document.getElementById('balanceInfo');
+    if (balanceInfo) {
+      balanceInfo.innerHTML = `
+        <p><strong>Balance:</strong> ${balance} ${currency}</p>
+        <p><strong>Equity:</strong> ${equity} ${currency}</p>
+        <p><strong>Margin Used:</strong> ${acc.marginUsed || 0} ${currency}</p>
+        <p><strong>Margin Available:</strong> ${acc.marginAvailable || 0} ${currency}</p>
+      `;
+    }
   } catch (e) {
     console.error('loadAccount error:', e);
-    // Display fallback values
     document.getElementById('statBalance').textContent = '—';
     document.getElementById('statEquity').textContent = '—';
   }
