@@ -1,6 +1,7 @@
 // core/execution/orderService.js – Order Management (with Portfolio Risk Integration)
 
 const { getBroker } = require('./brokerFactory');
+const marketProvider = require('../market/provider'); // For current price
 const eventBus = require('../../infrastructure/eventBus');
 const { validateOrderInput } = require('../../shared/validators');
 const { ExecutionAnalytics } = require('../analytics/performanceSuite');
@@ -63,14 +64,14 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
   const signal = {
     symbol: instrument,
     side,
-    entryPrice: 0, // will be filled by broker
+    entryPrice: 0, // will be filled
     stopLoss,
     takeProfit,
     recommendedLotSize: lotSize,
   };
 
-  // Get current price for exposure calculation
-  const currentPrice = await broker.getCurrentPrice(instrument);
+  // ---- FIX: Get current price using marketProvider ----
+  const currentPrice = await marketProvider.getCurrentPrice(instrument, product);
   signal.entryPrice = currentPrice;
 
   const portfolioApproval = await portfolioIntelligence.assessNewTrade(signal, parseFloat(account.balance), currentPositions);
@@ -83,10 +84,7 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
   // Use adjusted lot size from portfolio assessment
   const finalLotSize = portfolioApproval.adjustedLotSize || lotSize;
 
-  // 3. If auto‑trade, perform extra pre‑flight checks (if decisionId is provided, we can check confidence/edge from decision)
-  // The caller (autoTrade controller) should pass the decision object; for now, we rely on the controller to have validated.
-  // If decisionId is provided and autoTrade is true, we could fetch the decision and check confidence/edge.
-  // We'll trust the controller to have done that, but we add a safety check.
+  // 3. If auto‑trade, perform extra pre‑flight checks
   if (autoTrade && decisionId) {
     try {
       const Decision = require('../../models/HistoricalDecision');
@@ -100,7 +98,6 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
         }
       }
     } catch (err) {
-      // If we can't fetch the decision, log but proceed (the controller should have validated)
       logger.warn(`[orderService] Could not validate auto‑trade signal: ${err.message}`);
     }
   }
@@ -245,7 +242,6 @@ async function cancelOrder(contractId, product) {
     await broker.connect();
   }
   const result = await broker.cancelOrder(contractId);
-  // Update Order status to CANCELLED
   await Order.findOneAndUpdate(
     { contractId },
     { status: 'CANCELLED', updatedAt: new Date() },
@@ -286,13 +282,11 @@ async function closeTrade(contractId, product) {
   if (!updatedTrade) {
     logger.warn(`[closeTrade] No Trade found with contractId: ${contractId}`);
   } else {
-    // Update Order status to CLOSED
     await Order.findOneAndUpdate(
       { contractId },
       { status: 'CLOSED', updatedAt: new Date() },
       { upsert: false }
     );
-    // If decisionId is stored, update HistoricalDecision outcome
     if (updatedTrade.decisionId) {
       try {
         await selfLearner.updateDecisionOutcome(updatedTrade.decisionId, updatedTrade);
@@ -303,7 +297,6 @@ async function closeTrade(contractId, product) {
     }
   }
 
-  // Record analytics for close
   executionAnalytics.recordExecution({
     orderId: contractId,
     instrument: updatedTrade?.instrument || 'unknown',
@@ -340,7 +333,6 @@ async function modifyTrade(contractId, stopLoss, takeProfit, product) {
     await broker.connect();
   }
   const result = await broker.modifySLTP(contractId, stopLoss, takeProfit);
-  // Update Order and Trade records
   await Order.findOneAndUpdate(
     { contractId },
     { stopLoss, takeProfit, updatedAt: new Date() },
