@@ -1,4 +1,4 @@
-// api/routes.js – Complete API Routes (with Developer Key Management & new endpoints)
+// api/routes.js – Complete API Routes (with Developer Key Management & new report endpoint)
 
 const express = require('express');
 const router = express.Router();
@@ -42,7 +42,7 @@ router.post('/broker/reset-circuit-breaker', (req, res) => {
   }
 });
 
-// ---------- NEW: Execute live signal directly (for auto‑execute toggle) ----------
+// ---------- Execute live signal directly (for auto‑execute toggle) ----------
 router.post('/execute-signal', controllers.executeSignal);
 
 // ---------- User Preferences ----------
@@ -135,11 +135,14 @@ router.post('/performance/learn', async (req, res) => {
 });
 
 // ================================================================
-// ================ NEW ENDPOINTS (expose to dashboard) ===========
+// ================ NEW ENDPOINTS ==================================
 // ================================================================
 
 router.get('/symbols', controllers.getSymbols);           // symbol metadata
 router.get('/capabilities', controllers.getCapabilities); // broker capabilities
+
+// ---- NEW: Report Generation ----
+router.post('/report', controllers.generateReport);
 
 // ================================================================
 // ================ DEVELOPER API KEY MANAGEMENT ===================
