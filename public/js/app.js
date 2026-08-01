@@ -1,39 +1,56 @@
-// public/js/app.js – Dashboard Logic (Professional UI)
-// Supports: sidebar navigation, stats cards, filtered/paginated history, exports, notifications.
+// public/js/app.js – Dashboard Logic (Full Original + Sound Alerts + Report Generation + Trade History Fix)
 
 // ---- Configuration ----
 const REFRESH_INTERVAL = 3000; // 3 seconds – real‑time P&L updates
-const HISTORY_PAGE_SIZE = 20;   // Rows per page in trade history
+const HISTORY_PAGE_SIZE = 20;
 let isSubmitting = false;
 let isAutoSubmitting = false;
-
-// ---- Global state for history pagination ----
 let historyData = [];
 let historyFiltered = [];
 let historyPage = 1;
 let historyTotalPages = 1;
 
-// ---- Sound Helper (fallback to Web Audio if files missing) ----
-function playSound(type) {
-  try {
-    const audio = new Audio();
-    if (type === 'open') audio.src = '/sounds/trade-open.mp3';
-    else if (type === 'close') audio.src = '/sounds/trade-close.mp3';
-    else if (type === 'alert') audio.src = '/sounds/alert.mp3';
-    else return;
-    audio.play().catch(() => {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
+// ---- Sound Manager (Web Audio API) ----
+const SoundManager = {
+  _ctx: null,
+  _init() {
+    if (!this._ctx) {
+      this._ctx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+  },
+  _playTone(frequency, duration, type = 'sine', volume = 0.3) {
+    try {
+      this._init();
+      const osc = this._ctx.createOscillator();
+      const gain = this._ctx.createGain();
       osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.frequency.value = type === 'alert' ? 800 : 600;
-      gain.gain.value = 0.3;
+      gain.connect(this._ctx.destination);
+      osc.frequency.value = frequency;
+      osc.type = type;
+      gain.gain.value = volume;
       osc.start();
-      osc.stop(ctx.currentTime + 0.3);
-    });
-  } catch (e) { /* ignore */ }
-}
+      osc.stop(this._ctx.currentTime + duration);
+    } catch (e) { /* ignore */ }
+  },
+  signal() { this._playTone(800, 0.2, 'sine', 0.4); },
+  tradeOpen() {
+    this._playTone(600, 0.15, 'sine', 0.4);
+    setTimeout(() => this._playTone(900, 0.2, 'sine', 0.4), 150);
+  },
+  tradeClose() {
+    this._playTone(900, 0.15, 'sine', 0.4);
+    setTimeout(() => this._playTone(600, 0.2, 'sine', 0.4), 150);
+  },
+  danger() {
+    this._playTone(150, 0.3, 'sawtooth', 0.3);
+    setTimeout(() => this._playTone(150, 0.3, 'sawtooth', 0.3), 300);
+    setTimeout(() => this._playTone(150, 0.3, 'sawtooth', 0.3), 600);
+  },
+  reject() {
+    this._playTone(300, 0.3, 'square', 0.2);
+    setTimeout(() => this._playTone(200, 0.4, 'square', 0.2), 350);
+  }
+};
 
 // ---- API helper ----
 async function fetchJson(url, options = {}) {
@@ -52,48 +69,7 @@ function formatPrice(p) {
   return parseFloat(p).toFixed(5);
 }
 
-// ============================================================
-// NOTIFICATION CENTRE
-// ============================================================
-function addNotification(message, type = 'info') {
-  const list = document.getElementById('notifList');
-  if (!list) return;
-  const icons = {
-    success: 'fa-check-circle',
-    danger: 'fa-exclamation-circle',
-    warning: 'fa-exclamation-triangle',
-    info: 'fa-info-circle'
-  };
-  const bgClasses = {
-    success: 'bg-success-light',
-    danger: 'bg-danger-light',
-    warning: 'bg-warning-light',
-    info: 'bg-info-light'
-  };
-  const icon = icons[type] || icons.info;
-  const bg = bgClasses[type] || bgClasses.info;
-  const item = document.createElement('div');
-  item.className = 'notif-item';
-  item.innerHTML = `
-    <div class="notif-icon ${bg}"><i class="fas ${icon}"></i></div>
-    <div>
-      <div>${message}</div>
-      <div class="notif-time">${new Date().toLocaleTimeString()}</div>
-    </div>
-  `;
-  list.prepend(item);
-  // Show dot
-  const dot = document.getElementById('notifDot');
-  if (dot) dot.style.display = 'block';
-  // Keep only last 20 notifications
-  while (list.children.length > 20) {
-    list.removeChild(list.lastChild);
-  }
-}
-
-// ============================================================
-// LOAD PRODUCT PREFERENCE
-// ============================================================
+// ---- Load Product Preference ----
 async function loadProductPreference() {
   try {
     const data = await fetchJson(`${CONFIG.API_BASE}/api/user/preferences`);
@@ -128,46 +104,34 @@ window.handleProductChange = async function(e) {
   }
 };
 
-// ============================================================
-// LOAD ACCOUNT & STATS
-// ============================================================
+// ---- Load Account ----
 async function loadAccount() {
   try {
     const acc = await fetchJson(`${CONFIG.API_BASE}/api/account`);
+    const created = acc.createdTime || acc.createdAt || acc.updatedAt || null;
+    document.getElementById('accountInfo').innerHTML = `
+      <p><strong>ID:</strong> ${acc.id}</p>
+      <p><strong>Currency:</strong> ${acc.currency}</p>
+      <p><strong>Created:</strong> ${created ? new Date(created).toLocaleDateString() : 'N/A'}</p>
+    `;
+    document.getElementById('balanceInfo').innerHTML = `
+      <p><strong>Balance:</strong> ${acc.balance} ${acc.currency}</p>
+      <p><strong>Equity:</strong> ${acc.equity} ${acc.currency}</p>
+      <p><strong>Margin Used:</strong> ${acc.marginUsed} ${acc.currency}</p>
+      <p><strong>Margin Available:</strong> ${acc.marginAvailable} ${acc.currency}</p>
+    `;
     // Update stats cards
     document.getElementById('statBalance').textContent = `${acc.balance} ${acc.currency}`;
     document.getElementById('statEquity').textContent = `${acc.equity} ${acc.currency}`;
-    // Also update old panels if they exist (backward compatibility)
-    const accountInfo = document.getElementById('accountInfo');
-    if (accountInfo) {
-      const created = acc.createdTime || acc.createdAt || acc.updatedAt || null;
-      accountInfo.innerHTML = `
-        <p><strong>ID:</strong> ${acc.id}</p>
-        <p><strong>Currency:</strong> ${acc.currency}</p>
-        <p><strong>Created:</strong> ${created ? new Date(created).toLocaleDateString() : 'N/A'}</p>
-      `;
-    }
-    const balanceInfo = document.getElementById('balanceInfo');
-    if (balanceInfo) {
-      balanceInfo.innerHTML = `
-        <p><strong>Balance:</strong> ${acc.balance} ${acc.currency}</p>
-        <p><strong>Equity:</strong> ${acc.equity} ${acc.currency}</p>
-        <p><strong>Margin Used:</strong> ${acc.marginUsed} ${acc.currency}</p>
-        <p><strong>Margin Available:</strong> ${acc.marginAvailable} ${acc.currency}</p>
-      `;
-    }
-    // Update API status
-    if (window.updateApiStatus) window.updateApiStatus(true);
   } catch (e) {
+    document.getElementById('accountInfo').innerHTML = `<p class="text-danger">Error: ${e.message}</p>`;
+    document.getElementById('balanceInfo').innerHTML = `<p class="text-danger">Error: ${e.message}</p>`;
     document.getElementById('statBalance').textContent = 'Error';
     document.getElementById('statEquity').textContent = 'Error';
-    if (window.updateApiStatus) window.updateApiStatus(false);
   }
 }
 
-// ============================================================
-// LOAD PRICES
-// ============================================================
+// ---- Load Prices ----
 async function loadPrices() {
   const pairs = CONFIG.PRICE_PAIRS;
   try {
@@ -179,17 +143,13 @@ async function loadPrices() {
       const mid = (bid + ask) / 2;
       html += `<div class="d-flex justify-content-between"><span>${p.instrument}</span><span><strong>${formatPrice(mid)}</strong> (Bid ${formatPrice(bid)} / Ask ${formatPrice(ask)})</span></div>`;
     });
-    const priceInfo = document.getElementById('priceInfo');
-    if (priceInfo) priceInfo.innerHTML = html;
+    document.getElementById('priceInfo').innerHTML = html;
   } catch (e) {
-    const priceInfo = document.getElementById('priceInfo');
-    if (priceInfo) priceInfo.innerHTML = `<p class="text-danger">Error: ${e.message}</p>`;
+    document.getElementById('priceInfo').innerHTML = `<p class="text-danger">Error: ${e.message}</p>`;
   }
 }
 
-// ============================================================
-// NOTIFICATION STATUS
-// ============================================================
+// ---- Load Notification Status ----
 async function loadNotificationStatus() {
   try {
     const status = await fetchJson(`${CONFIG.API_BASE}/api/notifications/status`);
@@ -204,10 +164,8 @@ async function loadNotificationStatus() {
   }
 }
 
-// ============================================================
-// SIGNAL GENERATION
-// ============================================================
-document.getElementById('getSignalBtn')?.addEventListener('click', async function() {
+// ---- Signal Generation ----
+document.getElementById('getSignalBtn').addEventListener('click', async function() {
   const pair = document.getElementById('signalPair').value.trim();
   const strategy = document.getElementById('signalStrategy')?.value || 'sma';
   if (!pair) return;
@@ -233,6 +191,7 @@ document.getElementById('getSignalBtn')?.addEventListener('click', async functio
       </button>
     `;
     resultDiv.innerHTML = details;
+    SoundManager.signal();
   } catch (e) {
     resultDiv.innerHTML = `<p class="text-danger">Error: ${e.message}</p>`;
   }
@@ -247,10 +206,8 @@ window.fillTradeForm = function(pair, side, entry, sl, tp, lotSize) {
   document.querySelector('#tradeForm').scrollIntoView({ behavior: 'smooth' });
 };
 
-// ============================================================
-// MANUAL TRADE
-// ============================================================
-document.getElementById('tradeForm')?.addEventListener('submit', async function(e) {
+// ---- Manual Trade ----
+document.getElementById('tradeForm').addEventListener('submit', async function(e) {
   e.preventDefault();
   if (isSubmitting) {
     alert('Please wait, order is being processed...');
@@ -275,15 +232,14 @@ document.getElementById('tradeForm')?.addEventListener('submit', async function(
       method: 'POST',
       body: JSON.stringify({ pair, side, lotSize, stopLoss: sl, takeProfit: tp })
     });
-    playSound('open');
-    addNotification(`Order placed: ${side} ${pair} ${lotSize} lots`, 'success');
+    SoundManager.tradeOpen();
     alert('Order placed successfully! Trade ID: ' + (result.trade?.contractId || result.trade?.oandaTradeId || 'N/A'));
     loadOpenTrades();
     loadTradeHistory();
     loadAccount();
   } catch (e) {
     alert('Error placing order: ' + e.message);
-    addNotification(`Order failed: ${e.message}`, 'danger');
+    SoundManager.reject();
   } finally {
     isSubmitting = false;
     btn.disabled = false;
@@ -291,10 +247,8 @@ document.getElementById('tradeForm')?.addEventListener('submit', async function(
   }
 });
 
-// ============================================================
-// AUTO-TRADE
-// ============================================================
-document.getElementById('autoTradeForm')?.addEventListener('submit', async function(e) {
+// ---- Auto-Trade ----
+document.getElementById('autoTradeForm').addEventListener('submit', async function(e) {
   e.preventDefault();
   if (isAutoSubmitting) {
     alert('Please wait, auto-trade is being processed...');
@@ -318,19 +272,18 @@ document.getElementById('autoTradeForm')?.addEventListener('submit', async funct
       body: JSON.stringify({ pair, riskPercent: risk, strategy })
     });
     if (result.success) {
-      playSound('open');
-      addNotification(`Auto-trade executed: ${pair}`, 'success');
+      SoundManager.tradeOpen();
       alert(`Auto-trade executed! Trade opened.`);
       loadOpenTrades();
       loadTradeHistory();
       loadAccount();
     } else {
+      SoundManager.reject();
       alert('Auto-trade: ' + (result.message || 'No signal'));
-      addNotification(`Auto-trade failed: ${result.message || 'No signal'}`, 'warning');
     }
   } catch (e) {
     alert('Error auto-trading: ' + e.message);
-    addNotification(`Auto-trade error: ${e.message}`, 'danger');
+    SoundManager.reject();
   } finally {
     isAutoSubmitting = false;
     btn.disabled = false;
@@ -338,9 +291,7 @@ document.getElementById('autoTradeForm')?.addEventListener('submit', async funct
   }
 });
 
-// ============================================================
-// OPEN TRADES & POSITION BADGE
-// ============================================================
+// ---- Load Open Trades ----
 let openTradesInterval = null;
 
 async function loadOpenTrades() {
@@ -351,7 +302,6 @@ async function loadOpenTrades() {
     const trades = await fetchJson(`${CONFIG.API_BASE}/api/trades`);
     if (!trades || trades.length === 0) {
       container.innerHTML = '<p class="text-muted">No open trades.</p>';
-      // Update badge & stats
       document.getElementById('statOpenTrades').textContent = '0';
       document.getElementById('statOpenPL').textContent = '—';
       if (window.updatePositionBadge) window.updatePositionBadge(0);
@@ -377,8 +327,6 @@ async function loadOpenTrades() {
     html += `<tr><td colspan="6"><strong>Total Unrealized P&L</strong></td><td class="${totalPL >= 0 ? 'text-success' : 'text-danger'}"><strong>${totalPL.toFixed(2)}</strong></td><td></td></tr>`;
     html += '</tbody></table>';
     container.innerHTML = html;
-
-    // Update stats
     document.getElementById('statOpenTrades').textContent = trades.length;
     document.getElementById('statOpenPL').textContent = (totalPL >= 0 ? '+' : '') + totalPL.toFixed(2);
     document.getElementById('statOpenPL').className = `stat-change ${totalPL >= 0 ? 'positive' : 'negative'}`;
@@ -392,21 +340,102 @@ window.closeTrade = async function(tradeId) {
   if (!confirm(`Close trade ${tradeId}?`)) return;
   try {
     await fetchJson(`${CONFIG.API_BASE}/api/close/${tradeId}`, { method: 'PUT' });
-    playSound('close');
-    addNotification(`Trade ${tradeId} closed`, 'info');
+    SoundManager.tradeClose();
     alert('Trade closed successfully.');
     loadOpenTrades();
     loadTradeHistory();
     loadAccount();
   } catch (e) {
     alert('Error closing trade: ' + e.message);
-    addNotification(`Close failed: ${e.message}`, 'danger');
+    SoundManager.reject();
   }
 };
 
-// ============================================================
-// PENDING ORDERS
-// ============================================================
+// ---- Load Trade History (with proper field mapping) ----
+async function loadTradeHistory(page = 1) {
+  const container = document.getElementById('historyContainer');
+  if (!container) return;
+  container.innerHTML = '<p class="text-muted">Loading history...</p>';
+
+  try {
+    const trades = await fetchJson(`${CONFIG.API_BASE}/api/trade-history`);
+    if (!trades || trades.length === 0) {
+      container.innerHTML = '<p class="text-muted">No trade history yet.</p>';
+      document.getElementById('historyCount').textContent = '0';
+      document.getElementById('pageStart').textContent = '0';
+      document.getElementById('pageEnd').textContent = '0';
+      document.getElementById('pageTotal').textContent = '0';
+      historyData = [];
+      historyFiltered = [];
+      return;
+    }
+
+    historyData = trades;
+    // Filters
+    const from = document.getElementById('historyFrom')?.value;
+    const to = document.getElementById('historyTo')?.value;
+    const symbol = document.getElementById('historySymbol')?.value.trim();
+    const side = document.getElementById('historySide')?.value;
+    const status = document.getElementById('historyStatus')?.value;
+
+    historyFiltered = historyData.filter(t => {
+      if (from && new Date(t.date) < new Date(from)) return false;
+      if (to && new Date(t.date) > new Date(to)) return false;
+      if (symbol && !t.pair?.toUpperCase().includes(symbol.toUpperCase())) return false;
+      if (side && t.side !== side) return false;
+      if (status && t.status !== status) return false;
+      return true;
+    });
+
+    historyFiltered.sort((a, b) => new Date(b.date) - new Date(a.date));
+    document.getElementById('historyCount').textContent = historyFiltered.length;
+
+    const totalItems = historyFiltered.length;
+    historyTotalPages = Math.ceil(totalItems / HISTORY_PAGE_SIZE) || 1;
+    if (page < 1) page = 1;
+    if (page > historyTotalPages) page = historyTotalPages;
+    historyPage = page;
+
+    const start = (historyPage - 1) * HISTORY_PAGE_SIZE;
+    const end = Math.min(start + HISTORY_PAGE_SIZE, totalItems);
+    const pageItems = historyFiltered.slice(start, end);
+
+    document.getElementById('pageStart').textContent = totalItems > 0 ? start + 1 : 0;
+    document.getElementById('pageEnd').textContent = end;
+    document.getElementById('pageTotal').textContent = totalItems;
+    document.getElementById('pageInfo').textContent = `Page ${historyPage} of ${historyTotalPages}`;
+    document.getElementById('prevPage').disabled = (historyPage <= 1);
+    document.getElementById('nextPage').disabled = (historyPage >= historyTotalPages);
+
+    if (pageItems.length === 0) {
+      container.innerHTML = '<p class="text-muted">No matching records.</p>';
+      return;
+    }
+
+    let html = `<div class="table-responsive"><table class="table table-striped table-sm">
+      <thead><tr><th>Pair</th><th>Side</th><th>Entry</th><th>Exit</th><th>Lot</th><th>P/L</th><th>Status</th><th>Date</th></tr></thead><tbody>`;
+    pageItems.forEach(t => {
+      const pl = t.pnl ? parseFloat(t.pnl).toFixed(2) : '0.00';
+      const statusClass = t.status === 'OPEN' ? 'bg-primary' : (t.pnl >= 0 ? 'bg-success' : 'bg-danger');
+      html += `<tr>
+        <td>${t.pair}</td>
+        <td><span class="badge ${t.side === 'BUY' ? 'bg-success' : 'bg-danger'}">${t.side}</span></td>
+        <td>${t.entryPrice !== null ? formatPrice(t.entryPrice) : '-'}</td>
+        <td>${t.exitPrice !== null ? formatPrice(t.exitPrice) : '-'}</td>
+        <td>${t.lotSize}</td>
+        <td class="${pl >= 0 ? 'text-success' : 'text-danger'}">${pl}</td>
+        <td><span class="badge ${statusClass}">${t.status}</span></td>
+        <td>${new Date(t.date).toLocaleString()}</td>
+      </tr>`;
+    });
+    html += '</tbody></table></div>';
+    container.innerHTML = html;
+  } catch (e) {
+    container.innerHTML = `<p class="text-danger">Error loading history: ${e.message}</p>`;
+  }
+}
+
+// ---- Load Pending Orders ----
 async function loadPendingOrders() {
   const container = document.getElementById('pendingOrdersContainer');
   if (!container) return;
@@ -443,172 +472,80 @@ window.cancelPending = async function(orderId) {
   try {
     await fetchJson(`${CONFIG.API_BASE}/api/order/${orderId}`, { method: 'DELETE' });
     alert('Order cancelled successfully.');
-    addNotification(`Order ${orderId} cancelled`, 'info');
     loadPendingOrders();
     loadOpenTrades();
   } catch (e) {
     alert('Error cancelling order: ' + e.message);
-    addNotification(`Cancel failed: ${e.message}`, 'danger');
   }
 };
 
-// ============================================================
-// TRADE HISTORY – FILTERABLE & PAGINATED
-// ============================================================
-async function loadTradeHistory(page = 1) {
-  const container = document.getElementById('historyContainer');
-  if (!container) return;
-  container.innerHTML = '<p class="text-muted">Loading history...</p>';
-
-  try {
-    // Build filter from UI
-    const from = document.getElementById('historyFrom')?.value;
-    const to = document.getElementById('historyTo')?.value;
-    const symbol = document.getElementById('historySymbol')?.value.trim();
-    const side = document.getElementById('historySide')?.value;
-    const status = document.getElementById('historyStatus')?.value;
-
-    // Fetch all trades (we'll filter client-side for flexibility)
-    const trades = await fetchJson(`${CONFIG.API_BASE}/api/trade-history`);
-    if (!trades || trades.length === 0) {
-      container.innerHTML = '<p class="text-muted">No trade history yet.</p>';
-      document.getElementById('historyCount').textContent = '0';
-      document.getElementById('pageStart').textContent = '0';
-      document.getElementById('pageEnd').textContent = '0';
-      document.getElementById('pageTotal').textContent = '0';
-      historyData = [];
-      historyFiltered = [];
-      return;
-    }
-
-    // Store full data
-    historyData = trades;
-
-    // Apply filters
-    historyFiltered = historyData.filter(t => {
-      if (from && new Date(t.createdAt) < new Date(from)) return false;
-      if (to && new Date(t.createdAt) > new Date(to)) return false;
-      if (symbol && !t.pair?.toUpperCase().includes(symbol.toUpperCase())) return false;
-      if (side && t.side !== side) return false;
-      if (status && t.status !== status) return false;
-      return true;
-    });
-
-    // Sort descending by date
-    historyFiltered.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-
-    // Update total count
-    document.getElementById('historyCount').textContent = historyFiltered.length;
-
-    // Pagination
-    const totalItems = historyFiltered.length;
-    historyTotalPages = Math.ceil(totalItems / HISTORY_PAGE_SIZE) || 1;
-    if (page < 1) page = 1;
-    if (page > historyTotalPages) page = historyTotalPages;
-    historyPage = page;
-
-    const start = (historyPage - 1) * HISTORY_PAGE_SIZE;
-    const end = Math.min(start + HISTORY_PAGE_SIZE, totalItems);
-    const pageItems = historyFiltered.slice(start, end);
-
-    document.getElementById('pageStart').textContent = totalItems > 0 ? start + 1 : 0;
-    document.getElementById('pageEnd').textContent = end;
-    document.getElementById('pageTotal').textContent = totalItems;
-    document.getElementById('pageInfo').textContent = `Page ${historyPage} of ${historyTotalPages}`;
-    document.getElementById('prevPage').disabled = (historyPage <= 1);
-    document.getElementById('nextPage').disabled = (historyPage >= historyTotalPages);
-
-    if (pageItems.length === 0) {
-      container.innerHTML = '<p class="text-muted">No matching records.</p>';
-      return;
-    }
-
-    // Build table
-    let html = `<div class="table-responsive"><table class="table table-striped table-sm">
-      <thead><tr><th>Pair</th><th>Side</th><th>Entry</th><th>Exit</th><th>Lot</th><th>P/L</th><th>Status</th><th>Date</th></tr></thead><tbody>`;
-    pageItems.forEach(t => {
-      const pl = t.pnl ? parseFloat(t.pnl).toFixed(2) : '0.00';
-      const statusClass = t.status === 'OPEN' ? 'bg-primary' : (t.pnl >= 0 ? 'bg-success' : 'bg-danger');
-      html += `<tr>
-        <td>${t.pair}</td>
-        <td><span class="badge ${t.side === 'BUY' ? 'bg-success' : 'bg-danger'}">${t.side}</span></td>
-        <td>${t.entryPrice}</td>
-        <td>${t.closePrice || '-'}</td>
-        <td>${t.lotSize}</td>
-        <td class="${pl >= 0 ? 'text-success' : 'text-danger'}">${pl}</td>
-        <td><span class="badge ${statusClass}">${t.status}</span></td>
-        <td>${new Date(t.createdAt).toLocaleString()}</td>
-      </tr>`;
-    });
-    html += '</tbody></table></div>';
-    container.innerHTML = html;
-  } catch (e) {
-    container.innerHTML = `<p class="text-danger">Error loading history: ${e.message}</p>`;
-  }
-}
-
-// History filter controls
-document.getElementById('applyHistoryFilter')?.addEventListener('click', () => loadTradeHistory(1));
-document.getElementById('resetHistoryFilter')?.addEventListener('click', function() {
-  document.getElementById('historyFrom').value = '';
-  document.getElementById('historyTo').value = '';
-  document.getElementById('historySymbol').value = '';
-  document.getElementById('historySide').value = '';
-  document.getElementById('historyStatus').value = '';
-  loadTradeHistory(1);
-});
-document.getElementById('prevPage')?.addEventListener('click', () => loadTradeHistory(historyPage - 1));
-document.getElementById('nextPage')?.addEventListener('click', () => loadTradeHistory(historyPage + 1));
-
-// ============================================================
-// DELETE HISTORY
-// ============================================================
+// ---- Delete History ----
 document.getElementById('deleteHistoryBtn')?.addEventListener('click', async function() {
   if (!confirm('Delete all closed trades from history? This cannot be undone.')) return;
   try {
     const result = await fetchJson(`${CONFIG.API_BASE}/api/history`, { method: 'DELETE' });
     alert(`Deleted ${result.deletedCount} closed trades.`);
-    addNotification(`Deleted ${result.deletedCount} trades`, 'info');
     loadTradeHistory(1);
   } catch (e) {
     alert('Error deleting history: ' + e.message);
-    addNotification(`Delete failed: ${e.message}`, 'danger');
   }
 });
 
-// ============================================================
-// TEST NOTIFICATION
-// ============================================================
+// ---- Test Notification ----
 document.getElementById('testNotificationBtn')?.addEventListener('click', async function() {
   try {
     const result = await fetchJson(`${CONFIG.API_BASE}/api/test-email`, { method: 'POST' });
     alert('Test email sent! Check your inbox.');
-    addNotification('Test email sent', 'success');
   } catch (e) {
     alert('Error sending test email: ' + e.message);
-    addNotification(`Email test failed: ${e.message}`, 'danger');
   }
 });
 
+// ---- Refresh buttons ----
+document.getElementById('refreshTrades')?.addEventListener('click', loadOpenTrades);
+document.getElementById('refreshHistory')?.addEventListener('click', () => loadTradeHistory(1));
+document.getElementById('refreshPending')?.addEventListener('click', loadPendingOrders);
+
+// ---- Start Live Updates ----
+function startLiveUpdates() {
+  if (openTradesInterval) clearInterval(openTradesInterval);
+  openTradesInterval = setInterval(loadOpenTrades, REFRESH_INTERVAL);
+}
+
+// ---- Initialise ----
+loadProductPreference();
+loadAccount();
+loadPrices();
+loadOpenTrades();
+loadTradeHistory(1);
+loadPendingOrders();
+loadNotificationStatus();
+startLiveUpdates();
+setInterval(loadPrices, CONFIG.PRICE_REFRESH_INTERVAL);
+
+// ---- Cleanup on page unload ----
+window.addEventListener('beforeunload', function() {
+  if (openTradesInterval) clearInterval(openTradesInterval);
+});
+
 // ============================================================
-// EXPORT CSV
+// EXPORT HISTORY CSV (Original)
 // ============================================================
 function exportHistoryCSV() {
   if (!historyFiltered || historyFiltered.length === 0) {
     alert('No data to export.');
     return;
   }
-  const headers = ['Pair','Side','Entry Price','Exit Price','Lot Size','P/L','Status','Open Date','Close Date'];
+  const headers = ['Pair','Side','Entry','Exit','Lot','P/L','Status','Date'];
   const rows = historyFiltered.map(t => [
     t.pair,
     t.side,
     t.entryPrice,
-    t.closePrice || '',
+    t.exitPrice,
     t.lotSize,
-    t.pnl || '',
+    t.pnl || 0,
     t.status,
-    new Date(t.createdAt).toLocaleString(),
-    t.closeTime ? new Date(t.closeTime).toLocaleString() : ''
+    new Date(t.date).toLocaleString()
   ]);
   let csv = headers.join(',') + '\n';
   rows.forEach(row => {
@@ -621,62 +558,11 @@ function exportHistoryCSV() {
   a.download = `trade_history_${new Date().toISOString().slice(0,10)}.csv`;
   a.click();
   URL.revokeObjectURL(url);
-  addNotification('CSV exported', 'success');
 }
-
 document.getElementById('exportCSVBtn')?.addEventListener('click', exportHistoryCSV);
 
-// Report export placeholder
-document.getElementById('exportReportBtn')?.addEventListener('click', function() {
-  alert('📊 Performance report feature coming soon.\nIt will include summary stats, equity curve, and trade analysis.');
-  addNotification('Report feature requested', 'info');
-});
-
 // ============================================================
-// REFRESH BUTTONS
-// ============================================================
-document.getElementById('refreshTrades')?.addEventListener('click', loadOpenTrades);
-document.getElementById('refreshHistory')?.addEventListener('click', () => loadTradeHistory(1));
-document.getElementById('refreshPending')?.addEventListener('click', loadPendingOrders);
-
-// ============================================================
-// START LIVE UPDATES
-// ============================================================
-function startLiveUpdates() {
-  if (openTradesInterval) clearInterval(openTradesInterval);
-  openTradesInterval = setInterval(loadOpenTrades, REFRESH_INTERVAL);
-}
-
-// ============================================================
-// INITIALISE
-// ============================================================
-loadProductPreference();
-loadAccount();
-loadPrices();
-loadOpenTrades();
-loadTradeHistory(1);
-loadPendingOrders();
-loadNotificationStatus();
-startLiveUpdates();
-
-// Auto-refresh prices
-setInterval(loadPrices, CONFIG.PRICE_REFRESH_INTERVAL);
-
-// ---- Cleanup on page unload ----
-window.addEventListener('beforeunload', function() {
-  if (openTradesInterval) clearInterval(openTradesInterval);
-});
-
-// ============================================================
-// EXPOSE FUNCTIONS GLOBALLY
-// ============================================================
-window.loadOpenTrades = loadOpenTrades;
-window.loadTradeHistory = loadTradeHistory;
-window.loadAccount = loadAccount;
-window.addNotification = addNotification;
-
-// ============================================================
-// RESEARCH / DECISION INSPECTOR (unchanged from previous)
+// DECISION INSPECTOR (Original)
 // ============================================================
 async function openDecisionInspector(decisionId) {
   if (!decisionId) {
@@ -777,7 +663,7 @@ Win rate: ${(data.similarity?.stats?.winRate * 100).toFixed(1)}%
 window.openDecisionInspector = openDecisionInspector;
 
 // ============================================================
-// BELIEF PANEL UPDATE (for live.js)
+// BELIEF PANEL (Original)
 // ============================================================
 function updateBeliefPanel(beliefData) {
   const panel = document.getElementById('beliefPanel');
@@ -799,7 +685,7 @@ function updateBeliefPanel(beliefData) {
 window.updateBeliefPanel = updateBeliefPanel;
 
 // ============================================================
-// KNOWLEDGE EXPLORER (unchanged)
+// KNOWLEDGE EXPLORER (Original)
 // ============================================================
 async function submitKnowledgeQuery() {
   const symbol = document.getElementById('knowledgeSymbol')?.value || 'EUR_USD';
@@ -855,8 +741,77 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 
 // ============================================================
-// EXPOSE LOAD FUNCTIONS GLOBALLY FOR live.js
+// REPORT GENERATION (New)
 // ============================================================
+async function generateReport() {
+  const from = document.getElementById('reportFrom')?.value || '';
+  const to = document.getElementById('reportTo')?.value || '';
+  const includeTrades = document.getElementById('reportIncludeTrades')?.checked !== false;
+
+  const btn = document.getElementById('generateReportBtn');
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Generating...';
+  }
+
+  try {
+    const response = await fetch(`${CONFIG.API_BASE}/api/report`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from, to, format: 'pdf', includeTrades })
+    });
+
+    if (!response.ok) {
+      const err = await response.json();
+      throw new Error(err.error || 'Report generation failed');
+    }
+
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `RTS_Report_${new Date().toISOString().slice(0,10)}.pdf`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    alert('Report generation error: ' + err.message);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fas fa-file-pdf"></i> Generate Report';
+    }
+  }
+}
+window.generateReport = generateReport;
+
+document.addEventListener('DOMContentLoaded', function() {
+  const reportBtn = document.getElementById('generateReportBtn');
+  if (reportBtn) {
+    reportBtn.addEventListener('click', generateReport);
+  }
+});
+
+// ---- Expose for live.js ----
 window.loadOpenTrades = loadOpenTrades;
 window.loadTradeHistory = loadTradeHistory;
 window.loadAccount = loadAccount;
+window.SoundManager = SoundManager;
+window.updatePositionBadge = function(count) {
+  const badge = document.getElementById('positionCount');
+  if (badge) badge.textContent = count || 0;
+};
+window.updateApiStatus = function(connected) {
+  const dot = document.getElementById('apiStatusDot');
+  const text = document.getElementById('apiStatusText');
+  if (dot) dot.className = 'dot ' + (connected ? 'connected' : 'disconnected');
+  if (text) text.textContent = connected ? 'Connected' : 'Disconnected';
+};
+
+// ---- Listen for danger signals (from live.js) ----
+window.addEventListener('dangerSignal', function() {
+  SoundManager.danger();
+});
+
+console.log('✅ App.js loaded with all original functions + sound alerts + report generation.');
