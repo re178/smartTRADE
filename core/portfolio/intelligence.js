@@ -180,6 +180,24 @@ class PortfolioIntelligence extends EventEmitter {
   }
 
   /**
+   * Get a quick exposure summary for dashboard/decision engine.
+   * @returns {Object} { totalExposure, maxExposure, utilization, pairExposures, concentration, averageDirection }
+   */
+  getExposureSummary() {
+    const metrics = this.getMetrics();
+    return {
+      totalExposure: metrics.totalExposure || 0,
+      maxExposure: metrics.maxExposure || 0,
+      utilization: metrics.maxExposure > 0 ? (metrics.totalExposure / metrics.maxExposure) : 0,
+      pairExposures: metrics.exposureByPair || {},
+      concentration: metrics.concentration || 0,
+      averageDirection: metrics.averageDirection || 0,
+      totalPositions: metrics.totalPositions || 0,
+      totalUnrealizedPL: metrics.totalUnrealizedPL || 0,
+    };
+  }
+
+  /**
    * Compute comprehensive portfolio metrics.
    */
   _computeMetrics(positions) {
@@ -192,6 +210,7 @@ class PortfolioIntelligence extends EventEmitter {
         concentration: 0,
         averageDirection: 0,
         correlations: [],
+        maxExposure: 0,
       };
     }
 
@@ -233,6 +252,7 @@ class PortfolioIntelligence extends EventEmitter {
       concentration,
       averageDirection,
       correlations: [], // We'll compute on demand
+      maxExposure: 0, // This will be set later if needed
     };
   }
 
