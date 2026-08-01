@@ -423,6 +423,18 @@
     .gap-2 { gap: 0.5rem; }
     .gap-3 { gap: 1rem; }
     .fw-600 { font-weight: 600; }
+
+    /* ──────────── MODAL STYLING ──────────── */
+    .modal-content {
+      border-radius: 12px;
+      border: none;
+    }
+    .modal-header {
+      border-bottom: 1px solid var(--border-light);
+    }
+    .modal-footer {
+      border-top: 1px solid var(--border-light);
+    }
   </style>
 </head>
 <body>
@@ -535,11 +547,11 @@
 
       <!-- Export / Download -->
       <div class="btn-group" role="group">
-        <button class="btn btn-outline-secondary btn-sm" id="exportReportBtn" title="Download Report">
-          <i class="fas fa-file-export"></i> Report
-        </button>
         <button class="btn btn-outline-secondary btn-sm" id="exportCSVBtn" title="Export CSV">
           <i class="fas fa-file-csv"></i>
+        </button>
+        <button class="btn btn-outline-primary btn-sm" id="reportModalBtn" data-bs-toggle="modal" data-bs-target="#reportModal" title="Generate Report">
+          <i class="fas fa-file-pdf"></i> Report
         </button>
       </div>
     </div>
@@ -810,7 +822,24 @@
       <div class="card-header"><span class="card-title"><i class="fas fa-flask"></i> Knowledge Explorer</span></div>
       <div class="card-body">
         <div class="row g-2 mb-3">
-          <div class="col-md-2"><label class="form-label small">Symbol</label><input type="text" id="knowledgeSymbol" class="form-control" value="EUR_USD" /></div>
+          <div class="col-md-2"><label class="form-label small">Symbol</label <div class="page-info">Showing <span id="pageStart">0</span>–<span id="pageEnd">0</span> of <span id="pageTotal">0</span></div>
+          <div>
+            <button class="btn btn-sm btn-outline-secondary" id="prevPage" disabled><i class="fas fa-chevron-left"></i></button>
+            <span class="mx-2" id="pageInfo">Page 1</span>
+            <button class="btn btn-sm btn-outline-secondary" id="nextPage"><i class="fas fa-chevron-right"></i></button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== RESEARCH LAB SECTION ===== -->
+  <div id="section-research" class="section-content" style="display:none;">
+    <div class="card">
+      <div class="card-header"><span class="card-title"><i class="fas fa-flask"></i> Knowledge Explorer</span></div>
+      <div class="card-body">
+        <div class="row g-2 mb-3">
+          <div class="col-md-2"><label class="form-label small">Symbol</label><input type="text><input type="text" id="knowledgeSymbol" class="form-control" value="EUR_USD" /></div>
           <div class="col-md-2"><label class="form-label small">Timeframe</label>
             <select id="knowledgeTimeframe" class="form-select"><option value="M5">M5</option><option value="M15">M15</option><option value="H1">H1</option></select>
           </div>
@@ -827,7 +856,24 @@
             <button class="btn btn-primary w-100" id="knowledgeSearchBtn"><i class="fas fa-search"></i> Search</button>
           </div>
         </div>
-        <div id="knowledgeResults"><p class="text-muted">Enter filters and click Search to explore historical market states.</p></div>
+        <div id="knowledgeResults"><p class="text-muted">Enter" id="knowledgeSymbol" class="form-control" value="EUR_USD" /></div>
+          <div class="col-md-2"><label class="form-label small">Timeframe</label>
+            <select id="knowledgeTimeframe" class="form-select"><option value="M5">M5</option><option value="M15">M15</option><option value="H1">H1</option></select>
+          </div>
+          <div class="col-md-2"><label class="form-label small">Regime</label>
+            <select id="knowledgeRegime" class="form-select"><option value="">Any</option><option value="STRONG_TREND_BULL">Bull Trend</option><option value="STRONG_TREND_BEAR">Bear Trend</option><option value="RANGING">Ranging</option><option value="BREAKOUT">Breakout</option></select>
+          </div>
+          <div class="col-md-2"><label class="form-label small">Session</label>
+            <select id="knowledgeSession" class="form-select"><option value="">Any</option><option value="London">London</option><option value="New York">NY</option><option value="Asia">Asia</option></select>
+          </div>
+          <div class="col-md-2"><label class="form-label small">Lookahead</label>
+            <select id="knowledgeLookahead" class="form-select"><option value="5">5</option><option value="10">10</option><option value="20">20</option><option value="40">40</option></select>
+          </div>
+          <div class="col-md-2 d-flex align-items-end">
+            <button class="btn btn-primary w-100" id="knowledgeSearchBtn"><i class="fas fa-search"></i> Search</button>
+          </div>
+        </div>
+        <div id="knowledgeResults"><p class="text-muted">Enter filters and click filters and click Search to explore historical market states.</p></div>
       </div>
     </div>
   </div>
@@ -861,6 +907,92 @@
 
 </div><!-- /.main-content -->
 
+<!-- ============================================================ -->
+<!-- ============== REPORT GENERATION MODAL ===================== -->
+<!-- ============================================================ -->
+<div class="modal fade" id="reportModal" tabindex="-1" aria-labelledby="reportModalLabel" aria-hidden="true">
+  <div class="modal-dialog modal-md">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="reportModalLabel"><i class="fas fa-file-pdf text-primary"></i> Generate Report</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <form id="reportForm">
+          <div class="mb-3">
+            <label for="reportFrom" class="form-label">From Date</label>
+            <input type="date" class="form-control" id="reportFrom" />
+          </div>
+          Search to explore historical market states.</p></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== NOTIFICATIONS SECTION ===== -->
+  <div id="section-notifications" class="section-content" style="display:none;">
+    <div class="card">
+      <div class="card-header"><span class="card-title"><i class="fas fa-bell"></i> Notification Settings</span></div>
+      <div class="card-body">
+        <div class="row">
+          <div class="col-md-6">
+            <p><strong>Email</strong> <span id="emailStatus" class="badge bg-secondary">Checking...</span></p>
+            <p>Email: <span id="emailAddress">-</span></p>
+            <button class="btn btn-sm btn-outline-primary" id="testNotificationBtn">Test Notification</button>
+          </div>
+          <div class="col-md-6">
+            <p><strong>Instagram</strong> <span id="instagramStatus" class="badge bg-secondary">Checking...</span></p>
+            <div class="form-check form-switch mt-2">
+              <input class="form-check-input" type="checkbox" id="notifEmailToggle" checked />
+              <label class="form-check-label" for="notifEmailToggle">Email alerts</label>
+            </div>
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" id="notifSoundToggle" checked />
+              <label class="form-check-label" for="notifSoundToggle">Sound alerts</label>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /.main-content -->
+
+<!-- ============================================================ -->
+<!-- ============== REPORT GENERATION MODAL ===================== -->
+<!-- ============================================================ -->
+<div class="modal fade" id="reportModal" tabindex="-1" aria-labelledby="reportModalLabel" aria-hidden="true">
+  <div class="modal-dialog modal-md">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="reportModalLabel"><i class="fas fa-file-pdf text-primary"></i> Generate Report</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <form id="reportForm">
+          <div class="mb-3">
+            <label for="reportFrom" class="form-label">From Date</label>
+            <input type="date" class="form-control" id="report <div class="mb-3">
+            <label for="reportTo" class="form-label">To Date</label>
+            <input type="date" class="form-control" id="reportTo" />
+          </div>
+          <div class="form-check mb-3">
+            <input class="form-check-input" type="checkbox" id="reportIncludeTrades" checked />
+            <label class="form-check-label" for="reportIncludeTrades">
+              Include trade history
+            </label>
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-primary" id="generateReportBtn">
+          <i class="fas fa-file-pdf"></i> Generate Report
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- ──────────────────────────────────────────────── -->
 <!-- SCRIPTS                                       -->
 <!-- ──────────────────────────────────────────────── -->
@@ -868,7 +1000,7 @@
 <script src="js/app.js"></script>
 <script src="js/live.js"></script>
 
-<!-- ──── Dashboard navigation ──── -->
+<!-- ──── Dashboard navigation & Report modal handler ──── -->
 <script>
 (function() {
   // Sidebar toggle
@@ -897,7 +1029,7 @@
     positions: document.getElementById('section-positions'),
     history: document.getElementById('section-history'),
     research: document.getElementById('section-research'),
-    signals: document.getElementById('section-dashboard'), // signals are in dashboard
+    signals: document.getElementById('section-dashboard'),
     regime: document.getElementById('section-dashboard'),
     notifications: document.getElementById('section-notifications'),
   };
@@ -916,22 +1048,103 @@
   navItems.forEach(item => {
     item.addEventListener('click', function() {
       const section = this.dataset.section;
-      // Update active state
       navItems.forEach(n => n.classList.remove('active'));
       this.classList.add('active');
-      // Show section
       Object.keys(sections).forEach(key => {
         if (sections[key]) {
           sections[key].style.display = key === section ? 'block' : 'none';
         }
       });
-      // Update title
+      pageTitle.textContent = sectionNames[section] || section.charAt(0From" />
+          </div>
+          <div class="mb-3">
+            <label for="reportTo" class="form-label">To Date</label>
+            <input type="date" class="form-control" id="reportTo" />
+          </div>
+          <div class="form-check mb-3">
+            <input class="form-check-input" type="checkbox" id="reportIncludeTrades" checked />
+            <label class="form-check-label" for="reportIncludeTrades">
+              Include trade history
+            </label>
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-primary" id="generateReportBtn">
+          <i class="fas fa-file-pdf"></i> Generate Report
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ──────────────────────────────────────────────── -->
+<!-- SCRIPTS                                       -->
+<!-- ──────────────────────────────────────────────── -->
+<script src="js/config.js"></script>
+<script src="js/app.js"></script>
+<script src="js/live.js"></script>
+
+<!-- ──── Dashboard navigation & Report modal handler ──── -->
+<script>
+(function() {
+  // Sidebar toggle
+  const sidebar = document.getElementById('sidebar');
+  const toggleBtn = document.getElementById('sidebarToggle');
+  if (toggleBtn) {
+    toggleBtn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      sidebar.classList.toggle('open');
+    });
+  }
+  // Close sidebar on outside click (mobile)
+  document.addEventListener('click', function(e) {
+    if (window.innerWidth <= 992 && sidebar.classList.contains('open')) {
+      if (!sidebar.contains(e.target) && !toggleBtn.contains(e.target)) {
+        sidebar.classList.remove('open');
+      }
+    }
+  });
+
+  // Navigation switching
+  const navItems = document.querySelectorAll('.sidebar-nav .nav-item[data-section]');
+  const sections = {
+    dashboard: document.getElementById('section-dashboard'),
+    trading: document.getElementById('section-trading'),
+    positions: document.getElementById('section-positions'),
+    history: document.getElementById('section-history'),
+    research: document.getElementById('section-research'),
+    signals: document.getElementById('section-dashboard'),
+    regime: document.getElementById('section-dashboard'),
+    notifications: document.getElementById('section-notifications'),
+  };
+  const pageTitle = document.getElementById('pageTitle');
+  const sectionNames = {
+    dashboard: 'Dashboard',
+    trading: 'Trading',
+    positions: 'Positions',
+    history: 'Trade History',
+    research: 'Research Lab',
+    signals: 'Dashboard',
+    regime: 'Dashboard',
+    notifications: 'Notifications',
+  };
+
+  navItems.forEach(item => {
+    item.addEventListener('click', function() {
+      const section = this.dataset.section;
+      navItems.forEach(n => n.classList.remove('active'));
+      this.classList.add('active');
+      Object.keys(sections).forEach(key => {
+        if (sections[key]) {
+          sections[key].style.display = key === section ? 'block' : 'none';
+        }
+      });
       pageTitle.textContent = sectionNames[section] || section.charAt(0).toUpperCase() + section.slice(1);
-      // Close sidebar on mobile
       if (window.innerWidth <= 992) {
         sidebar.classList.remove('open');
       }
-      // Scroll to top
       window.scrollTo({ top: 0, behavior: 'smooth' });
     });
   });
@@ -958,20 +1171,56 @@
     notifDropdown.classList.remove('open');
   });
 
-  // Position count badge update (expose function)
+  // Position count badge update
   window.updatePositionBadge = function(count) {
     const badge = document.getElementById('positionCount');
     if (badge) badge.textContent = count || 0;
   };
 
-  // Export report
-  document.getElementById('exportReportBtn')?.addEventListener('click', function() {
-    alert('📊 Report download initiated.\n\nThis would generate a PDF/HTML performance report.\n(Feature: Downloadable Performance Report)');
+  // Export CSV
+  document.getElementById(').toUpperCase() + section.slice(1);
+      if (window.innerWidth <= 992) {
+        sidebar.classList.remove('open');
+      }
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    });
   });
+
+  // Notification dropdown
+  const notifToggle = document.getElementById('notifToggle');
+  const notifDropdown = document.getElementById('notifDropdown');
+  if (notifToggle) {
+    notifToggle.addEventListener('click', function(e) {
+      e.stopPropagation();
+      notifDropdown.classList.toggle('open');
+    });
+    document.addEventListener('click', function(e) {
+      if (!notifToggle.contains(e.target) && !notifDropdown.contains(e.target)) {
+        notifDropdown.classList.remove('open');
+      }
+    });
+  }
+
+  // Clear notifications
+  document.getElementById('clearNotifs')?.addEventListener('click', function() {
+    document.getElementById('notifList').innerHTML = '<div class="notif-item"><div class="text-muted">No notifications</div></div>';
+    document.getElementById('notifDot').style.display = 'none';
+    notifDropdown.classList.remove('open');
+  });
+
+  // Position count badge update
+  window.updatePositionBadge = function(count) {
+    const badge = document.getElementById('positionCount');
+    if (badge) badge.textContent = count || 0;
+  };
 
   // Export CSV
   document.getElementById('exportCSVBtn')?.addEventListener('click', function() {
-    alert('📄 CSV export initiated.\n\nThis would export trade history as CSV.\n(Feature: CSV Export)');
+    if (typeof window.exportHistoryCSV === 'function') {
+      window.exportHistoryCSV();
+    } else {
+      alert('CSV export function not available.');
+    }
   });
 
   // API status
@@ -985,7 +1234,68 @@
       text.textContent = connected ? 'Connected' : 'Disconnected';
     }
   };
+
+  // ---- Report modal handler ----
+  const generateReportBtn = document.getElementById('generateReportBtn');
+  if (generateReportBtn) {
+    generateReportBtn.addEventListener('click', function() {
+      if (typeof window.generateReport === 'function') {
+        // The function reads from reportFrom, reportTo, reportIncludeTrades IDs.
+        window.generateReport();
+        // Close modal after a short delay (the function will download PDF)
+        const modal = bootstrap.Modal.getInstance(document.getElementById('reportModal'));
+        if (modal) modal.hide();
+      } else {
+        alert('Report generation function not loadedexportCSVBtn')?.addEventListener('click', function() {
+    if (typeof window.exportHistoryCSV === 'function') {
+      window.exportHistoryCSV();
+    } else {
+      alert('CSV export function not available.');
+    }
+  });
+
+  // API status
+  window.updateApiStatus = function(connected) {
+    const dot = document.getElementById('apiStatusDot');
+    const text = document.getElementById('apiStatusText');
+    if (dot) {
+      dot.className = 'dot ' + (connected ? 'connected' : 'disconnected');
+    }
+    if (text) {
+      text.textContent = connected ? 'Connected' : 'Disconnected';
+    }
+  };
+
+  // ---- Report modal handler ----
+  const generateReportBtn = document.getElementById('generateReportBtn');
+  if (generateReportBtn) {
+    generateReportBtn.addEventListener('click', function() {
+      if (typeof window.generateReport === 'function') {
+        // The function reads from reportFrom, reportTo, reportIncludeTrades IDs.
+        window.generateReport();
+        // Close modal after a short delay (the function will download PDF)
+        const modal = bootstrap.Modal.getInstance(document.getElementById('reportModal'));
+        if (modal) modal.hide();
+      } else {
+        alert('Report generation function not loaded.');
+      }
+    });
+  }
+
+  // Set default dates (last 30 days)
+  const now = new Date();
+  const thirtyDaysAgo = new Date(now);
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+  const fromInput = document.getElementById('reportFrom');
+  const toInput = document.getElementById('reportTo');
+  if (fromInput) {
+    fromInput.value = thirtyDaysAgo.toISOString().slice(0,10);
+  }
+  if (toInput) {
+    toInput.value = now.toISOString().slice(0,10);
+  }
 })();
 </script>
+
 </body>
 </html>
