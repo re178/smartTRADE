@@ -47,8 +47,8 @@ async function inspect() {
     CandleModel = mongoose.model('HistoricalCandle', candleSchema);
   }
 
-  const StateModel = require('./models/HistoricalState');
-  const OutcomeModel = require('./models/HistoricalOutcome');
+  const StateModel = require('../models/HistoricalState');
+  const OutcomeModel = require('../models/HistoricalOutcome');
 
   // ---- 1. Candles ----
   printHeader('CANDLES (HistoricalCandle)');
