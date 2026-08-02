@@ -1,5 +1,5 @@
 // inspectData.js – Inspect Candles, States, and Outcomes
-// Run: node inspectData.js
+// Run: node scripts/inspectData.js
 
 require('dotenv').config();
 const mongoose = require('mongoose');
@@ -29,12 +29,10 @@ async function inspect() {
   console.log('✅ Connected.\n');
 
   // ---- Get models ----
-  // HistoricalCandle might be defined in candleHistory.js, but we can also get it from mongoose.
   let CandleModel;
   try {
     CandleModel = mongoose.model('HistoricalCandle');
   } catch (e) {
-    // If not defined, define a simple schema (must match candleHistory.js)
     const candleSchema = new mongoose.Schema({
       symbol: String,
       timeframe: String,
@@ -49,13 +47,24 @@ async function inspect() {
     CandleModel = mongoose.model('HistoricalCandle', candleSchema);
   }
 
-  const StateModel = require('../models/HistoricalState');
-  const OutcomeModel = require('../models/HistoricalOutcome');
+  const StateModel = require('./models/HistoricalState');
+  const OutcomeModel = require('./models/HistoricalOutcome');
 
   // ---- 1. Candles ----
   printHeader('CANDLES (HistoricalCandle)');
   const totalCandles = await CandleModel.countDocuments();
   console.log(`Total candles: ${totalCandles}`);
+
+  // Candle stats per symbol and timeframe
+  const candleStats = await CandleModel.aggregate([
+    { $group: { _id: { symbol: '$symbol', timeframe: '$timeframe' }, count: { $sum: 1 } } },
+    { $sort: { count: -1 } }
+  ]);
+  console.log('\nCandle counts per symbol/timeframe:');
+  candleStats.forEach(s => {
+    console.log(`  ${s._id.symbol} ${s._id.timeframe}: ${s.count}`);
+  });
+
   if (totalCandles > 0) {
     const sampleCandles = await CandleModel.find().limit(5).lean();
     console.log('\nSample candles (first 5):');
@@ -64,7 +73,7 @@ async function inspect() {
       console.log(`  Symbol: ${c.symbol}, Timeframe: ${c.timeframe}`);
       console.log(`  Time: ${c.time.toISOString()}`);
       console.log(`  O: ${c.open}, H: ${c.high}, L: ${c.low}, C: ${c.close}`);
-      console.log(`  Volume: ${c.volume}, Source: ${c.source}`);
+      console.log(`  Volume: ${c.volume}, Source: ${c.source || 'N/A'}`);
     });
   }
 
@@ -72,9 +81,10 @@ async function inspect() {
   printHeader('STATES (HistoricalState)');
   const totalStates = await StateModel.countDocuments();
   console.log(`Total states: ${totalStates}`);
+
+  let stateStats = [];
   if (totalStates > 0) {
-    // Statistics per symbol and timeframe
-    const stateStats = await StateModel.aggregate([
+    stateStats = await StateModel.aggregate([
       { $group: { _id: { symbol: '$symbol', timeframe: '$timeframe' }, count: { $sum: 1 } } },
       { $sort: { count: -1 } }
     ]);
@@ -101,7 +111,7 @@ async function inspect() {
     console.log(`  outcome40: ${labelled40}`);
     console.log(`  Fully labelled (all 4): ${fullyLabelled}`);
 
-    // Sample states (first 5)
+    // Sample states
     const sampleStates = await StateModel.find().limit(5).lean();
     console.log('\nSample states (first 5):');
     sampleStates.forEach((s, i) => {
@@ -116,7 +126,7 @@ async function inspect() {
       console.log(`  Outcome40: ${s.outcome40.return !== null ? `R=${s.outcome40.returnR.toFixed(2)}, win=${s.outcome40.win}` : 'Not labelled'}`);
     });
 
-    // Show one fully labelled state if exists
+    // One fully labelled state
     const fullState = await StateModel.findOne({
       'outcome5.return': { $ne: null },
       'outcome10.return': { $ne: null },
@@ -126,6 +136,8 @@ async function inspect() {
     if (fullState) {
       console.log('\n--- FULLY LABELLED STATE EXAMPLE ---');
       printObj(fullState, 'Full State');
+    } else {
+      console.log('\nNo fully labelled state found.');
     }
   }
 
@@ -154,25 +166,42 @@ async function inspect() {
     });
   }
 
-  // ---- 4. Save samples to JSON ----
+  // ---- 4. Export samples to JSON ----
   const report = {
     candles: {
       total: totalCandles,
+      perSymbolTimeframe: candleStats,
       sample: await CandleModel.find().limit(5).lean()
     },
     states: {
       total: totalStates,
+      perSymbolTimeframe: stateStats,
       sample: await StateModel.find().limit(5).lean(),
-      stats: {
-        perSymbolTimeframe: stateStats,
-        labelled: { outcome5: labelled5, outcome10: labelled10, outcome20: labelled20, outcome40: labelled40, fullyLabelled }
+      labelling: {
+        outcome5: await StateModel.countDocuments({ 'outcome5.return': { $ne: null } }),
+        outcome10: await StateModel.countDocuments({ 'outcome10.return': { $ne: null } }),
+        outcome20: await StateModel.countDocuments({ 'outcome20.return': { $ne: null } }),
+        outcome40: await StateModel.countDocuments({ 'outcome40.return': { $ne: null } }),
+        fullyLabelled: await StateModel.countDocuments({
+          'outcome5.return': { $ne: null },
+          'outcome10.return': { $ne: null },
+          'outcome20.return': { $ne: null },
+          'outcome40.return': { $ne: null },
+        })
       },
-      fullyLabelledExample: fullState || null
+      fullyLabelledExample: await StateModel.findOne({
+        'outcome5.return': { $ne: null },
+        'outcome10.return': { $ne: null },
+        'outcome20.return': { $ne: null },
+        'outcome40.return': { $ne: null },
+      }).lean() || null
     },
     outcomes: {
       total: totalOutcomes,
-      sample: await OutcomeModel.find().limit(5).lean(),
-      perLookahead: outcomeStats
+      perLookahead: await OutcomeModel.aggregate([
+        { $group: { _id: '$lookahead', count: { $sum: 1 } } }
+      ]),
+      sample: await OutcomeModel.find().limit(5).lean()
     }
   };
 
@@ -184,7 +213,7 @@ async function inspect() {
   console.log(`  Candles:       ${totalCandles}`);
   console.log(`  States:        ${totalStates}`);
   console.log(`  Outcomes:      ${totalOutcomes}`);
-  console.log(`  Fully labelled states: ${fullyLabelled}`);
+  console.log(`  Fully labelled states: ${report.states.labelling.fullyLabelled}`);
   console.log(`  Sample files saved to: ${OUTPUT_FILE}`);
 
   process.exit(0);
