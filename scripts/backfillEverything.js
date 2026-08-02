@@ -26,8 +26,8 @@ const candleSchema = new mongoose.Schema({
 });
 const HistoricalCandle = mongoose.model('HistoricalCandle', candleSchema);
 
-const HistoricalState = require('./models/HistoricalState');
-const HistoricalOutcome = require('./models/HistoricalOutcome');
+const HistoricalState = require('../models/HistoricalState');
+const HistoricalOutcome = require('../models/HistoricalOutcome');
 
 // ----- Indicator Functions (from strategy/engine) -----
 const {
@@ -37,7 +37,7 @@ const {
   MACD,
   BollingerBands,
   findSupportResistance,
-} = require('./core/strategy/engine');
+} = require('../core/strategy/engine');
 
 // ----- Local helpers (not exported from engine) -----
 function EMA(prices, period) {
