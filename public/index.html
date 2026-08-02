@@ -586,7 +586,7 @@
       </div>
     </div>
 
-    <!-- Live Signal & Regime -->
+    <!-- Live Signal & Regime & Metrics -->
     <div class="row g-3">
       <div class="col-lg-6">
         <div class="card">
@@ -617,7 +617,22 @@
       </div>
     </div>
 
-    <!-- Awareness & Knowledge -->
+    <!-- NEW: Fusion Panel (Multi-Timeframe Consensus) -->
+    <div class="row g-3 mt-3">
+      <div class="col-12">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title"><i class="fas fa-layer-group text-primary"></i> Multi‑Timeframe Fusion</span>
+            <span class="badge bg-secondary">Consensus</span>
+          </div>
+          <div class="card-body" id="fusionPanel">
+            <p class="text-muted">Waiting for timeframe assessments...</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Awareness & Knowledge (existing) -->
     <div class="row g-3 mt-2">
       <div class="col-md-4">
         <div class="card">
@@ -648,6 +663,7 @@
 
   <!-- ===== TRADING SECTION ===== -->
   <div id="section-trading" class="section-content" style="display:none;">
+    <!-- ... unchanged ... -->
     <div class="row g-3">
       <div class="col-lg-6">
         <div class="card">
@@ -754,7 +770,7 @@
     </div>
   </div>
 
-  <!-- ===== HISTORY SECTION (Searchable & Filterable) ===== -->
+  <!-- ===== HISTORY SECTION ===== -->
   <div id="section-history" class="section-content" style="display:none;">
     <div class="card">
       <div class="card-header">
@@ -900,6 +916,23 @@
         <button type="button" class="btn btn-primary" id="generateReportBtn">
           <i class="fas fa-file-pdf"></i> Generate Report
         </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- ========== DECISION INSPECTOR MODAL ========================= -->
+<!-- ============================================================ -->
+<div class="modal fade" id="decisionInspectorModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="fas fa-search"></i> Decision Inspector</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body" id="decisionInspectorBody">
+        <p class="text-muted">Loading...</p>
       </div>
     </div>
   </div>
