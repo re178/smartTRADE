@@ -5,11 +5,11 @@ require('dotenv').config();
 const mongoose = require('mongoose');
 
 // ----- Import required modules -----
-const candleHistory = require('./core/data/candleHistory');
-const deepMarketState = require('./core/intelligence/deep/marketState');
-const { dataOrchestrator } = require('./core/data/dataOrchestrator');
-const HistoricalState = require('./models/HistoricalState');
-const HistoricalOutcome = require('./models/HistoricalOutcome');
+const candleHistory = require('../core/data/candleHistory');
+const deepMarketState = require('../core/intelligence/deep/marketState');
+const { dataOrchestrator } = require('../core/data/dataOrchestrator');
+const HistoricalState = require('../models/HistoricalState');
+const HistoricalOutcome = require('../models/HistoricalOutcome');
 
 // ----- Configuration -----
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/rts';
