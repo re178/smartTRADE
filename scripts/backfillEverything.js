@@ -39,7 +39,7 @@ const {
   getSession,
   detectRegime,
   EMA, // added missing import
-} = require('./core/strategy/engine');
+} = require('../core/strategy/engine');
 
 // ----- Helper: Format candle for indicators -----
 function formatCandle(c) {
