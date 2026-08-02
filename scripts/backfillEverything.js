@@ -7,12 +7,12 @@ const { performance } = require('perf_hooks');
 
 // ----- Configuration -----
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/rts';
-const STATE_BATCH_SIZE = 500;           // states per insert batch
-const OUTCOME_BATCH_SIZE = 500;         // outcomes per update batch
-const MIN_CANDLES_FOR_INDICATORS = 50;  // need at least this many candles to compute indicators
+const STATE_BATCH_SIZE = 500;
+const OUTCOME_BATCH_SIZE = 500;
+const MIN_CANDLES_FOR_INDICATORS = 50;
 const LOOKAHEADS = [5, 10, 20, 40];
 
-// ----- Import Models (only, no core modules) -----
+// ----- Import Models -----
 const HistoricalCandle = mongoose.model('HistoricalCandle', new mongoose.Schema({
   symbol: String,
   timeframe: String,
@@ -38,37 +38,42 @@ const {
   findSupportResistance,
   getSession,
   detectRegime,
-  EMA, // added missing import
 } = require('../core/strategy/engine');
+
+// ----- Local EMA (since it's not exported from strategy/engine) -----
+function EMA(prices, period) {
+  const result = [];
+  const multiplier = 2 / (period + 1);
+  let ema = prices[0];
+  for (let i = 0; i < prices.length; i++) {
+    if (i === 0) ema = prices[0];
+    else ema = (prices[i] - ema) * multiplier + ema;
+    result.push(ema);
+  }
+  return result;
+}
 
 // ----- Helper: Format candle for indicators -----
 function formatCandle(c) {
   return { mid: { h: c.high, l: c.low, c: c.close } };
 }
 
-// ----- Helper: Build state from indicators (no duplicate declaration) -----
+// ----- Helper: Build state from indicators -----
 function buildState(symbol, timeframe, candles, idx, awareness) {
-  // If awareness is not provided, use defaults
   if (!awareness) {
     awareness = { velocity: 0, acceleration: 0, liquidity: 0.5, spread: 0.0002, unusualEvents: [] };
   }
 
   const closes = candles.map(c => c.close);
-  const highs = candles.map(c => c.high);
-  const lows = candles.map(c => c.low);
   const currentIdx = idx;
   const currentPrice = closes[currentIdx];
 
-  // Ensure we have enough data
   if (currentIdx < MIN_CANDLES_FOR_INDICATORS - 1) return null;
 
-  // Slice only the needed history for indicators (using a window of 200)
   const start = Math.max(0, currentIdx - 199);
   const windowCandles = candles.slice(start, currentIdx + 1);
   const windowCandlesFormatted = windowCandles.map(c => formatCandle(c));
   const windowCloses = windowCandles.map(c => c.close);
-  const windowHighs = windowCandles.map(c => c.high);
-  const windowLows = windowCandles.map(c => c.low);
 
   // Compute indicators
   const adxData = ADX(windowCandlesFormatted, 14);
@@ -93,14 +98,20 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
   // Determine trend direction using EMA
   const ema50 = EMA(windowCloses, 50);
   const ema200 = EMA(windowCloses, 200);
-  const lastEma50 = ema50[ema50.length - 1];
-  const prevEma50 = ema50[ema50.length - 2];
-  const lastEma200 = ema200[ema200.length - 1];
-  const prevEma200 = ema200[ema200.length - 2];
-  const direction = (lastEma50 > prevEma50 && lastEma200 > prevEma200) ? 'bullish' :
-                    (lastEma50 < prevEma50 && lastEma200 < prevEma200) ? 'bearish' : 'neutral';
+  let direction = 'neutral';
+  if (ema50.length >= 2 && ema200.length >= 2) {
+    const lastEma50 = ema50[ema50.length - 1];
+    const prevEma50 = ema50[ema50.length - 2];
+    const lastEma200 = ema200[ema200.length - 1];
+    const prevEma200 = ema200[ema200.length - 2];
+    if (lastEma50 > prevEma50 && lastEma200 > prevEma200) {
+      direction = 'bullish';
+    } else if (lastEma50 < prevEma50 && lastEma200 < prevEma200) {
+      direction = 'bearish';
+    }
+  }
 
-  // Build state object (matching HistoricalState schema)
+  // Build state
   const state = {
     symbol,
     timeframe,
@@ -173,7 +184,7 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
     version: '2.0',
   };
 
-  // Set outcome fields to null initially (will be filled later)
+  // Set outcomes to null
   for (const la of LOOKAHEADS) {
     state[`outcome${la}`] = {
       return: null,
@@ -188,7 +199,24 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
   return state;
 }
 
-// ----- Main Backfill Function -----
+// ---- Helper: insert states in bulk ----
+async function insertStates(states) {
+  try {
+    const docs = states.map(s => {
+      const { _id, ...rest } = s;
+      return rest;
+    });
+    await HistoricalState.insertMany(docs, { ordered: false });
+  } catch (err) {
+    if (err.code === 11000) {
+      // Duplicate - ignore
+    } else {
+      console.error('   ❌ Error inserting states:', err.message);
+    }
+  }
+}
+
+// ---- Main backfill ----
 async function backfill() {
   console.log('🔌 Connecting to MongoDB...');
   await mongoose.connect(MONGODB_URI);
@@ -196,7 +224,6 @@ async function backfill() {
 
   const startTime = performance.now();
 
-  // ---- 1. Fetch all candles ----
   console.log('📥 Fetching candles from HistoricalCandle...');
   const candles = await HistoricalCandle.find().lean();
   console.log(`   Found ${candles.length} candles.`);
@@ -215,7 +242,6 @@ async function backfill() {
   }
   console.log(`   Grouped into ${Object.keys(groups).length} symbol/timeframe pairs.`);
 
-  // ---- 2. Process each group: generate states ----
   console.log('\n🧠 Generating states from candles...');
   let totalStatesGenerated = 0;
   let stateBatch = [];
@@ -229,10 +255,8 @@ async function backfill() {
       continue;
     }
 
-    // Sort candles by time (ascending)
     candleList.sort((a, b) => new Date(a.time) - new Date(b.time));
 
-    // For each candle starting from the minimum index
     for (let i = MIN_CANDLES_FOR_INDICATORS - 1; i < candleList.length; i++) {
       const state = buildState(symbol, timeframe, candleList, i, null);
       if (state) {
@@ -246,18 +270,17 @@ async function backfill() {
     }
   }
 
-  // Insert any remaining states
   if (stateBatch.length > 0) {
     await insertStates(stateBatch);
   }
 
   console.log(`   ✅ Generated ${totalStatesGenerated} states.`);
 
-  // ---- 3. Label outcomes ----
+  // ---- Label outcomes ----
   console.log('\n🏷️  Labelling outcomes...');
 
   const states = await HistoricalState.find({
-    'outcome5.return': null, // only process unlabelled
+    'outcome5.return': null,
   }).lean();
 
   if (states.length === 0) {
@@ -273,7 +296,6 @@ async function backfill() {
       const timeframe = state.timeframe;
       const stateTime = new Date(state.timestamp).getTime();
 
-      // Find the candle index in the group
       const key = `${symbol}:${timeframe}`;
       const candleList = groups[key];
       if (!candleList) {
@@ -281,7 +303,6 @@ async function backfill() {
         continue;
       }
 
-      // Find index of candle matching state time
       let idx = -1;
       for (let i = 0; i < candleList.length; i++) {
         if (new Date(candleList[i].time).getTime() === stateTime) {
@@ -300,15 +321,11 @@ async function backfill() {
 
       for (const la of LOOKAHEADS) {
         const endIdx = idx + la;
-        if (endIdx >= candleList.length) {
-          // Not enough future candles – leave as null
-          continue;
-        }
+        if (endIdx >= candleList.length) continue;
         const endPrice = candleList[endIdx].close;
         const returnVal = endPrice - startPrice;
         const returnR = returnVal / atr;
         const win = returnVal > 0;
-        // Max drawdown during period
         let maxDD = 0;
         for (let k = idx; k <= endIdx; k++) {
           const dd = (candleList[k].low - startPrice) / startPrice;
@@ -343,7 +360,6 @@ async function backfill() {
     console.log(`   ✅ Labelled ${labelled} states, skipped ${skipped}, errors ${errors}.`);
   }
 
-  // ---- 4. Summary ----
   const endTime = performance.now();
   const elapsed = ((endTime - startTime) / 1000).toFixed(1);
   const stateCount = await HistoricalState.countDocuments();
@@ -359,24 +375,6 @@ async function backfill() {
   process.exit(0);
 }
 
-// ---- Helper: insert states in bulk (idempotent) ----
-async function insertStates(states) {
-  try {
-    const docs = states.map(s => {
-      const { _id, ...rest } = s;
-      return rest;
-    });
-    await HistoricalState.insertMany(docs, { ordered: false });
-  } catch (err) {
-    if (err.code === 11000) {
-      // Duplicate key – skip
-    } else {
-      console.error('   ❌ Error inserting states:', err.message);
-    }
-  }
-}
-
-// ---- Run ----
 backfill().catch(err => {
   console.error('❌ Fatal error:', err);
   process.exit(1);
