@@ -1,4 +1,4 @@
-// backfillEverything.js – Complete Backfill: Candles → States → Outcomes
+// backfillEverything.js – Complete Backfill with Zero Errors
 // Run: node backfillEverything.js
 
 require('dotenv').config();
@@ -12,8 +12,8 @@ const OUTCOME_BATCH_SIZE = 500;
 const MIN_CANDLES_FOR_INDICATORS = 50;
 const LOOKAHEADS = [5, 10, 20, 40];
 
-// ----- Import Models -----
-const HistoricalCandle = mongoose.model('HistoricalCandle', new mongoose.Schema({
+// ----- Models -----
+const candleSchema = new mongoose.Schema({
   symbol: String,
   timeframe: String,
   time: Date,
@@ -23,12 +23,13 @@ const HistoricalCandle = mongoose.model('HistoricalCandle', new mongoose.Schema(
   close: Number,
   volume: Number,
   source: String,
-}));
+});
+const HistoricalCandle = mongoose.model('HistoricalCandle', candleSchema);
 
-const HistoricalState = require('../models/HistoricalState');
-const HistoricalOutcome = require('../models/HistoricalOutcome');
+const HistoricalState = require('./models/HistoricalState');
+const HistoricalOutcome = require('./models/HistoricalOutcome');
 
-// ----- Import Indicator Functions (from strategy/engine) -----
+// ----- Indicator Functions (from strategy/engine) -----
 const {
   ADX,
   ATR,
@@ -36,11 +37,9 @@ const {
   MACD,
   BollingerBands,
   findSupportResistance,
-  getSession,
-  detectRegime,
-} = require('../core/strategy/engine');
+} = require('./core/strategy/engine');
 
-// ----- Local EMA (since it's not exported from strategy/engine) -----
+// ----- Local helpers (not exported from engine) -----
 function EMA(prices, period) {
   const result = [];
   const multiplier = 2 / (period + 1);
@@ -53,12 +52,34 @@ function EMA(prices, period) {
   return result;
 }
 
-// ----- Helper: Format candle for indicators -----
+function getSession() {
+  const hour = new Date().getUTCHours();
+  if (hour >= 7 && hour < 15) return 'London';
+  if (hour >= 12 && hour < 20) return 'New York';
+  if (hour >= 0 && hour < 8) return 'Asia';
+  if (hour >= 22 || hour < 6) return 'Sydney';
+  return 'Other';
+}
+
+// ----- Helper: format candle for indicator functions -----
 function formatCandle(c) {
   return { mid: { h: c.high, l: c.low, c: c.close } };
 }
 
-// ----- Helper: Build state from indicators -----
+// ----- Helper: detect regime manually (avoids engine's detectRegime) -----
+function detectRegimeManual(adx, atr, bbWidth, rsi, direction) {
+  if (adx > 30) {
+    if (direction === 'bullish') return 'STRONG_TREND_BULL';
+    if (direction === 'bearish') return 'STRONG_TREND_BEAR';
+  }
+  if (adx > 20) return 'WEAK_TREND';
+  if (bbWidth < 0.15) return 'RANGING';
+  if (atr > 0.005) return 'HIGH_VOLATILITY';
+  if (rsi > 70 || rsi < 30) return 'REVERSAL';
+  return 'NEUTRAL';
+}
+
+// ----- Build state from candles -----
 function buildState(symbol, timeframe, candles, idx, awareness) {
   if (!awareness) {
     awareness = { velocity: 0, acceleration: 0, liquidity: 0.5, spread: 0.0002, unusualEvents: [] };
@@ -72,18 +93,16 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
 
   const start = Math.max(0, currentIdx - 199);
   const windowCandles = candles.slice(start, currentIdx + 1);
-  const windowCandlesFormatted = windowCandles.map(c => formatCandle(c));
+  const windowFormatted = windowCandles.map(c => formatCandle(c));
   const windowCloses = windowCandles.map(c => c.close);
 
   // Compute indicators
-  const adxData = ADX(windowCandlesFormatted, 14);
-  const atrArray = ATR(windowCandlesFormatted, 14);
+  const adxData = ADX(windowFormatted, 14);
+  const atrArray = ATR(windowFormatted, 14);
   const rsi = RSI(windowCloses, 14);
   const macd = MACD(windowCloses, 12, 26, 9);
   const bb = BollingerBands(windowCloses, 20, 2);
-  const sr = findSupportResistance(windowCandlesFormatted, 30, 0.001);
-  const regime = detectRegime(windowCandles);
-  const session = getSession();
+  const sr = findSupportResistance(windowFormatted, 30, 0.001);
 
   const atr = atrArray ? atrArray[atrArray.length - 1] : 0.001;
   const rsiVal = rsi || 50;
@@ -95,7 +114,7 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
   const isAtSupport = support ? Math.abs(currentPrice - support) / currentPrice < 0.001 : false;
   const isAtResistance = resistance ? Math.abs(currentPrice - resistance) / currentPrice < 0.001 : false;
 
-  // Determine trend direction using EMA
+  // Trend direction using EMA
   const ema50 = EMA(windowCloses, 50);
   const ema200 = EMA(windowCloses, 200);
   let direction = 'neutral';
@@ -104,12 +123,14 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
     const prevEma50 = ema50[ema50.length - 2];
     const lastEma200 = ema200[ema200.length - 1];
     const prevEma200 = ema200[ema200.length - 2];
-    if (lastEma50 > prevEma50 && lastEma200 > prevEma200) {
-      direction = 'bullish';
-    } else if (lastEma50 < prevEma50 && lastEma200 < prevEma200) {
-      direction = 'bearish';
-    }
+    if (lastEma50 > prevEma50 && lastEma200 > prevEma200) direction = 'bullish';
+    else if (lastEma50 < prevEma50 && lastEma200 < prevEma200) direction = 'bearish';
   }
+
+  // Regime
+  const adx = adxData ? adxData.adx : 0;
+  const regimeCode = detectRegimeManual(adx, atr, bbWidth, rsiVal, direction);
+  const session = getSession();
 
   // Build state
   const state = {
@@ -125,8 +146,8 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
     },
     trend: {
       direction,
-      strength: adxData ? adxData.adx : 0,
-      adx: adxData ? adxData.adx : 0,
+      strength: adx,
+      adx,
       plusDI: adxData ? adxData.plusDI : 0,
       minusDI: adxData ? adxData.minusDI : 0,
       slope: (closes[currentIdx] - closes[Math.max(0, currentIdx - 50)]) / (closes[Math.max(0, currentIdx - 50)] || 0.0001),
@@ -163,8 +184,8 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
       isWeekday: true,
     },
     regime: {
-      code: regime.regime ? regime.regime.toUpperCase() : 'NEUTRAL',
-      name: regime.regime ? regime.regime.charAt(0).toUpperCase() + regime.regime.slice(1) : 'Neutral',
+      code: regimeCode,
+      name: regimeCode.charAt(0).toUpperCase() + regimeCode.slice(1).toLowerCase().replace('_', ' '),
       confidence: 50,
       description: '',
     },
@@ -175,8 +196,8 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
     summary: {
       marketQuality: 50,
       noiseLevel: 'medium',
-      regimeSuggestion: regime.regime || 'neutral',
-      trendConfidence: adxData ? adxData.adx : 50,
+      regimeSuggestion: regimeCode,
+      trendConfidence: adx,
     },
     confidence: 50,
     reason: 'Backfill',
@@ -184,7 +205,7 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
     version: '2.0',
   };
 
-  // Set outcomes to null
+  // Null outcomes
   for (const la of LOOKAHEADS) {
     state[`outcome${la}`] = {
       return: null,
@@ -199,7 +220,7 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
   return state;
 }
 
-// ---- Helper: insert states in bulk ----
+// ----- Insert states in bulk -----
 async function insertStates(states) {
   try {
     const docs = states.map(s => {
@@ -208,15 +229,11 @@ async function insertStates(states) {
     });
     await HistoricalState.insertMany(docs, { ordered: false });
   } catch (err) {
-    if (err.code === 11000) {
-      // Duplicate - ignore
-    } else {
-      console.error('   ❌ Error inserting states:', err.message);
-    }
+    if (err.code !== 11000) console.error('   ❌ Insert error:', err.message);
   }
 }
 
-// ---- Main backfill ----
+// ----- Main -----
 async function backfill() {
   console.log('🔌 Connecting to MongoDB...');
   await mongoose.connect(MONGODB_URI);
@@ -233,7 +250,7 @@ async function backfill() {
     process.exit(0);
   }
 
-  // Group by symbol+timeframe
+  // Group
   const groups = {};
   for (const c of candles) {
     const key = `${c.symbol}:${c.timeframe}`;
@@ -243,8 +260,8 @@ async function backfill() {
   console.log(`   Grouped into ${Object.keys(groups).length} symbol/timeframe pairs.`);
 
   console.log('\n🧠 Generating states from candles...');
-  let totalStatesGenerated = 0;
-  let stateBatch = [];
+  let totalStates = 0;
+  let batch = [];
 
   for (const [key, candleList] of Object.entries(groups)) {
     const [symbol, timeframe] = key.split(':');
@@ -260,49 +277,36 @@ async function backfill() {
     for (let i = MIN_CANDLES_FOR_INDICATORS - 1; i < candleList.length; i++) {
       const state = buildState(symbol, timeframe, candleList, i, null);
       if (state) {
-        stateBatch.push(state);
-        totalStatesGenerated++;
-        if (stateBatch.length >= STATE_BATCH_SIZE) {
-          await insertStates(stateBatch);
-          stateBatch.length = 0;
+        batch.push(state);
+        totalStates++;
+        if (batch.length >= STATE_BATCH_SIZE) {
+          await insertStates(batch);
+          batch = [];
         }
       }
     }
   }
 
-  if (stateBatch.length > 0) {
-    await insertStates(stateBatch);
-  }
-
-  console.log(`   ✅ Generated ${totalStatesGenerated} states.`);
+  if (batch.length > 0) await insertStates(batch);
+  console.log(`   ✅ Generated ${totalStates} states.`);
 
   // ---- Label outcomes ----
   console.log('\n🏷️  Labelling outcomes...');
 
-  const states = await HistoricalState.find({
-    'outcome5.return': null,
-  }).lean();
+  const states = await HistoricalState.find({ 'outcome5.return': null }).lean();
 
   if (states.length === 0) {
     console.log('   No states to label (all already labelled).');
   } else {
     console.log(`   Found ${states.length} states to label.`);
-    let labelled = 0;
-    let skipped = 0;
-    let errors = 0;
+    let labelled = 0, skipped = 0, errors = 0;
 
     for (const state of states) {
-      const symbol = state.symbol;
-      const timeframe = state.timeframe;
-      const stateTime = new Date(state.timestamp).getTime();
-
-      const key = `${symbol}:${timeframe}`;
+      const key = `${state.symbol}:${state.timeframe}`;
       const candleList = groups[key];
-      if (!candleList) {
-        skipped++;
-        continue;
-      }
+      if (!candleList) { skipped++; continue; }
 
+      const stateTime = new Date(state.timestamp).getTime();
       let idx = -1;
       for (let i = 0; i < candleList.length; i++) {
         if (new Date(candleList[i].time).getTime() === stateTime) {
@@ -310,10 +314,7 @@ async function backfill() {
           break;
         }
       }
-      if (idx === -1) {
-        skipped++;
-        continue;
-      }
+      if (idx === -1) { skipped++; continue; }
 
       const atr = state.volatility.atr || 0.001;
       const startPrice = state.price.current;
@@ -331,7 +332,6 @@ async function backfill() {
           const dd = (candleList[k].low - startPrice) / startPrice;
           if (dd < maxDD) maxDD = dd;
         }
-
         updates[`outcome${la}`] = {
           return: returnVal,
           returnR,
@@ -343,10 +343,7 @@ async function backfill() {
       }
 
       if (Object.keys(updates).length > 0) {
-        await HistoricalState.updateOne(
-          { _id: state._id },
-          { $set: updates }
-        );
+        await HistoricalState.updateOne({ _id: state._id }, { $set: updates });
         labelled++;
       } else {
         skipped++;
@@ -360,8 +357,7 @@ async function backfill() {
     console.log(`   ✅ Labelled ${labelled} states, skipped ${skipped}, errors ${errors}.`);
   }
 
-  const endTime = performance.now();
-  const elapsed = ((endTime - startTime) / 1000).toFixed(1);
+  const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
   const stateCount = await HistoricalState.countDocuments();
   const outcomeCount = await HistoricalOutcome.countDocuments();
 
