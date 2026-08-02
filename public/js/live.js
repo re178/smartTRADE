@@ -1,4 +1,4 @@
-// public/js/live.js – Updated for CTOS Real-time Events with Sound Alerts
+// public/js/live.js – Updated for CTOS Real-time Events with Sound Alerts and Fusion
 
 (function() {
   'use strict';
@@ -15,6 +15,7 @@
   const liveSignalPanel = document.getElementById('liveSignalPanel');
   const regimePanel = document.getElementById('regimePanel');
   const metricsPanel = document.getElementById('metricsPanel');
+  const fusionPanel = document.getElementById('fusionPanel');
   const wsStatus = document.getElementById('wsStatus');
 
   // ---- SoundManager (global from app.js) ----
@@ -122,6 +123,9 @@
       case 'decision':
         displayDecision(msg.data);
         break;
+      case 'fusion':
+        displayFusion(msg.data);
+        break;
       case 'marketClosed':
         displayMarketClosed(msg.data);
         break;
@@ -129,14 +133,12 @@
         displayMetrics(msg.data);
         break;
       case 'tradeClosed':
-        // Refresh open trades and history
         if (typeof loadOpenTrades === 'function') loadOpenTrades();
         if (typeof loadTradeHistory === 'function') loadTradeHistory();
         if (typeof addNotification === 'function') addNotification('Trade closed', 'info');
         playSound('tradeClose');
         break;
       case 'trade.placed':
-        // Trade opened (from orderService)
         if (typeof loadOpenTrades === 'function') loadOpenTrades();
         if (typeof loadTradeHistory === 'function') loadTradeHistory();
         playSound('tradeOpen');
@@ -151,7 +153,7 @@
     }
   }
 
-  // ---- Display functions (unchanged) ----
+  // ---- Display functions (existing, unchanged) ----
   function displayAwareness(data) {
     if (!awarenessPanel) return;
     const { symbol, spread, velocity, acceleration, liquidity, unusualEvents, lastUpdated } = data;
@@ -236,7 +238,8 @@
 
   function displayDecision(decision) {
     if (!liveSignalPanel) return;
-    const { symbol, decision: side, confidence, entryPrice, stopLoss, takeProfit, recommendedLotSize, reason, timestamp } = decision;
+    const { _id, symbol, decision: side, confidence, entryPrice, stopLoss, takeProfit, recommendedLotSize, reason, timestamp } = decision;
+    const decisionId = _id || decision.id; // ensure we have an ID
 
     // Play signal sound
     playSound('signal');
@@ -256,7 +259,7 @@
     const sideLabel = side || 'NO TRADE';
     const formattedSymbol = formatSymbol(symbol);
 
-    let html = `<div class="alert alert-${alertClass} live-signal-card" data-symbol="${formattedSymbol}" data-side="${side}" data-entry="${entryPrice}" data-sl="${stopLoss}" data-tp="${takeProfit}" data-lot="${recommendedLotSize || 0.01}">`;
+    let html = `<div class="alert alert-${alertClass} live-signal-card" data-symbol="${formattedSymbol}" data-side="${side}" data-entry="${entryPrice}" data-sl="${stopLoss}" data-tp="${takeProfit}" data-lot="${recommendedLotSize || 0.01}" data-decision-id="${decisionId}">`;
     html += `<h5><strong>${sideLabel}</strong> ${formattedSymbol} (${confidence}% confidence)</h5>`;
     if (side && side !== 'NO_TRADE') {
       html += `<p>Entry: ${formatPrice(entryPrice)} | SL: ${formatPrice(stopLoss)} | TP: ${formatPrice(takeProfit)}</p>`;
@@ -264,6 +267,9 @@
       html += `<p><small>${reason || ''}</small></p>`;
       html += `<button class="btn btn-sm btn-primary execute-signal-btn" onclick="window.executeSignalFromCard(this)">`;
       html += `<i class="fas fa-rocket"></i> Execute Trade</button>`;
+      // Explain button
+      html += `<button class="btn btn-sm btn-outline-info ms-2 explain-signal-btn" onclick="window.openDecisionInspector('${decisionId}')">`;
+      html += `<i class="fas fa-info-circle"></i> Explain</button>`;
     }
     html += `<p class="text-muted small mt-2">${new Date(timestamp).toLocaleString()}</p>`;
     html += `</div>`;
@@ -304,6 +310,50 @@
       });
     }
   }
+
+  // ---- NEW: Fusion display ----
+  function displayFusion(fusion) {
+    if (!fusionPanel) return;
+    const { symbol, verdict, confidence, agreement, timeframeBreakdown, reasons, session } = fusion;
+
+    const verdictClass = verdict === 'bullish' ? 'success' : (verdict === 'bearish' ? 'danger' : 'secondary');
+    const verdictIcon = verdict === 'bullish' ? '📈' : (verdict === 'bearish' ? '📉' : '➖');
+
+    let html = `
+      <div class="row">
+        <div class="col-md-6">
+          <h5>${verdictIcon} ${symbol} – <span class="text-${verdictClass}">${verdict.toUpperCase()}</span> (${confidence}% confidence)</h5>
+          <p>Agreement: ${agreement}% across ${fusion.timeframeCount} timeframes</p>
+          <ul class="list-inline">
+            <li class="list-inline-item"><span class="badge bg-success">Bullish ${timeframeBreakdown.bullish}</span></li>
+            <li class="list-inline-item"><span class="badge bg-danger">Bearish ${timeframeBreakdown.bearish}</span></li>
+            <li class="list-inline-item"><span class="badge bg-secondary">Neutral ${timeframeBreakdown.neutral}</span></li>
+          </ul>
+          <p><small>Session: ${session.name} (multiplier ${session.liquidityMultiplier})</small></p>
+        </div>
+        <div class="col-md-6">
+          <p><strong>Reasons</strong></p>
+          <ul class="small">
+            ${reasons.map(r => `<li>${r}</li>`).join('') || '<li>No detailed reasons</li>'}
+          </ul>
+        </div>
+      </div>
+      <div class="mt-2">
+        <button class="btn btn-sm btn-outline-secondary" onclick="window.showTimeframeDetails('${symbol}')">
+          <i class="fas fa-table"></i> Show Timeframe Details
+        </button>
+      </div>
+    `;
+    fusionPanel.innerHTML = html;
+  }
+
+  // ---- Placeholder for timeframe details (can be extended) ----
+  window.showTimeframeDetails = function(symbol) {
+    // This would fetch detailed assessments from the backend if an endpoint exists.
+    // For now, log to console and show a simple alert.
+    console.log('Fetch details for', symbol);
+    alert('Timeframe details will be displayed here (to be implemented).');
+  };
 
   function displayMarketClosed(data) {
     if (!liveSignalPanel) return;
