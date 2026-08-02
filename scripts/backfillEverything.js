@@ -38,6 +38,7 @@ const {
   findSupportResistance,
   getSession,
   detectRegime,
+  EMA, // added missing import
 } = require('./core/strategy/engine');
 
 // ----- Helper: Format candle for indicators -----
@@ -45,8 +46,13 @@ function formatCandle(c) {
   return { mid: { h: c.high, l: c.low, c: c.close } };
 }
 
-// ----- Helper: Build state from indicators -----
+// ----- Helper: Build state from indicators (no duplicate declaration) -----
 function buildState(symbol, timeframe, candles, idx, awareness) {
+  // If awareness is not provided, use defaults
+  if (!awareness) {
+    awareness = { velocity: 0, acceleration: 0, liquidity: 0.5, spread: 0.0002, unusualEvents: [] };
+  }
+
   const closes = candles.map(c => c.close);
   const highs = candles.map(c => c.high);
   const lows = candles.map(c => c.low);
@@ -84,12 +90,9 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
   const isAtSupport = support ? Math.abs(currentPrice - support) / currentPrice < 0.001 : false;
   const isAtResistance = resistance ? Math.abs(currentPrice - resistance) / currentPrice < 0.001 : false;
 
-  // Get awareness (default if not available)
-  const awareness = awareness || { velocity: 0, acceleration: 0, liquidity: 0.5, spread: 0.0002, unusualEvents: [] };
-
-  // Determine trend direction
-  const ema50 = require('./core/strategy/engine').EMA(windowCloses, 50);
-  const ema200 = require('./core/strategy/engine').EMA(windowCloses, 200);
+  // Determine trend direction using EMA
+  const ema50 = EMA(windowCloses, 50);
+  const ema200 = EMA(windowCloses, 200);
   const lastEma50 = ema50[ema50.length - 1];
   const prevEma50 = ema50[ema50.length - 2];
   const lastEma200 = ema200[ema200.length - 1];
@@ -149,8 +152,8 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
       isWeekday: true,
     },
     regime: {
-      code: regime.regime.toUpperCase(),
-      name: regime.regime.charAt(0).toUpperCase() + regime.regime.slice(1),
+      code: regime.regime ? regime.regime.toUpperCase() : 'NEUTRAL',
+      name: regime.regime ? regime.regime.charAt(0).toUpperCase() + regime.regime.slice(1) : 'Neutral',
       confidence: 50,
       description: '',
     },
@@ -264,7 +267,6 @@ async function backfill() {
     let labelled = 0;
     let skipped = 0;
     let errors = 0;
-    let outcomeBatch = [];
 
     for (const state of states) {
       const symbol = state.symbol;
@@ -360,14 +362,12 @@ async function backfill() {
 // ---- Helper: insert states in bulk (idempotent) ----
 async function insertStates(states) {
   try {
-    // Remove _id to let MongoDB generate new ones
     const docs = states.map(s => {
       const { _id, ...rest } = s;
       return rest;
     });
     await HistoricalState.insertMany(docs, { ordered: false });
   } catch (err) {
-    // Ignore duplicate key errors (if any)
     if (err.code === 11000) {
       // Duplicate key – skip
     } else {
