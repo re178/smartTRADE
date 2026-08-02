@@ -25,8 +25,8 @@ const HistoricalCandle = mongoose.model('HistoricalCandle', new mongoose.Schema(
   source: String,
 }));
 
-const HistoricalState = require('./models/HistoricalState');
-const HistoricalOutcome = require('./models/HistoricalOutcome');
+const HistoricalState = require('../models/HistoricalState');
+const HistoricalOutcome = require('../models/HistoricalOutcome');
 
 // ----- Import Indicator Functions (from strategy/engine) -----
 const {
