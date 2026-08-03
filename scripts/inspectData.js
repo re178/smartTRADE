@@ -1,4 +1,4 @@
-// backfillEverything.js – Complete Backfill with Robust Model Loading
+// backfillEverything.js – Complete Backfill (Self‑Contained)
 // Run: node scripts/backfillEverything.js
 
 require('dotenv').config();
@@ -7,12 +7,12 @@ const { performance } = require('perf_hooks');
 
 // ----- Configuration -----
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/rts';
-const STATE_BATCH_SIZE = 2000;    // increased for speed
+const STATE_BATCH_SIZE = 2000;      // faster
 const OUTCOME_BATCH_SIZE = 2000;
 const MIN_CANDLES_FOR_INDICATORS = 50;
 const LOOKAHEADS = [5, 10, 20, 40];
 
-// ----- Import Models (use your actual paths) -----
+// ----- Import Models (your actual paths) -----
 const HistoricalState = require('../models/HistoricalState');
 const HistoricalOutcome = require('../models/HistoricalOutcome');
 
@@ -26,7 +26,7 @@ const {
   findSupportResistance,
 } = require('../core/strategy/engine');
 
-// ----- Local helpers (not exported from engine) -----
+// ----- Local helpers -----
 function EMA(prices, period) {
   const result = [];
   const multiplier = 2 / (period + 1);
@@ -242,7 +242,7 @@ async function backfill() {
   await mongoose.connect(MONGODB_URI);
   console.log('✅ Connected.\n');
 
-  // ----- Get HistoricalCandle model with fallback (same as inspectData.js) -----
+  // ----- HistoricalCandle model: use fallback (same as inspectData.js) -----
   let HistoricalCandle;
   try {
     HistoricalCandle = mongoose.model('HistoricalCandle');
