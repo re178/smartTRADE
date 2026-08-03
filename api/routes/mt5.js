@@ -137,7 +137,8 @@ router.post('/orders/result', async (req, res) => {
           trade.closeTime = new Date(time ? time * 1000 : Date.now());
           trade.pendingClose = false;
           if (trade.openPrice && trade.lotSize) {
-            const multiplier = trade.side === 'buy' ? 1 : -1;
+            // FIX: compare uppercase to handle 'BUY' and 'buy'
+            const multiplier = trade.side && trade.side.toUpperCase() === 'BUY' ? 1 : -1;
             trade.realizedProfit = (price - trade.openPrice) * trade.lotSize * multiplier;
             trade.pnl = trade.realizedProfit; // sync with pnl field
           }
