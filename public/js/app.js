@@ -108,14 +108,11 @@ window.handleProductChange = async function(e) {
 async function loadAccount() {
   try {
     const acc = await fetchJson(`${CONFIG.API_BASE}/api/account`);
-    // Ensure numeric values
     const balance = typeof acc.balance === 'number' ? acc.balance : parseFloat(acc.balance) || 0;
     const equity = typeof acc.equity === 'number' ? acc.equity : parseFloat(acc.equity) || 0;
     const currency = acc.currency || 'USD';
-    // Update stats cards
     document.getElementById('statBalance').textContent = `${balance} ${currency}`;
     document.getElementById('statEquity').textContent = `${equity} ${currency}`;
-    // Update legacy panels
     const created = acc.createdTime || acc.createdAt || acc.updatedAt || null;
     const accountInfo = document.getElementById('accountInfo');
     if (accountInfo) {
@@ -301,7 +298,7 @@ document.getElementById('autoTradeForm').addEventListener('submit', async functi
   }
 });
 
-// ---- Load Open Trades (updates Open Trades count and P&L) ----
+// ---- Load Open Trades ----
 let openTradesInterval = null;
 
 async function loadOpenTrades() {
@@ -355,14 +352,14 @@ window.closeTrade = async function(tradeId) {
     loadOpenTrades();
     loadTradeHistory();
     loadAccount();
-    updateStatsFromHistory(); // refresh win rate / PF
+    updateStatsFromHistory();
   } catch (e) {
     alert('Error closing trade: ' + e.message);
     SoundManager.reject();
   }
 };
 
-// ---- Update Win Rate and Profit Factor from Trade History ----
+// ---- Update Win Rate and Profit Factor ----
 async function updateStatsFromHistory() {
   try {
     const trades = await fetchJson(`${CONFIG.API_BASE}/api/trade-history`);
@@ -401,6 +398,8 @@ async function loadTradeHistory(page = 1) {
       historyData = [];
       historyFiltered = [];
       updateStatsFromHistory();
+      // Remove any existing total P&L display
+      document.getElementById('totalPnLDisplay')?.remove();
       return;
     }
 
@@ -423,6 +422,11 @@ async function loadTradeHistory(page = 1) {
 
     historyFiltered.sort((a, b) => new Date(b.date) - new Date(a.date));
     document.getElementById('historyCount').textContent = historyFiltered.length;
+
+    // ---- NEW: Calculate total P&L for filtered trades ----
+    const totalPnL = historyFiltered.reduce((sum, t) => sum + (t.pnl || 0), 0);
+    // Remove old total P&L display
+    document.getElementById('totalPnLDisplay')?.remove();
 
     const totalItems = historyFiltered.length;
     historyTotalPages = Math.ceil(totalItems / HISTORY_PAGE_SIZE) || 1;
@@ -447,6 +451,7 @@ async function loadTradeHistory(page = 1) {
       return;
     }
 
+    // Build table
     let html = `<div class="table-responsive"><table class="table table-striped table-sm">
       <thead><tr><th>Pair</th><th>Side</th><th>Entry</th><th>Exit</th><th>Lot</th><th>P/L</th><th>Status</th><th>Date</th></tr></thead><tbody>`;
     pageItems.forEach(t => {
@@ -466,6 +471,16 @@ async function loadTradeHistory(page = 1) {
     html += '</tbody></table></div>';
     container.innerHTML = html;
     updateStatsFromHistory();
+
+    // Insert total P&L above the table
+    if (historyFiltered.length > 0) {
+      const totalRow = document.createElement('div');
+      totalRow.id = 'totalPnLDisplay';
+      totalRow.className = 'fw-bold mb-2';
+      totalRow.innerHTML = `Total P&L (filtered): <span class="${totalPnL >= 0 ? 'text-success' : 'text-danger'}">${totalPnL.toFixed(2)}</span>`;
+      container.parentNode.insertBefore(totalRow, container);
+    }
+
   } catch (e) {
     container.innerHTML = `<p class="text-danger">Error loading history: ${e.message}</p>`;
   }
@@ -543,6 +558,27 @@ document.getElementById('refreshTrades')?.addEventListener('click', loadOpenTrad
 document.getElementById('refreshHistory')?.addEventListener('click', () => loadTradeHistory(1));
 document.getElementById('refreshPending')?.addEventListener('click', loadPendingOrders);
 
+// ---- NEW: History Filter Buttons ----
+document.getElementById('applyHistoryFilter')?.addEventListener('click', function() {
+  loadTradeHistory(1);
+});
+document.getElementById('resetHistoryFilter')?.addEventListener('click', function() {
+  document.getElementById('historyFrom').value = '';
+  document.getElementById('historyTo').value = '';
+  document.getElementById('historySymbol').value = '';
+  document.getElementById('historySide').value = '';
+  document.getElementById('historyStatus').value = '';
+  loadTradeHistory(1);
+});
+
+// ---- NEW: Pagination Buttons ----
+document.getElementById('prevPage')?.addEventListener('click', function() {
+  if (historyPage > 1) loadTradeHistory(historyPage - 1);
+});
+document.getElementById('nextPage')?.addEventListener('click', function() {
+  if (historyPage < historyTotalPages) loadTradeHistory(historyPage + 1);
+});
+
 // ---- Start Live Updates ----
 function startLiveUpdates() {
   if (openTradesInterval) clearInterval(openTradesInterval);
@@ -559,7 +595,6 @@ loadPendingOrders();
 loadNotificationStatus();
 startLiveUpdates();
 setInterval(loadPrices, CONFIG.PRICE_REFRESH_INTERVAL);
-// Update win rate periodically
 setInterval(updateStatsFromHistory, 30000);
 
 // ---- Cleanup on page unload ----
