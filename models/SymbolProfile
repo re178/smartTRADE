@@ -1,0 +1,66 @@
+// models/SymbolProfile.js
+const mongoose = require('mongoose');
+
+const SymbolProfileSchema = new mongoose.Schema(
+  {
+    symbol: {
+      type: String,
+      required: true,
+      unique: true,
+      index: true,
+      description: 'Instrument symbol (e.g., EURUSD)',
+    },
+    typicalMFE: {
+      type: Number,
+      default: 2.5,
+      description: 'Average maximum favorable excursion (in R)',
+    },
+    typicalMAE: {
+      type: Number,
+      default: -0.6,
+      description: 'Average maximum adverse excursion (in R)',
+    },
+    medianMFE: {
+      type: Number,
+      default: 2.0,
+      description: 'Median MFE',
+    },
+    p75MFE: {
+      type: Number,
+      default: 3.2,
+      description: '75th percentile MFE',
+    },
+    optimalTrail: {
+      type: Number,
+      default: 0.5,
+      description: 'Optimal trailing distance (in R)',
+    },
+    optimalPartialPoint: {
+      type: Number,
+      default: 3.0,
+      description: 'Optimal profit level (in R) to take partial profits',
+    },
+    volatilityMultiplier: {
+      type: Number,
+      default: 1.0,
+      description: 'Volatility adjustment factor',
+    },
+    sampleSize: {
+      type: Number,
+      default: 0,
+      description: 'Number of trades/states used to compute profile',
+    },
+    lastUpdated: {
+      type: Date,
+      default: Date.now,
+      description: 'Last time profile was updated',
+    },
+  },
+  {
+    timestamps: true,
+  }
+);
+
+SymbolProfileSchema.index({ symbol: 1 });
+
+module.exports = mongoose.model('SymbolProfile', SymbolProfileSchema);
