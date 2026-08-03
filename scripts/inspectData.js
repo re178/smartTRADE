@@ -1,5 +1,5 @@
-// backfillEverything.js – Complete Backfill (Self‑Contained)
-// Run: node scripts/backfillEverything.js
+// backfillIndependent.js – Fully Self-Contained Backfill
+// Run: node scripts/backfillIndependent.js
 
 require('dotenv').config();
 const mongoose = require('mongoose');
@@ -7,7 +7,7 @@ const { performance } = require('perf_hooks');
 
 // ----- Configuration -----
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/rts';
-const STATE_BATCH_SIZE = 2000;      // faster
+const STATE_BATCH_SIZE = 2000;
 const OUTCOME_BATCH_SIZE = 2000;
 const MIN_CANDLES_FOR_INDICATORS = 50;
 const LOOKAHEADS = [5, 10, 20, 40];
@@ -16,7 +16,7 @@ const LOOKAHEADS = [5, 10, 20, 40];
 const HistoricalState = require('../models/HistoricalState');
 const HistoricalOutcome = require('../models/HistoricalOutcome');
 
-// ----- Indicator Functions (from strategy/engine) -----
+// ----- Import Indicator Functions (from strategy/engine) -----
 const {
   ADX,
   ATR,
@@ -25,6 +25,20 @@ const {
   BollingerBands,
   findSupportResistance,
 } = require('../core/strategy/engine');
+
+// ----- Define Candle model locally (self-contained) -----
+const candleSchema = new mongoose.Schema({
+  symbol: String,
+  timeframe: String,
+  time: Date,
+  open: Number,
+  high: Number,
+  low: Number,
+  close: Number,
+  volume: Number,
+  source: String,
+}, { collection: 'historicalcandles' }); // explicit collection name
+const Candle = mongoose.model('Candle', candleSchema);
 
 // ----- Local helpers -----
 function EMA(prices, period) {
@@ -178,7 +192,7 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
     summary: {
       marketQuality: 50,
       noiseLevel: 'medium',
-      regimeSuggestion: regimeCode.toLowerCase().includes('trend') ? 'trending' : 
+      regimeSuggestion: regimeCode.toLowerCase().includes('trend') ? 'trending' :
                          regimeCode === 'RANGING' ? 'ranging' :
                          regimeCode === 'HIGH_VOLATILITY' ? 'volatile' :
                          regimeCode === 'LOW_VOLATILITY' ? 'quiet' :
@@ -205,7 +219,7 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
   return state;
 }
 
-// ----- Insert states with full error logging -----
+// ----- Insert states with logging -----
 async function insertStatesWithLogging(states, batchNum) {
   if (states.length === 0) return;
   try {
@@ -242,35 +256,13 @@ async function backfill() {
   await mongoose.connect(MONGODB_URI);
   console.log('✅ Connected.\n');
 
-  // ----- HistoricalCandle model: use fallback (same as inspectData.js) -----
-  let HistoricalCandle;
-  try {
-    HistoricalCandle = mongoose.model('HistoricalCandle');
-    console.log('✅ Using existing HistoricalCandle model.');
-  } catch (e) {
-    console.log('⚠️  HistoricalCandle model not found; defining schema...');
-    const candleSchema = new mongoose.Schema({
-      symbol: String,
-      timeframe: String,
-      time: Date,
-      open: Number,
-      high: Number,
-      low: Number,
-      close: Number,
-      volume: Number,
-      source: String,
-    });
-    HistoricalCandle = mongoose.model('HistoricalCandle', candleSchema);
-    console.log('✅ HistoricalCandle model registered.');
-  }
-
+  console.log(`📂 Candle collection: ${Candle.collection.collectionName}`);
   console.log(`📂 HistoricalState collection: ${HistoricalState.collection.collectionName}`);
-  console.log(`📂 HistoricalCandle collection: ${HistoricalCandle.collection.collectionName}`);
 
   const startTime = performance.now();
 
-  console.log('📥 Fetching candles from HistoricalCandle...');
-  const candles = await HistoricalCandle.find().lean();
+  console.log('📥 Fetching candles from historicalcandles...');
+  const candles = await Candle.find().lean();
   console.log(`   Found ${candles.length} candles.`);
 
   if (candles.length === 0) {
