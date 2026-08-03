@@ -1,4 +1,4 @@
-// backfillEverything.js – Complete Backfill with Zero Errors
+// backfillEverything.js – Complete Backfill with Zero Errors & Full Logging
 // Run: node backfillEverything.js
 
 require('dotenv').config();
@@ -12,20 +12,8 @@ const OUTCOME_BATCH_SIZE = 500;
 const MIN_CANDLES_FOR_INDICATORS = 50;
 const LOOKAHEADS = [5, 10, 20, 40];
 
-// ----- Models -----
-const candleSchema = new mongoose.Schema({
-  symbol: String,
-  timeframe: String,
-  time: Date,
-  open: Number,
-  high: Number,
-  low: Number,
-  close: Number,
-  volume: Number,
-  source: String,
-});
-const HistoricalCandle = mongoose.model('HistoricalCandle', candleSchema);
-
+// ----- Models (use your actual models) -----
+const HistoricalCandle = require('../models/HistoricalCandle');
 const HistoricalState = require('../models/HistoricalState');
 const HistoricalOutcome = require('../models/HistoricalOutcome');
 
@@ -66,7 +54,7 @@ function formatCandle(c) {
   return { mid: { h: c.high, l: c.low, c: c.close } };
 }
 
-// ----- Helper: detect regime manually (avoids engine's detectRegime) -----
+// ----- Helper: detect regime manually -----
 function detectRegimeManual(adx, atr, bbWidth, rsi, direction) {
   if (adx > 30) {
     if (direction === 'bullish') return 'STRONG_TREND_BULL';
@@ -127,7 +115,6 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
     else if (lastEma50 < prevEma50 && lastEma200 < prevEma200) direction = 'bearish';
   }
 
-  // Regime
   const adx = adxData ? adxData.adx : 0;
   const regimeCode = detectRegimeManual(adx, atr, bbWidth, rsiVal, direction);
   const session = getSession();
@@ -220,16 +207,36 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
   return state;
 }
 
-// ----- Insert states in bulk -----
-async function insertStates(states) {
+// ----- Insert states with full error logging -----
+async function insertStatesWithLogging(states, batchNum) {
+  if (states.length === 0) return;
   try {
+    // Remove _id to let MongoDB generate new ones
     const docs = states.map(s => {
       const { _id, ...rest } = s;
       return rest;
     });
-    await HistoricalState.insertMany(docs, { ordered: false });
+    console.log(`   📦 Batch ${batchNum}: attempting to insert ${docs.length} states...`);
+    const result = await HistoricalState.insertMany(docs, { ordered: false });
+    console.log(`   ✅ Batch ${batchNum}: inserted ${result.length} states.`);
   } catch (err) {
-    if (err.code !== 11000) console.error('   ❌ Insert error:', err.message);
+    if (err.code === 11000) {
+      console.log(`   ⚠️  Batch ${batchNum}: duplicates skipped.`);
+      return;
+    }
+    // For other errors, log the error and the first document to help debug
+    console.error(`   ❌ Batch ${batchNum} error:`, err.message);
+    if (err.name === 'ValidationError') {
+      // Log validation errors for each field
+      const errors = err.errors;
+      for (const field in errors) {
+        console.error(`      - ${field}: ${errors[field].message}`);
+      }
+      console.error('   First document causing validation error:', JSON.stringify(states[0], null, 2));
+    } else {
+      console.error('   First document:', JSON.stringify(states[0], null, 2));
+    }
+    // Do not throw; continue with other batches
   }
 }
 
@@ -238,6 +245,10 @@ async function backfill() {
   console.log('🔌 Connecting to MongoDB...');
   await mongoose.connect(MONGODB_URI);
   console.log('✅ Connected.\n');
+
+  // Verify model collection name
+  console.log(`📂 HistoricalState collection: ${HistoricalState.collection.collectionName}`);
+  console.log(`📂 HistoricalCandle collection: ${HistoricalCandle.collection.collectionName}`);
 
   const startTime = performance.now();
 
@@ -262,6 +273,7 @@ async function backfill() {
   console.log('\n🧠 Generating states from candles...');
   let totalStates = 0;
   let batch = [];
+  let batchCounter = 0;
 
   for (const [key, candleList] of Object.entries(groups)) {
     const [symbol, timeframe] = key.split(':');
@@ -280,15 +292,22 @@ async function backfill() {
         batch.push(state);
         totalStates++;
         if (batch.length >= STATE_BATCH_SIZE) {
-          await insertStates(batch);
+          batchCounter++;
+          await insertStatesWithLogging(batch, batchCounter);
           batch = [];
         }
       }
     }
   }
 
-  if (batch.length > 0) await insertStates(batch);
-  console.log(`   ✅ Generated ${totalStates} states.`);
+  if (batch.length > 0) {
+    batchCounter++;
+    await insertStatesWithLogging(batch, batchCounter);
+  }
+
+  // Verify count after insertion
+  const finalCount = await HistoricalState.countDocuments();
+  console.log(`\n✅ Generated ${totalStates} states, saved ${finalCount} states.`);
 
   // ---- Label outcomes ----
   console.log('\n🏷️  Labelling outcomes...');
