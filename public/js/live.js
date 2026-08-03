@@ -1,4 +1,5 @@
 // public/js/live.js – Updated for CTOS Real-time Events with Sound Alerts and Fusion
+// Added OTIE V5 state and action display
 
 (function() {
   'use strict';
@@ -17,6 +18,8 @@
   const metricsPanel = document.getElementById('metricsPanel');
   const fusionPanel = document.getElementById('fusionPanel');
   const wsStatus = document.getElementById('wsStatus');
+  // OTIE V5 panel
+  const otieContent = document.getElementById('otieContent');
 
   // ---- SoundManager (global from app.js) ----
   function playSound(type) {
@@ -132,6 +135,13 @@
       case 'metrics':
         displayMetrics(msg.data);
         break;
+      // ---- OTIE V5 events ----
+      case 'otieV5State':
+        displayOTIEState(msg.data);
+        break;
+      case 'otieV5Action':
+        displayOTIEAction(msg.data);
+        break;
       case 'tradeClosed':
         if (typeof loadOpenTrades === 'function') loadOpenTrades();
         if (typeof loadTradeHistory === 'function') loadTradeHistory();
@@ -153,7 +163,7 @@
     }
   }
 
-  // ---- Display functions (existing, unchanged) ----
+  // ---- Display functions (existing) ----
   function displayAwareness(data) {
     if (!awarenessPanel) return;
     const { symbol, spread, velocity, acceleration, liquidity, unusualEvents, lastUpdated } = data;
@@ -315,7 +325,7 @@
     }
   }
 
-  // ---- NEW: Fusion display ----
+  // ---- Fusion display ----
   function displayFusion(fusion) {
     if (!fusionPanel) return;
     const { symbol, verdict, confidence, agreement, timeframeBreakdown, reasons, session } = fusion;
@@ -395,6 +405,87 @@
         </div>
       </div>
     `;
+  }
+
+  // ---- OTIE V5 Display Functions ----
+  function displayOTIEState(data) {
+    if (!otieContent) return;
+    const { tradeId, symbol, profitR, scores, prediction, stateProbs, bestAction, actions, timestamp } = data;
+
+    let html = `
+      <div class="card mb-2">
+        <div class="card-header">
+          <strong>${symbol} (${tradeId})</strong>
+          <span class="badge bg-info float-end">Profit: ${profitR.toFixed(2)}R</span>
+        </div>
+        <div class="card-body">
+          <div class="row">
+            <div class="col-md-6">
+              <h6>Trade State Probabilities</h6>
+              <ul class="list-unstyled small">
+                ${Object.entries(stateProbs).map(([state, prob]) => `
+                  <li><span class="badge bg-secondary">${state}</span> ${(prob * 100).toFixed(1)}%</li>
+                `).join('')}
+              </ul>
+            </div>
+            <div class="col-md-6">
+              <h6>Continuous Scores</h6>
+              <ul class="list-unstyled small">
+                <li>Health: ${scores.health?.toFixed(0) || 'N/A'}</li>
+                <li>Trend Strength: ${scores.trendStrength?.toFixed(0) || 'N/A'}</li>
+                <li>Momentum: ${scores.momentum?.toFixed(0) || 'N/A'}</li>
+                <li>Liquidity: ${scores.liquidity?.toFixed(0) || 'N/A'}</li>
+                <li>Opportunity: ${scores.opportunity?.toFixed(0) || 'N/A'}</li>
+                <li>Risk: ${scores.risk?.toFixed(0) || 'N/A'}</li>
+                <li>Confidence: ${scores.confidence?.toFixed(0) || 'N/A'}</li>
+              </ul>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-12">
+              <h6>Prediction</h6>
+              <p class="small">Continuation: ${(prediction.continuationProbability * 100).toFixed(1)}% | Reversal: ${(prediction.reversalProbability * 100).toFixed(1)}% | Confidence: ${prediction.confidence.toFixed(0)}%</p>
+            </div>
+          </div>
+          <div class="row">
+            <div class="col-12">
+              <h6>Best Action: <span class="badge bg-success">${bestAction}</span></h6>
+              <ul class="list-unstyled small">
+                ${(actions || []).map(a => `<li>${a.type}: EV ${a.ev.toFixed(3)} (conf ${a.confidence.toFixed(0)}%)</li>`).join('')}
+              </ul>
+            </div>
+          </div>
+          <p class="text-muted small">${new Date(timestamp).toLocaleString()}</p>
+        </div>
+      </div>
+    `;
+
+    // Prepend to keep latest on top
+    otieContent.innerHTML = html + otieContent.innerHTML;
+    // Limit to last 10 items to avoid clutter
+    const items = otieContent.querySelectorAll('.card');
+    if (items.length > 10) {
+      items[items.length - 1].remove();
+    }
+  }
+
+  function displayOTIEAction(data) {
+    if (!otieContent) return;
+    const { tradeId, action, details, timestamp } = data;
+    // We can append a small notification or update the existing state card.
+    // Since we already display the state, we can add a small badge or just log.
+    // For simplicity, we'll add a small alert at the top of the OTIE panel.
+    const alertDiv = document.createElement('div');
+    alertDiv.className = 'alert alert-info alert-dismissible fade show';
+    alertDiv.innerHTML = `
+      <strong>Action Executed:</strong> ${action} on trade ${tradeId} - ${details.reason || ''}
+      <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    `;
+    otieContent.prepend(alertDiv);
+    // Auto-dismiss after 5 seconds
+    setTimeout(() => {
+      if (alertDiv) alertDiv.remove();
+    }, 5000);
   }
 
   function formatPrice(p) {
