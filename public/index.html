@@ -472,6 +472,11 @@
     <button class="nav-item" data-section="research">
       <i class="fas fa-flask"></i> Research Lab
     </button>
+    <!-- NEW: Trade Management (OTIE V5) -->
+    <button class="nav-item" data-section="trademanagement">
+      <i class="fas fa-robot"></i> Trade Management
+      <span class="badge">OTIE</span>
+    </button>
 
     <div class="nav-label">System</div>
     <button class="nav-item" data-section="notifications">
@@ -826,13 +831,12 @@
     </div>
   </div>
 
-  <!-- ===== RESEARCH LAB SECTION ===== -->
+  <!-- ===== RESEARCH LAB SECTION (with Limit input) ===== -->
   <div id="section-research" class="section-content" style="display:none;">
     <div class="card">
       <div class="card-header"><span class="card-title"><i class="fas fa-flask"></i> Knowledge Explorer</span></div>
       <div class="card-body">
         <div class="row g-2 mb-3">
-          <!-- CHANGED: default symbol to EURUSD (no underscore) -->
           <div class="col-md-2"><label class="form-label small">Symbol</label><input type="text" id="knowledgeSymbol" class="form-control" value="EURUSD" /></div>
           <div class="col-md-2"><label class="form-label small">Timeframe</label>
             <select id="knowledgeTimeframe" class="form-select"><option value="M5">M5</option><option value="M15">M15</option><option value="H1">H1</option></select>
@@ -846,11 +850,35 @@
           <div class="col-md-2"><label class="form-label small">Lookahead</label>
             <select id="knowledgeLookahead" class="form-select"><option value="5">5</option><option value="10">10</option><option value="20">20</option><option value="40">40</option></select>
           </div>
-          <div class="col-md-2 d-flex align-items-end">
+          <!-- NEW: Limit input -->
+          <div class="col-md-2">
+            <label class="form-label small">Limit</label>
+            <input type="number" id="knowledgeLimit" class="form-control" value="100" min="1" max="50000" />
+          </div>
+        </div>
+        <div class="row">
+          <div class="col-12">
             <button class="btn btn-primary w-100" id="knowledgeSearchBtn"><i class="fas fa-search"></i> Search</button>
           </div>
         </div>
-        <div id="knowledgeResults"><p class="text-muted">Enter filters and click Search to explore historical market states.</p></div>
+        <div id="knowledgeResults" class="mt-3"><p class="text-muted">Enter filters and click Search to explore historical market states.</p></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== TRADE MANAGEMENT SECTION (OTIE V5) ===== -->
+  <div id="section-trademanagement" class="section-content" style="display:none;">
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title"><i class="fas fa-robot text-primary"></i> Open Trade Intelligence (OTIE V5)</span>
+        <span class="badge bg-success">Active</span>
+      </div>
+      <div class="card-body" id="otiePanel">
+        <p class="text-muted">Real‑time trade management decisions will appear here.</p>
+        <!-- You can populate this with WebSocket data from otieV5State -->
+        <div id="otieContent">
+          <!-- Dynamic content will be inserted by live.js or a custom script -->
+        </div>
       </div>
     </div>
   </div>
@@ -979,6 +1007,7 @@
     signals: document.getElementById('section-dashboard'),
     regime: document.getElementById('section-dashboard'),
     notifications: document.getElementById('section-notifications'),
+    trademanagement: document.getElementById('section-trademanagement'),
   };
   const pageTitle = document.getElementById('pageTitle');
   const sectionNames = {
@@ -990,6 +1019,7 @@
     signals: 'Dashboard',
     regime: 'Dashboard',
     notifications: 'Notifications',
+    trademanagement: 'Trade Management',
   };
 
   navItems.forEach(item => {
