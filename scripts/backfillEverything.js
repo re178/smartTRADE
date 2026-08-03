@@ -13,9 +13,9 @@ const MIN_CANDLES_FOR_INDICATORS = 50;
 const LOOKAHEADS = [5, 10, 20, 40];
 
 // ----- Models (use your actual models) -----
-const HistoricalCandle = require('../models/HistoricalCandle');
-const HistoricalState = require('../models/HistoricalState');
-const HistoricalOutcome = require('../models/HistoricalOutcome');
+const HistoricalCandle = require('./models/HistoricalCandle');
+const HistoricalState = require('./models/HistoricalState');
+const HistoricalOutcome = require('./models/HistoricalOutcome');
 
 // ----- Indicator Functions (from strategy/engine) -----
 const {
