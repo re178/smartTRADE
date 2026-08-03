@@ -236,10 +236,12 @@
     `;
   }
 
+  // ----- UPDATED: displayDecision with correct decisionId ----
   function displayDecision(decision) {
     if (!liveSignalPanel) return;
-    const { _id, symbol, decision: side, confidence, entryPrice, stopLoss, takeProfit, recommendedLotSize, reason, timestamp } = decision;
-    const decisionId = _id || decision.id; // ensure we have an ID
+    // Extract decisionId from the payload (sent by selfLearner.recordDecision)
+    const decisionId = decision.decisionId || decision._id || decision.id;
+    const { symbol, decision: side, confidence, entryPrice, stopLoss, takeProfit, recommendedLotSize, reason, timestamp } = decision;
 
     // Play signal sound
     playSound('signal');
@@ -267,9 +269,11 @@
       html += `<p><small>${reason || ''}</small></p>`;
       html += `<button class="btn btn-sm btn-primary execute-signal-btn" onclick="window.executeSignalFromCard(this)">`;
       html += `<i class="fas fa-rocket"></i> Execute Trade</button>`;
-      // Explain button
-      html += `<button class="btn btn-sm btn-outline-info ms-2 explain-signal-btn" onclick="window.openDecisionInspector('${decisionId}')">`;
-      html += `<i class="fas fa-info-circle"></i> Explain</button>`;
+      // ---- Explain button: only if decisionId is valid ----
+      if (decisionId) {
+        html += `<button class="btn btn-sm btn-outline-info ms-2 explain-signal-btn" onclick="window.openDecisionInspector('${decisionId}')">`;
+        html += `<i class="fas fa-info-circle"></i> Explain</button>`;
+      }
     }
     html += `<p class="text-muted small mt-2">${new Date(timestamp).toLocaleString()}</p>`;
     html += `</div>`;
@@ -349,8 +353,6 @@
 
   // ---- Placeholder for timeframe details (can be extended) ----
   window.showTimeframeDetails = function(symbol) {
-    // This would fetch detailed assessments from the backend if an endpoint exists.
-    // For now, log to console and show a simple alert.
     console.log('Fetch details for', symbol);
     alert('Timeframe details will be displayed here (to be implemented).');
   };
