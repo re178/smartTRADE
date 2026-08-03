@@ -1,5 +1,5 @@
-// backfillEverything.js – Complete Backfill with Zero Errors & Full Logging
-// Run: node backfillEverything.js
+// backfillEverything.js – Complete Backfill with Correct Model Loading
+// Run: node scripts/backfillEverything.js
 
 require('dotenv').config();
 const mongoose = require('mongoose');
@@ -7,15 +7,16 @@ const { performance } = require('perf_hooks');
 
 // ----- Configuration -----
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/rts';
-const STATE_BATCH_SIZE = 500;
-const OUTCOME_BATCH_SIZE = 500;
+const STATE_BATCH_SIZE = 1000;
+const OUTCOME_BATCH_SIZE = 1000;
 const MIN_CANDLES_FOR_INDICATORS = 50;
 const LOOKAHEADS = [5, 10, 20, 40];
 
-// ----- Models (use your actual models) -----
-const HistoricalCandle = require('../models/HistoricalCandle');
+// ----- Import Models (using your actual paths) -----
 const HistoricalState = require('../models/HistoricalState');
 const HistoricalOutcome = require('../models/HistoricalOutcome');
+// Do NOT import HistoricalCandle from a file – it's defined in candleHistory.js
+// We will get it via mongoose.model after connection.
 
 // ----- Indicator Functions (from strategy/engine) -----
 const {
@@ -27,7 +28,7 @@ const {
   findSupportResistance,
 } = require('../core/strategy/engine');
 
-// ----- Local helpers (not exported from engine) -----
+// ----- Local helpers -----
 function EMA(prices, period) {
   const result = [];
   const multiplier = 2 / (period + 1);
@@ -49,12 +50,10 @@ function getSession() {
   return 'Other';
 }
 
-// ----- Helper: format candle for indicator functions -----
 function formatCandle(c) {
   return { mid: { h: c.high, l: c.low, c: c.close } };
 }
 
-// ----- Helper: detect regime manually -----
 function detectRegimeManual(adx, atr, bbWidth, rsi, direction) {
   if (adx > 30) {
     if (direction === 'bullish') return 'STRONG_TREND_BULL';
@@ -67,7 +66,7 @@ function detectRegimeManual(adx, atr, bbWidth, rsi, direction) {
   return 'NEUTRAL';
 }
 
-// ----- Build state from candles -----
+// ----- Build state matching HistoricalState schema -----
 function buildState(symbol, timeframe, candles, idx, awareness) {
   if (!awareness) {
     awareness = { velocity: 0, acceleration: 0, liquidity: 0.5, spread: 0.0002, unusualEvents: [] };
@@ -76,7 +75,6 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
   const closes = candles.map(c => c.close);
   const currentIdx = idx;
   const currentPrice = closes[currentIdx];
-
   if (currentIdx < MIN_CANDLES_FOR_INDICATORS - 1) return null;
 
   const start = Math.max(0, currentIdx - 199);
@@ -84,7 +82,6 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
   const windowFormatted = windowCandles.map(c => formatCandle(c));
   const windowCloses = windowCandles.map(c => c.close);
 
-  // Compute indicators
   const adxData = ADX(windowFormatted, 14);
   const atrArray = ATR(windowFormatted, 14);
   const rsi = RSI(windowCloses, 14);
@@ -102,7 +99,6 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
   const isAtSupport = support ? Math.abs(currentPrice - support) / currentPrice < 0.001 : false;
   const isAtResistance = resistance ? Math.abs(currentPrice - resistance) / currentPrice < 0.001 : false;
 
-  // Trend direction using EMA
   const ema50 = EMA(windowCloses, 50);
   const ema200 = EMA(windowCloses, 200);
   let direction = 'neutral';
@@ -119,7 +115,8 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
   const regimeCode = detectRegimeManual(adx, atr, bbWidth, rsiVal, direction);
   const session = getSession();
 
-  // Build state
+  const sessionName = ['Sydney','Asia','London','New York','Other'].includes(session) ? session : 'Other';
+
   const state = {
     symbol,
     timeframe,
@@ -132,9 +129,9 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
       close: candles[currentIdx].close,
     },
     trend: {
-      direction,
+      direction: direction,
       strength: adx,
-      adx,
+      adx: adx,
       plusDI: adxData ? adxData.plusDI : 0,
       minusDI: adxData ? adxData.minusDI : 0,
       slope: (closes[currentIdx] - closes[Math.max(0, currentIdx - 50)]) / (closes[Math.max(0, currentIdx - 50)] || 0.0001),
@@ -143,14 +140,14 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
       rsi: rsiVal,
       macdLine: macd ? macd.macd[macd.macd.length - 1] : 0,
       macdSignal: macd ? macd.signal[macd.signal.length - 1] : 0,
-      macdHist,
+      macdHist: macdHist,
       velocity: awareness.velocity || 0,
       acceleration: awareness.acceleration || 0,
     },
     volatility: {
-      atr,
+      atr: atr,
       atrPercent: atr / (currentPrice || 0.0001),
-      bbWidth,
+      bbWidth: bbWidth,
       regime: atr > 0 ? (atr / (atrArray ? atrArray.slice(-20).reduce((a,b)=>a+b,0)/20 : 0.001) > 1.5 ? 'high' : 'normal') : 'normal',
     },
     liquidity: {
@@ -159,15 +156,15 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
       tickFrequency: 0,
     },
     structure: {
-      support,
-      resistance,
-      pricePosition,
-      isAtSupport,
-      isAtResistance,
+      support: support,
+      resistance: resistance,
+      pricePosition: pricePosition,
+      isAtSupport: isAtSupport,
+      isAtResistance: isAtResistance,
     },
     session: {
-      name: session,
-      liquidityMultiplier: (session === 'London' || session === 'New York') ? 1.5 : 1.0,
+      name: sessionName,
+      liquidityMultiplier: (sessionName === 'London' || sessionName === 'New York') ? 1.5 : 1.0,
       isWeekday: true,
     },
     regime: {
@@ -183,7 +180,11 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
     summary: {
       marketQuality: 50,
       noiseLevel: 'medium',
-      regimeSuggestion: regimeCode,
+      regimeSuggestion: regimeCode.toLowerCase().includes('trend') ? 'trending' : 
+                         regimeCode === 'RANGING' ? 'ranging' :
+                         regimeCode === 'HIGH_VOLATILITY' ? 'volatile' :
+                         regimeCode === 'LOW_VOLATILITY' ? 'quiet' :
+                         regimeCode === 'REVERSAL' ? 'reversal' : 'neutral',
       trendConfidence: adx,
     },
     confidence: 50,
@@ -192,7 +193,6 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
     version: '2.0',
   };
 
-  // Null outcomes
   for (const la of LOOKAHEADS) {
     state[`outcome${la}`] = {
       return: null,
@@ -211,12 +211,11 @@ function buildState(symbol, timeframe, candles, idx, awareness) {
 async function insertStatesWithLogging(states, batchNum) {
   if (states.length === 0) return;
   try {
-    // Remove _id to let MongoDB generate new ones
     const docs = states.map(s => {
       const { _id, ...rest } = s;
       return rest;
     });
-    console.log(`   📦 Batch ${batchNum}: attempting to insert ${docs.length} states...`);
+    console.log(`   📦 Batch ${batchNum}: attempting ${docs.length} inserts...`);
     const result = await HistoricalState.insertMany(docs, { ordered: false });
     console.log(`   ✅ Batch ${batchNum}: inserted ${result.length} states.`);
   } catch (err) {
@@ -224,19 +223,18 @@ async function insertStatesWithLogging(states, batchNum) {
       console.log(`   ⚠️  Batch ${batchNum}: duplicates skipped.`);
       return;
     }
-    // For other errors, log the error and the first document to help debug
     console.error(`   ❌ Batch ${batchNum} error:`, err.message);
     if (err.name === 'ValidationError') {
-      // Log validation errors for each field
       const errors = err.errors;
       for (const field in errors) {
         console.error(`      - ${field}: ${errors[field].message}`);
       }
-      console.error('   First document causing validation error:', JSON.stringify(states[0], null, 2));
+      if (states.length > 0) {
+        console.error('   First document causing validation error:', JSON.stringify(states[0], null, 2));
+      }
     } else {
       console.error('   First document:', JSON.stringify(states[0], null, 2));
     }
-    // Do not throw; continue with other batches
   }
 }
 
@@ -246,7 +244,15 @@ async function backfill() {
   await mongoose.connect(MONGODB_URI);
   console.log('✅ Connected.\n');
 
-  // Verify model collection name
+  // Get HistoricalCandle model from mongoose (defined in candleHistory.js)
+  let HistoricalCandle;
+  try {
+    HistoricalCandle = mongoose.model('HistoricalCandle');
+  } catch (e) {
+    console.error('❌ HistoricalCandle model not found. Ensure candleHistory.js is loaded.');
+    process.exit(1);
+  }
+
   console.log(`📂 HistoricalState collection: ${HistoricalState.collection.collectionName}`);
   console.log(`📂 HistoricalCandle collection: ${HistoricalCandle.collection.collectionName}`);
 
@@ -271,7 +277,7 @@ async function backfill() {
   console.log(`   Grouped into ${Object.keys(groups).length} symbol/timeframe pairs.`);
 
   console.log('\n🧠 Generating states from candles...');
-  let totalStates = 0;
+  let totalStatesGenerated = 0;
   let batch = [];
   let batchCounter = 0;
 
@@ -290,7 +296,7 @@ async function backfill() {
       const state = buildState(symbol, timeframe, candleList, i, null);
       if (state) {
         batch.push(state);
-        totalStates++;
+        totalStatesGenerated++;
         if (batch.length >= STATE_BATCH_SIZE) {
           batchCounter++;
           await insertStatesWithLogging(batch, batchCounter);
@@ -305,9 +311,8 @@ async function backfill() {
     await insertStatesWithLogging(batch, batchCounter);
   }
 
-  // Verify count after insertion
   const finalCount = await HistoricalState.countDocuments();
-  console.log(`\n✅ Generated ${totalStates} states, saved ${finalCount} states.`);
+  console.log(`\n✅ Generated ${totalStatesGenerated} states, saved ${finalCount} states.`);
 
   // ---- Label outcomes ----
   console.log('\n🏷️  Labelling outcomes...');
@@ -353,8 +358,8 @@ async function backfill() {
         }
         updates[`outcome${la}`] = {
           return: returnVal,
-          returnR,
-          win,
+          returnR: returnR,
+          win: win,
           maxDrawdown: maxDD,
           volatility: atr,
           filledAt: new Date(),
