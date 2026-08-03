@@ -1,3 +1,4 @@
+// models/Trade.js
 const mongoose = require('mongoose');
 
 const TradeSchema = new mongoose.Schema(
@@ -159,13 +160,32 @@ const TradeSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
+
+    // ---- NEW fields required by OTIE V5 ----
+    atrAtEntry: {
+      type: Number,
+      default: null,
+      description: 'ATR value at the time the trade was opened (used for R calculation)',
+    },
+    riskAmount: {
+      type: Number,
+      default: null,
+      description: 'Risk amount in account currency (used for R calculation)',
+    },
+    maxFloatingProfit: {
+      type: Number,
+      default: 0,
+      description: 'Maximum unrealized profit reached (in account currency)',
+    },
+    // Internal flag used by OTIE (not persisted, but can be stored if needed)
+    // _partialClosed: { type: Boolean, default: false } // optional
   },
   {
     timestamps: true,
   }
 );
 
-// ---- Indexes for fast lookups ----
+// ---- Indexes ----
 TradeSchema.index({ login: 1, status: 1 });
 TradeSchema.index({ contractId: 1, status: 1 });
 TradeSchema.index({ decisionId: 1 });
