@@ -1,5 +1,6 @@
 // server.js – RTS Entry Point with Debug Routes & CTOS (Non‑Breaking)
 // Added: Outcome labeler scheduler.
+// Added: OTIE V5 Open Trade Intelligence Engine.
 
 require('dotenv').config();
 
@@ -33,6 +34,9 @@ const stateStore = require('./core/intelligence/lab/stateStore');
 
 // ---------- OUTCOME LABELER ----------
 const { startScheduler } = require('./core/intelligence/lab/outcomeLabeler');
+
+// ---------- OTIE V5 ----------
+const otie = require('./core/intelligence/openTradeIntelligenceV5');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -236,6 +240,14 @@ eventBus.on('order.placed', (data) => {
   broadcast('orderPlaced', data);
 });
 
+// ---------- OTIE V5 Event Broadcasts ----------
+otie.on('otieV5State', (state) => {
+  broadcast('otieV5State', state);
+});
+otie.on('otieV5Action', (action) => {
+  broadcast('otieV5Action', action);
+});
+
 // ---------- DEBUG ROUTES ----------
 app.get('/debug/ea-status', async (req, res) => {
   try {
@@ -288,6 +300,7 @@ app.get('/debug/status', (req, res) => {
       marketAwareness: awarenessEngine ? 'running' : 'not loaded',
       deepRegime: deepRegime ? 'running' : 'not loaded',
       decisionEngine: decisionEngine ? 'running' : 'not loaded',
+      otieV5: otie ? 'running' : 'not loaded',
     },
     lastCandle: candleStore.getHistory('EUR_USD', 'M5', 1)[0] || null,
     lastMarketState: lastState,
@@ -304,6 +317,7 @@ async function startCognitiveEngines() {
     console.log('[CTOS] Market Awareness Engine: active');
     console.log('[CTOS] Deep Regime Detector: active');
     console.log('[CTOS] Decision Engine: active');
+    console.log('[CTOS] OTIE V5: active');
     console.log('[CTOS] All cognitive modules initialized successfully.');
   } catch (err) {
     console.error('[CTOS] Initialization error:', err.message);
@@ -356,6 +370,10 @@ async function startServer() {
     console.log('\n🛑 Received SIGINT, shutting down gracefully...');
     try {
       await dataOrchestrator.shutdown();
+      // Stop OTIE timer
+      if (otie && typeof otie.stop === 'function') {
+        otie.stop();
+      }
       console.log('✅ Data Orchestrator flushed.');
     } catch (err) {
       console.error('Error during shutdown:', err.message);
@@ -367,6 +385,9 @@ async function startServer() {
     console.log('\n🛑 Received SIGTERM, shutting down gracefully...');
     try {
       await dataOrchestrator.shutdown();
+      if (otie && typeof otie.stop === 'function') {
+        otie.stop();
+      }
       console.log('✅ Data Orchestrator flushed.');
     } catch (err) {
       console.error('Error during shutdown:', err.message);
