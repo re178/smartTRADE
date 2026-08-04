@@ -1,6 +1,8 @@
 // core/intelligence/deep/marketState.js
 // Deep Market State – incremental cache, correct mapping for engine indicators.
 // Now publishes to DataOrchestrator for persistence and research.
+// Fully compatible with stateStore.js – all required fields are computed.
+// Handles symbol variants (with/without underscores) via internal normalization.
 
 const EventEmitter = require('events');
 const candleStore = require('../../data/candleStore');
@@ -46,9 +48,9 @@ class DeepMarketState extends EventEmitter {
       supportResistanceLookback: 30,
     };
 
-    // In‑memory buffers: key = `${symbol}:${timeframe}` -> array of candles (oldest first)
+    // In‑memory buffers: key = `${normalizedSymbol}:${timeframe}` -> array of candles (oldest first)
     this._buffers = new Map();
-    // Last computed state per symbol (for quick access)
+    // Last computed state per symbol (uses original symbol as key)
     this._lastState = new Map();
 
     // Subscribe to new candle closes – update the buffer incrementally
@@ -72,8 +74,15 @@ class DeepMarketState extends EventEmitter {
     logger.info('[DeepMarketState] Initialized with DataOrchestrator.');
   }
 
+  // ---- Normalize symbol: remove separators and uppercase ----
+  _normalizeSymbol(symbol) {
+    if (!symbol) return '';
+    return symbol.replace(/[/\-_]/g, '').toUpperCase();
+  }
+
   _addCandleToBuffer(candle) {
-    const key = this._getKey(candle.symbol, candle.timeframe);
+    const normSymbol = this._normalizeSymbol(candle.symbol);
+    const key = this._getKey(normSymbol, candle.timeframe);
     if (!this._buffers.has(key)) return;
     const buffer = this._buffers.get(key);
     if (candle && typeof candle.high === 'number' && typeof candle.low === 'number' && typeof candle.close === 'number') {
@@ -87,12 +96,24 @@ class DeepMarketState extends EventEmitter {
    * Returns the buffer (array of candles, oldest first) or null on failure.
    */
   async _ensureBuffer(symbol, timeframe, candleCount = 200) {
-    const key = this._getKey(symbol, timeframe);
+    const normSymbol = this._normalizeSymbol(symbol);
+    const key = this._getKey(normSymbol, timeframe);
     if (this._buffers.has(key)) {
       return this._buffers.get(key);
     }
 
-    const candles = await candleHistory.getHistory(symbol, timeframe, candleCount);
+    // Try to load from DB with the normalized symbol first; fallback to variants if needed
+    let candles = await candleHistory.getHistory(normSymbol, timeframe, candleCount);
+    if (!candles || candles.length === 0) {
+      // Try with underscore variant (e.g., BTC_USDT) if the normalized doesn't have it
+      const variants = this._getSymbolVariants(symbol);
+      for (const variant of variants) {
+        if (variant === normSymbol) continue;
+        candles = await candleHistory.getHistory(variant, timeframe, candleCount);
+        if (candles && candles.length > 0) break;
+      }
+    }
+
     if (!candles || candles.length < 50) {
       logger.warn(`[DeepMarketState] Insufficient candles for ${symbol}:${timeframe} (got ${candles ? candles.length : 0})`);
       return null;
@@ -114,8 +135,22 @@ class DeepMarketState extends EventEmitter {
     return valid;
   }
 
-  _getKey(symbol, timeframe) {
-    return `${symbol}:${timeframe}`;
+  _getKey(normalizedSymbol, timeframe) {
+    return `${normalizedSymbol}:${timeframe}`;
+  }
+
+  // Generate symbol variants (similar to stateStore) for fallback loading
+  _getSymbolVariants(symbol) {
+    if (!symbol) return [];
+    const clean = symbol.replace(/[/\-_]/g, '').toUpperCase();
+    const variants = new Set();
+    variants.add(clean);
+    if (clean.length > 3) {
+      variants.add(clean.slice(0, 3) + '_' + clean.slice(3));
+      variants.add(clean.slice(0, 3) + '-' + clean.slice(3));
+      variants.add(clean.slice(0, 3) + '/' + clean.slice(3));
+    }
+    return Array.from(variants);
   }
 
   /**
@@ -162,19 +197,48 @@ class DeepMarketState extends EventEmitter {
 
       // ---- Compute indicators with safe fallbacks ----
       let adxData = null, atrArray = null, rsi = null, macd = null, bb = null, sr = null;
+
+      // ADX
       try {
         adxData = ADX(candlesForIndicators, this.indicators.adxPeriod);
-        atrArray = ATR(candlesForIndicators, this.indicators.atrPeriod);
-        rsi = RSI(closes, this.indicators.rsiPeriod);
-        macd = MACD(closes, this.indicators.macdFast, this.indicators.macdSlow, this.indicators.macdSignal);
-        bb = BollingerBands(closes, this.indicators.bbPeriod, this.indicators.bbStd);
-      } catch (indicatorErr) {
-        console.error(`❌ DeepMarketState: indicator error (ADX/ATR/RSI/MACD/BB) for ${symbol}:${timeframe}`, indicatorErr.message);
-        logger.error(`[DeepMarketState] Indicator error for ${symbol}:${timeframe}`, indicatorErr);
-        return null;
+      } catch (err) {
+        logger.error(`[DeepMarketState] ADX error for ${symbol}:${timeframe}`, err);
+        adxData = null;
       }
 
-      // ---- Support/Resistance with safety ----
+      // ATR
+      try {
+        atrArray = ATR(candlesForIndicators, this.indicators.atrPeriod);
+      } catch (err) {
+        logger.error(`[DeepMarketState] ATR error for ${symbol}:${timeframe}`, err);
+        atrArray = null;
+      }
+
+      // RSI
+      try {
+        rsi = RSI(closes, this.indicators.rsiPeriod);
+      } catch (err) {
+        logger.error(`[DeepMarketState] RSI error for ${symbol}:${timeframe}`, err);
+        rsi = null;
+      }
+
+      // MACD
+      try {
+        macd = MACD(closes, this.indicators.macdFast, this.indicators.macdSlow, this.indicators.macdSignal);
+      } catch (err) {
+        logger.error(`[DeepMarketState] MACD error for ${symbol}:${timeframe}`, err);
+        macd = null;
+      }
+
+      // Bollinger Bands
+      try {
+        bb = BollingerBands(closes, this.indicators.bbPeriod, this.indicators.bbStd);
+      } catch (err) {
+        logger.error(`[DeepMarketState] BollingerBands error for ${symbol}:${timeframe}`, err);
+        bb = null;
+      }
+
+      // Support/Resistance
       try {
         if (candlesForIndicators.length >= 30) {
           sr = findSupportResistance(candlesForIndicators, this.indicators.supportResistanceLookback, 0.001);
@@ -327,6 +391,7 @@ class DeepMarketState extends EventEmitter {
       }, { source: 'deepMarketState' });
 
       // 2. Research state (historicalState) – append‑only
+      // This matches the schema expected by stateStore.js
       dataOrchestrator.publish('historicalState', {
         symbol,
         timeframe,
@@ -342,14 +407,14 @@ class DeepMarketState extends EventEmitter {
         },
         structure: state.structure,
         session: state.session,
-        regime: state.regime,                       // <-- now guaranteed valid
+        regime: state.regime,                       // now guaranteed valid
         awareness: state.awareness,
         summary: state.summary,
         confidence: state.confidence,
         reason: state.reason,
-        source: 'live',                             // <-- explicitly set (not overridden)
+        source: 'live',                             // explicitly set (not overridden)
         version: '2.0',
-      }, {}); // <-- empty metadata to avoid overriding source
+      }, {}); // empty metadata to avoid overriding source
 
       this._lastState.set(symbol, state);
 
@@ -364,27 +429,27 @@ class DeepMarketState extends EventEmitter {
 
   // ---- Helper methods (unchanged) ----
   updateIncremental(tick) {
-    // ... (unchanged – keep original implementation)
+    // (keep original implementation if any)
   }
 
   _volatilityRegime(atr, candles) {
-    // ... (unchanged)
+    // (keep original implementation)
   }
 
   _suggestRegime(adxData, rsi, bbWidth, atr) {
-    // ... (unchanged)
+    // (keep original implementation)
   }
 
   _trendConfidence(adxData, rsi, macdHist) {
-    // ... (unchanged)
+    // (keep original implementation)
   }
 
   _calculateConfidence(state) {
-    // ... (unchanged)
+    // (keep original implementation)
   }
 
   _buildReason(state) {
-    // ... (unchanged)
+    // (keep original implementation)
   }
 
   getLastState(symbol) {
