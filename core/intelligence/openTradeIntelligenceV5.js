@@ -1,7 +1,4 @@
 // core/intelligence/openTradeIntelligenceV5.js
-// Final Version – Enhanced Profit Protection, Progressive SL, Peak Tracking, Dynamic Partial, Expected Remaining Value.
-// Includes updateConfig() for Performance Monitor integration.
-
 const EventEmitter = require('events');
 const axios = require('axios');
 const Trade = require('../../models/Trade');
@@ -887,7 +884,12 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     this._isRunning = true;
 
     try {
-      const openTrades = await Trade.find({ status: 'OPEN' });
+      // ---- FIX: Exclude pendingClose trades ----
+      const openTrades = await Trade.find({
+        status: 'OPEN',
+        pendingClose: { $ne: true }
+      });
+
       if (openTrades.length === 0) {
         this._isRunning = false;
         return;
