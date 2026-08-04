@@ -1,8 +1,7 @@
 // core/intelligence/lab/stateStore.js
-// Similarity search, edge computation – fixed outcome detection, more stats.
+// Similarity search, edge computation – using embedded outcomes in HistoricalState.
 
 const HistoricalState = require('../../../models/HistoricalState');
-const HistoricalOutcome = require('../../../models/HistoricalOutcome');
 const logger = require('../../../infrastructure/logger') || console;
 
 const CONFIG = {
@@ -184,26 +183,27 @@ class StateStore {
         squaredSum += (q - s) ** 2;
       }
       const distance = Math.sqrt(squaredSum);
+
       const outcomeKey = `outcome${lookahead}`;
       const outcome = state[outcomeKey] || { return: null, returnR: null, win: null, maxDrawdown: null, volatility: null, filledAt: null };
+
+      // If returnR is null but return exists, compute returnR on the fly
+      if (outcome.returnR === null && outcome.return !== null) {
+        const atr = state.volatility?.atr || 0.001;
+        outcome.returnR = outcome.return / atr;
+        if (outcome.win === null) outcome.win = outcome.return > 0;
+      }
+
       return { state, distance, outcome };
     });
 
     withDistances.sort((a, b) => a.distance - b.distance);
     const topK = withDistances.slice(0, k);
 
-    // ---- FIX: Check BOTH return and returnR ----
+    // Filter to only those with valid returnR
     const labelled = topK.filter(item => {
       const out = item.outcome;
-      if (!out) return false;
-      // If returnR is null but return exists, compute returnR on the fly
-      if (out.returnR === null && out.return !== null) {
-        const atr = item.state.volatility?.atr || 0.001;
-        out.returnR = out.return / atr;
-        // Also set win based on return
-        if (out.win === null) out.win = out.return > 0;
-      }
-      return out.returnR !== null && typeof out.returnR === 'number' && !isNaN(out.returnR);
+      return out && out.returnR !== null && typeof out.returnR === 'number' && !isNaN(out.returnR);
     });
 
     const stats = this._computeStats(labelled.map(item => item.outcome));
@@ -272,9 +272,8 @@ class StateStore {
     // MAE (max drawdown) and MFE (max favourable excursion)
     const maeValues = outcomes.map(o => o.maxDrawdown || 0);
     const avgMAE = maeValues.reduce((a, b) => a + b, 0) / total;
-    // MFE not directly stored; we could estimate from maxFavourable if available, else approximate
-    // We'll use a placeholder: assume MFE is related to max win.
-    const avgMFE = maxWin > 0 ? maxWin / 2 : 0; // placeholder
+    // MFE placeholder (not stored)
+    const avgMFE = maxWin > 0 ? maxWin / 2 : 0;
 
     // Confidence interval (95% for mean)
     const mean = avgReturnR;
