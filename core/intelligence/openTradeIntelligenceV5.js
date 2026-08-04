@@ -1,5 +1,6 @@
 // core/intelligence/openTradeIntelligenceV5.js
 // Final Version – Enhanced Profit Protection, Progressive SL, Peak Tracking, Dynamic Partial, Expected Remaining Value.
+// Includes updateConfig() for Performance Monitor integration.
 
 const EventEmitter = require('events');
 const axios = require('axios');
@@ -1086,6 +1087,18 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     } catch (err) {
       logger.error(`[OTIE V5] ❌ Failed to queue command:`, err.message);
     }
+  }
+
+  // ---- Update config from Performance Monitor ----
+  updateConfig(newThresholds) {
+    CONFIG.BREAKEVEN_PROFIT_R = newThresholds.breakevenProfitR ?? CONFIG.BREAKEVEN_PROFIT_R;
+    if (newThresholds.progressiveSLSteps) {
+      CONFIG.PROGRESSIVE_SL_STEPS = newThresholds.progressiveSLSteps;
+    }
+    CONFIG.PARTIAL_FRACTION_MIN = newThresholds.partialFractionMin ?? CONFIG.PARTIAL_FRACTION_MIN;
+    CONFIG.PARTIAL_FRACTION_MAX = newThresholds.partialFractionMax ?? CONFIG.PARTIAL_FRACTION_MAX;
+    CONFIG.EXPECTED_REMAINING_THRESHOLD = newThresholds.expectedRemainingThreshold ?? CONFIG.EXPECTED_REMAINING_THRESHOLD;
+    logger.info('[OTIE V5] Configuration updated by Performance Monitor.');
   }
 
   stop() {
