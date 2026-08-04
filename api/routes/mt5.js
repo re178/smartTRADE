@@ -1,3 +1,6 @@
+// api/mt5Routes.js – Full file with P&L fix and pending-close finalisation
+// Replace your current file with this.
+
 const express = require('express');
 const router = express.Router();
 const logger = require('../../infrastructure/logger') || console;
@@ -136,8 +139,8 @@ router.post('/orders/result', async (req, res) => {
           trade.dealId = deal;
           trade.closeTime = new Date(time ? time * 1000 : Date.now());
           trade.pendingClose = false;
+          // ---- FIXED P&L CALCULATION (case-insensitive side) ----
           if (trade.openPrice && trade.lotSize) {
-            // FIX: compare uppercase to handle 'BUY' and 'buy'
             const multiplier = trade.side && trade.side.toUpperCase() === 'BUY' ? 1 : -1;
             trade.realizedProfit = (price - trade.openPrice) * trade.lotSize * multiplier;
             trade.pnl = trade.realizedProfit; // sync with pnl field
@@ -243,7 +246,7 @@ router.get('/account/status', async (req, res) => {
   }
 });
 
-// ---------- ENHANCED: POST /positions ----------
+// ---------- ENHANCED: POST /positions with pending-close finalisation ----------
 router.post('/positions', async (req, res) => {
   try {
     const { login, positions, timestamp, magic } = req.body;
@@ -281,6 +284,7 @@ router.post('/positions', async (req, res) => {
           login: login,
           pendingClose: false,
           floatingProfit: pos.profit || 0,
+          currentPrice: pos.current_price || pos.price,
         });
       } else {
         trade.currentPrice = pos.current_price;
@@ -308,6 +312,38 @@ router.post('/positions', async (req, res) => {
         trade.pendingClose = true;
         await trade.save();
         logger.debug(`[MT5] Marked trade ${trade.contractId} as pendingClose`);
+      }
+    }
+
+    // 4. NEW: Finalise pendingClose trades using last known price
+    const pendingTrades = await Trade.find({ status: 'OPEN', pendingClose: true, login: login });
+    if (pendingTrades.length > 0) {
+      logger.info(`[MT5] Finalising ${pendingTrades.length} pending close trades...`);
+      for (const trade of pendingTrades) {
+        try {
+          // Use latest price from Mt5Price (most recent) or fallback to trade.currentPrice
+          const priceDoc = await Mt5Price.findOne({ symbol: trade.instrument }).sort({ time: -1 });
+          const closePrice = priceDoc ? (trade.side.toUpperCase() === 'BUY' ? priceDoc.bid : priceDoc.ask) : trade.currentPrice;
+          if (closePrice && trade.openPrice) {
+            const multiplier = trade.side && trade.side.toUpperCase() === 'BUY' ? 1 : -1;
+            const pnl = (closePrice - trade.openPrice) * trade.lotSize * multiplier;
+            trade.status = 'CLOSED';
+            trade.closePrice = closePrice;
+            trade.closeTime = new Date();
+            trade.realizedProfit = pnl;
+            trade.pnl = pnl;
+            trade.pendingClose = false;
+            await trade.save();
+            logger.info(`[MT5] Finalised pending close trade ${trade.contractId} at ${closePrice} with P&L ${pnl}`);
+            // Emit trade.closed event for dashboard and performance monitor
+            const eventBus = require('../../infrastructure/eventBus');
+            eventBus.emit('trade.closed', { contractId: trade.contractId, price: closePrice, pl: pnl });
+          } else {
+            logger.warn(`[MT5] Could not finalise trade ${trade.contractId} – no price data available.`);
+          }
+        } catch (err) {
+          logger.error(`[MT5] Failed to finalise pending close trade ${trade.contractId}:`, err.message);
+        }
       }
     }
 
