@@ -1,4 +1,4 @@
-// api/mt5Routes.js – Full file with P&L fix and pending-close finalisation
+// api/mt5Routes.js – Full file with P&L fix, pending-close finalisation, and PARTIAL support.
 // Replace your current file with this.
 
 const express = require('express');
@@ -97,16 +97,16 @@ router.get('/orders/pending', async (req, res) => {
   }
 });
 
-// ---------- ENHANCED: POST /orders/result ----------
+// ---------- ENHANCED: POST /orders/result (handles PARTIAL, MODIFY, CLOSE) ----------
 router.post('/orders/result', async (req, res) => {
   try {
     const result = req.body;
-    const { commandId, success, ticket, deal, price, symbol, side, time } = result;
+    const { commandId, success, ticket, deal, price, symbol, side, time, volume } = result;
     if (!commandId) {
       return res.status(400).json({ error: 'Missing commandId' });
     }
 
-    // 1. Save the result (existing behavior)
+    // 1. Save the result (existing behaviour)
     await Mt5CommandResult.findOneAndUpdate(
       { commandId },
       result,
@@ -126,40 +126,72 @@ router.post('/orders/result', async (req, res) => {
     );
     logger.info(`[MT5] Result stored for ${commandId}, success=${successFlag}`);
 
-    // 3. If this was a successful CLOSE, finalize the Trade
+    // 3. Get the original command
     const command = await Mt5Command.findOne({ commandId }).lean();
     const action = command?.action;
 
-    if (successFlag && action === 'CLOSE' && ticket && price) {
-      const trade = await Trade.findOne({ contractId: ticket });
-      if (trade) {
-        if (trade.status !== 'CLOSED') {
-          trade.status = 'CLOSED';
-          trade.closePrice = price;
-          trade.dealId = deal;
-          trade.closeTime = new Date(time ? time * 1000 : Date.now());
-          trade.pendingClose = false;
-          // ---- FIXED P&L CALCULATION (case-insensitive side) ----
-          if (trade.openPrice && trade.lotSize) {
-            const multiplier = trade.side && trade.side.toUpperCase() === 'BUY' ? 1 : -1;
-            trade.realizedProfit = (price - trade.openPrice) * trade.lotSize * multiplier;
-            trade.pnl = trade.realizedProfit; // sync with pnl field
-          }
-          await trade.save();
-          logger.info(`[MT5] Trade ${ticket} finalized as CLOSED at ${price}`);
+    if (!successFlag) {
+      return res.status(201).json({ status: 'accepted' });
+    }
 
-          // Update decision outcome
-          if (trade.decisionId) {
-            try {
-              await selfLearner.updateDecisionOutcome(trade.decisionId, trade);
-              logger.info(`[MT5] Decision ${trade.decisionId} outcome updated via close result`);
-            } catch (err) {
-              logger.warn(`[MT5] Failed to update decision outcome for ${trade.decisionId}:`, err.message);
-            }
+    // 4. Process by action type
+    if (action === 'CLOSE') {
+      // ----- CLOSE: finalise trade -----
+      const trade = await Trade.findOne({ contractId: ticket });
+      if (trade && trade.status !== 'CLOSED') {
+        trade.status = 'CLOSED';
+        trade.closePrice = price;
+        trade.dealId = deal;
+        trade.closeTime = new Date(time ? time * 1000 : Date.now());
+        trade.pendingClose = false;
+        if (trade.openPrice && trade.lotSize) {
+          const multiplier = trade.side && trade.side.toUpperCase() === 'BUY' ? 1 : -1;
+          trade.realizedProfit = (price - trade.openPrice) * trade.lotSize * multiplier;
+          trade.pnl = trade.realizedProfit;
+        }
+        await trade.save();
+        logger.info(`[MT5] Trade ${ticket} finalized as CLOSED at ${price}`);
+        if (trade.decisionId) {
+          try {
+            await selfLearner.updateDecisionOutcome(trade.decisionId, trade);
+          } catch (err) {
+            logger.warn(`[MT5] Failed to update decision outcome: ${err.message}`);
           }
         }
-      } else {
-        logger.warn(`[MT5] Trade with ticket ${ticket} not found for closing; will be created on next positions sync.`);
+      }
+    } else if (action === 'MODIFY') {
+      // ----- MODIFY: update SL/TP -----
+      const trade = await Trade.findOne({ contractId: ticket });
+      if (trade && trade.status === 'OPEN') {
+        if (command.stopLoss !== undefined) trade.stopLoss = command.stopLoss;
+        if (command.takeProfit !== undefined) trade.takeProfit = command.takeProfit;
+        await trade.save();
+        logger.info(`[MT5] Trade ${ticket} SL/TP updated`);
+      }
+    } else if (action === 'PARTIAL') {
+      // ----- PARTIAL: reduce lotSize (the 'volume' field from EA is the NEW remaining volume) -----
+      const trade = await Trade.findOne({ contractId: ticket });
+      if (trade && trade.status === 'OPEN') {
+        // The EA sends back the new remaining volume in the 'volume' field.
+        // If volume is not present, we assume it's a full close (should not happen for PARTIAL).
+        if (volume !== undefined && volume > 0) {
+          trade.lotSize = volume;
+          await trade.save();
+          logger.info(`[MT5] Trade ${ticket} lotSize reduced to ${volume}`);
+        } else {
+          // If volume is 0 or missing, treat as full close.
+          trade.status = 'CLOSED';
+          trade.closePrice = price || trade.currentPrice;
+          trade.closeTime = new Date();
+          trade.pendingClose = false;
+          if (trade.openPrice && trade.lotSize) {
+            const multiplier = trade.side && trade.side.toUpperCase() === 'BUY' ? 1 : -1;
+            trade.realizedProfit = (trade.closePrice - trade.openPrice) * trade.lotSize * multiplier;
+            trade.pnl = trade.realizedProfit;
+          }
+          await trade.save();
+          logger.info(`[MT5] Trade ${ticket} closed after partial reduction`);
+        }
       }
     }
 
