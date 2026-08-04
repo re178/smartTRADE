@@ -1,5 +1,7 @@
 // core/execution/orderService.js – Order Management (with Portfolio Risk Integration)
-// FIX: Trade side now uses lowercase to match schema enum.
+// FIX: Order model validation (units, clientOrderId) now correctly populated.
+// FIX: Trade side uses lowercase to match schema enum.
+// FIX: Trade is created even if Order fails (order already placed).
 
 const { getBroker } = require('./brokerFactory');
 const marketProvider = require('../market/provider');
@@ -22,7 +24,7 @@ const MIN_CONFIDENCE = 60;
 const MIN_EDGE = 0.2;
 
 /**
- * Pre‑flight validation for auto‑trade (checks confidence and edge)
+ * Pre‑flight validation for auto‑trade
  */
 function validateAutoTradeSignal(signal) {
   if (!signal || !signal.side) {
@@ -105,35 +107,45 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
     const result = await broker.placeMarketOrder(instrument, units, stopLoss, takeProfit);
     const latency = Date.now() - startTime;
 
-    const contractId = result.tradeID || result.id || null;
+    const contractId = result.tradeID || result.id || result.ticket || null;
     const price = result.price || result.averagePrice || null;
 
     if (!contractId) {
       throw new Error('Broker did not return a trade ID');
     }
 
-    // 5. Create Order document
-    const newOrder = new Order({
+    // ---- 5. Create Order document (with required fields) ----
+    const orderData = {
       contractId,
       instrument,
       side: side.toUpperCase(),
       lotSize: finalLotSize,
+      units: finalLotSize,                 // required by Order schema
+      clientOrderId: contractId,           // required by Order schema
       stopLoss,
       takeProfit,
       status: 'FILLED',
       product,
       filledPrice: price,
       placedAt: new Date(),
-    });
-    await newOrder.save();
+    };
+    let order = null;
+    try {
+      order = new Order(orderData);
+      await order.save();
+      logger.debug(`[orderService] Order saved for ${contractId}`);
+    } catch (orderErr) {
+      logger.error(`[orderService] Failed to save Order for ${contractId}:`, orderErr.message);
+      // We still continue to create Trade because the order is already placed.
+    }
 
-    // 6. Create Trade record – FIX: use lowercase for side to match schema enum
+    // ---- 6. Create Trade record (with correct side case) ----
     let trade = null;
     try {
-      const newTrade = new Trade({
+      const tradeData = {
         contractId,
         instrument,
-        side: side.toLowerCase(),  // ✅ fixes validation error
+        side: side.toLowerCase(),          // ✅ schema expects lowercase
         lotSize: finalLotSize,
         openPrice: price,
         status: 'OPEN',
@@ -142,16 +154,16 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
         decisionId: decisionId || null,
         currentPrice: price,
         floatingProfit: 0,
-        // optional fields for future use
         atrAtEntry: null,
         riskAmount: null,
         maxFloatingProfit: 0,
-      });
-      trade = await newTrade.save();
+      };
+      trade = new Trade(tradeData);
+      await trade.save();
       logger.info(`[orderService] Trade created (OPEN) for ${contractId} (${instrument} ${side})`);
     } catch (tradeErr) {
       logger.error(`[orderService] Failed to create Trade for ${contractId}:`, tradeErr.message);
-      // We'll still continue; the positions sync will create the Trade later.
+      // We'll still continue; the positions sync may create it later.
     }
 
     // 7. Record analytics
