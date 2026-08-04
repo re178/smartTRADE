@@ -1,6 +1,7 @@
 // server.js – RTS Entry Point with Debug Routes & CTOS (Non‑Breaking)
 // Added: Outcome labeler scheduler.
 // Added: OTIE V5 Open Trade Intelligence Engine.
+// Added: Performance Monitor for R/R optimization.
 
 require('dotenv').config();
 
@@ -37,6 +38,9 @@ const { startScheduler } = require('./core/intelligence/lab/outcomeLabeler');
 
 // ---------- OTIE V5 ----------
 const otie = require('./core/intelligence/openTradeIntelligenceV5');
+
+// ---------- PERFORMANCE MONITOR ----------
+const performanceMonitor = require('./core/performance/performanceMonitor');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -248,6 +252,30 @@ otie.on('otieV5Action', (action) => {
   broadcast('otieV5Action', action);
 });
 
+// ---------- Performance Monitor Integration ----------
+// 1. Record closed trades for performance monitoring
+eventBus.on('trade.closed', async (data) => {
+  try {
+    const Trade = require('./models/Trade');
+    const trade = await Trade.findOne({ contractId: data.contractId });
+    if (trade) {
+      performanceMonitor.recordTrade(trade);
+    }
+  } catch (err) {
+    console.error('[PerformanceMonitor] Failed to record trade:', err.message);
+  }
+});
+
+// 2. Update OTIE config when performance thresholds change
+performanceMonitor.on('thresholdsUpdated', (thresholds) => {
+  if (otie && typeof otie.updateConfig === 'function') {
+    otie.updateConfig(thresholds);
+    console.log('[PerformanceMonitor] OTIE config updated.');
+  } else {
+    console.warn('[PerformanceMonitor] OTIE updateConfig method not available.');
+  }
+});
+
 // ---------- DEBUG ROUTES ----------
 app.get('/debug/ea-status', async (req, res) => {
   try {
@@ -318,6 +346,7 @@ async function startCognitiveEngines() {
     console.log('[CTOS] Deep Regime Detector: active');
     console.log('[CTOS] Decision Engine: active');
     console.log('[CTOS] OTIE V5: active');
+    console.log('[CTOS] Performance Monitor: active');
     console.log('[CTOS] All cognitive modules initialized successfully.');
   } catch (err) {
     console.error('[CTOS] Initialization error:', err.message);
@@ -370,7 +399,6 @@ async function startServer() {
     console.log('\n🛑 Received SIGINT, shutting down gracefully...');
     try {
       await dataOrchestrator.shutdown();
-      // Stop OTIE timer
       if (otie && typeof otie.stop === 'function') {
         otie.stop();
       }
