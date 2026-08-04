@@ -1,6 +1,7 @@
 // core/intelligence/openTradeIntelligenceV5.js
 // Open Trade Intelligence Engine V5 – Production-Ready, Addresses All Hidden Issues.
 // Self-contained, modular, evidence-driven, anticipatory trade management.
+// Commands are queued via server API with correct EA payload structure.
 
 const EventEmitter = require('events');
 const axios = require('axios');
@@ -16,7 +17,7 @@ const awarenessEngine = require('../awareness/engine');
 const logger = require('../../infrastructure/logger') || console;
 
 // ========================================================================
-// CONFIGURATION (all tunable via env)
+// CONFIGURATION
 // ========================================================================
 const CONFIG = {
   EVALUATION_INTERVAL_MS: parseInt(process.env.OTIE_INTERVAL) || 30000,
@@ -39,7 +40,7 @@ const CONFIG = {
 };
 
 // ========================================================================
-// 1. SLIDING WINDOW (with adaptive size)
+// 1. SLIDING WINDOW
 // ========================================================================
 class AdaptiveSlidingWindow {
   constructor(symbol) {
@@ -923,30 +924,49 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     });
   }
 
+  // ---- UPDATED: Execute action via server API with correct EA payload ----
   async _executeAction(trade, action) {
     try {
+      const commandId = `otie_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
       const payload = {
-        action: action.type,
-        tradeId: trade.contractId,
-        symbol: trade.instrument,
-        side: trade.side,
+        commandId,
+        action: action.type,          // 'MODIFY', 'CLOSE', 'PARTIAL'
+        tradeId: trade.contractId,    // MT5 ticket number (for MODIFY/CLOSE)
+        instrument: trade.instrument, // for OPEN (though not used for MODIFY/CLOSE)
+        side: trade.side,             // for OPEN
         stopLoss: action.stopLoss,
         takeProfit: action.takeProfit,
-        volume: action.volume,
+        volume: action.volume,        // for PARTIAL CLOSE (EA expects 'volume')
+        units: action.volume,         // for OPEN, but included anyway
       };
+
+      // Remove undefined fields to avoid confusion
+      if (payload.stopLoss === undefined) delete payload.stopLoss;
+      if (payload.takeProfit === undefined) delete payload.takeProfit;
+      if (payload.volume === undefined) delete payload.volume;
+      if (payload.units === undefined) delete payload.units;
+
+      // If action is MODIFY, ensure we have either stopLoss or takeProfit
+      if (action.type === 'MODIFY' && !payload.stopLoss && !payload.takeProfit) {
+        logger.warn('[OTIE V5] MODIFY action without SL or TP, skipping.');
+        return;
+      }
+
       const response = await axios.post(
         `${process.env.API_BASE || 'http://localhost:5000'}/api/mt5/orders/command`,
         payload,
         { headers: { 'Content-Type': 'application/json' } }
       );
+
       if (response.status === 201 || response.status === 200) {
-        logger.info(`[OTIE V5] Action executed: ${action.type} for trade ${trade.contractId} - ${action.reason}`);
+        logger.info(`[OTIE V5] Command queued: ${action.type} for trade ${trade.contractId} - ${action.reason}`);
         this.emit('otieV5Action', {
           tradeId: trade.contractId,
           action: action.type,
           details: action,
           timestamp: new Date().toISOString(),
         });
+        // Update local trade record for SL/TP changes (optional, but good for consistency)
         if (action.type === 'MODIFY') {
           const updates = {};
           if (action.stopLoss !== undefined) updates.stopLoss = action.stopLoss;
@@ -955,14 +975,15 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
             await Trade.updateOne({ contractId: trade.contractId }, { $set: updates });
           }
         }
+        // For partial close, reduce lot size in DB (will be confirmed by EA result)
         if (action.type === 'PARTIAL' && action.volume) {
           await Trade.updateOne({ contractId: trade.contractId }, { $inc: { lotSize: -action.volume } });
         }
       } else {
-        logger.warn(`[OTIE V5] Command failed: ${response.statusText}`);
+        logger.warn(`[OTIE V5] Command queuing failed: ${response.statusText}`);
       }
     } catch (err) {
-      logger.error(`[OTIE V5] Failed to execute action:`, err.message);
+      logger.error(`[OTIE V5] Failed to queue command:`, err.message);
     }
   }
 
