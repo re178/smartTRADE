@@ -166,7 +166,7 @@ class DecisionEngine extends EventEmitter {
     // 5. Compute edge (probability and expected value) from historical analogues
     let edge = null;
     let similarity = null;
-    if (this._isReady && stateStore) {
+    if (this._isReady && stateStore && flatFeatures) {
       try {
         edge = await stateStore.computeEdge(
           flatFeatures,
@@ -291,16 +291,122 @@ class DecisionEngine extends EventEmitter {
       expectedValueModel: 'v2.1',
     };
 
-    // ---- DO NOT LOG HERE – logging is done only when we emit ----
-    // The caller (_onRegime or _evaluate) will log and emit after checking changes.
-
     return decisionObj;
+  }
+
+  // ============================================================
+  // FEATURE EXTRACTION
+  // ============================================================
+  _extractFeatures(state, regime) {
+    if (!state) return null;
+    const features = {
+      adx: state.trend?.adx || 0,
+      rsi: state.momentum?.rsi || 50,
+      atrPercent: state.volatility?.atrPercent || 0.001,
+      bbWidth: state.volatility?.bbWidth || 0.15,
+      macdHist: state.momentum?.macdHist || 0,
+      liquidity: state.liquidity?.score || state.liquidity || 0.5,
+      velocity: state.awareness?.velocity || state.velocity || 0,
+      acceleration: state.awareness?.acceleration || state.acceleration || 0,
+      pricePosition: state.structure?.pricePosition || 0.5,
+      marketQuality: state.summary?.marketQuality || 50,
+    };
+    // Ensure all are numbers
+    for (const [key, val] of Object.entries(features)) {
+      if (typeof val !== 'number' || isNaN(val)) {
+        features[key] = 0;
+      }
+    }
+    return features;
+  }
+
+  // ============================================================
+  // CONTRIBUTIONS (for explainability)
+  // ============================================================
+  _buildContributions(state, regime, edge) {
+    const positive = [];
+    const negative = [];
+    let totalScore = 0;
+
+    // Regime contribution
+    if (regime.code === 'STRONG_TREND_BULL') {
+      positive.push({ name: 'Regime (Strong Bull)', score: 20, description: 'Strong bullish trend detected' });
+      totalScore += 20;
+    } else if (regime.code === 'STRONG_TREND_BEAR') {
+      positive.push({ name: 'Regime (Strong Bear)', score: 20, description: 'Strong bearish trend detected' });
+      totalScore += 20;
+    } else if (regime.code === 'REVERSAL') {
+      if (state.trend === 'bullish') {
+        negative.push({ name: 'Reversal Risk', score: 15, description: 'Reversal zone at resistance' });
+        totalScore -= 15;
+      } else {
+        positive.push({ name: 'Reversal Opportunity', score: 15, description: 'Reversal zone at support' });
+        totalScore += 15;
+      }
+    }
+
+    // Momentum
+    const rsi = state.momentum?.rsi || 50;
+    if (rsi > 70) negative.push({ name: 'Overbought RSI', score: 10, description: `RSI at ${rsi.toFixed(1)}` });
+    else if (rsi < 30) positive.push({ name: 'Oversold RSI', score: 10, description: `RSI at ${rsi.toFixed(1)}` });
+    else if (rsi > 60) positive.push({ name: 'Strong Momentum', score: 5, description: `RSI at ${rsi.toFixed(1)}` });
+    else if (rsi < 40) negative.push({ name: 'Weak Momentum', score: 5, description: `RSI at ${rsi.toFixed(1)}` });
+
+    // Trend strength (ADX)
+    const adx = state.trend?.adx || 0;
+    if (adx > 30) positive.push({ name: 'Strong Trend (ADX)', score: 15, description: `ADX at ${adx.toFixed(1)}` });
+    else if (adx > 20) positive.push({ name: 'Moderate Trend', score: 8, description: `ADX at ${adx.toFixed(1)}` });
+    else negative.push({ name: 'Weak Trend', score: 8, description: `ADX at ${adx.toFixed(1)}` });
+
+    // Volatility
+    const vol = state.volatility?.regime || 'normal';
+    if (vol === 'high') negative.push({ name: 'High Volatility', score: 5, description: 'Increased risk' });
+    else if (vol === 'low') positive.push({ name: 'Low Volatility', score: 5, description: 'Stable conditions' });
+
+    // Liquidity
+    const liq = state.liquidity?.score || state.liquidity || 0.5;
+    if (liq > 0.6) positive.push({ name: 'Good Liquidity', score: 5, description: `Liquidity ${(liq*100).toFixed(0)}%` });
+    else if (liq < 0.3) negative.push({ name: 'Low Liquidity', score: 5, description: `Liquidity ${(liq*100).toFixed(0)}%` });
+
+    // Structure
+    const isAtSupport = state.structure?.isAtSupport || false;
+    const isAtResistance = state.structure?.isAtResistance || false;
+    if (isAtSupport) positive.push({ name: 'At Support', score: 10, description: 'Price at support level' });
+    if (isAtResistance) negative.push({ name: 'At Resistance', score: 10, description: 'Price at resistance level' });
+
+    // Edge (if available)
+    if (edge && edge.sampleSize >= 20) {
+      if (edge.winRate > 0.55) positive.push({ name: 'Historical Edge', score: Math.min(20, (edge.winRate - 0.5) * 100), description: `Win rate ${(edge.winRate*100).toFixed(0)}% over ${edge.sampleSize} analogues` });
+      else if (edge.winRate < 0.45) negative.push({ name: 'Weak Historical Edge', score: Math.min(20, (0.5 - edge.winRate) * 100), description: `Win rate ${(edge.winRate*100).toFixed(0)}% over ${edge.sampleSize} analogues` });
+    }
+
+    // Sort by absolute score descending
+    positive.sort((a, b) => b.score - a.score);
+    negative.sort((a, b) => b.score - a.score);
+
+    return { positive, negative, totalScore };
+  }
+
+  // ============================================================
+  // REASON GENERATION
+  // ============================================================
+  _buildReason(decision, confidence, edge, regime) {
+    let reason = `${decision} signal with ${confidence}% confidence. `;
+    if (edge && edge.sampleSize >= 20) {
+      reason += `Historical edge: win rate ${(edge.winRate*100).toFixed(1)}%, avg return ${edge.avgReturnR.toFixed(2)}R (${edge.sampleSize} analogues). `;
+    }
+    if (regime && regime.code !== 'NEUTRAL') {
+      reason += `Regime: ${regime.code}. `;
+    }
+    if (decision === 'NO_TRADE') {
+      reason += 'No clear edge or insufficient confidence.';
+    }
+    return reason.trim();
   }
 
   // ============================================================
   // FALLBACK: Rule-Based Scoring with Learning Weights
   // ============================================================
-
   _weightedFallbackRuleBased(symbol, state, regime) {
     // Get learning weights from selfLearner (if available)
     let weights = {
@@ -310,22 +416,18 @@ class DecisionEngine extends EventEmitter {
     };
     try {
       const learnerWeights = selfLearner.getWeights();
-      // Map strategy names to our components – we can use generic mapping
-      // For simplicity, we use equal weights if no specific mapping.
-      // However, we can extract weights for 'regime', 'velocity', 'liquidity' if stored.
-      // Since we don't have separate keys, we'll use the average of all strategy weights as a proxy.
       const allWeights = Object.values(learnerWeights);
       if (allWeights.length > 0) {
         const avgWeight = allWeights.reduce((a, b) => a + b, 0) / allWeights.length;
-        // Use avgWeight as a multiplier for all components (or we can keep equal)
-        // For now, we keep equal weighting but we can optionally scale.
-        // We'll keep equal weighting to avoid breaking existing behavior.
+        // Use avgWeight as a multiplier for all components
+        weights.regime = avgWeight;
+        weights.velocity = avgWeight;
+        weights.liquidity = avgWeight;
       }
     } catch (err) {
       // ignore
     }
 
-    // Weights are currently equal; we could scale but let's keep simple.
     let buyScore = 0, sellScore = 0;
 
     // Regime bias (weighted)
@@ -377,11 +479,10 @@ class DecisionEngine extends EventEmitter {
     return { decision, confidence };
   }
 
-  // ---- The rest of the methods are unchanged ----
-  _extractFeatures(state, regime) { /* ... unchanged */ }
-  _buildContributions(state, regime, edge) { /* ... unchanged */ }
-  _buildReason(decision, confidence, edge, regime) { /* ... unchanged */ }
-  getLastDecision(symbol) { return this._lastDecision[symbol] || null; }
+  // ---- Convenience method ----
+  getLastDecision(symbol) {
+    return this._lastDecision[symbol] || null;
+  }
 }
 
 module.exports = new DecisionEngine();
