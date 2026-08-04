@@ -1,7 +1,8 @@
 // core/execution/orderService.js – Order Management (with Portfolio Risk Integration)
+// FIX: Trade side now uses lowercase to match schema enum.
 
 const { getBroker } = require('./brokerFactory');
-const marketProvider = require('../market/provider'); // For current price
+const marketProvider = require('../market/provider');
 const eventBus = require('../../infrastructure/eventBus');
 const { validateOrderInput } = require('../../shared/validators');
 const { ExecutionAnalytics } = require('../analytics/performanceSuite');
@@ -22,8 +23,6 @@ const MIN_EDGE = 0.2;
 
 /**
  * Pre‑flight validation for auto‑trade (checks confidence and edge)
- * @param {Object} signal - signal object from decision engine
- * @returns {Object} { valid: boolean, reason: string }
  */
 function validateAutoTradeSignal(signal) {
   if (!signal || !signal.side) {
@@ -40,15 +39,6 @@ function validateAutoTradeSignal(signal) {
 
 /**
  * Place a market order (BUY/SELL) with portfolio risk checks.
- * @param {string} instrument - e.g., 'EUR_USD'
- * @param {string} side - 'BUY' or 'SELL'
- * @param {number} lotSize - Number of units (positive)
- * @param {number|null} stopLoss - Stop loss price (optional)
- * @param {number|null} takeProfit - Take profit price (optional)
- * @param {string} [product] - Trading product (optional, default from env)
- * @param {string} [decisionId] - HistoricalDecision ID (optional)
- * @param {boolean} [autoTrade=false] - Whether this is an auto‑trade (for additional checks)
- * @returns {Promise<Object>} { contractId, price, raw }
  */
 async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, takeProfit = null, product, decisionId = null, autoTrade = false) {
   // 1. Validate input
@@ -64,13 +54,12 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
   const signal = {
     symbol: instrument,
     side,
-    entryPrice: 0, // will be filled
+    entryPrice: 0,
     stopLoss,
     takeProfit,
     recommendedLotSize: lotSize,
   };
 
-  // ---- FIX: Get current price using marketProvider ----
   const currentPrice = await marketProvider.getCurrentPrice(instrument, product);
   signal.entryPrice = currentPrice;
 
@@ -81,10 +70,9 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
     throw new Error(`Portfolio risk rejection: ${portfolioApproval.reason}`);
   }
 
-  // Use adjusted lot size from portfolio assessment
   const finalLotSize = portfolioApproval.adjustedLotSize || lotSize;
 
-  // 3. If auto‑trade, perform extra pre‑flight checks
+  // 3. Auto-trade pre-flight
   if (autoTrade && decisionId) {
     try {
       const Decision = require('../../models/HistoricalDecision');
@@ -139,13 +127,13 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
     });
     await newOrder.save();
 
-    // 6. Create Trade record (with fallback if creation fails)
+    // 6. Create Trade record – FIX: use lowercase for side to match schema enum
     let trade = null;
     try {
       const newTrade = new Trade({
         contractId,
         instrument,
-        side: side.toUpperCase(),
+        side: side.toLowerCase(),  // ✅ fixes validation error
         lotSize: finalLotSize,
         openPrice: price,
         status: 'OPEN',
@@ -154,11 +142,15 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
         decisionId: decisionId || null,
         currentPrice: price,
         floatingProfit: 0,
+        // optional fields for future use
+        atrAtEntry: null,
+        riskAmount: null,
+        maxFloatingProfit: 0,
       });
       trade = await newTrade.save();
-      logger.debug(`[orderService] Trade created for ${contractId}`);
+      logger.info(`[orderService] Trade created (OPEN) for ${contractId} (${instrument} ${side})`);
     } catch (tradeErr) {
-      logger.warn(`[orderService] Could not create Trade for ${contractId}, but order placed:`, tradeErr.message);
+      logger.error(`[orderService] Failed to create Trade for ${contractId}:`, tradeErr.message);
       // We'll still continue; the positions sync will create the Trade later.
     }
 
@@ -190,7 +182,7 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
       decisionId: decisionId || null,
       timestamp: new Date().toISOString(),
     });
-    eventBus.emit('trade.placed', { instrument, side, contractId, price }); // for sound alerts
+    eventBus.emit('trade.placed', { instrument, side, contractId, price });
 
     // 9. Update HistoricalDecision if decisionId provided
     if (decisionId) {
@@ -199,7 +191,7 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
         const decision = await Decision.findById(decisionId);
         if (decision) {
           decision.outcome.executed = true;
-          decision.outcome.tradeId = newTrade?._id || contractId;
+          decision.outcome.tradeId = trade?._id || contractId;
           await decision.save();
         }
       } catch (err) {
@@ -228,9 +220,6 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
 
 /**
  * Cancel a pending order by its contract ID.
- * @param {string} contractId - The contract/trade ID (ticket)
- * @param {string} [product] - Trading product (optional)
- * @returns {Promise<Object>} Result from broker.
  */
 async function cancelOrder(contractId, product) {
   if (!contractId) throw new Error('contractId is required');
@@ -253,9 +242,6 @@ async function cancelOrder(contractId, product) {
 
 /**
  * Close an open trade by its contract ID.
- * @param {string} contractId - Trade ID (ticket)
- * @param {string} [product] - Trading product (optional)
- * @returns {Promise<Object>} Result from broker.
  */
 async function closeTrade(contractId, product) {
   if (!contractId) throw new Error('contractId is required');
@@ -267,7 +253,6 @@ async function closeTrade(contractId, product) {
     await broker.connect();
   }
   const result = await broker.closeTrade(contractId);
-  // Update Trade record
   const updatedTrade = await Trade.findOneAndUpdate(
     { contractId },
     {
@@ -311,17 +296,12 @@ async function closeTrade(contractId, product) {
   });
 
   eventBus.emit('trade.closed', { contractId, result, timestamp: new Date().toISOString() });
-  eventBus.emit('trade.closed.sound', { contractId }); // for sound alerts
+  eventBus.emit('trade.closed.sound', { contractId });
   return result;
 }
 
 /**
  * Modify stop-loss and take-profit for an open trade.
- * @param {string} contractId - Trade ID (ticket)
- * @param {number|null} stopLoss - New stop loss (or null to leave unchanged)
- * @param {number|null} takeProfit - New take profit (or null to leave unchanged)
- * @param {string} [product] - Trading product (optional)
- * @returns {Promise<Object>} Result from broker.
  */
 async function modifyTrade(contractId, stopLoss, takeProfit, product) {
   if (!contractId) throw new Error('contractId is required');
@@ -349,8 +329,6 @@ async function modifyTrade(contractId, stopLoss, takeProfit, product) {
 
 /**
  * Get all open trades from the broker.
- * @param {string} [product]
- * @returns {Promise<Array>} List of open trade objects.
  */
 async function getOpenTrades(product) {
   const broker = getBroker(product);
@@ -362,8 +340,6 @@ async function getOpenTrades(product) {
 
 /**
  * Get all positions from the broker.
- * @param {string} [product]
- * @returns {Promise<Array>} List of position objects.
  */
 async function getPositions(product) {
   const broker = getBroker(product);
@@ -375,7 +351,6 @@ async function getPositions(product) {
 
 /**
  * Get execution analytics report.
- * @returns {Object} Analytics report.
  */
 function getExecutionAnalytics() {
   return executionAnalytics.getReport();
@@ -383,7 +358,6 @@ function getExecutionAnalytics() {
 
 /**
  * Delete all closed trades from the Trade collection.
- * @returns {Promise<number>} Number of deleted records.
  */
 async function deleteClosedTrades() {
   const result = await Trade.deleteMany({ status: 'CLOSED' });
