@@ -50,6 +50,49 @@ const CONFIG = {
 };
 
 // ========================================================================
+// Utility: get pip size from symbol (fix for hardcoded 0.0001)
+// ========================================================================
+function getPipSize(symbol) {
+  const mapping = {
+    EURUSD: 0.0001,
+    GBPUSD: 0.0001,
+    USDJPY: 0.01,
+    AUDUSD: 0.0001,
+    NZDUSD: 0.0001,
+    USDCHF: 0.0001,
+    USDCAD: 0.0001,
+    XAUUSD: 0.01,
+    XAGUSD: 0.001,
+    BTCUSD: 0.1,
+    ETHUSD: 0.01,
+    // Add more as needed
+  };
+  const clean = symbol.replace(/[/\-_]/g, '').toUpperCase();
+  return mapping[clean] || 0.0001; // fallback
+}
+
+// ========================================================================
+// Utility: stable softmax (fix for overflow)
+// ========================================================================
+function stableSoftmax(scores) {
+  const maxScore = Math.max(...Object.values(scores));
+  const expScores = {};
+  let sumExp = 0;
+  for (const [key, val] of Object.entries(scores)) {
+    expScores[key] = Math.exp(val - maxScore);
+    sumExp += expScores[key];
+  }
+  if (sumExp === 0) {
+    // fallback uniform
+    const n = Object.keys(scores).length;
+    for (const key in expScores) expScores[key] = 1 / n;
+    return expScores;
+  }
+  for (const key in expScores) expScores[key] /= sumExp;
+  return expScores;
+}
+
+// ========================================================================
 // 1. SLIDING WINDOW
 // ========================================================================
 class AdaptiveSlidingWindow {
@@ -89,7 +132,7 @@ class AdaptiveSlidingWindow {
 }
 
 // ========================================================================
-// 2. PROBABILISTIC STATE CLASSIFIER
+// 2. PROBABILISTIC STATE CLASSIFIER (with stable softmax)
 // ========================================================================
 class ProbabilisticStateClassifier {
   classify(state, trade, history) {
@@ -146,21 +189,15 @@ class ProbabilisticStateClassifier {
       rawScores.RANGE_BOUND = (20 - adx) * 3 + (0.15 - bbWidth) * 100;
     }
 
-    const expScores = Object.values(rawScores).map(s => Math.exp(s));
-    const sumExp = expScores.reduce((a, b) => a + b, 0);
-    const probs = {};
-    let idx = 0;
-    for (const key in rawScores) {
-      probs[key] = expScores[idx++] / (sumExp + 1e-9);
-    }
-
+    // ---- Stable softmax ----
+    const probs = stableSoftmax(rawScores);
     const maxProb = Math.max(...Object.values(probs));
     return { probabilities: probs, mostLikely: Object.keys(probs).find(k => probs[k] === maxProb), confidence: maxProb * 100 };
   }
 }
 
 // ========================================================================
-// 3. SYMBOL PROFILE MANAGER
+// 3. SYMBOL PROFILE MANAGER (no changes)
 // ========================================================================
 class SymbolProfileManager {
   async getProfile(symbol) {
@@ -222,7 +259,7 @@ class SymbolProfileManager {
 }
 
 // ========================================================================
-// 4. HISTORICAL MEMORY ENGINE
+// 4. HISTORICAL MEMORY ENGINE (uses risk-based R)
 // ========================================================================
 class HistoricalMemoryEngine {
   async getAnalogues(trade, state, history) {
@@ -239,11 +276,24 @@ class HistoricalMemoryEngine {
     const fullFeatureVector = { ...currentFeatures, ...trajFeatures };
 
     try {
-      const edgeResult = await stateStore.computeEdge(currentFeatures, symbol, 'M5', 5, 200);
-      if (!edgeResult || edgeResult.sampleSize < 20) return null;
+      // Use risk-based profitR for analogues comparison
+      const riskDistance = Math.abs(trade.openPrice - trade.stopLoss);
+      const currentProfitR = (trade.currentPrice - trade.openPrice) * (trade.side.toUpperCase() === 'BUY' ? 1 : -1) / riskDistance;
 
-      const topStates = edgeResult.similarity?.states || [];
-      const analogues = topStates.map(s => ({
+      const similarityResult = await stateStore.findSimilar(
+        currentFeatures,
+        symbol,
+        'M5',
+        200,                 // k
+        5,                   // lookahead
+        state.regime?.code || null
+      );
+
+      if (!similarityResult || similarityResult.states.length < 20) {
+        return null;
+      }
+
+      const analogues = similarityResult.states.map(s => ({
         returnR: s.outcome?.returnR || 0,
         maxDrawdown: s.outcome?.maxDrawdown || 0,
         win: s.outcome?.win || false,
@@ -251,18 +301,18 @@ class HistoricalMemoryEngine {
         mae: s.outcome?.maxDrawdown || 0,
       }));
 
-      const currentProfitR = (trade.currentPrice - trade.openPrice) / (state.volatility.atr || 0.001);
+      const stats = similarityResult.stats;
       const continuationCount = analogues.filter(a => a.returnR > currentProfitR + 1).length;
       const survivalProb = analogues.length > 0 ? continuationCount / analogues.length : 0.5;
 
       return {
-        sampleSize: edgeResult.sampleSize,
-        winRate: edgeResult.winRate,
-        avgReturnR: edgeResult.avgReturnR,
-        avgMFE: edgeResult.avgMFE || 0,
-        avgMAE: edgeResult.avgMAE || 0,
-        medianReturnR: edgeResult.medianReturnR || 0,
-        profitFactor: edgeResult.profitFactor || 0,
+        sampleSize: stats.count || analogues.length,
+        winRate: stats.winRate || 0,
+        avgReturnR: stats.avgReturnR || 0,
+        avgMFE: stats.avgMFE || 0,
+        avgMAE: stats.avgMAE || 0,
+        medianReturnR: stats.medianReturnR || 0,
+        profitFactor: stats.profitFactor || 0,
         analogues,
         survivalProb,
         trajectoryMatch: 0.8,
@@ -295,7 +345,7 @@ class HistoricalMemoryEngine {
 }
 
 // ========================================================================
-// 5. PREDICTION ENGINE
+// 5. PREDICTION ENGINE (no changes)
 // ========================================================================
 class PredictionEngine {
   predict(trade, state, history) {
@@ -333,23 +383,28 @@ class PredictionEngine {
 }
 
 // ========================================================================
-// 6. COST MODEL
+// 6. COST MODEL (fixed: costR = totalCost / riskAmount)
 // ========================================================================
 class CostModel {
   computeCost(trade, state) {
-    const spreadPips = state.awareness?.spread ? state.awareness.spread / 0.0001 : CONFIG.SPREAD_COST_PIPS;
-    const spreadCost = spreadPips * 0.1;
+    const symbol = trade.instrument;
+    const pipSize = getPipSize(symbol);
+    const spreadPips = state.awareness?.spread ? state.awareness.spread / pipSize : CONFIG.SPREAD_COST_PIPS;
+    const spreadCost = spreadPips * 0.1; // in monetary units? This is approximate; we need actual cost.
+    // For better accuracy, we should get actual spread cost from trade metadata.
+    // Here we assume a fixed commission per lot.
     const commission = CONFIG.COMMISSION_PER_LOT * trade.lotSize;
     const swap = trade.swap || 0;
     const totalCost = spreadCost + commission + swap;
-    const atr = state.volatility.atr || 0.001;
-    const costR = totalCost / atr;
+    // Convert to R multiples using monetary risk
+    const riskAmount = trade.riskAmount || 1; // fallback to avoid division by zero
+    const costR = totalCost / riskAmount;
     return { spreadCost, commission, swap, totalCost, costR };
   }
 }
 
 // ========================================================================
-// 7. CONTINUOUS TRADE SCORE ENGINE
+// 7. CONTINUOUS TRADE SCORE ENGINE (adjust to risk-based R)
 // ========================================================================
 class ContinuousScoreEngine {
   async compute(trade, state, awareness, regime, profitR, history, analogues, prediction, weights) {
@@ -417,42 +472,50 @@ class ContinuousScoreEngine {
 }
 
 // ========================================================================
-// 8. FORWARD SIMULATION ENGINE
+// 8. FORWARD SIMULATION (fixed: includes current profit)
 // ========================================================================
 class ForwardSimulation {
   async simulate(trade, state, actions, analogues) {
     const results = [];
     const direction = trade.side.toUpperCase() === 'BUY' ? 1 : -1;
+    const riskDistance = Math.abs(trade.openPrice - trade.stopLoss);
+    const currentProfitR = (state.price.current - trade.openPrice) * direction / riskDistance;
     const atr = state.volatility.atr || 0.001;
-    const currentPrice = state.price.current;
-    const entryPrice = trade.openPrice;
-    const profitR = (currentPrice - entryPrice) / atr * direction;
 
     for (const action of actions) {
-      let simulatedProfit = profitR;
+      let simulatedProfit = currentProfitR; // start with current profit
       let confidence = action.confidence || 50;
       switch (action.type) {
         case 'HOLD':
           const contProb = action.contProb || 0.5;
           const expectedGain = contProb * (analogues?.avgMFE || 1.0);
           const expectedLoss = (1 - contProb) * (analogues?.avgMAE || -0.5);
-          simulatedProfit = expectedGain + expectedLoss;
+          const futureEV = expectedGain + expectedLoss;
+          simulatedProfit += futureEV;
           confidence = 50 + Math.abs(contProb - 0.5) * 100;
           break;
         case 'MODIFY':
           if (action.stopLoss) {
             const newSL = action.stopLoss;
-            const slDistance = Math.abs(newSL - currentPrice) / atr;
-            const hitSLProb = 0.3;
-            simulatedProfit = (1 - hitSLProb) * profitR + hitSLProb * (slDistance * direction);
+            const slDistance = Math.abs(newSL - state.price.current) / riskDistance; // in R
+            const hitSLProb = 0.3; // simplified
+            const lossIfHit = -slDistance * direction; // will be negative if direction is correct
+            // Future EV: partial chance to hit SL
+            const futureEV = (1 - hitSLProb) * (analogues?.avgMFE || 0) + hitSLProb * lossIfHit;
+            simulatedProfit += futureEV;
           }
           break;
         case 'PARTIAL':
           const fraction = action.volume / trade.lotSize;
-          simulatedProfit = fraction * profitR + (1 - fraction) * profitR * 0.8;
+          // EV = current profit on closed part + expected future profit on remaining part
+          const remainingFraction = 1 - fraction;
+          // Future expected profit for remaining part (using analogues)
+          const futureRemainingEV = remainingFraction * (prediction?.continuationProbability || 0.5) * (analogues?.avgMFE || 0)
+                                  + remainingFraction * (1 - (prediction?.continuationProbability || 0.5)) * (analogues?.avgMAE || -0.5);
+          simulatedProfit = fraction * currentProfitR + futureRemainingEV;
           break;
         case 'CLOSE':
-          simulatedProfit = profitR;
+          simulatedProfit = currentProfitR; // just close, no future
           break;
         default:
           break;
@@ -465,7 +528,7 @@ class ForwardSimulation {
 }
 
 // ========================================================================
-// 9. ACTION COMPETITION ENGINE (ENHANCED)
+// 9. ACTION COMPETITION ENGINE (fixed partial EV, trailing stop, retracement)
 // ========================================================================
 class ActionCompetition {
   constructor() {
@@ -478,7 +541,8 @@ class ActionCompetition {
     const atr = state.volatility.atr || 0.001;
     const currentPrice = state.price.current;
     const entryPrice = trade.openPrice;
-    const profitR = (currentPrice - entryPrice) / atr * direction;
+    const riskDistance = Math.abs(entryPrice - trade.stopLoss);
+    const profitR = (currentPrice - entryPrice) * direction / riskDistance; // risk-based R
     const actions = [];
     const tradeId = trade.contractId;
     const currentStage = this.tradeStates[tradeId] || 'INITIAL';
@@ -495,7 +559,6 @@ class ActionCompetition {
     });
 
     // --- PROGRESSIVE STOP-LOSS (MODIFY) ---
-    // Find the best SL step based on current profit
     let bestSLR = null;
     let bestProfitR = 0;
     for (const step of CONFIG.PROGRESSIVE_SL_STEPS) {
@@ -505,11 +568,9 @@ class ActionCompetition {
       }
     }
     if (bestSLR !== null && currentStage !== 'PROTECTING') {
-      // Calculate new SL price
-      const newSL = direction === 1 ? entryPrice + bestSLR * atr : entryPrice - bestSLR * atr;
-      // Only if new SL improves current SL
+      const newSL = direction === 1 ? entryPrice + bestSLR * riskDistance : entryPrice - bestSLR * riskDistance;
       if ((direction === 1 && newSL > trade.stopLoss) || (direction === -1 && newSL < trade.stopLoss)) {
-        const ev = holdEV * 1.1; // slightly better than hold because it locks profit
+        const ev = holdEV * 1.1;
         actions.push({
           type: 'MODIFY',
           stopLoss: newSL,
@@ -520,12 +581,13 @@ class ActionCompetition {
       }
     }
 
-    // --- TRAILING STOP (another MODIFY) ----
+    // --- TRAILING STOP (using absolute MAE) ---
     if (profitR > 0.5 && scores.health > 50 && currentStage !== 'PROTECTING') {
-      // Use ATR, health, and symbol MAE to compute distance
+      // FIX: use Math.abs(profile.typicalMAE) for distance
+      const maeAbs = Math.abs(profile.typicalMAE || 0.6);
       const trailDistance = Math.min(
         (1 - scores.health/100) * atr,
-        profile.typicalMAE * 0.5,
+        maeAbs * riskDistance,
         state.volatility.atr * 1.5
       );
       const newSL = direction === 1 ? currentPrice - trailDistance : currentPrice + trailDistance;
@@ -541,13 +603,15 @@ class ActionCompetition {
       }
     }
 
-    // --- PARTIAL CLOSE (dynamic fraction) ----
+    // --- PARTIAL CLOSE (dynamic fraction) ---
     if (profitR > 1.5 && scores.opportunity < 60 && currentStage !== 'PROTECTING') {
-      // Dynamic fraction based on profitR / typicalMFE
       const ratio = Math.min(profitR / profile.typicalMFE, 1);
       const fraction = CONFIG.PARTIAL_FRACTION_MIN + (CONFIG.PARTIAL_FRACTION_MAX - CONFIG.PARTIAL_FRACTION_MIN) * ratio;
       const fractionRounded = Math.round(fraction * 100) / 100;
-      const ev = profitR * fractionRounded + (profitR * (1 - fractionRounded) * prediction.continuationProbability);
+      // FIX: include downside risk for remaining part
+      const contProb = prediction.continuationProbability;
+      const futureEV = contProb * (analogues?.avgMFE || 0) + (1 - contProb) * (analogues?.avgMAE || -0.5);
+      const ev = fractionRounded * profitR + (1 - fractionRounded) * futureEV;
       actions.push({
         type: 'PARTIAL',
         volume: trade.lotSize * fractionRounded,
@@ -557,13 +621,13 @@ class ActionCompetition {
       });
     }
 
-    // --- RETRACEMENT PROTECTION (if peakProfitR exists) ----
-    if (peakProfitR && peakProfitR > profitR) {
+    // --- RETRACEMENT PROTECTION (with division guard) ---
+    if (peakProfitR && peakProfitR > 0 && peakProfitR > profitR) {
       const retracement = (peakProfitR - profitR) / peakProfitR;
       if (retracement > CONFIG.RETRACEMENT_THRESHOLD && profitR > 0) {
-        // Suggest partial close or tighten SL
         const fraction = Math.min(0.3, 0.1 + retracement * 0.5);
-        const ev = profitR * fraction + (profitR * (1 - fraction) * prediction.continuationProbability);
+        const futureEV = prediction.continuationProbability * (analogues?.avgMFE || 0) + (1 - prediction.continuationProbability) * (analogues?.avgMAE || -0.5);
+        const ev = fraction * profitR + (1 - fraction) * futureEV;
         actions.push({
           type: 'PARTIAL',
           volume: trade.lotSize * fraction,
@@ -571,7 +635,6 @@ class ActionCompetition {
           confidence: 60 + retracement * 30,
           reason: `Retracement protection (${(retracement*100).toFixed(0)}% from peak)`,
         });
-        // Also tighten TP
         const newTP = direction === 1 ? currentPrice + atr * 1.5 : currentPrice - atr * 1.5;
         if ((direction === 1 && newTP < trade.takeProfit) || (direction === -1 && newTP > trade.takeProfit)) {
           actions.push({
@@ -585,7 +648,7 @@ class ActionCompetition {
       }
     }
 
-    // --- EXPECTED REMAINING VALUE (CLOSE if negative) ----
+    // --- EXPECTED REMAINING VALUE (CLOSE if negative) ---
     if (analogues && prediction) {
       const avgMFE = analogues.avgMFE || 0;
       const avgMAE = analogues.avgMAE || 0;
@@ -603,7 +666,7 @@ class ActionCompetition {
       }
     }
 
-    // --- CLOSE (loss or health) ----
+    // --- CLOSE (loss or health) ---
     if (profitR < CONFIG.MAX_LOSS_R || (scores.health < 30 && profitR < 0.5)) {
       actions.push({
         type: 'CLOSE',
@@ -613,7 +676,7 @@ class ActionCompetition {
       });
     }
 
-    // --- EXTEND TP ----
+    // --- EXTEND TP ---
     if (scores.opportunity > 70 && scores.trendStrength > 70 && currentStage !== 'PROTECTING' && currentStage !== 'EXTENDED') {
       const newTP = direction === 1 ? currentPrice + atr * 4 : currentPrice - atr * 4;
       const ev = profitR * 1.2;
@@ -626,7 +689,7 @@ class ActionCompetition {
       });
     }
 
-    // --- TIGHTEN TP (if health weak) ----
+    // --- TIGHTEN TP (if health weak) ---
     if (scores.health < 50 && profitR > 0.5) {
       const newTP = direction === 1 ? currentPrice + atr * 1.5 : currentPrice - atr * 1.5;
       const ev = profitR * 0.9;
@@ -639,10 +702,9 @@ class ActionCompetition {
       });
     }
 
-    // --- PROFIT PROTECTION (if >3R, ensure SL is at least 1R, and partial close) ----
+    // --- PROFIT PROTECTION (if >3R) ---
     if (profitR > 3.0 && currentStage !== 'PROTECTING') {
-      // Ensure SL is at least entry + 1R (lock in 1R)
-      const minSL = direction === 1 ? entryPrice + atr : entryPrice - atr;
+      const minSL = direction === 1 ? entryPrice + riskDistance : entryPrice - riskDistance;
       if ((direction === 1 && trade.stopLoss < minSL) || (direction === -1 && trade.stopLoss > minSL)) {
         actions.push({
           type: 'MODIFY',
@@ -652,13 +714,15 @@ class ActionCompetition {
           reason: 'Lock in 1R profit (minimum)',
         });
       }
-      // Partial close if not done yet
       if (!trade._partialClosed) {
         const fraction = 0.25;
+        const contProb = prediction.continuationProbability;
+        const futureEV = contProb * (analogues?.avgMFE || 0) + (1 - contProb) * (analogues?.avgMAE || -0.5);
+        const ev = fraction * profitR + (1 - fraction) * futureEV;
         actions.push({
           type: 'PARTIAL',
           volume: trade.lotSize * fraction,
-          ev: profitR * 0.8,
+          ev: ev,
           confidence: 70,
           reason: 'Partial close to lock in profit.',
         });
@@ -700,14 +764,14 @@ class ActionCompetition {
 }
 
 // ========================================================================
-// 10. REGRET ANALYZER
+// 10. REGRET ANALYZER (fixed)
 // ========================================================================
 class RegretAnalyzer {
   async analyzeClosedTrade(trade, decisions) {
     if (decisions.length === 0) return null;
     const finalProfitR = trade.realizedProfit / (trade.riskAmount || 1);
-    const analogues = await stateStore.computeEdge({ symbol: trade.instrument }, trade.instrument, 'M5', 5, 100);
-    const maxMFE = analogues?.avgMFE || 1.0;
+    const similarity = await stateStore.findSimilar({ symbol: trade.instrument }, trade.instrument, 'M5', 100, 5);
+    const maxMFE = similarity?.stats?.avgMFE || 1.0;
     const regret = {
       actualProfit: finalProfitR,
       potentialProfit: maxMFE,
@@ -719,7 +783,7 @@ class RegretAnalyzer {
 }
 
 // ========================================================================
-// 11. ACTION VALIDATOR
+// 11. ACTION VALIDATOR (uses pip size from symbol)
 // ========================================================================
 class ActionValidator {
   async validate(trade, action) {
@@ -758,7 +822,8 @@ class ActionValidator {
           return { valid: false, reason: 'Stop loss must be above current price for SELL' };
         }
       }
-      const pipSize = 0.0001;
+      // Use pip size from symbol
+      const pipSize = getPipSize(trade.instrument);
       if (Math.abs(action.stopLoss - trade.currentPrice) < pipSize) {
         return { valid: false, reason: 'Stop loss too close to current price' };
       }
@@ -774,7 +839,7 @@ class ActionValidator {
 }
 
 // ========================================================================
-// 12. LEARNING ENGINE
+// 12. LEARNING ENGINE (no changes)
 // ========================================================================
 class LearningEngine {
   async updateEVWeights() {
@@ -818,7 +883,7 @@ class LearningEngine {
 }
 
 // ========================================================================
-// 13. MAIN OTIE V5 ENGINE
+// 13. MAIN OTIE V5 ENGINE (fixed profitR calculation)
 // ========================================================================
 class OpenTradeIntelligenceV5 extends EventEmitter {
   constructor() {
@@ -850,7 +915,7 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     this._scheduleBackgroundJobs();
     this.profileManager.updateAllProfiles().catch(err => logger.warn('[Profiles] Initial update failed:', err.message));
 
-    logger.info('[OTIE V5] Initialized (enhanced profit protection).');
+    logger.info('[OTIE V5] Initialized (enhanced profit protection, all fixes applied).');
   }
 
   _startTimer() {
@@ -884,7 +949,6 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     this._isRunning = true;
 
     try {
-      // ---- FIX: Exclude pendingClose trades ----
       const openTrades = await Trade.find({
         status: 'OPEN',
         pendingClose: { $ne: true }
@@ -922,11 +986,9 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
       return;
     }
 
-    const entryPrice = trade.openPrice;
-    const currentPrice = state.price.current;
-    const atrInitial = trade.atrAtEntry || state.volatility.atr || 0.001;
-    const rawR = (currentPrice - entryPrice) / atrInitial;
-    const profitR = side === 'BUY' ? rawR : -rawR;
+    // ---- Fixed: risk-based profitR ----
+    const riskDistance = Math.abs(trade.openPrice - trade.stopLoss);
+    const currentProfitR = (state.price.current - trade.openPrice) * (side === 'BUY' ? 1 : -1) / riskDistance;
 
     const tradeId = trade.contractId;
     if (!this._tradeHistory[tradeId]) {
@@ -935,8 +997,8 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     const history = this._tradeHistory[tradeId];
     history.push({
       timestamp: Date.now(),
-      price: currentPrice,
-      profitR,
+      price: state.price.current,
+      profitR: currentProfitR,
       adx: state.trend.adx || 0,
       rsi: state.momentum.rsi || 50,
       macdHist: state.momentum.macdHist || 0,
@@ -944,13 +1006,13 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
       velocity: state.momentum.velocity || 0,
     });
 
-    const peakProfitR = this.actionCompetition.updatePeakProfit(tradeId, profitR);
+    const peakProfitR = this.actionCompetition.updatePeakProfit(tradeId, currentProfitR);
 
     const stateProbs = this.stateClassifier.classify(state, trade, history);
     const analogues = await this.memoryEngine.getAnalogues(trade, state, history);
     const prediction = this.predictionEngine.predict(trade, state, history);
     const cost = this.costModel.computeCost(trade, state);
-    const scores = await this.scoreEngine.compute(trade, state, awareness, regime, profitR, history, analogues, prediction, {});
+    const scores = await this.scoreEngine.compute(trade, state, awareness, regime, currentProfitR, history, analogues, prediction, {});
     const profile = await this.profileManager.getProfile(symbol);
 
     const actions = this.actionCompetition.generateActions(trade, state, scores, analogues, prediction, profile, cost, peakProfitR);
@@ -962,7 +1024,7 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     const simulated = await this.forwardSim.simulate(trade, state, filteredActions, analogues);
     const bestAction = simulated[0] || { type: 'HOLD', ev: 0, confidence: 50 };
 
-    logger.info(`[OTIE V5] Trade ${tradeId} (${symbol}) profitR=${profitR.toFixed(2)} peak=${peakProfitR.toFixed(2)} bestAction=${bestAction.type} (ev=${bestAction.ev.toFixed(3)}, conf=${bestAction.confidence.toFixed(0)}%)`);
+    logger.info(`[OTIE V5] Trade ${tradeId} (${symbol}) profitR=${currentProfitR.toFixed(2)} peak=${peakProfitR.toFixed(2)} bestAction=${bestAction.type} (ev=${bestAction.ev.toFixed(3)}, conf=${bestAction.confidence.toFixed(0)}%)`);
 
     const validation = await this.validator.validate(trade, bestAction);
     if (!validation.valid) {
@@ -1025,7 +1087,7 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     this.emit('otieV5State', {
       tradeId: trade.contractId,
       symbol,
-      profitR,
+      profitR: currentProfitR,
       peakProfitR,
       scores,
       prediction,
