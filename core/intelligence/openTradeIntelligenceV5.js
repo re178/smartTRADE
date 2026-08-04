@@ -1,7 +1,5 @@
 // core/intelligence/openTradeIntelligenceV5.js
-// Open Trade Intelligence Engine V5 – Production-Ready, Addresses All Hidden Issues.
-// Self-contained, modular, evidence-driven, anticipatory trade management.
-// Commands are queued via server API with correct EA payload structure.
+// Final Version – Enhanced Profit Protection, Progressive SL, Peak Tracking, Dynamic Partial, Expected Remaining Value.
 
 const EventEmitter = require('events');
 const axios = require('axios');
@@ -17,12 +15,12 @@ const awarenessEngine = require('../awareness/engine');
 const logger = require('../../infrastructure/logger') || console;
 
 // ========================================================================
-// CONFIGURATION
+// CONFIGURATION (all tunable via env)
 // ========================================================================
 const CONFIG = {
   EVALUATION_INTERVAL_MS: parseInt(process.env.OTIE_INTERVAL) || 30000,
   MAX_LOSS_R: parseFloat(process.env.OTIE_MAX_LOSS_R) || -2.0,
-  MIN_ACTION_CONFIDENCE: parseFloat(process.env.OTIE_MIN_CONFIDENCE) || 60,
+  MIN_ACTION_CONFIDENCE: parseFloat(process.env.OTIE_MIN_CONFIDENCE) || 40,
   PROFILE_WINDOW_SIZE: 500,
   PROFILE_DECAY_FACTOR: 0.95,
   PROFILE_UPDATE_INTERVAL_MS: 24 * 60 * 60 * 1000,
@@ -37,6 +35,20 @@ const CONFIG = {
   BASE_HISTORY_WINDOW: 30,
   HISTORY_PER_SYMBOL: { EURUSD: 30, GBPUSD: 30, USDJPY: 25, AUDUSD: 25, XAUUSD: 15 },
   CALIBRATION_MIN_SAMPLES: 50,
+  // ---- Enhanced Profit Protection ----
+  BREAKEVEN_PROFIT_R: 0.5,
+  PROGRESSIVE_SL_STEPS: [
+    { profitR: 0.5, slR: -0.2 },
+    { profitR: 1.0, slR: 0.0 },
+    { profitR: 2.0, slR: 0.5 },
+    { profitR: 3.0, slR: 1.0 },
+    { profitR: 5.0, slR: 2.0 },
+    { profitR: 8.0, slR: 4.0 },
+  ],
+  RETRACEMENT_THRESHOLD: 0.2,
+  PARTIAL_FRACTION_MIN: 0.1,
+  PARTIAL_FRACTION_MAX: 0.5,
+  EXPECTED_REMAINING_THRESHOLD: 0.5,
 };
 
 // ========================================================================
@@ -150,7 +162,7 @@ class ProbabilisticStateClassifier {
 }
 
 // ========================================================================
-// 3. DYNAMIC SYMBOL PROFILE MANAGER
+// 3. SYMBOL PROFILE MANAGER
 // ========================================================================
 class SymbolProfileManager {
   async getProfile(symbol) {
@@ -455,14 +467,15 @@ class ForwardSimulation {
 }
 
 // ========================================================================
-// 9. ACTION COMPETITION ENGINE
+// 9. ACTION COMPETITION ENGINE (ENHANCED)
 // ========================================================================
 class ActionCompetition {
   constructor() {
     this.tradeStates = {};
+    this.peakProfit = {}; // tradeId -> peakProfitR
   }
 
-  generateActions(trade, state, scores, analogues, prediction, profile, cost) {
+  generateActions(trade, state, scores, analogues, prediction, profile, cost, peakProfitR) {
     const direction = trade.side.toUpperCase() === 'BUY' ? 1 : -1;
     const atr = state.volatility.atr || 0.001;
     const currentPrice = state.price.current;
@@ -472,6 +485,7 @@ class ActionCompetition {
     const tradeId = trade.contractId;
     const currentStage = this.tradeStates[tradeId] || 'INITIAL';
 
+    // --- HOLD (baseline) ---
     let holdEV = prediction.continuationProbability * (analogues?.avgMFE || 1.0) + (1 - prediction.continuationProbability) * (analogues?.avgMAE || -0.5);
     holdEV -= cost.costR;
     actions.push({
@@ -482,33 +496,116 @@ class ActionCompetition {
       contProb: prediction.continuationProbability,
     });
 
+    // --- PROGRESSIVE STOP-LOSS (MODIFY) ---
+    // Find the best SL step based on current profit
+    let bestSLR = null;
+    let bestProfitR = 0;
+    for (const step of CONFIG.PROGRESSIVE_SL_STEPS) {
+      if (profitR >= step.profitR && step.profitR > bestProfitR) {
+        bestSLR = step.slR;
+        bestProfitR = step.profitR;
+      }
+    }
+    if (bestSLR !== null && currentStage !== 'PROTECTING') {
+      // Calculate new SL price
+      const newSL = direction === 1 ? entryPrice + bestSLR * atr : entryPrice - bestSLR * atr;
+      // Only if new SL improves current SL
+      if ((direction === 1 && newSL > trade.stopLoss) || (direction === -1 && newSL < trade.stopLoss)) {
+        const ev = holdEV * 1.1; // slightly better than hold because it locks profit
+        actions.push({
+          type: 'MODIFY',
+          stopLoss: newSL,
+          ev: ev,
+          confidence: 70,
+          reason: `Progressive SL lock at ${bestSLR}R profit`,
+        });
+      }
+    }
+
+    // --- TRAILING STOP (another MODIFY) ----
     if (profitR > 0.5 && scores.health > 50 && currentStage !== 'PROTECTING') {
-      const trailDistance = Math.max(0.2, (1 - scores.health/100) * atr);
+      // Use ATR, health, and symbol MAE to compute distance
+      const trailDistance = Math.min(
+        (1 - scores.health/100) * atr,
+        profile.typicalMAE * 0.5,
+        state.volatility.atr * 1.5
+      );
       const newSL = direction === 1 ? currentPrice - trailDistance : currentPrice + trailDistance;
       if ((direction === 1 && newSL > trade.stopLoss) || (direction === -1 && newSL < trade.stopLoss)) {
-        const ev = holdEV * 0.9;
+        const ev = holdEV * 0.95;
         actions.push({
           type: 'MODIFY',
           stopLoss: newSL,
           ev: ev,
           confidence: 60 + scores.health * 0.3,
-          reason: 'Trailing stop to lock gains.',
+          reason: 'Trailing stop (enhanced)',
         });
       }
     }
 
-    if (profitR > 2.0 && scores.opportunity < 50 && currentStage !== 'PROTECTING') {
-      const fraction = 0.25;
-      const ev = profitR * fraction + (profitR * (1 - fraction) * prediction.continuationProbability);
+    // --- PARTIAL CLOSE (dynamic fraction) ----
+    if (profitR > 1.5 && scores.opportunity < 60 && currentStage !== 'PROTECTING') {
+      // Dynamic fraction based on profitR / typicalMFE
+      const ratio = Math.min(profitR / profile.typicalMFE, 1);
+      const fraction = CONFIG.PARTIAL_FRACTION_MIN + (CONFIG.PARTIAL_FRACTION_MAX - CONFIG.PARTIAL_FRACTION_MIN) * ratio;
+      const fractionRounded = Math.round(fraction * 100) / 100;
+      const ev = profitR * fractionRounded + (profitR * (1 - fractionRounded) * prediction.continuationProbability);
       actions.push({
         type: 'PARTIAL',
-        volume: trade.lotSize * fraction,
+        volume: trade.lotSize * fractionRounded,
         ev: ev,
         confidence: 50 + (100 - scores.opportunity) * 0.5,
-        reason: 'Partial take profit as opportunity diminishes.',
+        reason: `Partial close (${fractionRounded*100}%) based on profit potential`,
       });
     }
 
+    // --- RETRACEMENT PROTECTION (if peakProfitR exists) ----
+    if (peakProfitR && peakProfitR > profitR) {
+      const retracement = (peakProfitR - profitR) / peakProfitR;
+      if (retracement > CONFIG.RETRACEMENT_THRESHOLD && profitR > 0) {
+        // Suggest partial close or tighten SL
+        const fraction = Math.min(0.3, 0.1 + retracement * 0.5);
+        const ev = profitR * fraction + (profitR * (1 - fraction) * prediction.continuationProbability);
+        actions.push({
+          type: 'PARTIAL',
+          volume: trade.lotSize * fraction,
+          ev: ev,
+          confidence: 60 + retracement * 30,
+          reason: `Retracement protection (${(retracement*100).toFixed(0)}% from peak)`,
+        });
+        // Also tighten TP
+        const newTP = direction === 1 ? currentPrice + atr * 1.5 : currentPrice - atr * 1.5;
+        if ((direction === 1 && newTP < trade.takeProfit) || (direction === -1 && newTP > trade.takeProfit)) {
+          actions.push({
+            type: 'MODIFY',
+            takeProfit: newTP,
+            ev: profitR * 0.9,
+            confidence: 50 + retracement * 30,
+            reason: 'Tighten TP after retracement',
+          });
+        }
+      }
+    }
+
+    // --- EXPECTED REMAINING VALUE (CLOSE if negative) ----
+    if (analogues && prediction) {
+      const avgMFE = analogues.avgMFE || 0;
+      const avgMAE = analogues.avgMAE || 0;
+      const remainingUpside = Math.max(0, avgMFE - profitR);
+      const remainingDownside = Math.max(0, profitR - avgMAE);
+      const probContinue = prediction.continuationProbability;
+      const expectedRemaining = probContinue * remainingUpside - (1 - probContinue) * remainingDownside;
+      if (expectedRemaining < CONFIG.EXPECTED_REMAINING_THRESHOLD && profitR > 0.5) {
+        actions.push({
+          type: 'CLOSE',
+          ev: profitR,
+          confidence: 80,
+          reason: `Expected remaining ${expectedRemaining.toFixed(2)}R below threshold`,
+        });
+      }
+    }
+
+    // --- CLOSE (loss or health) ----
     if (profitR < CONFIG.MAX_LOSS_R || (scores.health < 30 && profitR < 0.5)) {
       actions.push({
         type: 'CLOSE',
@@ -518,19 +615,7 @@ class ActionCompetition {
       });
     }
 
-    if (scores.scaleProb > 70 && profitR > 0.5 && trade.lotSize < CONFIG.MAX_POSITION_SIZE && currentStage !== 'PROTECTING') {
-      const newLot = Math.min(trade.lotSize * 0.5, CONFIG.MAX_POSITION_SIZE - trade.lotSize);
-      if (newLot > 0.01) {
-        actions.push({
-          type: 'OPEN',
-          volume: newLot,
-          ev: profitR * 0.8,
-          confidence: scores.scaleProb,
-          reason: 'Scale into winning trade as trend accelerates.',
-        });
-      }
-    }
-
+    // --- EXTEND TP ----
     if (scores.opportunity > 70 && scores.trendStrength > 70 && currentStage !== 'PROTECTING' && currentStage !== 'EXTENDED') {
       const newTP = direction === 1 ? currentPrice + atr * 4 : currentPrice - atr * 4;
       const ev = profitR * 1.2;
@@ -543,6 +628,7 @@ class ActionCompetition {
       });
     }
 
+    // --- TIGHTEN TP (if health weak) ----
     if (scores.health < 50 && profitR > 0.5) {
       const newTP = direction === 1 ? currentPrice + atr * 1.5 : currentPrice - atr * 1.5;
       const ev = profitR * 0.9;
@@ -551,21 +637,24 @@ class ActionCompetition {
         takeProfit: newTP,
         ev: ev,
         confidence: 50 + (100 - scores.health) * 0.4,
-        reason: 'Tighten TP to protect profits as trade health declines.',
+        reason: 'Tighten TP to protect profits as health declines.',
       });
     }
 
+    // --- PROFIT PROTECTION (if >3R, ensure SL is at least 1R, and partial close) ----
     if (profitR > 3.0 && currentStage !== 'PROTECTING') {
-      const breakevenSL = entryPrice;
-      if ((direction === 1 && trade.stopLoss < breakevenSL) || (direction === -1 && trade.stopLoss > breakevenSL)) {
+      // Ensure SL is at least entry + 1R (lock in 1R)
+      const minSL = direction === 1 ? entryPrice + atr : entryPrice - atr;
+      if ((direction === 1 && trade.stopLoss < minSL) || (direction === -1 && trade.stopLoss > minSL)) {
         actions.push({
           type: 'MODIFY',
-          stopLoss: breakevenSL,
-          ev: holdEV * 0.95,
+          stopLoss: minSL,
+          ev: holdEV * 0.9,
           confidence: 80,
-          reason: 'Move to breakeven to protect profit.',
+          reason: 'Lock in 1R profit (minimum)',
         });
       }
+      // Partial close if not done yet
       if (!trade._partialClosed) {
         const fraction = 0.25;
         actions.push({
@@ -578,8 +667,10 @@ class ActionCompetition {
       }
     }
 
+    // Sort by EV descending
     actions.sort((a, b) => b.ev - a.ev);
 
+    // Apply stage filters
     if (currentStage === 'PROTECTING') {
       return actions.filter(a => !['OPEN', 'MODIFY'].includes(a.type) || a.type === 'MODIFY' && (a.stopLoss || a.takeProfit));
     }
@@ -599,6 +690,14 @@ class ActionCompetition {
     } else if (action.type === 'CLOSE') {
       this.tradeStates[tradeId] = 'CLOSED';
     }
+  }
+
+  // Track peak profit
+  updatePeakProfit(tradeId, profitR) {
+    if (!this.peakProfit[tradeId] || profitR > this.peakProfit[tradeId]) {
+      this.peakProfit[tradeId] = profitR;
+    }
+    return this.peakProfit[tradeId];
   }
 }
 
@@ -628,13 +727,14 @@ class ActionValidator {
   async validate(trade, action) {
     if (!action || !action.type) return { valid: false, reason: 'No action' };
 
+    // Duplicate check (allow after 10 seconds)
     const lastAction = await TradeManagementDecision.findOne({
       tradeId: trade.contractId,
       'chosenAction.type': action.type,
     }).sort({ timestamp: -1 });
     if (lastAction) {
       const timeDiff = Date.now() - new Date(lastAction.timestamp).getTime();
-      if (timeDiff < 60000) {
+      if (timeDiff < 10000) {
         let same = true;
         if (action.stopLoss !== undefined && lastAction.chosenAction.executedParams?.stopLoss !== undefined) {
           if (Math.abs(action.stopLoss - lastAction.chosenAction.executedParams.stopLoss) > 0.0001) same = false;
@@ -648,19 +748,16 @@ class ActionValidator {
       }
     }
 
+    // SL validation: allow trailing (SL can be above entry if profitable)
     if (action.stopLoss !== undefined) {
       const side = trade.side.toUpperCase();
       if (side === 'BUY') {
-        if (action.stopLoss >= trade.openPrice && action.stopLoss >= trade.currentPrice) {
-          if (action.stopLoss >= trade.currentPrice) {
-            return { valid: false, reason: 'Stop loss must be below current price for BUY' };
-          }
+        if (action.stopLoss >= trade.currentPrice) {
+          return { valid: false, reason: 'Stop loss must be below current price for BUY' };
         }
       } else {
-        if (action.stopLoss <= trade.openPrice && action.stopLoss <= trade.currentPrice) {
-          if (action.stopLoss <= trade.currentPrice) {
-            return { valid: false, reason: 'Stop loss must be above current price for SELL' };
-          }
+        if (action.stopLoss <= trade.currentPrice) {
+          return { valid: false, reason: 'Stop loss must be above current price for SELL' };
         }
       }
       const pipSize = 0.0001;
@@ -669,6 +766,7 @@ class ActionValidator {
       }
     }
 
+    // Partial close volume
     if (action.type === 'PARTIAL' && action.volume && action.volume > trade.lotSize) {
       return { valid: false, reason: 'Cannot close more than position size' };
     }
@@ -730,6 +828,7 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     this._timer = null;
     this._isRunning = false;
     this._tradeHistory = {};
+    this._peakProfit = {};
 
     this.stateClassifier = new ProbabilisticStateClassifier();
     this.profileManager = new SymbolProfileManager();
@@ -753,7 +852,7 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     this._scheduleBackgroundJobs();
     this.profileManager.updateAllProfiles().catch(err => logger.warn('[Profiles] Initial update failed:', err.message));
 
-    logger.info('[OTIE V5] Initialized (production-ready).');
+    logger.info('[OTIE V5] Initialized (enhanced profit protection).');
   }
 
   _startTimer() {
@@ -792,6 +891,8 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
         this._isRunning = false;
         return;
       }
+
+      logger.info(`[OTIE V5] Found ${openTrades.length} open trade(s).`);
 
       for (const trade of openTrades) {
         await this._evaluateTrade(trade);
@@ -840,6 +941,8 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
       velocity: state.momentum.velocity || 0,
     });
 
+    const peakProfitR = this.actionCompetition.updatePeakProfit(tradeId, profitR);
+
     const stateProbs = this.stateClassifier.classify(state, trade, history);
     const analogues = await this.memoryEngine.getAnalogues(trade, state, history);
     const prediction = this.predictionEngine.predict(trade, state, history);
@@ -847,7 +950,7 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     const scores = await this.scoreEngine.compute(trade, state, awareness, regime, profitR, history, analogues, prediction, {});
     const profile = await this.profileManager.getProfile(symbol);
 
-    const actions = this.actionCompetition.generateActions(trade, state, scores, analogues, prediction, profile, cost);
+    const actions = this.actionCompetition.generateActions(trade, state, scores, analogues, prediction, profile, cost, peakProfitR);
     let filteredActions = actions.filter(a => a.confidence >= CONFIG.MIN_ACTION_CONFIDENCE);
     if (filteredActions.length === 0) {
       filteredActions = [{ type: 'HOLD', ev: 0, confidence: 50, reason: 'No action meets threshold' }];
@@ -855,6 +958,8 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
 
     const simulated = await this.forwardSim.simulate(trade, state, filteredActions, analogues);
     const bestAction = simulated[0] || { type: 'HOLD', ev: 0, confidence: 50 };
+
+    logger.info(`[OTIE V5] Trade ${tradeId} (${symbol}) profitR=${profitR.toFixed(2)} peak=${peakProfitR.toFixed(2)} bestAction=${bestAction.type} (ev=${bestAction.ev.toFixed(3)}, conf=${bestAction.confidence.toFixed(0)}%)`);
 
     const validation = await this.validator.validate(trade, bestAction);
     if (!validation.valid) {
@@ -866,6 +971,8 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     if (bestAction.type !== 'HOLD' && bestAction.confidence >= CONFIG.MIN_ACTION_CONFIDENCE) {
       await this._executeAction(trade, bestAction);
       this.actionCompetition.updateTradeStage(tradeId, bestAction);
+    } else {
+      logger.debug(`[OTIE V5] Trade ${tradeId}: no action taken (${bestAction.type}, conf=${bestAction.confidence})`);
     }
 
     const decision = new TradeManagementDecision({
@@ -908,6 +1015,7 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
       scores: scores,
       cost: cost,
       regret: null,
+      peakProfitR: peakProfitR,
     });
     await decision.save();
 
@@ -915,6 +1023,7 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
       tradeId: trade.contractId,
       symbol,
       profitR,
+      peakProfitR,
       scores,
       prediction,
       stateProbs: stateProbs.probabilities,
@@ -924,49 +1033,42 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     });
   }
 
-  // ---- UPDATED: Execute action via server API with correct EA payload ----
+  // ---- Execute action via server API (command queue) ----
   async _executeAction(trade, action) {
     try {
-      const commandId = `otie_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-      const payload = {
-        commandId,
-        action: action.type,          // 'MODIFY', 'CLOSE', 'PARTIAL'
-        tradeId: trade.contractId,    // MT5 ticket number (for MODIFY/CLOSE)
-        instrument: trade.instrument, // for OPEN (though not used for MODIFY/CLOSE)
-        side: trade.side,             // for OPEN
-        stopLoss: action.stopLoss,
-        takeProfit: action.takeProfit,
-        volume: action.volume,        // for PARTIAL CLOSE (EA expects 'volume')
-        units: action.volume,         // for OPEN, but included anyway
-      };
+      logger.info(`[OTIE V5] Attempting action: ${action.type} on trade ${trade.contractId} (reason: ${action.reason})`);
 
-      // Remove undefined fields to avoid confusion
-      if (payload.stopLoss === undefined) delete payload.stopLoss;
-      if (payload.takeProfit === undefined) delete payload.takeProfit;
-      if (payload.volume === undefined) delete payload.volume;
-      if (payload.units === undefined) delete payload.units;
-
-      // If action is MODIFY, ensure we have either stopLoss or takeProfit
-      if (action.type === 'MODIFY' && !payload.stopLoss && !payload.takeProfit) {
-        logger.warn('[OTIE V5] MODIFY action without SL or TP, skipping.');
+      const freshTrade = await Trade.findOne({ contractId: trade.contractId, status: 'OPEN' });
+      if (!freshTrade) {
+        logger.warn(`[OTIE V5] Trade ${trade.contractId} no longer open – skipping action.`);
         return;
       }
 
+      const payload = {
+        action: action.type,
+        tradeId: trade.contractId,
+        symbol: trade.instrument,
+        side: trade.side,
+        stopLoss: action.stopLoss,
+        takeProfit: action.takeProfit,
+        volume: action.volume,
+      };
+
+      const apiBase = process.env.API_BASE || 'http://localhost:5000';
       const response = await axios.post(
-        `${process.env.API_BASE || 'http://localhost:5000'}/api/mt5/orders/command`,
+        `${apiBase}/api/mt5/orders/command`,
         payload,
         { headers: { 'Content-Type': 'application/json' } }
       );
 
       if (response.status === 201 || response.status === 200) {
-        logger.info(`[OTIE V5] Command queued: ${action.type} for trade ${trade.contractId} - ${action.reason}`);
+        logger.info(`[OTIE V5] ✅ Command queued: ${action.type} for trade ${trade.contractId}`);
         this.emit('otieV5Action', {
           tradeId: trade.contractId,
           action: action.type,
           details: action,
           timestamp: new Date().toISOString(),
         });
-        // Update local trade record for SL/TP changes (optional, but good for consistency)
         if (action.type === 'MODIFY') {
           const updates = {};
           if (action.stopLoss !== undefined) updates.stopLoss = action.stopLoss;
@@ -975,15 +1077,14 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
             await Trade.updateOne({ contractId: trade.contractId }, { $set: updates });
           }
         }
-        // For partial close, reduce lot size in DB (will be confirmed by EA result)
         if (action.type === 'PARTIAL' && action.volume) {
           await Trade.updateOne({ contractId: trade.contractId }, { $inc: { lotSize: -action.volume } });
         }
       } else {
-        logger.warn(`[OTIE V5] Command queuing failed: ${response.statusText}`);
+        logger.warn(`[OTIE V5] ❌ Command queuing failed: HTTP ${response.status}`);
       }
     } catch (err) {
-      logger.error(`[OTIE V5] Failed to queue command:`, err.message);
+      logger.error(`[OTIE V5] ❌ Failed to queue command:`, err.message);
     }
   }
 
