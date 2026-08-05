@@ -1,7 +1,6 @@
-// server.js – RTS Entry Point with Debug Routes & CTOS (Non‑Breaking)
-// Added: Outcome labeler scheduler.
-// Added: OTIE V5 Open Trade Intelligence Engine.
-// Added: Performance Monitor for R/R optimization.
+// server.js – RTS Entry Point with Real‑Time EA Support
+// Preserves all existing functionality; WebSocket for EA is an enhancement.
+// Dashboard WebSocket remains unchanged.
 
 require('dotenv').config();
 
@@ -205,22 +204,311 @@ app.get('*', (req, res) => {
 // ---------- Create HTTP server ----------
 const server = http.createServer(app);
 
-// ---------- WebSocket Server ----------
+// ---------- WebSocket Server (with EA support) ----------
 const wss = new WebSocket.Server({ server });
 
-// -------- Attach WebSocket server to OTIE V5 for real‑time broadcasts --------
-otie.setWebSocket(wss);
+// Store connected EA clients
+const eaClients = new Set();
 
-wss.on('connection', (ws) => {
-  console.log('[WebSocket] Client connected.');
-  ws.on('close', () => console.log('[WebSocket] Client disconnected.'));
+// Store connected dashboard clients (optional)
+const dashboardClients = new Set();
+
+wss.on('connection', (ws, req) => {
+  // Parse URL for client type and API key
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const type = url.searchParams.get('type') || 'dashboard';
+  const apiKey = url.searchParams.get('apiKey') || '';
+
+  // Authentication
+  const validApiKey = process.env.MT5_API_KEY || 'change-me-in-production';
+  if (apiKey !== validApiKey) {
+    ws.close(1008, 'Invalid API key');
+    console.log('[WebSocket] Authentication failed.');
+    return;
+  }
+
+  if (type === 'ea') {
+    eaClients.add(ws);
+    console.log('[WebSocket] EA client connected.');
+    // Send a welcome message
+    ws.send(JSON.stringify({ type: 'welcome', message: 'Connected to RTS WebSocket' }));
+
+    ws.on('message', async (message) => {
+      try {
+        const data = JSON.parse(message);
+        await handleEAMessage(ws, data);
+      } catch (err) {
+        console.error('[WebSocket] EA message error:', err.message);
+      }
+    });
+
+    ws.on('close', () => {
+      eaClients.delete(ws);
+      console.log('[WebSocket] EA client disconnected.');
+    });
+  } else {
+    // Dashboard client
+    dashboardClients.add(ws);
+    console.log('[WebSocket] Dashboard client connected.');
+    ws.on('close', () => dashboardClients.delete(ws));
+  }
+
   ws.on('error', (err) => console.error('[WebSocket] Error:', err.message));
 });
 
-// ---------- Broadcast functions ----------
+// ---- WebSocket message handler for EA ----
+async function handleEAMessage(ws, data) {
+  const { type, commandId, ...payload } = data;
+  const Mt5Command = require('./models/Mt5Command');
+  const Mt5CommandResult = require('./models/Mt5CommandResult');
+  const Trade = require('./models/Trade');
+  const logger = require('./infrastructure/logger') || console;
+
+  switch (type) {
+    case 'ack':
+      // ACK: command received
+      await Mt5Command.findOneAndUpdate(
+        { commandId },
+        { $set: { state: 'RECEIVED', receivedAt: new Date() } }
+      );
+      console.log(`[WebSocket] ACK for ${commandId}`);
+      break;
+
+    case 'executing':
+      await Mt5Command.findOneAndUpdate(
+        { commandId },
+        { $set: { state: 'EXECUTING', executingStartedAt: new Date() } }
+      );
+      console.log(`[WebSocket] EXECUTING for ${commandId}`);
+      break;
+
+    case 'result':
+      // Result from EA
+      const { success, ticket, deal, price, volume, symbol, side, retcode, retcodeDescription, error } = payload;
+      // Save result
+      await Mt5CommandResult.findOneAndUpdate(
+        { commandId },
+        { commandId, success, ticket, deal, price, volume, symbol, side, retcode, retcodeDescription, error, time: Date.now() },
+        { upsert: true }
+      );
+      // Update command state
+      await Mt5Command.findOneAndUpdate(
+        { commandId },
+        {
+          $set: {
+            state: success ? 'EXECUTED' : 'FAILED',
+            error: success ? null : (error || 'Execution failed'),
+            completedAt: new Date(),
+          }
+        }
+      );
+      // Process result (update Trade, etc.) – reuse logic from mt5Routes POST /orders/result
+      await processCommandResult(commandId, payload);
+      console.log(`[WebSocket] RESULT for ${commandId}: ${success ? 'SUCCESS' : 'FAILED'}`);
+      break;
+
+    case 'position_update':
+      // Handle real-time position update (opened, modified, closed)
+      await handleSinglePositionUpdate(payload);
+      break;
+
+    case 'account_update':
+      await handleAccountUpdate(payload);
+      break;
+
+    case 'price':
+      // Handle price tick
+      await handlePriceTick(payload);
+      break;
+
+    case 'heartbeat':
+      // Update heartbeat with additional info
+      const { login, status, timestamp, latency, eaVersion, lastTick } = payload;
+      await Mt5Heartbeat.findOneAndUpdate(
+        { login },
+        {
+          login,
+          status,
+          lastHeartbeat: timestamp || Date.now(),
+          latency,
+          eaVersion,
+          lastTick,
+          updatedAt: new Date(),
+        },
+        { upsert: true }
+      );
+      break;
+
+    default:
+      console.log(`[WebSocket] Unknown message type: ${type}`);
+  }
+}
+
+// ---- Helper: process command result (reused from mt5Routes) ----
+async function processCommandResult(commandId, result) {
+  const { success, ticket, deal, price, symbol, side, time, volume } = result;
+  const Mt5Command = require('./models/Mt5Command');
+  const Trade = require('./models/Trade');
+  const selfLearner = require('./core/learning/learner');
+  const logger = require('./infrastructure/logger') || console;
+
+  const command = await Mt5Command.findOne({ commandId }).lean();
+  const action = command?.action;
+
+  if (!success || !action) return;
+
+  if (action === 'CLOSE') {
+    const trade = await Trade.findOne({ contractId: ticket });
+    if (trade && trade.status !== 'CLOSED') {
+      trade.status = 'CLOSED';
+      trade.closePrice = price;
+      trade.dealId = deal;
+      trade.closeTime = new Date(time ? time * 1000 : Date.now());
+      trade.pendingClose = false;
+      if (trade.openPrice && trade.lotSize) {
+        const multiplier = trade.side && trade.side.toUpperCase() === 'BUY' ? 1 : -1;
+        trade.realizedProfit = (price - trade.openPrice) * trade.lotSize * multiplier;
+        trade.pnl = trade.realizedProfit;
+      }
+      await trade.save();
+      logger.info(`[WebSocket] Trade ${ticket} finalized as CLOSED at ${price}`);
+      if (trade.decisionId) {
+        try {
+          await selfLearner.updateDecisionOutcome(trade.decisionId, trade);
+        } catch (err) {
+          logger.warn(`[WebSocket] Failed to update decision outcome: ${err.message}`);
+        }
+      }
+    }
+  } else if (action === 'MODIFY') {
+    const trade = await Trade.findOne({ contractId: ticket });
+    if (trade && trade.status === 'OPEN') {
+      if (command.stopLoss !== undefined) trade.stopLoss = command.stopLoss;
+      if (command.takeProfit !== undefined) trade.takeProfit = command.takeProfit;
+      await trade.save();
+      logger.info(`[WebSocket] Trade ${ticket} SL/TP updated`);
+    }
+  } else if (action === 'PARTIAL') {
+    const trade = await Trade.findOne({ contractId: ticket });
+    if (trade && trade.status === 'OPEN') {
+      if (volume !== undefined && volume > 0) {
+        trade.lotSize = volume;
+        await trade.save();
+        logger.info(`[WebSocket] Trade ${ticket} lotSize reduced to ${volume}`);
+      } else {
+        trade.status = 'CLOSED';
+        trade.closePrice = price || trade.currentPrice;
+        trade.closeTime = new Date();
+        trade.pendingClose = false;
+        if (trade.openPrice && trade.lotSize) {
+          const multiplier = trade.side && trade.side.toUpperCase() === 'BUY' ? 1 : -1;
+          trade.realizedProfit = (trade.closePrice - trade.openPrice) * trade.lotSize * multiplier;
+          trade.pnl = trade.realizedProfit;
+        }
+        await trade.save();
+        logger.info(`[WebSocket] Trade ${ticket} closed after partial reduction`);
+      }
+    }
+  }
+}
+
+// ---- Helper: handle single position update ----
+async function handleSinglePositionUpdate(pos) {
+  const Trade = require('./models/Trade');
+  const eventBus = require('./infrastructure/eventBus');
+  const { ticket, symbol, type, volume, price, current_price, profit, stop_loss, take_profit, swap, commission, margin, magic, comment, open_time, reason, identifier, login } = pos;
+
+  let trade = await Trade.findOne({ contractId: ticket });
+  if (!trade) {
+    trade = new Trade({
+      contractId: ticket,
+      instrument: symbol,
+      side: type === 'BUY' ? 'buy' : 'sell',
+      lotSize: volume,
+      openPrice: price,
+      openTime: new Date(open_time * 1000),
+      status: 'OPEN',
+      magic,
+      comment,
+      stopLoss: stop_loss || 0,
+      takeProfit: take_profit || 0,
+      swap: swap || 0,
+      commission: commission || 0,
+      margin: margin || 0,
+      login,
+      pendingClose: false,
+      floatingProfit: profit || 0,
+      currentPrice: current_price || price,
+    });
+    await trade.save();
+  } else {
+    trade.currentPrice = current_price;
+    trade.floatingProfit = profit;
+    trade.lotSize = volume;
+    trade.pendingClose = false;
+    if (trade.status === 'OPEN') {
+      trade.stopLoss = stop_loss || 0;
+      trade.takeProfit = take_profit || 0;
+      trade.swap = swap || 0;
+      trade.commission = commission || 0;
+      trade.margin = margin || 0;
+      trade.magic = magic || 0;
+      trade.comment = comment || '';
+      trade.login = login;
+    }
+    await trade.save();
+  }
+  // Emit event for dashboard
+  eventBus.emit('position.updated', { ticket, symbol, type, volume, price, current_price, profit });
+}
+
+// ---- Helper: handle account update ----
+async function handleAccountUpdate(accountData) {
+  const Mt5Account = require('./models/Mt5Account');
+  const eventBus = require('./infrastructure/eventBus');
+  await Mt5Account.findOneAndUpdate(
+    { login: accountData.login },
+    {
+      ...accountData,
+      updatedAt: new Date(),
+    },
+    { upsert: true }
+  );
+  eventBus.emit('account.fetched', accountData);
+}
+
+// ---- Helper: handle price tick ----
+async function handlePriceTick(priceData) {
+  const Mt5Price = require('./models/Mt5Price');
+  const eventBus = require('./infrastructure/eventBus');
+  const timeMs = priceData.time ? Number(priceData.time) * 1000 : Date.now();
+  priceBuffer.update(priceData.symbol, priceData.bid, priceData.ask, timeMs);
+  await Mt5Price.findOneAndUpdate(
+    { symbol: priceData.symbol },
+    priceData,
+    { upsert: true, new: true }
+  );
+  eventBus.emit('price.tick', priceData);
+}
+
+// ---- Function to broadcast new command to all connected EAs ----
+function broadcastCommandToEA(command) {
+  if (eaClients.size === 0) return;
+  const message = JSON.stringify({ type: 'command', data: command });
+  eaClients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(message);
+    }
+  });
+}
+
+// ---- Export broadcast function for mt5Routes to use ----
+module.exports.broadcastCommandToEA = broadcastCommandToEA;
+
+// ---------- Broadcast functions for dashboard ----------
 function broadcast(type, data) {
   const message = JSON.stringify({ type, data });
-  wss.clients.forEach((client) => {
+  dashboardClients.forEach((client) => {
     if (client.readyState === WebSocket.OPEN) {
       client.send(message);
     }
@@ -228,35 +516,19 @@ function broadcast(type, data) {
 }
 
 // ---------- Connect CTOS Events to WebSocket ----------
-awarenessEngine.on('marketAwareness', (data) => {
-  broadcast('marketAwareness', data);
-});
-deepRegime.on('regime', (regime) => {
-  broadcast('regime', regime);
-});
-decisionEngine.on('decision', (decision) => {
-  broadcast('decision', decision);
-});
-eventBus.on('account.fetched', (account) => {
-  broadcast('account', account);
-});
-eventBus.on('trade.closed', (data) => {
-  broadcast('tradeClosed', data);
-});
-eventBus.on('order.placed', (data) => {
-  broadcast('orderPlaced', data);
-});
+awarenessEngine.on('marketAwareness', (data) => broadcast('marketAwareness', data));
+deepRegime.on('regime', (regime) => broadcast('regime', regime));
+decisionEngine.on('decision', (decision) => broadcast('decision', decision));
+eventBus.on('account.fetched', (account) => broadcast('account', account));
+eventBus.on('trade.closed', (data) => broadcast('tradeClosed', data));
+eventBus.on('order.placed', (data) => broadcast('orderPlaced', data));
+eventBus.on('position.updated', (data) => broadcast('positionUpdated', data));
 
 // ---------- OTIE V5 Event Broadcasts ----------
-otie.on('otieV5State', (state) => {
-  broadcast('otieV5State', state);
-});
-otie.on('otieV5Action', (action) => {
-  broadcast('otieV5Action', action);
-});
+otie.on('otieV5State', (state) => broadcast('otieV5State', state));
+otie.on('otieV5Action', (action) => broadcast('otieV5Action', action));
 
 // ---------- Performance Monitor Integration ----------
-// 1. Record closed trades for performance monitoring
 eventBus.on('trade.closed', async (data) => {
   try {
     const Trade = require('./models/Trade');
@@ -269,7 +541,6 @@ eventBus.on('trade.closed', async (data) => {
   }
 });
 
-// 2. Update OTIE config when performance thresholds change
 performanceMonitor.on('thresholdsUpdated', (thresholds) => {
   if (otie && typeof otie.updateConfig === 'function') {
     otie.updateConfig(thresholds);
@@ -288,6 +559,7 @@ app.get('/debug/ea-status', async (req, res) => {
       lastPriceReceived: lastPrice || null,
       lastHeartbeat: lastHeartbeat || null,
       eaOnline: lastHeartbeat && lastHeartbeat.status === 'online',
+      eaWebSocketConnected: eaClients.size > 0,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -366,7 +638,7 @@ async function startServer() {
     console.log(`🔌 API base: http://localhost:${PORT}/api`);
     console.log(`🟢 MT5 Bridge endpoints: http://localhost:${PORT}/api/mt5`);
     console.log(`🔬 Research endpoints: http://localhost:${PORT}/api/research`);
-    console.log('📡 WebSocket server ready for real‑time signals.');
+    console.log('📡 WebSocket server ready for real‑time signals and EA commands.');
     console.log('🧠 CTOS Cognitive Engine: enabled.');
     console.log('📡 Request logging enabled.');
     console.log('🛠️  JSON repair enabled as fallback.');
@@ -386,10 +658,10 @@ async function startServer() {
     // ---- Start Cognitive Engines ----
     setTimeout(startCognitiveEngines, 2000);
 
-    // ---- Start Outcome Labeler Scheduler (every hour) ----
+    // ---- Start Outcome Labeler Scheduler ----
     try {
       const labeler = require('./core/intelligence/lab/outcomeLabeler');
-      const interval = parseInt(process.env.OUTCOME_LABEL_INTERVAL_MS) || 60 * 60 * 1000; // default 1 hour
+      const interval = parseInt(process.env.OUTCOME_LABEL_INTERVAL_MS) || 60 * 60 * 1000;
       labeler.startScheduler(interval);
       console.log(`✅ Outcome labeler scheduler started (interval: ${interval}ms)`);
     } catch (err) {
@@ -402,9 +674,7 @@ async function startServer() {
     console.log('\n🛑 Received SIGINT, shutting down gracefully...');
     try {
       await dataOrchestrator.shutdown();
-      if (otie && typeof otie.stop === 'function') {
-        otie.stop();
-      }
+      if (otie && typeof otie.stop === 'function') otie.stop();
       console.log('✅ Data Orchestrator flushed.');
     } catch (err) {
       console.error('Error during shutdown:', err.message);
@@ -416,9 +686,7 @@ async function startServer() {
     console.log('\n🛑 Received SIGTERM, shutting down gracefully...');
     try {
       await dataOrchestrator.shutdown();
-      if (otie && typeof otie.stop === 'function') {
-        otie.stop();
-      }
+      if (otie && typeof otie.stop === 'function') otie.stop();
       console.log('✅ Data Orchestrator flushed.');
     } catch (err) {
       console.error('Error during shutdown:', err.message);
