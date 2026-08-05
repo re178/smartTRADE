@@ -91,7 +91,7 @@ function stableSoftmax(scores) {
 }
 
 // ========================================================================
-// 1. SLIDING WINDOW (FIXED: i -> b)
+// 1. SLIDING WINDOW (FIXED)
 // ========================================================================
 class AdaptiveSlidingWindow {
   constructor(symbol) {
@@ -861,12 +861,13 @@ class LearningEngine {
 }
 
 // ========================================================================
-// 13. MAIN OTIE V5 ENGINE
+// 13. MAIN OTIE V5 ENGINE WITH BROADCASTING
 // ========================================================================
 class OpenTradeIntelligenceV5 extends EventEmitter {
-  constructor(broker = null) {
+  constructor(broker = null, socketServer = null) {
     super();
     this.broker = broker || new MT5Broker();
+    this._socketServer = socketServer;  // socket.io instance
     this._timer = null;
     this._isRunning = false;
     this._tradeHistory = {};
@@ -894,12 +895,44 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
       }
     });
 
+    // ---- Broadcast internal events to WebSocket clients ----
+    this.on('otieV5State', (state) => {
+      this._broadcast('otieState', state);
+    });
+    this.on('otieV5Action', (action) => {
+      this._broadcast('otieAction', action);
+    });
+
     this._startTimer();
     this._scheduleBackgroundJobs();
     this.profileManager.updateAllProfiles().catch(err => logger.warn('[Profiles] Initial update failed:', err.message));
 
-    logger.info('[OTIE V5] Initialized with MT5Broker integration.');
+    logger.info('[OTIE V5] Initialized with MT5Broker and real‑time broadcasting.');
   }
+
+  // ---- Set WebSocket server after construction ----
+  setWebSocket(socketServer) {
+    this._socketServer = socketServer;
+    logger.info('[OTIE V5] WebSocket server attached.');
+  }
+
+  // ---- Broadcast to all connected clients ----
+  _broadcast(event, data) {
+    if (!this._socketServer) return;
+    // If using socket.io, emit to all clients in the default room.
+    if (this._socketServer.emit) {
+      this._socketServer.emit(event, data);
+    } else if (this._socketServer.clients) {
+      // If using 'ws' library, send to all clients (you'll need to JSON.stringify)
+      this._socketServer.clients.forEach(client => {
+        if (client.readyState === 1) {
+          client.send(JSON.stringify({ event, data }));
+        }
+      });
+    }
+  }
+
+  // ---- Other methods (unchanged) ----
 
   _startTimer() {
     if (this._timer) clearInterval(this._timer);
@@ -1067,6 +1100,7 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     });
     await decision.save();
 
+    // ---- Emit state for broadcasting (and internal listeners) ----
     this.emit('otieV5State', {
       tradeId: trade.contractId,
       symbol,
@@ -1120,6 +1154,7 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
 
       if (result && result.success) {
         logger.info(`[OTIE V5] ✅ Action ${action.type} executed successfully for trade ${trade.contractId}`);
+        // Emit action for broadcasting
         this.emit('otieV5Action', {
           tradeId: trade.contractId,
           action: action.type,
