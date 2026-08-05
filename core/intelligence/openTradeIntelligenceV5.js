@@ -10,10 +10,11 @@ const stateStore = require('./lab/stateStore');
 const deepRegime = require('./deep/regime');
 const marketStateCache = require('../data/marketStateCache');
 const awarenessEngine = require('../awareness/engine');
+const MT5Broker = require('../../execution/mt5Broker');
 const logger = require('../../infrastructure/logger') || console;
 
 // ========================================================================
-// CONFIGURATION (all tunable via env)
+// CONFIGURATION
 // ========================================================================
 const CONFIG = {
   EVALUATION_INTERVAL_MS: parseInt(process.env.OTIE_INTERVAL) || 30000,
@@ -33,7 +34,6 @@ const CONFIG = {
   BASE_HISTORY_WINDOW: 30,
   HISTORY_PER_SYMBOL: { EURUSD: 30, GBPUSD: 30, USDJPY: 25, AUDUSD: 25, XAUUSD: 15 },
   CALIBRATION_MIN_SAMPLES: 50,
-  // ---- Enhanced Profit Protection ----
   BREAKEVEN_PROFIT_R: 0.5,
   PROGRESSIVE_SL_STEPS: [
     { profitR: 0.5, slR: -0.2 },
@@ -50,7 +50,7 @@ const CONFIG = {
 };
 
 // ========================================================================
-// Utility: get pip size from symbol (fix for hardcoded 0.0001)
+// Utility: get pip size from symbol
 // ========================================================================
 function getPipSize(symbol) {
   const mapping = {
@@ -65,14 +65,13 @@ function getPipSize(symbol) {
     XAGUSD: 0.001,
     BTCUSD: 0.1,
     ETHUSD: 0.01,
-    // Add more as needed
   };
   const clean = symbol.replace(/[/\-_]/g, '').toUpperCase();
-  return mapping[clean] || 0.0001; // fallback
+  return mapping[clean] || 0.0001;
 }
 
 // ========================================================================
-// Utility: stable softmax (fix for overflow)
+// Utility: stable softmax
 // ========================================================================
 function stableSoftmax(scores) {
   const maxScore = Math.max(...Object.values(scores));
@@ -83,7 +82,6 @@ function stableSoftmax(scores) {
     sumExp += expScores[key];
   }
   if (sumExp === 0) {
-    // fallback uniform
     const n = Object.keys(scores).length;
     for (const key in expScores) expScores[key] = 1 / n;
     return expScores;
@@ -93,7 +91,7 @@ function stableSoftmax(scores) {
 }
 
 // ========================================================================
-// 1. SLIDING WINDOW
+// 1. SLIDING WINDOW (FIXED: i -> b)
 // ========================================================================
 class AdaptiveSlidingWindow {
   constructor(symbol) {
@@ -111,11 +109,10 @@ class AdaptiveSlidingWindow {
     if (this.data.length < 2) return 0;
     const values = this.data.map(d => d[field] || 0);
     const n = values.length;
-    const indices = values.map((_, i) => i);
-    const sumX = indices.reduce((a, b) => a + b, 0);
+    const sumX = values.reduce((a, _, i) => a + i, 0);
     const sumY = values.reduce((a, b) => a + b, 0);
-    const sumXY = indices.reduce((a, b) => a + b * values[i], 0);
-    const sumX2 = indices.reduce((a, b) => a + b * b, 0);
+    const sumXY = values.reduce((a, v, i) => a + i * v, 0);
+    const sumX2 = values.reduce((a, _, i) => a + i * i, 0);
     const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
     return slope;
   }
@@ -132,7 +129,7 @@ class AdaptiveSlidingWindow {
 }
 
 // ========================================================================
-// 2. PROBABILISTIC STATE CLASSIFIER (with stable softmax)
+// 2. PROBABILISTIC STATE CLASSIFIER (stable softmax)
 // ========================================================================
 class ProbabilisticStateClassifier {
   classify(state, trade, history) {
@@ -189,7 +186,6 @@ class ProbabilisticStateClassifier {
       rawScores.RANGE_BOUND = (20 - adx) * 3 + (0.15 - bbWidth) * 100;
     }
 
-    // ---- Stable softmax ----
     const probs = stableSoftmax(rawScores);
     const maxProb = Math.max(...Object.values(probs));
     return { probabilities: probs, mostLikely: Object.keys(probs).find(k => probs[k] === maxProb), confidence: maxProb * 100 };
@@ -197,7 +193,7 @@ class ProbabilisticStateClassifier {
 }
 
 // ========================================================================
-// 3. SYMBOL PROFILE MANAGER (no changes)
+// 3. SYMBOL PROFILE MANAGER
 // ========================================================================
 class SymbolProfileManager {
   async getProfile(symbol) {
@@ -276,7 +272,6 @@ class HistoricalMemoryEngine {
     const fullFeatureVector = { ...currentFeatures, ...trajFeatures };
 
     try {
-      // Use risk-based profitR for analogues comparison
       const riskDistance = Math.abs(trade.openPrice - trade.stopLoss);
       const currentProfitR = (trade.currentPrice - trade.openPrice) * (trade.side.toUpperCase() === 'BUY' ? 1 : -1) / riskDistance;
 
@@ -284,8 +279,8 @@ class HistoricalMemoryEngine {
         currentFeatures,
         symbol,
         'M5',
-        200,                 // k
-        5,                   // lookahead
+        200,
+        5,
         state.regime?.code || null
       );
 
@@ -345,7 +340,7 @@ class HistoricalMemoryEngine {
 }
 
 // ========================================================================
-// 5. PREDICTION ENGINE (no changes)
+// 5. PREDICTION ENGINE
 // ========================================================================
 class PredictionEngine {
   predict(trade, state, history) {
@@ -383,28 +378,25 @@ class PredictionEngine {
 }
 
 // ========================================================================
-// 6. COST MODEL (fixed: costR = totalCost / riskAmount)
+// 6. COST MODEL (costR = totalCost / riskAmount)
 // ========================================================================
 class CostModel {
   computeCost(trade, state) {
     const symbol = trade.instrument;
     const pipSize = getPipSize(symbol);
     const spreadPips = state.awareness?.spread ? state.awareness.spread / pipSize : CONFIG.SPREAD_COST_PIPS;
-    const spreadCost = spreadPips * 0.1; // in monetary units? This is approximate; we need actual cost.
-    // For better accuracy, we should get actual spread cost from trade metadata.
-    // Here we assume a fixed commission per lot.
+    const spreadCost = spreadPips * 0.1;
     const commission = CONFIG.COMMISSION_PER_LOT * trade.lotSize;
     const swap = trade.swap || 0;
     const totalCost = spreadCost + commission + swap;
-    // Convert to R multiples using monetary risk
-    const riskAmount = trade.riskAmount || 1; // fallback to avoid division by zero
+    const riskAmount = trade.riskAmount || 1;
     const costR = totalCost / riskAmount;
     return { spreadCost, commission, swap, totalCost, costR };
   }
 }
 
 // ========================================================================
-// 7. CONTINUOUS TRADE SCORE ENGINE (adjust to risk-based R)
+// 7. CONTINUOUS TRADE SCORE ENGINE
 // ========================================================================
 class ContinuousScoreEngine {
   async compute(trade, state, awareness, regime, profitR, history, analogues, prediction, weights) {
@@ -472,7 +464,7 @@ class ContinuousScoreEngine {
 }
 
 // ========================================================================
-// 8. FORWARD SIMULATION (fixed: includes current profit)
+// 8. FORWARD SIMULATION (includes current profit)
 // ========================================================================
 class ForwardSimulation {
   async simulate(trade, state, actions, analogues) {
@@ -483,7 +475,7 @@ class ForwardSimulation {
     const atr = state.volatility.atr || 0.001;
 
     for (const action of actions) {
-      let simulatedProfit = currentProfitR; // start with current profit
+      let simulatedProfit = currentProfitR;
       let confidence = action.confidence || 50;
       switch (action.type) {
         case 'HOLD':
@@ -497,25 +489,22 @@ class ForwardSimulation {
         case 'MODIFY':
           if (action.stopLoss) {
             const newSL = action.stopLoss;
-            const slDistance = Math.abs(newSL - state.price.current) / riskDistance; // in R
-            const hitSLProb = 0.3; // simplified
-            const lossIfHit = -slDistance * direction; // will be negative if direction is correct
-            // Future EV: partial chance to hit SL
+            const slDistance = Math.abs(newSL - state.price.current) / riskDistance;
+            const hitSLProb = 0.3;
+            const lossIfHit = -slDistance * direction;
             const futureEV = (1 - hitSLProb) * (analogues?.avgMFE || 0) + hitSLProb * lossIfHit;
             simulatedProfit += futureEV;
           }
           break;
         case 'PARTIAL':
           const fraction = action.volume / trade.lotSize;
-          // EV = current profit on closed part + expected future profit on remaining part
           const remainingFraction = 1 - fraction;
-          // Future expected profit for remaining part (using analogues)
           const futureRemainingEV = remainingFraction * (prediction?.continuationProbability || 0.5) * (analogues?.avgMFE || 0)
                                   + remainingFraction * (1 - (prediction?.continuationProbability || 0.5)) * (analogues?.avgMAE || -0.5);
           simulatedProfit = fraction * currentProfitR + futureRemainingEV;
           break;
         case 'CLOSE':
-          simulatedProfit = currentProfitR; // just close, no future
+          simulatedProfit = currentProfitR;
           break;
         default:
           break;
@@ -528,12 +517,12 @@ class ForwardSimulation {
 }
 
 // ========================================================================
-// 9. ACTION COMPETITION ENGINE (fixed partial EV, trailing stop, retracement)
+// 9. ACTION COMPETITION (fixed partial EV, trailing stop, retracement)
 // ========================================================================
 class ActionCompetition {
   constructor() {
     this.tradeStates = {};
-    this.peakProfit = {}; // tradeId -> peakProfitR
+    this.peakProfit = {};
   }
 
   generateActions(trade, state, scores, analogues, prediction, profile, cost, peakProfitR) {
@@ -542,12 +531,12 @@ class ActionCompetition {
     const currentPrice = state.price.current;
     const entryPrice = trade.openPrice;
     const riskDistance = Math.abs(entryPrice - trade.stopLoss);
-    const profitR = (currentPrice - entryPrice) * direction / riskDistance; // risk-based R
+    const profitR = (currentPrice - entryPrice) * direction / riskDistance;
     const actions = [];
     const tradeId = trade.contractId;
     const currentStage = this.tradeStates[tradeId] || 'INITIAL';
 
-    // --- HOLD (baseline) ---
+    // --- HOLD ---
     let holdEV = prediction.continuationProbability * (analogues?.avgMFE || 1.0) + (1 - prediction.continuationProbability) * (analogues?.avgMAE || -0.5);
     holdEV -= cost.costR;
     actions.push({
@@ -558,7 +547,7 @@ class ActionCompetition {
       contProb: prediction.continuationProbability,
     });
 
-    // --- PROGRESSIVE STOP-LOSS (MODIFY) ---
+    // --- PROGRESSIVE SL ---
     let bestSLR = null;
     let bestProfitR = 0;
     for (const step of CONFIG.PROGRESSIVE_SL_STEPS) {
@@ -583,7 +572,6 @@ class ActionCompetition {
 
     // --- TRAILING STOP (using absolute MAE) ---
     if (profitR > 0.5 && scores.health > 50 && currentStage !== 'PROTECTING') {
-      // FIX: use Math.abs(profile.typicalMAE) for distance
       const maeAbs = Math.abs(profile.typicalMAE || 0.6);
       const trailDistance = Math.min(
         (1 - scores.health/100) * atr,
@@ -608,7 +596,6 @@ class ActionCompetition {
       const ratio = Math.min(profitR / profile.typicalMFE, 1);
       const fraction = CONFIG.PARTIAL_FRACTION_MIN + (CONFIG.PARTIAL_FRACTION_MAX - CONFIG.PARTIAL_FRACTION_MIN) * ratio;
       const fractionRounded = Math.round(fraction * 100) / 100;
-      // FIX: include downside risk for remaining part
       const contProb = prediction.continuationProbability;
       const futureEV = contProb * (analogues?.avgMFE || 0) + (1 - contProb) * (analogues?.avgMAE || -0.5);
       const ev = fractionRounded * profitR + (1 - fractionRounded) * futureEV;
@@ -648,7 +635,7 @@ class ActionCompetition {
       }
     }
 
-    // --- EXPECTED REMAINING VALUE (CLOSE if negative) ---
+    // --- EXPECTED REMAINING VALUE ---
     if (analogues && prediction) {
       const avgMFE = analogues.avgMFE || 0;
       const avgMAE = analogues.avgMAE || 0;
@@ -702,7 +689,7 @@ class ActionCompetition {
       });
     }
 
-    // --- PROFIT PROTECTION (if >3R) ---
+    // --- PROFIT PROTECTION (>3R) ---
     if (profitR > 3.0 && currentStage !== 'PROTECTING') {
       const minSL = direction === 1 ? entryPrice + riskDistance : entryPrice - riskDistance;
       if ((direction === 1 && trade.stopLoss < minSL) || (direction === -1 && trade.stopLoss > minSL)) {
@@ -716,8 +703,7 @@ class ActionCompetition {
       }
       if (!trade._partialClosed) {
         const fraction = 0.25;
-        const contProb = prediction.continuationProbability;
-        const futureEV = contProb * (analogues?.avgMFE || 0) + (1 - contProb) * (analogues?.avgMAE || -0.5);
+        const futureEV = prediction.continuationProbability * (analogues?.avgMFE || 0) + (1 - prediction.continuationProbability) * (analogues?.avgMAE || -0.5);
         const ev = fraction * profitR + (1 - fraction) * futureEV;
         actions.push({
           type: 'PARTIAL',
@@ -729,17 +715,14 @@ class ActionCompetition {
       }
     }
 
-    // Sort by EV descending
     actions.sort((a, b) => b.ev - a.ev);
 
-    // Apply stage filters
     if (currentStage === 'PROTECTING') {
       return actions.filter(a => !['OPEN', 'MODIFY'].includes(a.type) || a.type === 'MODIFY' && (a.stopLoss || a.takeProfit));
     }
     if (currentStage === 'EXTENDED') {
       return actions.filter(a => !(a.type === 'MODIFY' && a.takeProfit));
     }
-
     return actions;
   }
 
@@ -754,7 +737,6 @@ class ActionCompetition {
     }
   }
 
-  // Track peak profit
   updatePeakProfit(tradeId, profitR) {
     if (!this.peakProfit[tradeId] || profitR > this.peakProfit[tradeId]) {
       this.peakProfit[tradeId] = profitR;
@@ -764,7 +746,7 @@ class ActionCompetition {
 }
 
 // ========================================================================
-// 10. REGRET ANALYZER (fixed)
+// 10. REGRET ANALYZER
 // ========================================================================
 class RegretAnalyzer {
   async analyzeClosedTrade(trade, decisions) {
@@ -783,13 +765,12 @@ class RegretAnalyzer {
 }
 
 // ========================================================================
-// 11. ACTION VALIDATOR (uses pip size from symbol)
+// 11. ACTION VALIDATOR
 // ========================================================================
 class ActionValidator {
   async validate(trade, action) {
     if (!action || !action.type) return { valid: false, reason: 'No action' };
 
-    // Duplicate check (allow after 10 seconds)
     const lastAction = await TradeManagementDecision.findOne({
       tradeId: trade.contractId,
       'chosenAction.type': action.type,
@@ -810,7 +791,6 @@ class ActionValidator {
       }
     }
 
-    // SL validation: allow trailing (SL can be above entry if profitable)
     if (action.stopLoss !== undefined) {
       const side = trade.side.toUpperCase();
       if (side === 'BUY') {
@@ -822,14 +802,12 @@ class ActionValidator {
           return { valid: false, reason: 'Stop loss must be above current price for SELL' };
         }
       }
-      // Use pip size from symbol
       const pipSize = getPipSize(trade.instrument);
       if (Math.abs(action.stopLoss - trade.currentPrice) < pipSize) {
         return { valid: false, reason: 'Stop loss too close to current price' };
       }
     }
 
-    // Partial close volume
     if (action.type === 'PARTIAL' && action.volume && action.volume > trade.lotSize) {
       return { valid: false, reason: 'Cannot close more than position size' };
     }
@@ -839,7 +817,7 @@ class ActionValidator {
 }
 
 // ========================================================================
-// 12. LEARNING ENGINE (no changes)
+// 12. LEARNING ENGINE
 // ========================================================================
 class LearningEngine {
   async updateEVWeights() {
@@ -883,11 +861,12 @@ class LearningEngine {
 }
 
 // ========================================================================
-// 13. MAIN OTIE V5 ENGINE (fixed profitR calculation)
+// 13. MAIN OTIE V5 ENGINE
 // ========================================================================
 class OpenTradeIntelligenceV5 extends EventEmitter {
-  constructor() {
+  constructor(broker = null) {
     super();
+    this.broker = broker || new MT5Broker();
     this._timer = null;
     this._isRunning = false;
     this._tradeHistory = {};
@@ -905,6 +884,10 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     this.regretAnalyzer = new RegretAnalyzer();
     this.learningEngine = new LearningEngine();
 
+    this.broker.connect().catch(err => {
+      logger.error('[OTIE V5] Broker connection failed:', err.message);
+    });
+
     awarenessEngine.on('marketAwareness', (data) => {
       if (data.unusualEvents && data.unusualEvents.length > 0) {
         this._evaluate().catch(err => logger.warn('[OTIE V5] Fast eval error:', err.message));
@@ -915,7 +898,7 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     this._scheduleBackgroundJobs();
     this.profileManager.updateAllProfiles().catch(err => logger.warn('[Profiles] Initial update failed:', err.message));
 
-    logger.info('[OTIE V5] Initialized (enhanced profit protection, all fixes applied).');
+    logger.info('[OTIE V5] Initialized with MT5Broker integration.');
   }
 
   _startTimer() {
@@ -986,7 +969,7 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
       return;
     }
 
-    // ---- Fixed: risk-based profitR ----
+    // ---- Risk-based profitR ----
     const riskDistance = Math.abs(trade.openPrice - trade.stopLoss);
     const currentProfitR = (state.price.current - trade.openPrice) * (side === 'BUY' ? 1 : -1) / riskDistance;
 
@@ -1098,10 +1081,10 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     });
   }
 
-  // ---- Execute action via server API (command queue) ----
+  // ---- Execute action via broker (no local DB updates) ----
   async _executeAction(trade, action) {
     try {
-      logger.info(`[OTIE V5] Attempting action: ${action.type} on trade ${trade.contractId} (reason: ${action.reason})`);
+      logger.info(`[OTIE V5] Executing action: ${action.type} on trade ${trade.contractId} (reason: ${action.reason})`);
 
       const freshTrade = await Trade.findOne({ contractId: trade.contractId, status: 'OPEN' });
       if (!freshTrade) {
@@ -1109,51 +1092,56 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
         return;
       }
 
-      const payload = {
-        action: action.type,
-        tradeId: trade.contractId,
-        symbol: trade.instrument,
-        side: trade.side,
-        stopLoss: action.stopLoss,
-        takeProfit: action.takeProfit,
-        volume: action.volume,
-      };
+      if (action.type === 'CLOSE') {
+        await Trade.updateOne({ contractId: trade.contractId }, { $set: { pendingClose: true } });
+      }
 
-      const apiBase = process.env.API_BASE || 'http://localhost:5000';
-      const response = await axios.post(
-        `${apiBase}/api/mt5/orders/command`,
-        payload,
-        { headers: { 'Content-Type': 'application/json' } }
-      );
+      let result;
+      switch (action.type) {
+        case 'MODIFY':
+          result = await this.broker.modifySLTP(trade.contractId, action.stopLoss, action.takeProfit);
+          break;
+        case 'PARTIAL':
+          if (this.broker.capabilities.supportsPartialClose) {
+            result = await this.broker.partialClose(trade.contractId, action.volume);
+          } else {
+            logger.warn('[OTIE V5] Broker does not support partial close – closing full position.');
+            result = await this.broker.closeTrade(trade.contractId);
+            action.type = 'CLOSE';
+          }
+          break;
+        case 'CLOSE':
+          result = await this.broker.closeTrade(trade.contractId);
+          break;
+        default:
+          logger.warn(`[OTIE V5] Unknown action type: ${action.type}`);
+          return;
+      }
 
-      if (response.status === 201 || response.status === 200) {
-        logger.info(`[OTIE V5] ✅ Command queued: ${action.type} for trade ${trade.contractId}`);
+      if (result && result.success) {
+        logger.info(`[OTIE V5] ✅ Action ${action.type} executed successfully for trade ${trade.contractId}`);
         this.emit('otieV5Action', {
           tradeId: trade.contractId,
           action: action.type,
           details: action,
+          result,
           timestamp: new Date().toISOString(),
         });
-        if (action.type === 'MODIFY') {
-          const updates = {};
-          if (action.stopLoss !== undefined) updates.stopLoss = action.stopLoss;
-          if (action.takeProfit !== undefined) updates.takeProfit = action.takeProfit;
-          if (Object.keys(updates).length) {
-            await Trade.updateOne({ contractId: trade.contractId }, { $set: updates });
-          }
-        }
-        if (action.type === 'PARTIAL' && action.volume) {
-          await Trade.updateOne({ contractId: trade.contractId }, { $inc: { lotSize: -action.volume } });
-        }
       } else {
-        logger.warn(`[OTIE V5] ❌ Command queuing failed: HTTP ${response.status}`);
+        if (action.type === 'CLOSE') {
+          await Trade.updateOne({ contractId: trade.contractId }, { $set: { pendingClose: false } });
+        }
+        const errorMsg = result?.error || 'Unknown error';
+        logger.error(`[OTIE V5] ❌ Action ${action.type} failed: ${errorMsg}`);
       }
     } catch (err) {
-      logger.error(`[OTIE V5] ❌ Failed to queue command:`, err.message);
+      logger.error(`[OTIE V5] ❌ Failed to execute action:`, err.message);
+      if (action.type === 'CLOSE') {
+        await Trade.updateOne({ contractId: trade.contractId }, { $set: { pendingClose: false } });
+      }
     }
   }
 
-  // ---- Update config from Performance Monitor ----
   updateConfig(newThresholds) {
     CONFIG.BREAKEVEN_PROFIT_R = newThresholds.breakevenProfitR ?? CONFIG.BREAKEVEN_PROFIT_R;
     if (newThresholds.progressiveSLSteps) {
@@ -1174,7 +1162,4 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
   }
 }
 
-// ========================================================================
-// SINGLETON EXPORT
-// ========================================================================
 module.exports = new OpenTradeIntelligenceV5();
