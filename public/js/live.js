@@ -1,5 +1,6 @@
 // public/js/live.js – Updated for CTOS Real-time Events with Sound Alerts and Fusion
 // Added OTIE V5 state and action display
+// Added account and position handlers for real-time dashboard updates
 
 (function() {
   'use strict';
@@ -18,7 +19,6 @@
   const metricsPanel = document.getElementById('metricsPanel');
   const fusionPanel = document.getElementById('fusionPanel');
   const wsStatus = document.getElementById('wsStatus');
-  // OTIE V5 panel
   const otieContent = document.getElementById('otieContent');
 
   // ---- SoundManager (global from app.js) ----
@@ -106,8 +106,12 @@
     setTimeout(connectWebSocket, delay);
   }
 
+  // ============================================================
+  //  MAIN MESSAGE HANDLER – UPDATED WITH NEW EVENTS
+  // ============================================================
   function handleMessage(msg) {
     switch (msg.type) {
+      // ---- Existing events ----
       case 'marketAwareness':
         displayAwareness(msg.data);
         break;
@@ -135,7 +139,6 @@
       case 'metrics':
         displayMetrics(msg.data);
         break;
-      // ---- OTIE V5 events ----
       case 'otieV5State':
         displayOTIEState(msg.data);
         break;
@@ -158,12 +161,164 @@
         playSound('reject');
         if (typeof addNotification === 'function') addNotification('Order rejected: ' + (msg.data.reason || ''), 'danger');
         break;
+
+      // ============================================================
+      //  NEW EVENTS FOR REAL‑TIME DASHBOARD
+      // ============================================================
+      case 'init':
+        // Initial state – populates everything at once
+        handleInit(msg.data);
+        break;
+      case 'positions':
+        // Update open trades panel
+        updatePositions(msg.data);
+        break;
+      case 'account':
+        // Update account stats and badge
+        updateAccount(msg.data);
+        break;
+      case 'price':
+        // Update price panel (if you have one)
+        updatePrice(msg.data);
+        break;
+
       default:
         console.debug('[Live] Unknown message type:', msg.type);
     }
   }
 
-  // ---- Display functions (existing) ----
+  // ============================================================
+  //  NEW HANDLERS
+  // ============================================================
+
+  function handleInit(data) {
+    console.log('[Live] Received initial state:', data);
+    if (data.account) updateAccount(data.account);
+    if (data.positions) updatePositions(data.positions);
+    if (data.trades) {
+      // If the server sends open trades, we can update the table directly
+      // but we can also just call loadOpenTrades() to keep it simple
+      if (typeof loadOpenTrades === 'function') loadOpenTrades();
+    }
+  }
+
+  function updatePositions(positions) {
+    // positions is an array of open trades from the broker
+    console.log('[Live] Positions update:', positions);
+
+    // Update the open trades count badge
+    const badge = document.getElementById('positionCount');
+    if (badge) badge.textContent = positions ? positions.length : 0;
+
+    // Update the open trades table (if it exists)
+    const container = document.getElementById('openTradesContainer');
+    if (container) {
+      if (!positions || positions.length === 0) {
+        container.innerHTML = '<p class="text-muted">No open trades.</p>';
+        document.getElementById('statOpenTrades').textContent = '0';
+        document.getElementById('statOpenPL').textContent = '—';
+        return;
+      }
+
+      // Build table – reuse the logic from app.js, but we can simplify
+      let html = `<table class="table table-striped"><thead><tr>
+        <th>ID</th><th>Pair</th><th>Side</th><th>Open Price</th>
+        <th>Current Price</th><th>Units</th><th>P/L</th><th>Action</th>
+      </tr></thead><tbody>`;
+      let totalPL = 0;
+      for (const t of positions) {
+        const pl = t.unrealizedPL ? parseFloat(t.unrealizedPL).toFixed(2) : '0.00';
+        totalPL += parseFloat(pl) || 0;
+        html += `<tr>
+          <td>${t.id}</td>
+          <td>${t.instrument}</td>
+          <td><span class="badge ${t.side === 'BUY' ? 'bg-success' : 'bg-danger'}">${t.side}</span></td>
+          <td>${formatPrice(t.price)}</td>
+          <td>${formatPrice(t.currentPrice)}</td>
+          <td>${t.units}</td>
+          <td class="${pl >= 0 ? 'text-success' : 'text-danger'}">${pl}</td>
+          <td><button class="btn btn-sm btn-danger" onclick="window.closeTrade('${t.id}')"><i class="fas fa-times"></i> Close</button></td>
+        </tr>`;
+      }
+      html += `<tr><td colspan="6"><strong>Total Unrealized P&L</strong></td>
+               <td class="${totalPL >= 0 ? 'text-success' : 'text-danger'}"><strong>${totalPL.toFixed(2)}</strong></td><td></td></tr>`;
+      html += '</tbody></table>';
+      container.innerHTML = html;
+
+      // Update stats
+      document.getElementById('statOpenTrades').textContent = positions.length;
+      document.getElementById('statOpenPL').textContent = (totalPL >= 0 ? '+' : '') + totalPL.toFixed(2);
+      document.getElementById('statOpenPL').className = `stat-change ${totalPL >= 0 ? 'positive' : 'negative'}`;
+      if (window.updatePositionBadge) window.updatePositionBadge(positions.length);
+    }
+  }
+
+  function updateAccount(account) {
+    console.log('[Live] Account update:', account);
+    if (!account) return;
+    const balance = typeof account.balance === 'number' ? account.balance : parseFloat(account.balance) || 0;
+    const equity = typeof account.equity === 'number' ? account.equity : parseFloat(account.equity) || 0;
+    const currency = account.currency || 'USD';
+
+    // Update stats row
+    document.getElementById('statBalance').textContent = `${balance} ${currency}`;
+    document.getElementById('statEquity').textContent = `${equity} ${currency}`;
+
+    // Update account badge (if exposed from app.js)
+    if (window.updateAccountBadge) {
+      window.updateAccountBadge(account);
+    } else {
+      // Fallback: try to update manually
+      const idEl = document.getElementById('accountId');
+      const typeEl = document.getElementById('accountTypeLabel');
+      const currencyEl = document.getElementById('accountCurrency');
+      if (idEl) idEl.textContent = account.id || account.login || '—';
+      if (currencyEl) currencyEl.textContent = account.currency || 'USD';
+      if (typeEl) {
+        let type = 'demo';
+        const server = account.server || '';
+        if (server.toLowerCase().includes('demo')) {
+          type = 'demo';
+        } else {
+          type = 'real';
+        }
+        typeEl.textContent = type.toUpperCase();
+        typeEl.className = 'account-type ' + type;
+      }
+    }
+
+    // Update accountInfo panel if exists
+    const accountInfo = document.getElementById('accountInfo');
+    if (accountInfo) {
+      accountInfo.innerHTML = `
+        <p><strong>ID:</strong> ${account.id || 'N/A'}</p>
+        <p><strong>Currency:</strong> ${account.currency || 'USD'}</p>
+        <p><strong>Created:</strong> ${account.createdTime ? new Date(account.createdTime).toLocaleDateString() : 'N/A'}</p>
+      `;
+    }
+    const balanceInfo = document.getElementById('balanceInfo');
+    if (balanceInfo) {
+      balanceInfo.innerHTML = `
+        <p><strong>Balance:</strong> ${balance} ${currency}</p>
+        <p><strong>Equity:</strong> ${equity} ${currency}</p>
+        <p><strong>Margin Used:</strong> ${account.marginUsed || 0} ${currency}</p>
+        <p><strong>Margin Available:</strong> ${account.marginAvailable || 0} ${currency}</p>
+      `;
+    }
+  }
+
+  function updatePrice(priceData) {
+    // If you have a price panel, update it
+    console.log('[Live] Price update:', priceData);
+    // Example: update a price display element
+    // const priceEl = document.getElementById('priceInfo');
+    // if (priceEl) { ... }
+  }
+
+  // ============================================================
+  //  EXISTING DISPLAY FUNCTIONS (unchanged)
+  // ============================================================
+
   function displayAwareness(data) {
     if (!awarenessPanel) return;
     const { symbol, spread, velocity, acceleration, liquidity, unusualEvents, lastUpdated } = data;
@@ -246,14 +401,11 @@
     `;
   }
 
-  // ----- UPDATED: displayDecision with correct decisionId ----
   function displayDecision(decision) {
     if (!liveSignalPanel) return;
-    // Extract decisionId from the payload (sent by selfLearner.recordDecision)
     const decisionId = decision.decisionId || decision._id || decision.id;
     const { symbol, decision: side, confidence, entryPrice, stopLoss, takeProfit, recommendedLotSize, reason, timestamp } = decision;
 
-    // Play signal sound
     playSound('signal');
 
     if (!side || side === 'NO_TRADE') {
@@ -279,7 +431,6 @@
       html += `<p><small>${reason || ''}</small></p>`;
       html += `<button class="btn btn-sm btn-primary execute-signal-btn" onclick="window.executeSignalFromCard(this)">`;
       html += `<i class="fas fa-rocket"></i> Execute Trade</button>`;
-      // ---- Explain button: only if decisionId is valid ----
       if (decisionId) {
         html += `<button class="btn btn-sm btn-outline-info ms-2 explain-signal-btn" onclick="window.openDecisionInspector('${decisionId}')">`;
         html += `<i class="fas fa-info-circle"></i> Explain</button>`;
@@ -289,7 +440,6 @@
     html += `</div>`;
     liveSignalPanel.innerHTML = html;
 
-    // ---- Auto‑execute: if toggle is ON, send to /execute-signal ----
     const toggle = document.getElementById('autoExecuteToggle');
     if (toggle && toggle.checked && side && side !== 'NO_TRADE') {
       console.log('[Live] Auto‑executing signal for', formattedSymbol, side);
@@ -325,7 +475,6 @@
     }
   }
 
-  // ---- Fusion display ----
   function displayFusion(fusion) {
     if (!fusionPanel) return;
     const { symbol, verdict, confidence, agreement, timeframeBreakdown, reasons, session } = fusion;
@@ -361,7 +510,6 @@
     fusionPanel.innerHTML = html;
   }
 
-  // ---- Placeholder for timeframe details (can be extended) ----
   window.showTimeframeDetails = function(symbol) {
     console.log('Fetch details for', symbol);
     alert('Timeframe details will be displayed here (to be implemented).');
@@ -407,7 +555,6 @@
     `;
   }
 
-  // ---- OTIE V5 Display Functions ----
   function displayOTIEState(data) {
     if (!otieContent) return;
     const { tradeId, symbol, profitR, scores, prediction, stateProbs, bestAction, actions, timestamp } = data;
@@ -460,9 +607,7 @@
       </div>
     `;
 
-    // Prepend to keep latest on top
     otieContent.innerHTML = html + otieContent.innerHTML;
-    // Limit to last 10 items to avoid clutter
     const items = otieContent.querySelectorAll('.card');
     if (items.length > 10) {
       items[items.length - 1].remove();
@@ -472,9 +617,6 @@
   function displayOTIEAction(data) {
     if (!otieContent) return;
     const { tradeId, action, details, timestamp } = data;
-    // We can append a small notification or update the existing state card.
-    // Since we already display the state, we can add a small badge or just log.
-    // For simplicity, we'll add a small alert at the top of the OTIE panel.
     const alertDiv = document.createElement('div');
     alertDiv.className = 'alert alert-info alert-dismissible fade show';
     alertDiv.innerHTML = `
@@ -482,7 +624,6 @@
       <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
     `;
     otieContent.prepend(alertDiv);
-    // Auto-dismiss after 5 seconds
     setTimeout(() => {
       if (alertDiv) alertDiv.remove();
     }, 5000);
@@ -530,4 +671,5 @@
     reconnectAttempts = 0;
     connectWebSocket();
   };
+
 })();
