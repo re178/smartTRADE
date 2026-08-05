@@ -1,6 +1,7 @@
 // server.js – RTS Entry Point with Real‑Time EA Support
 // Preserves all existing functionality; WebSocket for EA is an enhancement.
 // Dashboard WebSocket remains unchanged.
+// Added: WebSocket ping keep‑alive, initial state broadcast, export broadcastToDashboards.
 
 require('dotenv').config();
 
@@ -207,11 +208,13 @@ const server = http.createServer(app);
 // ---------- WebSocket Server (with EA support) ----------
 const wss = new WebSocket.Server({ server });
 
-// Store connected EA clients
+// Store connected clients
 const eaClients = new Set();
-
-// Store connected dashboard clients (optional)
 const dashboardClients = new Set();
+
+// WebSocket ping interval (keep‑alive)
+const WS_PING_INTERVAL = 30000; // 30 seconds
+let wsPingTimer = null;
 
 wss.on('connection', (ws, req) => {
   // Parse URL for client type and API key
@@ -250,11 +253,55 @@ wss.on('connection', (ws, req) => {
     // Dashboard client
     dashboardClients.add(ws);
     console.log('[WebSocket] Dashboard client connected.');
-    ws.on('close', () => dashboardClients.delete(ws));
+    // Send initial state immediately
+    sendDashboardInitialState(ws);
+
+    ws.on('close', () => {
+      dashboardClients.delete(ws);
+      console.log('[WebSocket] Dashboard client disconnected.');
+    });
   }
 
   ws.on('error', (err) => console.error('[WebSocket] Error:', err.message));
+
+  // Respond to ping messages from client
+  ws.on('pong', () => {
+    // Client is alive, no action needed
+  });
 });
+
+// ---------- WebSocket keep‑alive ----------
+function startWSPing() {
+  if (wsPingTimer) clearInterval(wsPingTimer);
+  wsPingTimer = setInterval(() => {
+    const allClients = [...eaClients, ...dashboardClients];
+    for (const client of allClients) {
+      if (client.readyState === WebSocket.OPEN) {
+        client.ping(); // send a ping frame
+      }
+    }
+  }, WS_PING_INTERVAL);
+}
+
+// ---------- Send initial state to a new dashboard client ----------
+async function sendDashboardInitialState(ws) {
+  try {
+    const Trade = require('./models/Trade');
+    const accountService = require('./core/portfolio/accountService');
+    const orderService = require('./core/execution/orderService');
+
+    const [trades, account, positions] = await Promise.all([
+      Trade.find({ status: 'OPEN' }).lean(),
+      accountService.getAccount('mt5'),
+      orderService.getOpenTrades('mt5')
+    ]);
+
+    ws.send(JSON.stringify({ type: 'init', data: { trades, account, positions } }));
+    console.log('[WebSocket] Initial state sent to new dashboard client.');
+  } catch (err) {
+    console.error('[WebSocket] Failed to send initial state:', err.message);
+  }
+}
 
 // ---- WebSocket message handler for EA ----
 async function handleEAMessage(ws, data) {
@@ -379,6 +426,9 @@ async function processCommandResult(commandId, result) {
           logger.warn(`[WebSocket] Failed to update decision outcome: ${err.message}`);
         }
       }
+      // Broadcast updated positions
+      broadcastToDashboards('positions', await require('./core/execution/orderService').getOpenTrades('mt5'));
+      broadcastToDashboards('tradeClosed', { contractId: ticket, price, pl: trade.realizedProfit });
     }
   } else if (action === 'MODIFY') {
     const trade = await Trade.findOne({ contractId: ticket });
@@ -387,6 +437,7 @@ async function processCommandResult(commandId, result) {
       if (command.takeProfit !== undefined) trade.takeProfit = command.takeProfit;
       await trade.save();
       logger.info(`[WebSocket] Trade ${ticket} SL/TP updated`);
+      broadcastToDashboards('positions', await require('./core/execution/orderService').getOpenTrades('mt5'));
     }
   } else if (action === 'PARTIAL') {
     const trade = await Trade.findOne({ contractId: ticket });
@@ -395,6 +446,7 @@ async function processCommandResult(commandId, result) {
         trade.lotSize = volume;
         await trade.save();
         logger.info(`[WebSocket] Trade ${ticket} lotSize reduced to ${volume}`);
+        broadcastToDashboards('positions', await require('./core/execution/orderService').getOpenTrades('mt5'));
       } else {
         trade.status = 'CLOSED';
         trade.closePrice = price || trade.currentPrice;
@@ -407,6 +459,8 @@ async function processCommandResult(commandId, result) {
         }
         await trade.save();
         logger.info(`[WebSocket] Trade ${ticket} closed after partial reduction`);
+        broadcastToDashboards('positions', await require('./core/execution/orderService').getOpenTrades('mt5'));
+        broadcastToDashboards('tradeClosed', { contractId: ticket, price: trade.closePrice, pl: trade.realizedProfit });
       }
     }
   }
@@ -460,6 +514,8 @@ async function handleSinglePositionUpdate(pos) {
   }
   // Emit event for dashboard
   eventBus.emit('position.updated', { ticket, symbol, type, volume, price, current_price, profit });
+  // Broadcast to dashboards
+  broadcastToDashboards('positions', await require('./core/execution/orderService').getOpenTrades('mt5'));
 }
 
 // ---- Helper: handle account update ----
@@ -475,6 +531,7 @@ async function handleAccountUpdate(accountData) {
     { upsert: true }
   );
   eventBus.emit('account.fetched', accountData);
+  broadcastToDashboards('account', accountData);
 }
 
 // ---- Helper: handle price tick ----
@@ -489,6 +546,7 @@ async function handlePriceTick(priceData) {
     { upsert: true, new: true }
   );
   eventBus.emit('price.tick', priceData);
+  broadcastToDashboards('price', priceData);
 }
 
 // ---- Function to broadcast new command to all connected EAs ----
@@ -502,17 +560,24 @@ function broadcastCommandToEA(command) {
   });
 }
 
-// ---- Export broadcast function for mt5Routes to use ----
-module.exports.broadcastCommandToEA = broadcastCommandToEA;
-
-// ---------- Broadcast functions for dashboard ----------
-function broadcast(type, data) {
+// ---- Function to broadcast to all dashboard clients ----
+function broadcastToDashboards(type, data) {
+  if (dashboardClients.size === 0) return;
   const message = JSON.stringify({ type, data });
   dashboardClients.forEach((client) => {
     if (client.readyState === WebSocket.OPEN) {
       client.send(message);
     }
   });
+}
+
+// ---- Export functions for mt5Routes to use ----
+module.exports.broadcastCommandToEA = broadcastCommandToEA;
+module.exports.broadcastToDashboards = broadcastToDashboards;
+
+// ---------- Broadcast functions for dashboard (backward compatibility) ----------
+function broadcast(type, data) {
+  broadcastToDashboards(type, data);
 }
 
 // ---------- Connect CTOS Events to WebSocket ----------
@@ -645,6 +710,9 @@ async function startServer() {
     console.log('🧹  Null bytes (\\0) stripped from all incoming JSON.');
     console.log('💾 MT5 data is persistent (MongoDB).');
 
+    // Start WebSocket ping interval
+    startWSPing();
+
     // ---- Initialise Data Orchestrator and State Store ----
     Promise.all([
       dataOrchestrator.recover(),
@@ -672,6 +740,7 @@ async function startServer() {
   // ---- Graceful shutdown ----
   process.on('SIGINT', async () => {
     console.log('\n🛑 Received SIGINT, shutting down gracefully...');
+    if (wsPingTimer) clearInterval(wsPingTimer);
     try {
       await dataOrchestrator.shutdown();
       if (otie && typeof otie.stop === 'function') otie.stop();
@@ -684,6 +753,7 @@ async function startServer() {
 
   process.on('SIGTERM', async () => {
     console.log('\n🛑 Received SIGTERM, shutting down gracefully...');
+    if (wsPingTimer) clearInterval(wsPingTimer);
     try {
       await dataOrchestrator.shutdown();
       if (otie && typeof otie.stop === 'function') otie.stop();
