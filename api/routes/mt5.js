@@ -1,4 +1,5 @@
 // api/routes/mt5.js – MT5 Bridge Routes with WebSocket Push
+// Updated to broadcast positions, account, tradeClosed, and price events.
 
 const express = require('express');
 const router = express.Router();
@@ -19,8 +20,8 @@ const priceBuffer = require('../../core/data/priceBuffer');
 // ---- IMPORT selfLearner for decision outcome updates ----
 const selfLearner = require('../../core/learning/learner');
 
-// ---- IMPORT broadcast function from server (for WebSocket push) ----
-const { broadcastCommandToEA } = require('../../server');
+// ---- IMPORT broadcast functions from server ----
+const { broadcastCommandToEA, broadcastToDashboards } = require('../../server');
 
 // ---------- Authentication ----------
 const API_KEY = process.env.MT5_API_KEY || 'change-me-in-production';
@@ -56,7 +57,7 @@ router.post('/orders/command', async (req, res) => {
     );
     logger.info(`[MT5] Command stored: ${command.commandId}`);
 
-    // ---- PUSH to EA via WebSocket ----
+    // PUSH to EA via WebSocket
     broadcastCommandToEA(saved.toObject());
 
     res.status(201).json({ commandId: command.commandId, status: 'queued' });
@@ -164,6 +165,11 @@ router.post('/orders/result', async (req, res) => {
             logger.warn(`[MT5] Failed to update decision outcome: ${err.message}`);
           }
         }
+        // ---- BROADCAST: positions and tradeClosed ----
+        const orderService = require('../../core/execution/orderService');
+        const openTrades = await orderService.getOpenTrades('mt5');
+        broadcastToDashboards('positions', openTrades);
+        broadcastToDashboards('tradeClosed', { contractId: ticket, price, pl: trade.realizedProfit });
       }
     } else if (action === 'MODIFY') {
       // ----- MODIFY: update SL/TP -----
@@ -173,6 +179,10 @@ router.post('/orders/result', async (req, res) => {
         if (command.takeProfit !== undefined) trade.takeProfit = command.takeProfit;
         await trade.save();
         logger.info(`[MT5] Trade ${ticket} SL/TP updated`);
+        // ---- BROADCAST: positions ----
+        const orderService = require('../../core/execution/orderService');
+        const openTrades = await orderService.getOpenTrades('mt5');
+        broadcastToDashboards('positions', openTrades);
       }
     } else if (action === 'PARTIAL') {
       // ----- PARTIAL: reduce lotSize (the 'volume' field from EA is the NEW remaining volume) -----
@@ -184,6 +194,9 @@ router.post('/orders/result', async (req, res) => {
           trade.lotSize = volume;
           await trade.save();
           logger.info(`[MT5] Trade ${ticket} lotSize reduced to ${volume}`);
+          const orderService = require('../../core/execution/orderService');
+          const openTrades = await orderService.getOpenTrades('mt5');
+          broadcastToDashboards('positions', openTrades);
         } else {
           // If volume is 0 or missing, treat as full close.
           trade.status = 'CLOSED';
@@ -197,6 +210,10 @@ router.post('/orders/result', async (req, res) => {
           }
           await trade.save();
           logger.info(`[MT5] Trade ${ticket} closed after partial reduction`);
+          const orderService = require('../../core/execution/orderService');
+          const openTrades = await orderService.getOpenTrades('mt5');
+          broadcastToDashboards('positions', openTrades);
+          broadcastToDashboards('tradeClosed', { contractId: ticket, price: trade.closePrice, pl: trade.realizedProfit });
         }
       }
     }
@@ -243,6 +260,8 @@ router.post('/account/status', async (req, res) => {
 
     if (saved) {
       logger.info('[MT5] Saved account:', JSON.stringify(saved, null, 2));
+      // ---- BROADCAST account ----
+      broadcastToDashboards('account', saved.toObject());
       res.status(201).json({ status: 'accepted', account: saved });
     } else {
       logger.error('[MT5] Account save returned null');
@@ -385,6 +404,15 @@ router.post('/positions', async (req, res) => {
       }
     }
 
+    // ---- BROADCAST: positions and account ----
+    const orderService = require('../../core/execution/orderService');
+    const openTrades = await orderService.getOpenTrades('mt5');
+    broadcastToDashboards('positions', openTrades);
+    // Also broadcast account to keep stats updated
+    const accountService = require('../../core/portfolio/accountService');
+    const account = await accountService.getAccount('mt5');
+    broadcastToDashboards('account', account);
+
     res.status(201).json({ status: 'accepted' });
   } catch (err) {
     logger.error('[MT5] Error in /positions:', err);
@@ -510,7 +538,6 @@ router.get('/history', async (req, res) => {
       pl: t.realizedProfit || t.pnl || 0,
       status: t.status,
       date: t.closeTime,
-      // keep original fields for any other consumer
       ...t,
     }));
 
