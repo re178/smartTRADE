@@ -1,5 +1,5 @@
 // api/routes/mt5.js – MT5 Bridge Routes with WebSocket Push
-// Updated to broadcast positions, account, tradeClosed, and price events.
+// Fixed: duplicate variable declaration (openTrades) error.
 
 const express = require('express');
 const router = express.Router();
@@ -167,8 +167,8 @@ router.post('/orders/result', async (req, res) => {
         }
         // ---- BROADCAST: positions and tradeClosed ----
         const orderService = require('../../core/execution/orderService');
-        const openTrades = await orderService.getOpenTrades('mt5');
-        broadcastToDashboards('positions', openTrades);
+        const broadcastOpenTrades = await orderService.getOpenTrades('mt5');
+        broadcastToDashboards('positions', broadcastOpenTrades);
         broadcastToDashboards('tradeClosed', { contractId: ticket, price, pl: trade.realizedProfit });
       }
     } else if (action === 'MODIFY') {
@@ -181,8 +181,8 @@ router.post('/orders/result', async (req, res) => {
         logger.info(`[MT5] Trade ${ticket} SL/TP updated`);
         // ---- BROADCAST: positions ----
         const orderService = require('../../core/execution/orderService');
-        const openTrades = await orderService.getOpenTrades('mt5');
-        broadcastToDashboards('positions', openTrades);
+        const broadcastOpenTrades = await orderService.getOpenTrades('mt5');
+        broadcastToDashboards('positions', broadcastOpenTrades);
       }
     } else if (action === 'PARTIAL') {
       // ----- PARTIAL: reduce lotSize (the 'volume' field from EA is the NEW remaining volume) -----
@@ -195,8 +195,8 @@ router.post('/orders/result', async (req, res) => {
           await trade.save();
           logger.info(`[MT5] Trade ${ticket} lotSize reduced to ${volume}`);
           const orderService = require('../../core/execution/orderService');
-          const openTrades = await orderService.getOpenTrades('mt5');
-          broadcastToDashboards('positions', openTrades);
+          const broadcastOpenTrades = await orderService.getOpenTrades('mt5');
+          broadcastToDashboards('positions', broadcastOpenTrades);
         } else {
           // If volume is 0 or missing, treat as full close.
           trade.status = 'CLOSED';
@@ -211,8 +211,8 @@ router.post('/orders/result', async (req, res) => {
           await trade.save();
           logger.info(`[MT5] Trade ${ticket} closed after partial reduction`);
           const orderService = require('../../core/execution/orderService');
-          const openTrades = await orderService.getOpenTrades('mt5');
-          broadcastToDashboards('positions', openTrades);
+          const broadcastOpenTrades = await orderService.getOpenTrades('mt5');
+          broadcastToDashboards('positions', broadcastOpenTrades);
           broadcastToDashboards('tradeClosed', { contractId: ticket, price: trade.closePrice, pl: trade.realizedProfit });
         }
       }
@@ -406,8 +406,8 @@ router.post('/positions', async (req, res) => {
 
     // ---- BROADCAST: positions and account ----
     const orderService = require('../../core/execution/orderService');
-    const openTrades = await orderService.getOpenTrades('mt5');
-    broadcastToDashboards('positions', openTrades);
+    const broadcastOpenTrades = await orderService.getOpenTrades('mt5');
+    broadcastToDashboards('positions', broadcastOpenTrades);
     // Also broadcast account to keep stats updated
     const accountService = require('../../core/portfolio/accountService');
     const account = await accountService.getAccount('mt5');
