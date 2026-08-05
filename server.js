@@ -1,7 +1,6 @@
 // server.js – RTS Entry Point with Real‑Time EA Support
-// Preserves all existing functionality; WebSocket for EA is an enhancement.
-// Dashboard WebSocket remains unchanged.
-// Added: WebSocket ping keep‑alive, initial state broadcast, export broadcastToDashboards.
+// Exports broadcastToDashboards and broadcastCommandToEA correctly.
+// Includes WebSocket ping (keep‑alive) to prevent dashboard disconnections.
 
 require('dotenv').config();
 
@@ -329,7 +328,7 @@ async function handleEAMessage(ws, data) {
       console.log(`[WebSocket] EXECUTING for ${commandId}`);
       break;
 
-    case 'result':
+    case 'result': {
       // Result from EA
       const { success, ticket, deal, price, volume, symbol, side, retcode, retcodeDescription, error } = payload;
       // Save result
@@ -353,6 +352,7 @@ async function handleEAMessage(ws, data) {
       await processCommandResult(commandId, payload);
       console.log(`[WebSocket] RESULT for ${commandId}: ${success ? 'SUCCESS' : 'FAILED'}`);
       break;
+    }
 
     case 'position_update':
       // Handle real-time position update (opened, modified, closed)
@@ -398,6 +398,7 @@ async function processCommandResult(commandId, result) {
   const Trade = require('./models/Trade');
   const selfLearner = require('./core/learning/learner');
   const logger = require('./infrastructure/logger') || console;
+  const orderService = require('./core/execution/orderService');
 
   const command = await Mt5Command.findOne({ commandId }).lean();
   const action = command?.action;
@@ -427,7 +428,8 @@ async function processCommandResult(commandId, result) {
         }
       }
       // Broadcast updated positions
-      broadcastToDashboards('positions', await require('./core/execution/orderService').getOpenTrades('mt5'));
+      const openTrades = await orderService.getOpenTrades('mt5');
+      broadcastToDashboards('positions', openTrades);
       broadcastToDashboards('tradeClosed', { contractId: ticket, price, pl: trade.realizedProfit });
     }
   } else if (action === 'MODIFY') {
@@ -437,7 +439,8 @@ async function processCommandResult(commandId, result) {
       if (command.takeProfit !== undefined) trade.takeProfit = command.takeProfit;
       await trade.save();
       logger.info(`[WebSocket] Trade ${ticket} SL/TP updated`);
-      broadcastToDashboards('positions', await require('./core/execution/orderService').getOpenTrades('mt5'));
+      const openTrades = await orderService.getOpenTrades('mt5');
+      broadcastToDashboards('positions', openTrades);
     }
   } else if (action === 'PARTIAL') {
     const trade = await Trade.findOne({ contractId: ticket });
@@ -446,7 +449,8 @@ async function processCommandResult(commandId, result) {
         trade.lotSize = volume;
         await trade.save();
         logger.info(`[WebSocket] Trade ${ticket} lotSize reduced to ${volume}`);
-        broadcastToDashboards('positions', await require('./core/execution/orderService').getOpenTrades('mt5'));
+        const openTrades = await orderService.getOpenTrades('mt5');
+        broadcastToDashboards('positions', openTrades);
       } else {
         trade.status = 'CLOSED';
         trade.closePrice = price || trade.currentPrice;
@@ -459,7 +463,8 @@ async function processCommandResult(commandId, result) {
         }
         await trade.save();
         logger.info(`[WebSocket] Trade ${ticket} closed after partial reduction`);
-        broadcastToDashboards('positions', await require('./core/execution/orderService').getOpenTrades('mt5'));
+        const openTrades = await orderService.getOpenTrades('mt5');
+        broadcastToDashboards('positions', openTrades);
         broadcastToDashboards('tradeClosed', { contractId: ticket, price: trade.closePrice, pl: trade.realizedProfit });
       }
     }
@@ -470,6 +475,7 @@ async function processCommandResult(commandId, result) {
 async function handleSinglePositionUpdate(pos) {
   const Trade = require('./models/Trade');
   const eventBus = require('./infrastructure/eventBus');
+  const orderService = require('./core/execution/orderService');
   const { ticket, symbol, type, volume, price, current_price, profit, stop_loss, take_profit, swap, commission, margin, magic, comment, open_time, reason, identifier, login } = pos;
 
   let trade = await Trade.findOne({ contractId: ticket });
@@ -515,7 +521,8 @@ async function handleSinglePositionUpdate(pos) {
   // Emit event for dashboard
   eventBus.emit('position.updated', { ticket, symbol, type, volume, price, current_price, profit });
   // Broadcast to dashboards
-  broadcastToDashboards('positions', await require('./core/execution/orderService').getOpenTrades('mt5'));
+  const openTrades = await orderService.getOpenTrades('mt5');
+  broadcastToDashboards('positions', openTrades);
 }
 
 // ---- Helper: handle account update ----
