@@ -1,4 +1,5 @@
 // public/js/app.js – Dashboard Logic (Full with Stats Update, P&L Fix, Sounds, Report)
+// Added: Account badge update (Real/Demo) and improved loadAccount.
 
 // ---- Configuration ----
 const REFRESH_INTERVAL = 3000; // 3 seconds – real‑time P&L updates
@@ -69,6 +70,40 @@ function formatPrice(p) {
   return parseFloat(p).toFixed(5);
 }
 
+// ---- Account Badge Update (New) ----
+function updateAccountBadge(account) {
+  if (!account) return;
+  const idEl = document.getElementById('accountId');
+  const typeEl = document.getElementById('accountTypeLabel');
+  const currencyEl = document.getElementById('accountCurrency');
+
+  if (idEl) idEl.textContent = account.id || account.login || '—';
+  if (currencyEl) currencyEl.textContent = account.currency || 'USD';
+
+  if (typeEl) {
+    let type = 'demo'; // default
+    // Determine real/demo based on tradeMode and server string
+    const tradeMode = account.tradeMode;
+    const server = account.server || '';
+    if (tradeMode === 0) {
+      // Often tradeMode 0 = real, but it's broker-specific
+      // If server contains 'Demo', it's demo
+      if (server.toLowerCase().includes('demo')) {
+        type = 'demo';
+      } else {
+        type = 'real';
+      }
+    } else if (tradeMode === 1) {
+      type = 'demo';
+    } else {
+      // fallback: check server string
+      type = server.toLowerCase().includes('demo') ? 'demo' : 'real';
+    }
+    typeEl.textContent = type.toUpperCase();
+    typeEl.className = 'account-type ' + type;
+  }
+}
+
 // ---- Load Product Preference ----
 async function loadProductPreference() {
   try {
@@ -104,7 +139,7 @@ window.handleProductChange = async function(e) {
   }
 };
 
-// ---- Load Account (updates Balance & Equity stats) ----
+// ---- Load Account (updates Balance & Equity stats + account badge) ----
 async function loadAccount() {
   try {
     const acc = await fetchJson(`${CONFIG.API_BASE}/api/account`);
@@ -131,6 +166,8 @@ async function loadAccount() {
         <p><strong>Margin Available:</strong> ${acc.marginAvailable || 0} ${currency}</p>
       `;
     }
+    // ---- Update account badge ----
+    updateAccountBadge(acc);
   } catch (e) {
     console.error('loadAccount error:', e);
     document.getElementById('statBalance').textContent = '—';
@@ -883,6 +920,7 @@ window.updateApiStatus = function(connected) {
   if (text) text.textContent = connected ? 'Connected' : 'Disconnected';
 };
 window.exportHistoryCSV = exportHistoryCSV;
+window.updateAccountBadge = updateAccountBadge; // expose for live.js
 
 // ---- Listen for danger signals (from live.js) ----
 window.addEventListener('dangerSignal', function() {
