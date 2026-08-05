@@ -1,4 +1,4 @@
-// api/routes/mt5.js
+// api/routes/mt5.js – MT5 Bridge Routes with WebSocket Push
 
 const express = require('express');
 const router = express.Router();
@@ -18,6 +18,9 @@ const priceBuffer = require('../../core/data/priceBuffer');
 
 // ---- IMPORT selfLearner for decision outcome updates ----
 const selfLearner = require('../../core/learning/learner');
+
+// ---- IMPORT broadcast function from server (for WebSocket push) ----
+const { broadcastCommandToEA } = require('../../server');
 
 // ---------- Authentication ----------
 const API_KEY = process.env.MT5_API_KEY || 'change-me-in-production';
@@ -46,12 +49,16 @@ router.post('/orders/command', async (req, res) => {
       command.commandId = generateCommandId();
     }
     command.state = 'QUEUED';
-    await Mt5Command.findOneAndUpdate(
+    const saved = await Mt5Command.findOneAndUpdate(
       { commandId: command.commandId },
       command,
       { upsert: true, new: true }
     );
     logger.info(`[MT5] Command stored: ${command.commandId}`);
+
+    // ---- PUSH to EA via WebSocket ----
+    broadcastCommandToEA(saved.toObject());
+
     res.status(201).json({ commandId: command.commandId, status: 'queued' });
   } catch (err) {
     logger.error('[MT5] Error storing command:', err);
