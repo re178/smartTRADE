@@ -208,6 +208,9 @@ const server = http.createServer(app);
 // ---------- WebSocket Server ----------
 const wss = new WebSocket.Server({ server });
 
+// -------- Attach WebSocket server to OTIE V5 for real‑time broadcasts --------
+otie.setWebSocket(wss);
+
 wss.on('connection', (ws) => {
   console.log('[WebSocket] Client connected.');
   ws.on('close', () => console.log('[WebSocket] Client disconnected.'));
