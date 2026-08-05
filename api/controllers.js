@@ -1,4 +1,5 @@
 // api/controllers.js – Complete Request Handlers (with Trade History, P&L, and Report Fixes)
+// Updated to broadcast positions and account after trade close, and to handle real‑time updates.
 
 const Trade = require('../models/Trade');
 const Order = require('../models/Order');
@@ -17,6 +18,9 @@ const logger = require('../infrastructure/logger') || console;
 
 // ---- Report Generator ----
 const { generateReport } = require('../core/reporting/reportGenerator');
+
+// ---- Import broadcast function from server ----
+const { broadcastToDashboards } = require('../server');
 
 // ---------- Portfolio Manager Instance ----------
 const portfolioManager = new PortfolioManager({
@@ -199,7 +203,6 @@ exports.getTradeHistory = async (req, res) => {
       entryPrice: t.openPrice || t.entryPrice || null,
       exitPrice: t.closePrice || t.exitPrice || null,
       lotSize: t.lotSize || 0,
-      // Use realizedProfit if available, else pnl, else 0
       pnl: t.realizedProfit !== undefined ? t.realizedProfit : (t.pnl || 0),
       status: t.status || 'CLOSED',
       date: t.closeTime || t.updatedAt || t.createdAt,
@@ -279,19 +282,21 @@ exports.closeTrade = async (req, res) => {
   if (!tradeId) return res.status(400).json({ error: 'tradeId required' });
   try {
     const product = getProduct(req);
+    // Use the updated closeTrade which broadcasts events
     const result = await orderService.closeTrade(tradeId, product);
-    const updated = await Trade.findOneAndUpdate(
-      { contractId: tradeId },
-      {
-        status: 'CLOSED',
-        closeTime: new Date(),
-        closePrice: result.price || null,
-        pnl: result.pl || 0,
-        realizedProfit: result.pl || 0, // store both for safety
-      },
-      { new: true }
-    );
+    
+    // Broadcast updated positions and account (redundant but safe)
+    try {
+      const openTrades = await orderService.getOpenTrades(product);
+      broadcastToDashboards('positions', openTrades);
+      const account = await accountService.getAccount(product);
+      broadcastToDashboards('account', account);
+    } catch (broadcastErr) {
+      logger.warn('[controllers] Failed to broadcast after close:', broadcastErr.message);
+    }
+
     portfolioManager.updateDailyPnL(result.pl || 0);
+    const updated = await Trade.findOne({ contractId: tradeId });
     if (updated) {
       const broker = getBroker(product);
       const account = await broker.getAccount();
@@ -363,7 +368,7 @@ exports.autoTrade = async (req, res) => {
     }
 
     const orderResult = await orderService.placeMarketOrder(
-      instrument, signal.side, lotSize, signal.stopLoss, signal.takeProfit, product, null, true // autoTrade=true
+      instrument, signal.side, lotSize, signal.stopLoss, signal.takeProfit, product, null, true
     );
 
     const trade = await Trade.findOne({ contractId: orderResult.contractId });
@@ -503,7 +508,6 @@ exports.generateReport = async (req, res) => {
         closeTime: { $gte: fromDate, $lte: toDate }
       }).sort({ closeTime: -1 }).lean();
 
-      // Map to expected format for report
       trades = rawTrades.map(t => ({
         pair: t.instrument || t.pair || 'N/A',
         side: t.side || 'N/A',
