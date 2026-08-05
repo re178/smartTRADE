@@ -1,5 +1,5 @@
 // api/routes/mt5.js – MT5 Bridge Routes with WebSocket Push
-// Fixed: duplicate variable declaration (openTrades) error.
+// Fixed: broadcastToDashboards is now correctly imported and used.
 
 const express = require('express');
 const router = express.Router();
