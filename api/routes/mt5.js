@@ -1,5 +1,4 @@
-// api/mt5Routes.js – Full file with P&L fix, pending-close finalisation, and PARTIAL support.
-// Replace your current file with this.
+// api/routes/mt5.js
 
 const express = require('express');
 const router = express.Router();
