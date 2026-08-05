@@ -13,7 +13,7 @@ const stateStore = require('./lab/stateStore');
 const deepRegime = require('./deep/regime');
 const marketStateCache = require('../data/marketStateCache');
 const awarenessEngine = require('../awareness/engine');
-const MT5Broker = require('../../execution/mt5Broker');
+const MT5Broker = require('../execution/mt5Broker');
 const eventBus = require('../../infrastructure/eventBus');
 const logger = require('../../infrastructure/logger') || console;
 
