@@ -6,28 +6,35 @@
   <title>RTS Trading Dashboard</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet" />
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
   <style>
     /* ──────────── ROOT VARIABLES ──────────── */
     :root {
-      --sidebar-width: 260px;
-      --header-height: 64px;
-      --primary: #0d6efd;
-      --primary-dark: #0a58ca;
-      --bg-dark: #0f172a;
-      --bg-sidebar: #111827;
+      --sidebar-width: 280px;
+      --header-height: 70px;
+      --primary: #1a73e8;
+      --primary-dark: #1557b0;
+      --bg-dark: #0b1a2e;
+      --bg-sidebar: #0f1e33;
       --bg-card: #ffffff;
-      --text-muted: #6b7280;
-      --border-light: #e5e7eb;
+      --text-muted: #6b7a8f;
+      --border-light: #e9edf2;
+      --success: #00b894;
+      --danger: #e74c5e;
+      --warning: #f39c12;
+      --info: #3498db;
+      --shadow: 0 4px 20px rgba(0,0,0,0.05);
+      --radius: 12px;
     }
 
     * { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
 
     body {
-      background: #f1f5f9;
+      background: #f5f7fa;
       margin: 0;
       padding: 0;
       overflow-x: hidden;
+      color: #1e2a41;
     }
 
     /* ──────────── SIDEBAR ──────────── */
@@ -38,51 +45,53 @@
       width: var(--sidebar-width);
       height: 100vh;
       background: var(--bg-sidebar);
-      color: #e2e8f0;
+      color: #c8d6e5;
       z-index: 1050;
       transition: transform 0.3s ease;
       overflow-y: auto;
       display: flex;
       flex-direction: column;
+      box-shadow: 2px 0 12px rgba(0,0,0,0.15);
     }
     .sidebar-brand {
-      padding: 20px 24px;
-      font-size: 1.25rem;
-      font-weight: 700;
+      padding: 24px 28px 20px;
+      font-size: 1.3rem;
+      font-weight: 800;
       color: #fff;
       border-bottom: 1px solid rgba(255,255,255,0.06);
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 12px;
       flex-shrink: 0;
+      background: rgba(255,255,255,0.02);
     }
-    .sidebar-brand i { color: var(--primary); font-size: 1.5rem; }
-    .sidebar-brand span { color: #94a3b8; font-weight: 400; font-size: 0.75rem; }
+    .sidebar-brand i { color: var(--primary); font-size: 1.8rem; }
+    .sidebar-brand span { color: #94a3b8; font-weight: 400; font-size: 0.7rem; letter-spacing: 0.05em; }
 
     .sidebar-nav {
       flex: 1;
-      padding: 16px 12px;
+      padding: 20px 16px;
       overflow-y: auto;
     }
     .sidebar-nav .nav-label {
-      font-size: 0.65rem;
+      font-size: 0.6rem;
       text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: #64748b;
-      padding: 12px 12px 6px;
+      letter-spacing: 0.1em;
+      color: #5a6f8a;
+      padding: 16px 14px 8px;
       font-weight: 600;
     }
     .sidebar-nav .nav-item {
       display: flex;
       align-items: center;
-      gap: 12px;
-      padding: 10px 14px;
-      border-radius: 8px;
-      color: #cbd5e1;
+      gap: 14px;
+      padding: 12px 16px;
+      border-radius: 10px;
+      color: #c8d6e5;
       text-decoration: none;
       font-size: 0.875rem;
       font-weight: 500;
-      transition: all 0.15s;
+      transition: all 0.2s ease;
       cursor: pointer;
       margin-bottom: 2px;
       border: none;
@@ -92,10 +101,10 @@
     }
     .sidebar-nav .nav-item:hover,
     .sidebar-nav .nav-item.active {
-      background: rgba(255,255,255,0.06);
+      background: rgba(255,255,255,0.08);
       color: #fff;
     }
-    .sidebar-nav .nav-item i { width: 20px; font-size: 1rem; color: #64748b; }
+    .sidebar-nav .nav-item i { width: 22px; font-size: 1.05rem; color: #6a7f9a; }
     .sidebar-nav .nav-item:hover i,
     .sidebar-nav .nav-item.active i { color: var(--primary); }
     .sidebar-nav .nav-item .badge {
@@ -103,35 +112,35 @@
       background: var(--primary);
       color: #fff;
       font-size: 0.65rem;
-      padding: 2px 8px;
-      border-radius: 12px;
+      padding: 2px 10px;
+      border-radius: 20px;
     }
 
     .sidebar-footer {
-      padding: 16px 20px;
+      padding: 18px 24px;
       border-top: 1px solid rgba(255,255,255,0.06);
       font-size: 0.75rem;
-      color: #64748b;
+      color: #5a6f8a;
       flex-shrink: 0;
     }
     .sidebar-footer .api-status {
       display: flex;
       align-items: center;
-      gap: 6px;
+      gap: 8px;
     }
     .sidebar-footer .api-status .dot {
-      width: 6px;
-      height: 6px;
+      width: 8px;
+      height: 8px;
       border-radius: 50%;
       display: inline-block;
     }
-    .dot.connected { background: #22c55e; }
-    .dot.disconnected { background: #ef4444; }
+    .dot.connected { background: var(--success); }
+    .dot.disconnected { background: var(--danger); }
 
     /* ──────────── MAIN CONTENT ──────────── */
     .main-content {
       margin-left: var(--sidebar-width);
-      padding: 20px 28px 40px;
+      padding: 24px 32px 40px;
       min-height: 100vh;
     }
 
@@ -140,33 +149,57 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 12px 0 20px;
+      padding: 8px 0 20px;
       flex-wrap: wrap;
-      gap: 12px;
+      gap: 16px;
       border-bottom: 1px solid var(--border-light);
-      margin-bottom: 24px;
+      margin-bottom: 28px;
     }
     .top-header h1 {
-      font-size: 1.5rem;
+      font-size: 1.6rem;
       font-weight: 700;
       margin: 0;
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 14px;
     }
     .top-header h1 small {
       font-size: 0.85rem;
       font-weight: 400;
       color: var(--text-muted);
     }
-    .top-header .header-actions {
+    .header-actions {
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 16px;
       flex-wrap: wrap;
     }
 
-    /* ──────────── NOTIFICATION CENTRE ──────────── */
+    /* Account Badge */
+    .account-badge {
+      background: #e9edf2;
+      border-radius: 30px;
+      padding: 6px 16px 6px 12px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 0.8rem;
+      font-weight: 500;
+      color: #1e2a41;
+    }
+    .account-badge .account-type {
+      background: var(--success);
+      color: #fff;
+      border-radius: 20px;
+      padding: 0 12px;
+      font-size: 0.7rem;
+      font-weight: 600;
+      line-height: 22px;
+    }
+    .account-badge .account-type.demo { background: var(--warning); }
+    .account-badge .account-type.real { background: var(--success); }
+
+    /* ---- Notification centre (unchanged ID) ---- */
     .notif-btn {
       position: relative;
       background: transparent;
@@ -185,7 +218,7 @@
       right: 4px;
       width: 8px;
       height: 8px;
-      background: #ef4444;
+      background: var(--danger);
       border-radius: 50%;
       border: 2px solid #fff;
     }
@@ -234,10 +267,10 @@
       flex-shrink: 0;
       font-size: 0.75rem;
     }
-    .notif-icon.bg-success-light { background: #dcfce7; color: #22c55e; }
-    .notif-icon.bg-danger-light { background: #fee2e2; color: #ef4444; }
-    .notif-icon.bg-warning-light { background: #fef3c7; color: #f59e0b; }
-    .notif-icon.bg-info-light { background: #dbeafe; color: #3b82f6; }
+    .notif-icon.bg-success-light { background: #dcfce7; color: var(--success); }
+    .notif-icon.bg-danger-light { background: #fee2e2; color: var(--danger); }
+    .notif-icon.bg-warning-light { background: #fef3c7; color: var(--warning); }
+    .notif-icon.bg-info-light { background: #dbeafe; color: var(--info); }
     .notif-dropdown .notif-time {
       font-size: 0.65rem;
       color: var(--text-muted);
@@ -247,17 +280,17 @@
     /* ──────────── CARDS ──────────── */
     .card {
       border: none;
-      border-radius: 12px;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 4px 16px rgba(0,0,0,0.04);
-      margin-bottom: 20px;
-      transition: box-shadow 0.2s;
+      border-radius: var(--radius);
       background: var(--bg-card);
+      box-shadow: var(--shadow);
+      margin-bottom: 24px;
+      transition: transform 0.15s, box-shadow 0.2s;
     }
-    .card:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.06), 0 8px 24px rgba(0,0,0,0.06); }
+    .card:hover { box-shadow: 0 6px 28px rgba(0,0,0,0.07); }
     .card-header {
       background: transparent;
       font-weight: 600;
-      padding: 16px 20px;
+      padding: 18px 24px;
       border-bottom: 1px solid var(--border-light);
       display: flex;
       align-items: center;
@@ -272,28 +305,28 @@
       font-size: 0.95rem;
     }
     .card-header .card-title i { color: var(--primary); }
-    .card-body { padding: 20px; }
+    .card-body { padding: 24px; }
 
     /* ──────────── STATS ROW ──────────── */
     .stat-card {
       background: var(--bg-card);
-      border-radius: 12px;
-      padding: 16px 20px;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+      border-radius: var(--radius);
+      padding: 20px 24px;
+      box-shadow: var(--shadow);
       border: 1px solid var(--border-light);
       transition: border-color 0.2s;
       height: 100%;
     }
     .stat-card:hover { border-color: var(--primary); }
     .stat-card .stat-label {
-      font-size: 0.75rem;
+      font-size: 0.7rem;
       text-transform: uppercase;
-      letter-spacing: 0.04em;
+      letter-spacing: 0.06em;
       color: var(--text-muted);
       font-weight: 600;
     }
     .stat-card .stat-value {
-      font-size: 1.5rem;
+      font-size: 1.6rem;
       font-weight: 700;
       margin-top: 4px;
     }
@@ -302,8 +335,8 @@
       font-weight: 500;
       margin-top: 2px;
     }
-    .stat-change.positive { color: #22c55e; }
-    .stat-change.negative { color: #ef4444; }
+    .stat-change.positive { color: var(--success); }
+    .stat-change.negative { color: var(--danger); }
 
     /* ──────────── LIVE SIGNAL ──────────── */
     .live-signal-card {
@@ -313,17 +346,17 @@
       background: #f8fafc;
       transition: background 0.2s;
     }
-    .live-signal-card.buy { border-left-color: #22c55e; background: #f0fdf4; }
-    .live-signal-card.sell { border-left-color: #ef4444; background: #fef2f2; }
+    .live-signal-card.buy { border-left-color: var(--success); background: #f0fdf4; }
+    .live-signal-card.sell { border-left-color: var(--danger); background: #fef2f2; }
     .live-signal-card.neutral { border-left-color: #94a3b8; background: #f8fafc; }
 
     /* ──────────── TRADE HISTORY ──────────── */
     .history-filters {
       display: flex;
       flex-wrap: wrap;
-      gap: 10px;
+      gap: 12px;
       align-items: center;
-      margin-bottom: 16px;
+      margin-bottom: 18px;
     }
     .history-filters .filter-group {
       display: flex;
@@ -338,18 +371,19 @@
     }
     .history-filters input,
     .history-filters select {
-      padding: 4px 10px;
-      border-radius: 6px;
+      padding: 6px 12px;
+      border-radius: 8px;
       border: 1px solid var(--border-light);
       font-size: 0.8rem;
       background: #fff;
     }
     .history-filters .btn-sm {
-      padding: 4px 12px;
+      padding: 6px 14px;
       font-size: 0.75rem;
+      border-radius: 8px;
     }
     #historyContainer .table-responsive {
-      max-height: 400px;
+      max-height: 420px;
       overflow-y: auto;
     }
     #historyContainer .table thead th {
@@ -364,8 +398,8 @@
       justify-content: space-between;
       align-items: center;
       flex-wrap: wrap;
-      gap: 10px;
-      margin-top: 12px;
+      gap: 12px;
+      margin-top: 16px;
     }
     .pagination-wrapper .page-info {
       font-size: 0.85rem;
@@ -387,7 +421,7 @@
     @media (max-width: 992px) {
       .sidebar {
         transform: translateX(-100%);
-        width: 280px;
+        width: 300px;
       }
       .sidebar.open { transform: translateX(0); }
       .sidebar-toggle { display: inline-block; }
@@ -408,26 +442,47 @@
     }
 
     /* ──────────── SCROLLBAR ──────────── */
-    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 8px; }
     ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
 
     /* ──────────── UTILITY ──────────── */
-    .text-truncate-2 {
-      display: -webkit-box;
-      -webkit-line-clamp: 2;
-      -webkit-box-orient: vertical;
-      overflow: hidden;
-    }
+    .fw-600 { font-weight: 600; }
     .gap-2 { gap: 0.5rem; }
     .gap-3 { gap: 1rem; }
-    .fw-600 { font-weight: 600; }
 
     /* ──────────── MODAL ──────────── */
     .modal-content {
-      border-radius: 12px;
+      border-radius: var(--radius);
       border: none;
+    }
+
+    /* ──────────── BUTTONS ──────────── */
+    .btn-primary {
+      background: var(--primary);
+      border: none;
+      border-radius: 8px;
+      padding: 10px 20px;
+      font-weight: 500;
+      transition: background 0.2s;
+    }
+    .btn-primary:hover { background: var(--primary-dark); }
+    .btn-outline-primary {
+      border-color: var(--primary);
+      color: var(--primary);
+    }
+    .btn-outline-primary:hover {
+      background: var(--primary);
+      color: #fff;
+    }
+    .btn-success { background: var(--success); border: none; border-radius: 8px; }
+    .btn-danger { background: var(--danger); border: none; border-radius: 8px; }
+    .btn-warning { background: var(--warning); border: none; border-radius: 8px; }
+
+    .form-control, .form-select {
+      border-radius: 8px;
+      border-color: var(--border-light);
     }
   </style>
 </head>
@@ -441,7 +496,7 @@
     <i class="fas fa-chart-line"></i>
     <div>
       RTS
-      <span>v2.0</span>
+      <span>v2.1</span>
     </div>
   </div>
 
@@ -472,7 +527,6 @@
     <button class="nav-item" data-section="research">
       <i class="fas fa-flask"></i> Research Lab
     </button>
-    <!-- NEW: Trade Management (OTIE V5) -->
     <button class="nav-item" data-section="trademanagement">
       <i class="fas fa-robot"></i> Trade Management
       <span class="badge">OTIE</span>
@@ -513,6 +567,14 @@
       </h1>
     </div>
     <div class="header-actions">
+      <!-- Account Badge (Real/Demo) -->
+      <div class="account-badge" id="accountBadge">
+        <i class="fas fa-user-circle"></i>
+        <span id="accountId">—</span>
+        <span class="account-type" id="accountTypeLabel">—</span>
+        <span id="accountCurrency">USD</span>
+      </div>
+
       <!-- Auto-execute toggle -->
       <div class="form-check form-switch d-inline-flex align-items-center gap-2 me-2">
         <input class="form-check-input" type="checkbox" id="autoExecuteToggle" style="width:2.5rem; height:1.3rem;">
@@ -622,7 +684,7 @@
       </div>
     </div>
 
-    <!-- NEW: Fusion Panel (Multi-Timeframe Consensus) -->
+    <!-- Fusion Panel (Multi-Timeframe Consensus) -->
     <div class="row g-3 mt-3">
       <div class="col-12">
         <div class="card">
@@ -637,7 +699,7 @@
       </div>
     </div>
 
-    <!-- Awareness & Knowledge (existing) -->
+    <!-- Awareness & Knowledge -->
     <div class="row g-3 mt-2">
       <div class="col-md-4">
         <div class="card">
@@ -668,7 +730,6 @@
 
   <!-- ===== TRADING SECTION ===== -->
   <div id="section-trading" class="section-content" style="display:none;">
-    <!-- ... unchanged ... -->
     <div class="row g-3">
       <div class="col-lg-6">
         <div class="card">
@@ -788,26 +849,11 @@
       <div class="card-body">
         <!-- Filters -->
         <div class="history-filters">
-          <div class="filter-group">
-            <label>From</label>
-            <input type="date" id="historyFrom" />
-          </div>
-          <div class="filter-group">
-            <label>To</label>
-            <input type="date" id="historyTo" />
-          </div>
-          <div class="filter-group">
-            <label>Symbol</label>
-            <input type="text" id="historySymbol" placeholder="EUR_USD" style="width:100px;" />
-          </div>
-          <div class="filter-group">
-            <label>Side</label>
-            <select id="historySide"><option value="">All</option><option value="BUY">BUY</option><option value="SELL">SELL</option></select>
-          </div>
-          <div class="filter-group">
-            <label>Status</label>
-            <select id="historyStatus"><option value="">All</option><option value="OPEN">Open</option><option value="CLOSED">Closed</option></select>
-          </div>
+          <div class="filter-group"><label>From</label><input type="date" id="historyFrom" /></div>
+          <div class="filter-group"><label>To</label><input type="date" id="historyTo" /></div>
+          <div class="filter-group"><label>Symbol</label><input type="text" id="historySymbol" placeholder="EUR_USD" style="width:100px;" /></div>
+          <div class="filter-group"><label>Side</label><select id="historySide"><option value="">All</option><option value="BUY">BUY</option><option value="SELL">SELL</option></select></div>
+          <div class="filter-group"><label>Status</label><select id="historyStatus"><option value="">All</option><option value="OPEN">Open</option><option value="CLOSED">Closed</option></select></div>
           <button class="btn btn-sm btn-primary" id="applyHistoryFilter"><i class="fas fa-filter"></i> Apply</button>
           <button class="btn btn-sm btn-outline-secondary" id="resetHistoryFilter"><i class="fas fa-undo"></i> Reset</button>
           <span style="margin-left:auto; font-size:0.85rem; color:var(--text-muted);">
@@ -831,7 +877,7 @@
     </div>
   </div>
 
-  <!-- ===== RESEARCH LAB SECTION (with Limit input) ===== -->
+  <!-- ===== RESEARCH LAB SECTION ===== -->
   <div id="section-research" class="section-content" style="display:none;">
     <div class="card">
       <div class="card-header"><span class="card-title"><i class="fas fa-flask"></i> Knowledge Explorer</span></div>
@@ -850,7 +896,6 @@
           <div class="col-md-2"><label class="form-label small">Lookahead</label>
             <select id="knowledgeLookahead" class="form-select"><option value="5">5</option><option value="10">10</option><option value="20">20</option><option value="40">40</option></select>
           </div>
-          <!-- NEW: Limit input -->
           <div class="col-md-2">
             <label class="form-label small">Limit</label>
             <input type="number" id="knowledgeLimit" class="form-control" value="100" min="1" max="50000" />
@@ -875,9 +920,8 @@
       </div>
       <div class="card-body" id="otiePanel">
         <p class="text-muted">Real‑time trade management decisions will appear here.</p>
-        <!-- You can populate this with WebSocket data from otieV5State -->
         <div id="otieContent">
-          <!-- Dynamic content will be inserted by live.js or a custom script -->
+          <!-- Dynamic content inserted by live.js -->
         </div>
       </div>
     </div>
@@ -1115,6 +1159,64 @@
   if (toInput) {
     toInput.value = now.toISOString().slice(0,10);
   }
+
+  // ---- Update account badge with real/demo ----
+  function updateAccountBadge(account) {
+    if (!account) return;
+    const idEl = document.getElementById('accountId');
+    const typeEl = document.getElementById('accountTypeLabel');
+    const currencyEl = document.getElementById('accountCurrency');
+    if (idEl) idEl.textContent = account.id || account.login || '—';
+    if (currencyEl) currencyEl.textContent = account.currency || 'USD';
+
+    // Determine real/demo
+    let type = 'demo';
+    if (account.tradeMode === 0 || account.server?.toLowerCase().includes('demo') === false) {
+      type = 'real';
+    }
+    // If server contains 'Demo', it's demo
+    if (account.server && account.server.toLowerCase().includes('demo')) {
+      type = 'demo';
+    }
+    if (typeEl) {
+      typeEl.textContent = type.toUpperCase();
+      typeEl.className = 'account-type ' + type;
+    }
+  }
+
+  // Listen for account updates from app.js or WebSocket
+  // The existing loadAccount function already updates the stat cards.
+  // We'll also override loadAccount to update the badge.
+  const originalLoadAccount = window.loadAccount;
+  if (originalLoadAccount) {
+    window.loadAccount = async function() {
+      await originalLoadAccount();
+      try {
+        const acc = await fetchJson(`${CONFIG.API_BASE}/api/account`);
+        updateAccountBadge(acc);
+      } catch (e) {
+        console.error('Failed to update account badge:', e);
+      }
+    };
+  }
+
+  // Also listen for WebSocket 'account' events
+  const wsHandler = window.handleMessage;
+  if (wsHandler) {
+    const origHandle = wsHandler;
+    // We'll add an event listener to live.js's message handler via a custom event
+    document.addEventListener('wsAccountUpdate', function(e) {
+      updateAccountBadge(e.detail);
+    });
+  }
+
+  // Since we cannot easily patch live.js from here, we'll use a MutationObserver
+  // or just call updateAccountBadge after a short delay.
+  setTimeout(() => {
+    fetchJson(`${CONFIG.API_BASE}/api/account`)
+      .then(acc => updateAccountBadge(acc))
+      .catch(() => {});
+  }, 1000);
 })();
 </script>
 </body>
