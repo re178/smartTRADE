@@ -2,6 +2,8 @@
 // FIX: Order model validation (units, clientOrderId) now correctly populated.
 // FIX: Trade side uses lowercase to match schema enum.
 // FIX: Trade is created even if Order fails (order already placed).
+// FIX: P&L is computed correctly on trade close.
+// ADDED: Real‑time broadcasts via WebSocket when trades are closed.
 
 const { getBroker } = require('./brokerFactory');
 const marketProvider = require('../market/provider');
@@ -13,6 +15,9 @@ const Order = require('../../models/Order');
 const Trade = require('../../models/Trade');
 const selfLearner = require('../learning/learner');
 const logger = require('../../infrastructure/logger') || console;
+
+// ---- IMPORT broadcast function from server for real‑time updates ----
+const { broadcastToDashboards } = require('../../server');
 
 // Singleton Execution Analytics instance
 const executionAnalytics = new ExecutionAnalytics({
@@ -254,6 +259,8 @@ async function cancelOrder(contractId, product) {
 
 /**
  * Close an open trade by its contract ID.
+ * FIX: Compute P&L from openPrice, closePrice, lotSize, side.
+ * FIX: Broadcast positions and tradeClosed via WebSocket for real‑time dashboard.
  */
 async function closeTrade(contractId, product) {
   if (!contractId) throw new Error('contractId is required');
@@ -265,14 +272,23 @@ async function closeTrade(contractId, product) {
     await broker.connect();
   }
   const result = await broker.closeTrade(contractId);
+  
+  // ---- FIX: Compute P&L ourselves ----
+  const trade = await Trade.findOne({ contractId });
+  let pl = 0;
+  if (trade && trade.openPrice && result.price) {
+    const multiplier = trade.side && trade.side.toUpperCase() === 'BUY' ? 1 : -1;
+    pl = (result.price - trade.openPrice) * trade.lotSize * multiplier;
+  }
+  
   const updatedTrade = await Trade.findOneAndUpdate(
     { contractId },
     {
       status: 'CLOSED',
       closeTime: new Date(),
       closePrice: result.price || null,
-      pnl: result.pl || 0,
-      realizedProfit: result.pl || 0,
+      pnl: pl,
+      realizedProfit: pl,
     },
     { new: true }
   );
@@ -294,6 +310,16 @@ async function closeTrade(contractId, product) {
     }
   }
 
+  // ---- BROADCAST REAL‑TIME EVENTS ----
+  try {
+    const openTrades = await getOpenTrades('mt5');
+    // broadcast positions and tradeClosed to all dashboard clients
+    broadcastToDashboards('positions', openTrades);
+    broadcastToDashboards('tradeClosed', { contractId, price: result.price, pl });
+  } catch (err) {
+    logger.warn('[orderService] Failed to broadcast trade close:', err.message);
+  }
+
   executionAnalytics.recordExecution({
     orderId: contractId,
     instrument: updatedTrade?.instrument || 'unknown',
@@ -309,7 +335,7 @@ async function closeTrade(contractId, product) {
 
   eventBus.emit('trade.closed', { contractId, result, timestamp: new Date().toISOString() });
   eventBus.emit('trade.closed.sound', { contractId });
-  return result;
+  return { ...result, pl };
 }
 
 /**
@@ -336,6 +362,15 @@ async function modifyTrade(contractId, stopLoss, takeProfit, product) {
     { upsert: false }
   );
   eventBus.emit('order.modified', { contractId, stopLoss, takeProfit, result, timestamp: new Date().toISOString() });
+  
+  // ---- BROADCAST updated positions ----
+  try {
+    const openTrades = await getOpenTrades('mt5');
+    broadcastToDashboards('positions', openTrades);
+  } catch (err) {
+    logger.warn('[orderService] Failed to broadcast positions after modify:', err.message);
+  }
+  
   return result;
 }
 
