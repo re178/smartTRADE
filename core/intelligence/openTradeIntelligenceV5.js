@@ -1,4 +1,7 @@
 // core/intelligence/openTradeIntelligenceV5.js
+// Event‑driven Trade Intelligence – listens to real‑time events and manages open trades.
+// Preserves all existing scoring, action generation, and broker execution logic.
+
 const EventEmitter = require('events');
 const axios = require('axios');
 const Trade = require('../../models/Trade');
@@ -10,7 +13,8 @@ const stateStore = require('./lab/stateStore');
 const deepRegime = require('./deep/regime');
 const marketStateCache = require('../data/marketStateCache');
 const awarenessEngine = require('../awareness/engine');
-const MT5Broker = require('../execution/mt5Broker');
+const MT5Broker = require('../../execution/mt5Broker');
+const eventBus = require('../../infrastructure/eventBus');
 const logger = require('../../infrastructure/logger') || console;
 
 // ========================================================================
@@ -91,7 +95,7 @@ function stableSoftmax(scores) {
 }
 
 // ========================================================================
-// 1. SLIDING WINDOW (FIXED)
+// 1. SLIDING WINDOW
 // ========================================================================
 class AdaptiveSlidingWindow {
   constructor(symbol) {
@@ -129,7 +133,7 @@ class AdaptiveSlidingWindow {
 }
 
 // ========================================================================
-// 2. PROBABILISTIC STATE CLASSIFIER (stable softmax)
+// 2. PROBABILISTIC STATE CLASSIFIER
 // ========================================================================
 class ProbabilisticStateClassifier {
   classify(state, trade, history) {
@@ -255,7 +259,7 @@ class SymbolProfileManager {
 }
 
 // ========================================================================
-// 4. HISTORICAL MEMORY ENGINE (uses risk-based R)
+// 4. HISTORICAL MEMORY ENGINE
 // ========================================================================
 class HistoricalMemoryEngine {
   async getAnalogues(trade, state, history) {
@@ -378,7 +382,7 @@ class PredictionEngine {
 }
 
 // ========================================================================
-// 6. COST MODEL (costR = totalCost / riskAmount)
+// 6. COST MODEL
 // ========================================================================
 class CostModel {
   computeCost(trade, state) {
@@ -464,7 +468,7 @@ class ContinuousScoreEngine {
 }
 
 // ========================================================================
-// 8. FORWARD SIMULATION (includes current profit)
+// 8. FORWARD SIMULATION
 // ========================================================================
 class ForwardSimulation {
   async simulate(trade, state, actions, analogues) {
@@ -517,7 +521,7 @@ class ForwardSimulation {
 }
 
 // ========================================================================
-// 9. ACTION COMPETITION (fixed partial EV, trailing stop, retracement)
+// 9. ACTION COMPETITION
 // ========================================================================
 class ActionCompetition {
   constructor() {
@@ -570,7 +574,7 @@ class ActionCompetition {
       }
     }
 
-    // --- TRAILING STOP (using absolute MAE) ---
+    // --- TRAILING STOP ---
     if (profitR > 0.5 && scores.health > 50 && currentStage !== 'PROTECTING') {
       const maeAbs = Math.abs(profile.typicalMAE || 0.6);
       const trailDistance = Math.min(
@@ -591,7 +595,7 @@ class ActionCompetition {
       }
     }
 
-    // --- PARTIAL CLOSE (dynamic fraction) ---
+    // --- PARTIAL CLOSE ---
     if (profitR > 1.5 && scores.opportunity < 60 && currentStage !== 'PROTECTING') {
       const ratio = Math.min(profitR / profile.typicalMFE, 1);
       const fraction = CONFIG.PARTIAL_FRACTION_MIN + (CONFIG.PARTIAL_FRACTION_MAX - CONFIG.PARTIAL_FRACTION_MIN) * ratio;
@@ -608,7 +612,7 @@ class ActionCompetition {
       });
     }
 
-    // --- RETRACEMENT PROTECTION (with division guard) ---
+    // --- RETRACEMENT PROTECTION ---
     if (peakProfitR && peakProfitR > 0 && peakProfitR > profitR) {
       const retracement = (peakProfitR - profitR) / peakProfitR;
       if (retracement > CONFIG.RETRACEMENT_THRESHOLD && profitR > 0) {
@@ -676,7 +680,7 @@ class ActionCompetition {
       });
     }
 
-    // --- TIGHTEN TP (if health weak) ---
+    // --- TIGHTEN TP ---
     if (scores.health < 50 && profitR > 0.5) {
       const newTP = direction === 1 ? currentPrice + atr * 1.5 : currentPrice - atr * 1.5;
       const ev = profitR * 0.9;
@@ -861,17 +865,17 @@ class LearningEngine {
 }
 
 // ========================================================================
-// 13. MAIN OTIE V5 ENGINE WITH BROADCASTING
+// 13. MAIN OTIE V5 ENGINE – Event‑Driven
 // ========================================================================
 class OpenTradeIntelligenceV5 extends EventEmitter {
-  constructor(broker = null, socketServer = null) {
+  constructor(broker = null) {
     super();
     this.broker = broker || new MT5Broker();
-    this._socketServer = socketServer;  // socket.io instance
     this._timer = null;
     this._isRunning = false;
     this._tradeHistory = {};
     this._peakProfit = {};
+    this._pendingEvaluations = new Set(); // symbol -> true (debounce)
 
     this.stateClassifier = new ProbabilisticStateClassifier();
     this.profileManager = new SymbolProfileManager();
@@ -889,56 +893,55 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
       logger.error('[OTIE V5] Broker connection failed:', err.message);
     });
 
-    awarenessEngine.on('marketAwareness', (data) => {
-      if (data.unusualEvents && data.unusualEvents.length > 0) {
-        this._evaluate().catch(err => logger.warn('[OTIE V5] Fast eval error:', err.message));
+    // ---- Event listeners for real‑time updates ----
+    eventBus.on('trade.placed', (data) => {
+      logger.info(`[OTIE V5] trade.placed event received for ${data.contractId} (${data.instrument})`);
+      this._triggerEvaluation(data.instrument);
+    });
+
+    eventBus.on('trade.closed', (data) => {
+      logger.info(`[OTIE V5] trade.closed event received for ${data.contractId}`);
+      // Remove from local caches
+      if (data.contractId) {
+        delete this._tradeHistory[data.contractId];
+        delete this._peakProfit[data.contractId];
+        this.actionCompetition.tradeStates[data.contractId] = 'CLOSED';
+      }
+      // No evaluation needed, but we could update UI
+    });
+
+    eventBus.on('position.updated', (data) => {
+      logger.info(`[OTIE V5] position.updated event received for ${data.symbol} (${data.ticket})`);
+      this._triggerEvaluation(data.symbol);
+    });
+
+    eventBus.on('price.tick', (data) => {
+      // Debounced evaluation per symbol
+      if (data.symbol) {
+        this._triggerEvaluation(data.symbol);
       }
     });
 
-    // ---- Broadcast internal events to WebSocket clients ----
-    this.on('otieV5State', (state) => {
-      this._broadcast('otieState', state);
-    });
-    this.on('otieV5Action', (action) => {
-      this._broadcast('otieAction', action);
+    // Also listen to awareness engine events (e.g., unusual events)
+    awarenessEngine.on('marketAwareness', (data) => {
+      if (data.symbol && data.unusualEvents && data.unusualEvents.length > 0) {
+        this._triggerEvaluation(data.symbol);
+      }
     });
 
+    // ---- Timer fallback ----
     this._startTimer();
     this._scheduleBackgroundJobs();
     this.profileManager.updateAllProfiles().catch(err => logger.warn('[Profiles] Initial update failed:', err.message));
 
-    logger.info('[OTIE V5] Initialized with MT5Broker and real‑time broadcasting.');
+    logger.info('[OTIE V5] Initialized with MT5Broker and event‑driven evaluation.');
   }
-
-  // ---- Set WebSocket server after construction ----
-  setWebSocket(socketServer) {
-    this._socketServer = socketServer;
-    logger.info('[OTIE V5] WebSocket server attached.');
-  }
-
-  // ---- Broadcast to all connected clients ----
-  _broadcast(event, data) {
-    if (!this._socketServer) return;
-    // If using socket.io, emit to all clients in the default room.
-    if (this._socketServer.emit) {
-      this._socketServer.emit(event, data);
-    } else if (this._socketServer.clients) {
-      // If using 'ws' library, send to all clients (you'll need to JSON.stringify)
-      this._socketServer.clients.forEach(client => {
-        if (client.readyState === 1) {
-          client.send(JSON.stringify({ event, data }));
-        }
-      });
-    }
-  }
-
-  // ---- Other methods (unchanged) ----
 
   _startTimer() {
     if (this._timer) clearInterval(this._timer);
     this._timer = setInterval(() => {
-      this._evaluate().catch(err => {
-        logger.error('[OTIE V5] Evaluation error:', err.message);
+      this._evaluateAll().catch(err => {
+        logger.error('[OTIE V5] Timer evaluation error:', err.message);
       });
     }, CONFIG.EVALUATION_INTERVAL_MS);
     logger.info(`[OTIE V5] Timer started (${CONFIG.EVALUATION_INTERVAL_MS}ms)`);
@@ -960,7 +963,22 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     }, 7 * 24 * 60 * 60 * 1000);
   }
 
-  async _evaluate() {
+  // ---- Debounced evaluation per symbol ----
+  _triggerEvaluation(symbol) {
+    if (!symbol) return;
+    if (this._pendingEvaluations.has(symbol)) return;
+    this._pendingEvaluations.add(symbol);
+    // Process after a small delay to coalesce multiple events
+    setTimeout(async () => {
+      this._pendingEvaluations.delete(symbol);
+      await this._evaluateSymbol(symbol).catch(err => {
+        logger.error(`[OTIE V5] Evaluation error for ${symbol}:`, err.message);
+      });
+    }, 500);
+  }
+
+  // ---- Evaluate all open trades (timer fallback) ----
+  async _evaluateAll() {
     if (this._isRunning) return;
     this._isRunning = true;
 
@@ -975,19 +993,55 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
         return;
       }
 
-      logger.info(`[OTIE V5] Found ${openTrades.length} open trade(s).`);
+      logger.info(`[OTIE V5] Timer: Found ${openTrades.length} open trade(s).`);
 
+      // Evaluate each trade individually (debounced already)
       for (const trade of openTrades) {
-        await this._evaluateTrade(trade);
+        if (trade.instrument) {
+          await this._evaluateTrade(trade);
+        }
       }
     } catch (err) {
-      logger.error('[OTIE V5] Evaluation error:', err.message);
+      logger.error('[OTIE V5] _evaluateAll error:', err.message);
     } finally {
       this._isRunning = false;
     }
   }
 
+  // ---- Evaluate a single symbol (called from event and timer) ----
+  async _evaluateSymbol(symbol) {
+    if (this._isRunning) return;
+    this._isRunning = true;
+    try {
+      // Fetch all open trades for this symbol
+      const trades = await Trade.find({
+        status: 'OPEN',
+        pendingClose: { $ne: true },
+        instrument: symbol,
+      });
+      if (trades.length === 0) {
+        this._isRunning = false;
+        return;
+      }
+      for (const trade of trades) {
+        await this._evaluateTrade(trade);
+      }
+    } catch (err) {
+      logger.error(`[OTIE V5] _evaluateSymbol error for ${symbol}:`, err.message);
+    } finally {
+      this._isRunning = false;
+    }
+  }
+
+  // ---- Core trade evaluation (unchanged logic) ----
   async _evaluateTrade(trade) {
+    // Double-check the trade is still open
+    const freshTrade = await Trade.findOne({ contractId: trade.contractId, status: 'OPEN' });
+    if (!freshTrade) {
+      logger.debug(`[OTIE V5] Trade ${trade.contractId} no longer open, skipping.`);
+      return;
+    }
+
     const symbol = trade.instrument;
     const side = trade.side.toUpperCase();
 
@@ -1100,7 +1154,6 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     });
     await decision.save();
 
-    // ---- Emit state for broadcasting (and internal listeners) ----
     this.emit('otieV5State', {
       tradeId: trade.contractId,
       symbol,
@@ -1154,7 +1207,6 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
 
       if (result && result.success) {
         logger.info(`[OTIE V5] ✅ Action ${action.type} executed successfully for trade ${trade.contractId}`);
-        // Emit action for broadcasting
         this.emit('otieV5Action', {
           tradeId: trade.contractId,
           action: action.type,
