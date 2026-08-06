@@ -1,5 +1,5 @@
 // api/routes/mt5.js – MT5 Bridge Routes with WebSocket Push
-// Fixed: broadcastToDashboards is now correctly imported and used.
+// Uses broadcastToDashboards and broadcastCommandToEA from server.js
 
 const express = require('express');
 const router = express.Router();
@@ -167,8 +167,8 @@ router.post('/orders/result', async (req, res) => {
         }
         // ---- BROADCAST: positions and tradeClosed ----
         const orderService = require('../../core/execution/orderService');
-        const broadcastOpenTrades = await orderService.getOpenTrades('mt5');
-        broadcastToDashboards('positions', broadcastOpenTrades);
+        const openTrades = await orderService.getOpenTrades('mt5');
+        broadcastToDashboards('positions', openTrades);
         broadcastToDashboards('tradeClosed', { contractId: ticket, price, pl: trade.realizedProfit });
       }
     } else if (action === 'MODIFY') {
@@ -181,22 +181,20 @@ router.post('/orders/result', async (req, res) => {
         logger.info(`[MT5] Trade ${ticket} SL/TP updated`);
         // ---- BROADCAST: positions ----
         const orderService = require('../../core/execution/orderService');
-        const broadcastOpenTrades = await orderService.getOpenTrades('mt5');
-        broadcastToDashboards('positions', broadcastOpenTrades);
+        const openTrades = await orderService.getOpenTrades('mt5');
+        broadcastToDashboards('positions', openTrades);
       }
     } else if (action === 'PARTIAL') {
       // ----- PARTIAL: reduce lotSize (the 'volume' field from EA is the NEW remaining volume) -----
       const trade = await Trade.findOne({ contractId: ticket });
       if (trade && trade.status === 'OPEN') {
-        // The EA sends back the new remaining volume in the 'volume' field.
-        // If volume is not present, we assume it's a full close (should not happen for PARTIAL).
         if (volume !== undefined && volume > 0) {
           trade.lotSize = volume;
           await trade.save();
           logger.info(`[MT5] Trade ${ticket} lotSize reduced to ${volume}`);
           const orderService = require('../../core/execution/orderService');
-          const broadcastOpenTrades = await orderService.getOpenTrades('mt5');
-          broadcastToDashboards('positions', broadcastOpenTrades);
+          const openTrades = await orderService.getOpenTrades('mt5');
+          broadcastToDashboards('positions', openTrades);
         } else {
           // If volume is 0 or missing, treat as full close.
           trade.status = 'CLOSED';
@@ -211,8 +209,8 @@ router.post('/orders/result', async (req, res) => {
           await trade.save();
           logger.info(`[MT5] Trade ${ticket} closed after partial reduction`);
           const orderService = require('../../core/execution/orderService');
-          const broadcastOpenTrades = await orderService.getOpenTrades('mt5');
-          broadcastToDashboards('positions', broadcastOpenTrades);
+          const openTrades = await orderService.getOpenTrades('mt5');
+          broadcastToDashboards('positions', openTrades);
           broadcastToDashboards('tradeClosed', { contractId: ticket, price: trade.closePrice, pl: trade.realizedProfit });
         }
       }
@@ -372,13 +370,12 @@ router.post('/positions', async (req, res) => {
       }
     }
 
-    // 4. NEW: Finalise pendingClose trades using last known price
+    // 4. Finalise pendingClose trades using last known price
     const pendingTrades = await Trade.find({ status: 'OPEN', pendingClose: true, login: login });
     if (pendingTrades.length > 0) {
       logger.info(`[MT5] Finalising ${pendingTrades.length} pending close trades...`);
       for (const trade of pendingTrades) {
         try {
-          // Use latest price from Mt5Price (most recent) or fallback to trade.currentPrice
           const priceDoc = await Mt5Price.findOne({ symbol: trade.instrument }).sort({ time: -1 });
           const closePrice = priceDoc ? (trade.side.toUpperCase() === 'BUY' ? priceDoc.bid : priceDoc.ask) : trade.currentPrice;
           if (closePrice && trade.openPrice) {
@@ -392,7 +389,6 @@ router.post('/positions', async (req, res) => {
             trade.pendingClose = false;
             await trade.save();
             logger.info(`[MT5] Finalised pending close trade ${trade.contractId} at ${closePrice} with P&L ${pnl}`);
-            // Emit trade.closed event for dashboard and performance monitor
             const eventBus = require('../../infrastructure/eventBus');
             eventBus.emit('trade.closed', { contractId: trade.contractId, price: closePrice, pl: pnl });
           } else {
@@ -406,9 +402,8 @@ router.post('/positions', async (req, res) => {
 
     // ---- BROADCAST: positions and account ----
     const orderService = require('../../core/execution/orderService');
-    const broadcastOpenTrades = await orderService.getOpenTrades('mt5');
-    broadcastToDashboards('positions', broadcastOpenTrades);
-    // Also broadcast account to keep stats updated
+    const openTrades = await orderService.getOpenTrades('mt5');
+    broadcastToDashboards('positions', openTrades);
     const accountService = require('../../core/portfolio/accountService');
     const account = await accountService.getAccount('mt5');
     broadcastToDashboards('account', account);
@@ -454,7 +449,7 @@ router.get('/heartbeat', async (req, res) => {
   }
 });
 
-// ---------- Price Feed (with cognitive integration) ----------
+// ---------- Price Feed ----------
 router.post('/price', async (req, res) => {
   try {
     const priceData = req.body;
@@ -517,7 +512,7 @@ router.get('/trade/:ticket', async (req, res) => {
   }
 });
 
-// ---------- UPDATED: History (with field mapping for dashboard) ----------
+// ---------- History ----------
 router.get('/history', async (req, res) => {
   try {
     const { from, to, symbol } = req.query;
@@ -528,7 +523,6 @@ router.get('/history', async (req, res) => {
 
     const trades = await Trade.find(filter).sort({ closeTime: -1 }).lean();
 
-    // Map fields to dashboard expectations
     const history = trades.map(t => ({
       pair: t.instrument,
       side: t.side,
