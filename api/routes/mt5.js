@@ -1,5 +1,5 @@
 // api/routes/mt5.js – MT5 Bridge Routes with WebSocket Push
-// Uses broadcastToDashboards and broadcastCommandToEA from server.js
+// Fixed: duplicate variable declaration (openTrades) error.
 
 const express = require('express');
 const router = express.Router();
@@ -28,13 +28,9 @@ const API_KEY = process.env.MT5_API_KEY || 'change-me-in-production';
 
 const authenticate = (req, res, next) => {
   const key = req.headers['x-api-key'];
-  if (key && key === API_KEY) {
-    return next();
-  }
+  if (key && key === API_KEY) return next();
   res.status(401).json({ error: 'Unauthorized: Invalid or missing API key' });
 };
-
-// Apply authentication to all routes
 router.use(authenticate);
 
 // ---------- Utility ----------
@@ -46,9 +42,7 @@ function generateCommandId() {
 router.post('/orders/command', async (req, res) => {
   try {
     const command = req.body;
-    if (!command.commandId) {
-      command.commandId = generateCommandId();
-    }
+    if (!command.commandId) command.commandId = generateCommandId();
     command.state = 'QUEUED';
     const saved = await Mt5Command.findOneAndUpdate(
       { commandId: command.commandId },
@@ -56,10 +50,7 @@ router.post('/orders/command', async (req, res) => {
       { upsert: true, new: true }
     );
     logger.info(`[MT5] Command stored: ${command.commandId}`);
-
-    // PUSH to EA via WebSocket
     broadcastCommandToEA(saved.toObject());
-
     res.status(201).json({ commandId: command.commandId, status: 'queued' });
   } catch (err) {
     logger.error('[MT5] Error storing command:', err);
@@ -70,9 +61,7 @@ router.post('/orders/command', async (req, res) => {
 router.post('/orders/claim', async (req, res) => {
   try {
     const { commandId } = req.body;
-    if (!commandId) {
-      return res.status(400).json({ error: 'Missing commandId' });
-    }
+    if (!commandId) return res.status(400).json({ error: 'Missing commandId' });
     const command = await Mt5Command.findOneAndUpdate(
       { commandId, state: 'QUEUED' },
       {
@@ -85,11 +74,8 @@ router.post('/orders/claim', async (req, res) => {
       },
       { new: true }
     );
-    if (command) {
-      res.json(command);
-    } else {
-      res.status(404).json({ error: 'Command not available for claiming' });
-    }
+    if (command) res.json(command);
+    else res.status(404).json({ error: 'Command not available for claiming' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -109,18 +95,14 @@ router.post('/orders/result', async (req, res) => {
   try {
     const result = req.body;
     const { commandId, success, ticket, deal, price, symbol, side, time, volume } = result;
-    if (!commandId) {
-      return res.status(400).json({ error: 'Missing commandId' });
-    }
+    if (!commandId) return res.status(400).json({ error: 'Missing commandId' });
 
-    // 1. Save the result (existing behaviour)
     await Mt5CommandResult.findOneAndUpdate(
       { commandId },
       result,
       { upsert: true, new: true }
     );
 
-    // 2. Update command state
     const successFlag = success === true;
     await Mt5Command.findOneAndUpdate(
       { commandId },
@@ -133,17 +115,13 @@ router.post('/orders/result', async (req, res) => {
     );
     logger.info(`[MT5] Result stored for ${commandId}, success=${successFlag}`);
 
-    // 3. Get the original command
     const command = await Mt5Command.findOne({ commandId }).lean();
     const action = command?.action;
 
-    if (!successFlag) {
-      return res.status(201).json({ status: 'accepted' });
-    }
+    if (!successFlag) return res.status(201).json({ status: 'accepted' });
 
-    // 4. Process by action type
+    // Process by action type
     if (action === 'CLOSE') {
-      // ----- CLOSE: finalise trade -----
       const trade = await Trade.findOne({ contractId: ticket });
       if (trade && trade.status !== 'CLOSED') {
         trade.status = 'CLOSED';
@@ -167,25 +145,22 @@ router.post('/orders/result', async (req, res) => {
         }
         // ---- BROADCAST: positions and tradeClosed ----
         const orderService = require('../../core/execution/orderService');
-        const openTrades = await orderService.getOpenTrades('mt5');
-        broadcastToDashboards('positions', openTrades);
+        const broadcastOpenTrades = await orderService.getOpenTrades('mt5');
+        broadcastToDashboards('positions', broadcastOpenTrades);
         broadcastToDashboards('tradeClosed', { contractId: ticket, price, pl: trade.realizedProfit });
       }
     } else if (action === 'MODIFY') {
-      // ----- MODIFY: update SL/TP -----
       const trade = await Trade.findOne({ contractId: ticket });
       if (trade && trade.status === 'OPEN') {
         if (command.stopLoss !== undefined) trade.stopLoss = command.stopLoss;
         if (command.takeProfit !== undefined) trade.takeProfit = command.takeProfit;
         await trade.save();
         logger.info(`[MT5] Trade ${ticket} SL/TP updated`);
-        // ---- BROADCAST: positions ----
         const orderService = require('../../core/execution/orderService');
-        const openTrades = await orderService.getOpenTrades('mt5');
-        broadcastToDashboards('positions', openTrades);
+        const broadcastOpenTrades = await orderService.getOpenTrades('mt5');
+        broadcastToDashboards('positions', broadcastOpenTrades);
       }
     } else if (action === 'PARTIAL') {
-      // ----- PARTIAL: reduce lotSize (the 'volume' field from EA is the NEW remaining volume) -----
       const trade = await Trade.findOne({ contractId: ticket });
       if (trade && trade.status === 'OPEN') {
         if (volume !== undefined && volume > 0) {
@@ -193,10 +168,9 @@ router.post('/orders/result', async (req, res) => {
           await trade.save();
           logger.info(`[MT5] Trade ${ticket} lotSize reduced to ${volume}`);
           const orderService = require('../../core/execution/orderService');
-          const openTrades = await orderService.getOpenTrades('mt5');
-          broadcastToDashboards('positions', openTrades);
+          const broadcastOpenTrades = await orderService.getOpenTrades('mt5');
+          broadcastToDashboards('positions', broadcastOpenTrades);
         } else {
-          // If volume is 0 or missing, treat as full close.
           trade.status = 'CLOSED';
           trade.closePrice = price || trade.currentPrice;
           trade.closeTime = new Date();
@@ -209,13 +183,12 @@ router.post('/orders/result', async (req, res) => {
           await trade.save();
           logger.info(`[MT5] Trade ${ticket} closed after partial reduction`);
           const orderService = require('../../core/execution/orderService');
-          const openTrades = await orderService.getOpenTrades('mt5');
-          broadcastToDashboards('positions', openTrades);
+          const broadcastOpenTrades = await orderService.getOpenTrades('mt5');
+          broadcastToDashboards('positions', broadcastOpenTrades);
           broadcastToDashboards('tradeClosed', { contractId: ticket, price: trade.closePrice, pl: trade.realizedProfit });
         }
       }
     }
-
     res.status(201).json({ status: 'accepted' });
   } catch (err) {
     logger.error('[MT5] Error in /orders/result:', err);
@@ -227,11 +200,8 @@ router.get('/orders/result/:commandId', async (req, res) => {
   try {
     const { commandId } = req.params;
     const result = await Mt5CommandResult.findOne({ commandId }).lean();
-    if (result) {
-      res.json(result);
-    } else {
-      res.status(404).json({ error: 'Result not found' });
-    }
+    if (result) res.json(result);
+    else res.status(404).json({ error: 'Result not found' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -245,20 +215,12 @@ router.post('/account/status', async (req, res) => {
 
     const saved = await Mt5Account.findOneAndUpdate(
       { login: status.login },
-      {
-        ...status,
-        updatedAt: new Date(),
-      },
-      {
-        upsert: true,
-        new: true,
-        runValidators: true,
-      }
+      { ...status, updatedAt: new Date() },
+      { upsert: true, new: true, runValidators: true }
     );
 
     if (saved) {
       logger.info('[MT5] Saved account:', JSON.stringify(saved, null, 2));
-      // ---- BROADCAST account ----
       broadcastToDashboards('account', saved.toObject());
       res.status(201).json({ status: 'accepted', account: saved });
     } else {
@@ -306,7 +268,6 @@ router.post('/positions', async (req, res) => {
   try {
     const { login, positions, timestamp, magic } = req.body;
 
-    // 1. Store raw snapshot in Mt5Position (existing behavior)
     await Mt5Position.deleteMany({ login });
     if (positions && positions.length) {
       const docs = positions.map(p => ({ ...p, login, updatedAt: new Date() }));
@@ -314,12 +275,11 @@ router.post('/positions', async (req, res) => {
     }
     logger.debug(`[MT5] Positions updated for login ${login}: ${positions?.length || 0} open`);
 
-    // 2. Synchronize Trade collection
     const incomingTickets = new Set(positions.map(p => p.ticket));
 
+    // Update or create trades from positions
     for (const pos of positions) {
       let trade = await Trade.findOne({ contractId: pos.ticket });
-
       if (!trade) {
         trade = new Trade({
           contractId: pos.ticket,
@@ -341,6 +301,7 @@ router.post('/positions', async (req, res) => {
           floatingProfit: pos.profit || 0,
           currentPrice: pos.current_price || pos.price,
         });
+        await trade.save();
       } else {
         trade.currentPrice = pos.current_price;
         trade.floatingProfit = pos.profit;
@@ -356,11 +317,11 @@ router.post('/positions', async (req, res) => {
           trade.comment = pos.comment || '';
           trade.login = login;
         }
+        await trade.save();
       }
-      await trade.save();
     }
 
-    // 3. Mark open trades missing from incoming as pendingClose
+    // Mark open trades missing from incoming as pendingClose
     const openTrades = await Trade.find({ status: 'OPEN', login: login });
     for (const trade of openTrades) {
       if (!incomingTickets.has(trade.contractId)) {
@@ -370,7 +331,7 @@ router.post('/positions', async (req, res) => {
       }
     }
 
-    // 4. Finalise pendingClose trades using last known price
+    // Finalise pendingClose trades using last known price
     const pendingTrades = await Trade.find({ status: 'OPEN', pendingClose: true, login: login });
     if (pendingTrades.length > 0) {
       logger.info(`[MT5] Finalising ${pendingTrades.length} pending close trades...`);
@@ -402,8 +363,8 @@ router.post('/positions', async (req, res) => {
 
     // ---- BROADCAST: positions and account ----
     const orderService = require('../../core/execution/orderService');
-    const openTrades = await orderService.getOpenTrades('mt5');
-    broadcastToDashboards('positions', openTrades);
+    const broadcastOpenTrades = await orderService.getOpenTrades('mt5');
+    broadcastToDashboards('positions', broadcastOpenTrades);
     const accountService = require('../../core/portfolio/accountService');
     const account = await accountService.getAccount('mt5');
     broadcastToDashboards('account', account);
@@ -449,13 +410,11 @@ router.get('/heartbeat', async (req, res) => {
   }
 });
 
-// ---------- Price Feed ----------
+// ---------- Price Feed (with cognitive integration) ----------
 router.post('/price', async (req, res) => {
   try {
     const priceData = req.body;
-    if (!priceData.symbol) {
-      return res.status(400).json({ error: 'Missing symbol' });
-    }
+    if (!priceData.symbol) return res.status(400).json({ error: 'Missing symbol' });
 
     const timeMs = priceData.time ? Number(priceData.time) * 1000 : Date.now();
     priceBuffer.update(priceData.symbol, priceData.bid, priceData.ask, timeMs);
@@ -479,20 +438,15 @@ router.get('/price/:symbol', async (req, res) => {
     const { symbol } = req.params;
     const lookupSymbol = symbol.replace(/_/g, '');
     let price = await Mt5Price.findOne({ symbol: lookupSymbol }).lean();
-    if (!price) {
-      price = await Mt5Price.findOne({ symbol }).lean();
-    }
-    if (price) {
-      res.json(price);
-    } else {
-      res.status(404).json({
-        symbol: lookupSymbol,
-        bid: 0,
-        ask: 0,
-        spread: 0,
-        error: 'Price not yet available from EA'
-      });
-    }
+    if (!price) price = await Mt5Price.findOne({ symbol }).lean();
+    if (price) res.json(price);
+    else res.status(404).json({
+      symbol: lookupSymbol,
+      bid: 0,
+      ask: 0,
+      spread: 0,
+      error: 'Price not yet available from EA'
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -503,9 +457,7 @@ router.get('/trade/:ticket', async (req, res) => {
   try {
     const { ticket } = req.params;
     const position = await Mt5Position.findOne({ ticket: Number(ticket) }).lean();
-    if (position) {
-      return res.json(position);
-    }
+    if (position) return res.json(position);
     res.status(404).json({ error: 'Trade not found' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -553,9 +505,7 @@ router.post('/sync', async (req, res) => {
 router.get('/candles', async (req, res) => {
   try {
     const { symbol, count = 200, timeframe = 'M5' } = req.query;
-    if (!symbol) {
-      return res.status(400).json({ error: 'symbol query param required' });
-    }
+    if (!symbol) return res.status(400).json({ error: 'symbol query param required' });
 
     const lookupSymbol = symbol.replace(/_/g, '');
     const candleHistory = require('../../core/data/candleHistory');
