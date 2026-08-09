@@ -3,7 +3,9 @@
 // FIX: Trade side uses lowercase to match schema enum.
 // FIX: Trade is created even if Order fails (order already placed).
 // FIX: P&L is computed correctly on trade close.
-// ADDED: Real‑time broadcasts via WebSocket when trades are closed.
+// FIX: Auto‑trade validation now stops execution on failure (no longer swallowed).
+// FIX: closeTrade & modifyTrade no longer update DB or broadcast – delegated to routes.
+// ADDED: partialCloseTrade method.
 
 const { getBroker } = require('./brokerFactory');
 const marketProvider = require('../market/provider');
@@ -15,9 +17,6 @@ const Order = require('../../models/Order');
 const Trade = require('../../models/Trade');
 const selfLearner = require('../learning/learner');
 const logger = require('../../infrastructure/logger') || console;
-
-// ---- IMPORT broadcast function from server for real‑time updates ----
-const { broadcastToDashboards } = require('../../server');
 
 // Singleton Execution Analytics instance
 const executionAnalytics = new ExecutionAnalytics({
@@ -79,21 +78,17 @@ async function placeMarketOrder(instrument, side, lotSize, stopLoss = null, take
 
   const finalLotSize = portfolioApproval.adjustedLotSize || lotSize;
 
-  // 3. Auto-trade pre-flight
+  // 3. Auto-trade pre-flight – STOP execution on failure (no longer swallowed)
   if (autoTrade && decisionId) {
-    try {
-      const Decision = require('../../models/HistoricalDecision');
-      const decision = await Decision.findById(decisionId);
-      if (decision) {
-        const autoCheck = validateAutoTradeSignal(decision);
-        if (!autoCheck.valid) {
-          logger.warn(`[orderService] Auto‑trade signal invalid: ${autoCheck.reason}`);
-          eventBus.emit('order.rejected', { instrument, side, reason: autoCheck.reason });
-          throw new Error(`Auto‑trade rejected: ${autoCheck.reason}`);
-        }
+    const Decision = require('../../models/HistoricalDecision');
+    const decision = await Decision.findById(decisionId);
+    if (decision) {
+      const autoCheck = validateAutoTradeSignal(decision);
+      if (!autoCheck.valid) {
+        logger.warn(`[orderService] Auto‑trade signal invalid: ${autoCheck.reason}`);
+        eventBus.emit('order.rejected', { instrument, side, reason: autoCheck.reason });
+        throw new Error(`Auto‑trade rejected: ${autoCheck.reason}`);
       }
-    } catch (err) {
-      logger.warn(`[orderService] Could not validate auto‑trade signal: ${err.message}`);
     }
   }
 
@@ -259,8 +254,8 @@ async function cancelOrder(contractId, product) {
 
 /**
  * Close an open trade by its contract ID.
- * FIX: Compute P&L from openPrice, closePrice, lotSize, side.
- * FIX: Broadcast positions and tradeClosed via WebSocket for real‑time dashboard.
+ * DB updates and broadcasts are now handled exclusively by the `/api/mt5/orders/result` route.
+ * This method only calls the broker and returns the result.
  */
 async function closeTrade(contractId, product) {
   if (!contractId) throw new Error('contractId is required');
@@ -272,58 +267,22 @@ async function closeTrade(contractId, product) {
     await broker.connect();
   }
   const result = await broker.closeTrade(contractId);
-  
-  // ---- FIX: Compute P&L ourselves ----
-  const trade = await Trade.findOne({ contractId });
-  let pl = 0;
-  if (trade && trade.openPrice && result.price) {
-    const multiplier = trade.side && trade.side.toUpperCase() === 'BUY' ? 1 : -1;
-    pl = (result.price - trade.openPrice) * trade.lotSize * multiplier;
-  }
-  
-  const updatedTrade = await Trade.findOneAndUpdate(
-    { contractId },
-    {
-      status: 'CLOSED',
-      closeTime: new Date(),
-      closePrice: result.price || null,
-      pnl: pl,
-      realizedProfit: pl,
-    },
-    { new: true }
-  );
-  if (!updatedTrade) {
-    logger.warn(`[closeTrade] No Trade found with contractId: ${contractId}`);
-  } else {
-    await Order.findOneAndUpdate(
-      { contractId },
-      { status: 'CLOSED', updatedAt: new Date() },
-      { upsert: false }
-    );
-    if (updatedTrade.decisionId) {
-      try {
-        await selfLearner.updateDecisionOutcome(updatedTrade.decisionId, updatedTrade);
-        logger.debug(`[orderService] Decision ${updatedTrade.decisionId} outcome updated from trade ${contractId}`);
-      } catch (err) {
-        logger.warn(`[orderService] Failed to update decision outcome for ${updatedTrade.decisionId}:`, err.message);
-      }
-    }
-  }
 
-  // ---- BROADCAST REAL‑TIME EVENTS ----
+  // ---- Update HistoricalDecision outcome (if any) using the now-closed trade ----
   try {
-    const openTrades = await getOpenTrades('mt5');
-    // broadcast positions and tradeClosed to all dashboard clients
-    broadcastToDashboards('positions', openTrades);
-    broadcastToDashboards('tradeClosed', { contractId, price: result.price, pl });
+    const closedTrade = await Trade.findOne({ contractId });
+    if (closedTrade && closedTrade.decisionId) {
+      await selfLearner.updateDecisionOutcome(closedTrade.decisionId, closedTrade);
+      logger.debug(`[orderService] Decision ${closedTrade.decisionId} outcome updated for trade ${contractId}`);
+    }
   } catch (err) {
-    logger.warn('[orderService] Failed to broadcast trade close:', err.message);
+    logger.warn(`[orderService] Failed to update decision outcome for ${contractId}:`, err.message);
   }
 
   executionAnalytics.recordExecution({
     orderId: contractId,
-    instrument: updatedTrade?.instrument || 'unknown',
-    side: updatedTrade?.side || 'unknown',
+    instrument: 'unknown', // not critical for analytics
+    side: 'unknown',
     requestedPrice: 0,
     filledPrice: result.price || 0,
     latency: 0,
@@ -335,11 +294,14 @@ async function closeTrade(contractId, product) {
 
   eventBus.emit('trade.closed', { contractId, result, timestamp: new Date().toISOString() });
   eventBus.emit('trade.closed.sound', { contractId });
-  return { ...result, pl };
+
+  return { ...result, pl: 0 }; // pl is computed and stored by the route
 }
 
 /**
  * Modify stop-loss and take-profit for an open trade.
+ * DB updates and broadcasts are handled exclusively by the `/api/mt5/orders/result` route.
+ * This method only calls the broker and returns the result.
  */
 async function modifyTrade(contractId, stopLoss, takeProfit, product) {
   if (!contractId) throw new Error('contractId is required');
@@ -351,26 +313,28 @@ async function modifyTrade(contractId, stopLoss, takeProfit, product) {
     await broker.connect();
   }
   const result = await broker.modifySLTP(contractId, stopLoss, takeProfit);
-  await Order.findOneAndUpdate(
-    { contractId },
-    { stopLoss, takeProfit, updatedAt: new Date() },
-    { upsert: false }
-  );
-  await Trade.findOneAndUpdate(
-    { contractId },
-    { stopLoss, takeProfit, updatedAt: new Date() },
-    { upsert: false }
-  );
+
   eventBus.emit('order.modified', { contractId, stopLoss, takeProfit, result, timestamp: new Date().toISOString() });
-  
-  // ---- BROADCAST updated positions ----
-  try {
-    const openTrades = await getOpenTrades('mt5');
-    broadcastToDashboards('positions', openTrades);
-  } catch (err) {
-    logger.warn('[orderService] Failed to broadcast positions after modify:', err.message);
+
+  return result;
+}
+
+/**
+ * Partially close an open trade by reducing its position size.
+ * DB updates and broadcasts are handled by the `/api/mt5/orders/result` route.
+ */
+async function partialCloseTrade(contractId, closeUnits, product) {
+  if (!contractId) throw new Error('contractId is required');
+  if (!closeUnits || closeUnits <= 0) throw new Error('closeUnits must be a positive number');
+  const broker = getBroker(product);
+  if (!broker.capabilities?.supportsPartialClose) {
+    throw new Error('Broker does not support partial close');
   }
-  
+  if (!broker.isConnected()) {
+    await broker.connect();
+  }
+  const result = await broker.partialClose(contractId, closeUnits);
+  eventBus.emit('trade.partialClosed', { contractId, closeUnits, result, timestamp: new Date().toISOString() });
   return result;
 }
 
@@ -417,6 +381,7 @@ module.exports = {
   cancelOrder,
   closeTrade,
   modifyTrade,
+  partialCloseTrade,
   getOpenTrades,
   getPositions,
   getExecutionAnalytics,
