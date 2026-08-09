@@ -1,6 +1,9 @@
 // core/execution/mt5Broker.js
 // MT5 Broker Adapter – uses the polling-based MT5 Bridge
 // Timeouts increased to 15s to handle Render cold starts.
+// FIX: Health-state now reflects actual EA availability (no false READY).
+// FIX: supportsPartialClose enabled.
+// ADDED: partialClose() method.
 
 const axios = require('axios');
 const { EventEmitter } = require('events');
@@ -31,7 +34,7 @@ class MT5Broker extends EventEmitter {
       supportsModify: true,
       supportsClose: true,
       supportsCancel: true,
-      supportsPartialClose: false,
+      supportsPartialClose: true,  // ✅ FIX: enabled
       supportsHedging: true,
       supportsNetting: false,
       supportsPriceFeed: true,
@@ -65,40 +68,44 @@ class MT5Broker extends EventEmitter {
     }
   }
 
-  // ---------- Connection (tolerant, with longer timeout) ----------
+  // ---------- Connection (strict health-state) ----------
   async connect() {
     if (this._state === 'READY') return;
-    try {
-      let accountAvailable = false;
-      try {
-        const statusResp = await axios.get(`${this.renderUrl}/api/mt5/account/status`, {
-          headers: this._getHeaders(),
-          timeout: 15000, // increased
-        });
-        if (statusResp.data && statusResp.data.login) {
-          this._lastStatus = statusResp.data;
-          accountAvailable = true;
-        }
-      } catch (err) {
-        if (err.response && err.response.status === 404) {
-          logger.warn('[MT5Broker] Account status not yet available (EA may be starting).');
-        } else {
-          logger.warn('[MT5Broker] Account status check failed:', err.message);
-        }
-      }
 
-      this._state = 'READY';
-      this._heartbeatState.bridgeOnline = true;
-      this._heartbeatState.eaOnline = true;
-      this._heartbeatState.brokerOnline = true;
-      this._heartbeatState.tradingAllowed = true;
-      this.emit('ready');
-      this.emit('connected');
-      logger.info('[MT5Broker] Connected to MT5 Bridge (account status: ' + (accountAvailable ? 'available' : 'not yet') + ')');
-      this._startPolling();
+    try {
+      const statusResp = await axios.get(`${this.renderUrl}/api/mt5/account/status`, {
+        headers: this._getHeaders(),
+        timeout: 15000,
+      });
+
+      if (statusResp.data && statusResp.data.login) {
+        this._lastStatus = statusResp.data;
+        this._state = 'READY';
+        this._heartbeatState.bridgeOnline = true;
+        this._heartbeatState.eaOnline = true;
+        this._heartbeatState.brokerOnline = true;
+        this._heartbeatState.tradingAllowed = true;
+        this.emit('ready');
+        this.emit('connected');
+        logger.info('[MT5Broker] Connected to MT5 Bridge (account status: available)');
+        this._startPolling();
+        return;
+      } else {
+        throw new Error('Account status returned invalid or missing login');
+      }
     } catch (err) {
-      logger.error('[MT5Broker] Connection failed:', err.message);
-      throw new Error('MT5 Bridge unreachable');
+      // Log the actual cause, but throw a clean error for the caller
+      if (err.response && err.response.status === 404) {
+        logger.error('[MT5Broker] Connection failed – EA/status endpoint not found (is EA running?)');
+      } else {
+        logger.error('[MT5Broker] Connection failed – account status unreachable:', err.message);
+      }
+      this._state = 'ERROR';
+      this._heartbeatState.bridgeOnline = false;
+      this._heartbeatState.eaOnline = false;
+      this._heartbeatState.brokerOnline = false;
+      this._heartbeatState.tradingAllowed = false;
+      throw new Error('MT5 Bridge unreachable or not ready');
     }
   }
 
@@ -190,6 +197,21 @@ class MT5Broker extends EventEmitter {
     });
     const result = await this._waitForResult(cmdId);
     if (!result.success) throw new Error(result.error || 'Cancel failed');
+    return result;
+  }
+
+  // ---------- Partial Close ----------
+  async partialClose(tradeId, units) {
+    await this._ensureReady();
+    if (!this.capabilities.supportsPartialClose) throw new Error('Partial close not supported');
+    const cmdId = `partial_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+    const payload = { commandId: cmdId, action: 'PARTIAL', tradeId, units };
+    await axios.post(`${this.renderUrl}/api/mt5/orders/command`, payload, {
+      headers: this._getHeaders(),
+      timeout: 15000,
+    });
+    const result = await this._waitForResult(cmdId);
+    if (!result.success) throw new Error(result.error || 'Partial close failed');
     return result;
   }
 
