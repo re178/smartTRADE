@@ -1,7 +1,4 @@
-// api/routes/mt5.js – MT5 Bridge Routes with WebSocket Push
-// Fixed: duplicate variable declaration (openTrades) error.
-// FIX: Added null‑safety guards in /orders/result to prevent crashes if a Trade is missing.
-// FIX: Removed redundant require for orderService inside /positions (already imported at top).
+// api/routes/mt5.js
 
 const express = require('express');
 const router = express.Router();
