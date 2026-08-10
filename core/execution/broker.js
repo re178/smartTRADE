@@ -1,4 +1,4 @@
-// core/execution/broker.js – Full Deriv broker with true CFD via cfd_open_position
+// core/execution/broker.js – Deriv CFD‑only broker (uses cfd_open_position exclusively)
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -243,20 +243,13 @@ class SymbolManager {
 }
 
 // ============================================================
-// PRODUCT EXECUTORS
+// CFD EXECUTOR (sole executor)
 // ============================================================
-class BaseExecutor {
-  constructor(broker) { this.broker = broker; }
-  async placeMarket(instrument, units, stopLoss, takeProfit) { throw new Error('Not implemented'); }
-  async placeLimit(instrument, units, price, stopLoss, takeProfit) { throw new Error('Not implemented'); }
-  async close(tradeId) { throw new Error('Not implemented'); }
-  async modifySLTP(tradeId, stopLoss, takeProfit) { throw new Error('Not implemented'); }
-  async partialClose(tradeId, units) { throw new Error('Not implemented'); }
-  async getPositions() { throw new Error('Not implemented'); }
-}
+class CFDExecutor {
+  constructor(broker) {
+    this.broker = broker;
+  }
 
-// ---- CFD Executor (uses cfd_open_position) ----
-class CFDExecutor extends BaseExecutor {
   async placeMarket(instrument, units, stopLoss, takeProfit) {
     const { symbol, amount, direction } = this._prepare(instrument, units);
     const leverage = this.broker.getLeverage(symbol);
@@ -287,6 +280,7 @@ class CFDExecutor extends BaseExecutor {
     };
   }
 
+  // Limit orders are not supported for CFDs via the public API; we fallback to market.
   async placeLimit(instrument, units, price, stopLoss, takeProfit) {
     logger.warn('[CFDExecutor] Limit orders not supported for CFDs; placing market order with price ignored.');
     return this.placeMarket(instrument, units, stopLoss, takeProfit);
@@ -346,179 +340,19 @@ class CFDExecutor extends BaseExecutor {
   }
 }
 
-// ---- Multiplier Executor (uses proposal -> buy) ----
-class MultiplierExecutor extends BaseExecutor {
-  async placeMarket(instrument, units, stopLoss, takeProfit) {
-    const { symbol, amount, side } = this._prepare(instrument, units);
-    const leverage = this.broker.getLeverage(symbol);
-    const proposalPayload = {
-      proposal: 1,
-      amount,
-      basis: 'stake',
-      currency: this.broker.accountCurrency || 'USD',
-      symbol,
-      product_type: 'multiplier',
-      contract_type: side === 'BUY' ? 'MULTUP' : 'MULTIDOWN',
-      multiplier: leverage,
-    };
-    const limitOrder = {};
-    if (stopLoss && !isNaN(stopLoss) && stopLoss > 0) limitOrder.stop_loss = stopLoss;
-    if (takeProfit && !isNaN(takeProfit) && takeProfit > 0) limitOrder.take_profit = takeProfit;
-    if (Object.keys(limitOrder).length) proposalPayload.limit_order = limitOrder;
-    if (this.broker.config.duration) {
-      proposalPayload.duration = this.broker.config.duration;
-      proposalPayload.duration_unit = 's';
-    }
-    const proposalResponse = await this.broker._sendRequest(proposalPayload);
-    if (!proposalResponse.proposal?.id) throw new Error('Multiplier proposal failed');
-    const buyPayload = { buy: proposalResponse.proposal.id, price: 0 };
-    const buyResponse = await this.broker._sendRequest(buyPayload);
-    return this._formatResponse(buyResponse);
-  }
-
-  async placeLimit(instrument, units, price, stopLoss, takeProfit) {
-    const { symbol, amount, side } = this._prepare(instrument, units);
-    const leverage = this.broker.getLeverage(symbol);
-    const proposalPayload = {
-      proposal: 1,
-      amount,
-      basis: 'stake',
-      currency: this.broker.accountCurrency || 'USD',
-      symbol,
-      product_type: 'multiplier',
-      contract_type: side === 'BUY' ? 'MULTUP' : 'MULTIDOWN',
-      multiplier: leverage,
-    };
-    const limitOrder = {};
-    if (stopLoss && !isNaN(stopLoss) && stopLoss > 0) limitOrder.stop_loss = stopLoss;
-    if (takeProfit && !isNaN(takeProfit) && takeProfit > 0) limitOrder.take_profit = takeProfit;
-    if (Object.keys(limitOrder).length) proposalPayload.limit_order = limitOrder;
-    if (this.broker.config.duration) {
-      proposalPayload.duration = this.broker.config.duration;
-      proposalPayload.duration_unit = 's';
-    }
-    const proposalResponse = await this.broker._sendRequest(proposalPayload);
-    if (!proposalResponse.proposal?.id) throw new Error('Multiplier proposal failed');
-    const buyPayload = { buy: proposalResponse.proposal.id, price: price };
-    const buyResponse = await this.broker._sendRequest(buyPayload);
-    return this._formatResponse(buyResponse);
-  }
-
-  async close(tradeId) {
-    const response = await this.broker._sendRequest({ sell: tradeId, price: 0 });
-    return response.sell;
-  }
-
-  async modifySLTP(tradeId, stopLoss, takeProfit) {
-    throw new Error('Modify SL/TP not implemented for Multipliers');
-  }
-
-  async partialClose(tradeId, units) {
-    throw new Error('Partial close not supported for Multipliers');
-  }
-
-  async getPositions() {
-    return this.broker.getOpenTrades();
-  }
-
-  _prepare(instrument, units) {
-    const symbol = toDerivSymbol(instrument, this.broker.symbolMap);
-    if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
-    const amount = Math.abs(units);
-    if (amount <= 0) throw new Error('Units must be positive');
-    const side = units > 0 ? 'BUY' : 'SELL';
-    return { symbol, amount, side };
-  }
-
-  _formatResponse(response) {
-    const tx = response.buy;
-    const contractId = tx.contract_id || tx.transaction_id;
-    return {
-      tradeID: contractId,
-      id: contractId,
-      price: tx.buy_price || tx.price || 0,
-      averagePrice: tx.buy_price || tx.price || 0,
-      raw: response,
-    };
-  }
-}
-
-// ---- Basic Options Executor (uses proposal -> buy) ----
-class OptionsExecutor extends BaseExecutor {
-  async placeMarket(instrument, units, stopLoss, takeProfit) {
-    const { symbol, amount, side } = this._prepare(instrument, units);
-    if (stopLoss || takeProfit) logger.warn('[Options] SL/TP ignored');
-    const duration = this.broker.config.duration || 60;
-    const proposalPayload = {
-      proposal: 1,
-      amount,
-      basis: 'stake',
-      currency: this.broker.accountCurrency || 'USD',
-      symbol,
-      product_type: 'basic',
-      contract_type: side === 'BUY' ? 'CALL' : 'PUT',
-      duration,
-      duration_unit: 's',
-    };
-    const proposalResponse = await this.broker._sendRequest(proposalPayload);
-    if (!proposalResponse.proposal?.id) throw new Error('Options proposal failed');
-    const buyPayload = { buy: proposalResponse.proposal.id, price: 0 };
-    const buyResponse = await this.broker._sendRequest(buyPayload);
-    return this._formatResponse(buyResponse);
-  }
-
-  async placeLimit(instrument, units, price, stopLoss, takeProfit) {
-    logger.warn('[Options] Limit orders not supported; placing market order with price ignored.');
-    return this.placeMarket(instrument, units, stopLoss, takeProfit);
-  }
-
-  async close(tradeId) {
-    const response = await this.broker._sendRequest({ sell: tradeId, price: 0 });
-    return response.sell;
-  }
-
-  async modifySLTP() { throw new Error('Options do not support SL/TP modification'); }
-  async partialClose() { throw new Error('Options do not support partial close'); }
-
-  async getPositions() {
-    return this.broker.getOpenTrades();
-  }
-
-  _prepare(instrument, units) {
-    const symbol = toDerivSymbol(instrument, this.broker.symbolMap);
-    if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
-    const amount = Math.abs(units);
-    if (amount <= 0) throw new Error('Units must be positive');
-    const side = units > 0 ? 'BUY' : 'SELL';
-    return { symbol, amount, side };
-  }
-
-  _formatResponse(response) {
-    const tx = response.buy;
-    const contractId = tx.contract_id || tx.transaction_id;
-    return {
-      tradeID: contractId,
-      id: contractId,
-      price: tx.buy_price || tx.price || 0,
-      averagePrice: tx.buy_price || tx.price || 0,
-      raw: response,
-    };
-  }
-}
-
 // ============================================================
-// MAIN BROKER CLASS
+// MAIN BROKER CLASS (CFD‑only)
 // ============================================================
 const BROKER_CAPABILITIES = {
   supportsTrailingStop: false,
   supportsHedging: false,
   supportsNetting: true,
-  supportsPartialClose: true,
+  supportsPartialClose: false,  // not via API
   supportsGuaranteedSL: false,
   supportsOCO: false,
   supportsMarketOrders: true,
-  supportsLimitOrders: true,
-  supportsStopOrders: true,
+  supportsLimitOrders: false,   // fallback to market
+  supportsStopOrders: false,
   supportsDemo: true,
   supportsLive: true,
   supportedMarkets: ['Forex', 'Indices', 'Commodities', 'Cryptocurrencies'],
@@ -546,9 +380,7 @@ class DerivBroker extends EventEmitter {
       minStopDistance: parseFloat(config.minStopDistance || 0.0001),
       rateLimit: parseFloat(config.rateLimit || 5),
       rateCapacity: parseFloat(config.rateCapacity || 10),
-      contractType: config.contractType || 'cfd',
       leverage: parseFloat(config.leverage || 100),
-      duration: config.duration ? parseInt(config.duration) : 60,
       riskValidator: config.riskValidator || null,
       fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || 3),
       readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 30000),
@@ -556,15 +388,11 @@ class DerivBroker extends EventEmitter {
       heartbeatTimeout: parseInt(config.heartbeatTimeout || process.env.DERIV_HEARTBEAT_TIMEOUT || 60000),
     };
 
-    // ---- CHANGE: use config.productType, fallback to environment ----
-    const rawProduct = (config.productType || process.env.TRADING_PRODUCT || 'cfd').toLowerCase();
-    const validProducts = ['cfd', 'multiplier', 'basic'];
-    if (!validProducts.includes(rawProduct)) {
-      logger.warn(`[DerivBroker] Invalid productType '${rawProduct}', defaulting to 'cfd'`);
-      this.productType = 'cfd';
-    } else {
-      this.productType = rawProduct;
+    // Force CFD – ignore any productType setting
+    if (config.productType || process.env.TRADING_PRODUCT) {
+      logger.warn('[DerivBroker] Ignoring productType setting; CFD is the only supported product.');
     }
+    this.productType = 'cfd';
 
     this.validateConfig();
 
@@ -625,22 +453,10 @@ class DerivBroker extends EventEmitter {
     this._account = null;
     this._portfolioLogged = false;
 
-    // ---------- Instantiate the appropriate executor ----------
-    switch (this.productType) {
-      case 'cfd':
-        this.executor = new CFDExecutor(this);
-        break;
-      case 'multiplier':
-        this.executor = new MultiplierExecutor(this);
-        break;
-      case 'basic':
-        this.executor = new OptionsExecutor(this);
-        break;
-      default:
-        this.executor = new CFDExecutor(this);
-    }
+    // ---------- Instantiate the CFD executor ----------
+    this.executor = new CFDExecutor(this);
 
-    logger.info(`[DerivBroker] Created with product type: ${this.productType}, using ${this.executor.constructor.name}`);
+    logger.info('[DerivBroker] Created CFD‑only broker.');
   }
 
   validateConfig() {
@@ -649,7 +465,6 @@ class DerivBroker extends EventEmitter {
     if (!this.config.wsUrl || !this.config.wsUrl.startsWith('ws')) throw new Error('Invalid WebSocket URL');
     if (this.config.maxQueueSize < 1) throw new Error('maxQueueSize must be at least 1');
     if (isNaN(this.config.leverage) || this.config.leverage <= 0) throw new Error('leverage must be positive');
-    if (isNaN(this.config.duration) || this.config.duration <= 0) throw new Error('duration must be positive');
     logger.info('[DerivBroker] Configuration validated.');
   }
 
@@ -965,19 +780,18 @@ class DerivBroker extends EventEmitter {
         handled = true;
       }
 
-      if (msg.buy || msg.sell || msg.cfd_open_position) {
+      if (msg.cfd_open_position || msg.cfd_close_position || msg.cfd_update_position || msg.cfd_get_positions) {
         this._handleOrderResponse(msg);
+        logger.info('[In] CFD response:', JSON.stringify(redactSensitive(msg), null, 2));
         handled = true;
       }
 
-      if (msg.cfd_open_position || msg.cfd_close_position || msg.cfd_update_position || msg.cfd_get_positions) {
-        logger.info('[In] CFD response:', JSON.stringify(redactSensitive(msg), null, 2));
-      }
-
+      // Still handle portfolio responses if they appear (though not used for CFD)
       if (msg.portfolio || msg.contracts) {
         const portfolio = msg.portfolio || msg.contracts;
         logger.info('[In] Portfolio response (first 2):', JSON.stringify(Array.isArray(portfolio) ? portfolio.slice(0, 2) : portfolio, null, 2));
         logger.debug('[In] Full portfolio:', JSON.stringify(portfolio, null, 2));
+        handled = true;
       }
 
       if (!handled) {
@@ -996,21 +810,10 @@ class DerivBroker extends EventEmitter {
       }
       return;
     }
+    // No other order types – we ignore buy/sell responses because we only use CFD
     if (msg.echo_req && msg.echo_req.client_order_id) {
-      const clientOrderId = msg.echo_req.client_order_id;
-      const tx = msg.buy || msg.sell;
-      if (tx) {
-        const contractId = tx.contract_id || tx.transaction_id;
-        const status = tx.status || 'FILLED';
-        let mappedStatus = ORDER_STATUS.FILLED;
-        if (status === 'PENDING') mappedStatus = ORDER_STATUS.PENDING;
-        else if (status === 'ACCEPTED') mappedStatus = ORDER_STATUS.ACCEPTED;
-        else if (status === 'EXECUTING') mappedStatus = ORDER_STATUS.EXECUTING;
-        else if (status === 'REJECTED') mappedStatus = ORDER_STATUS.REJECTED;
-        else if (status === 'CANCELLED') mappedStatus = ORDER_STATUS.CANCELLED;
-        else if (status === 'CLOSED') mappedStatus = ORDER_STATUS.CLOSED;
-        this._updateOrderStatus(clientOrderId, mappedStatus, contractId, tx);
-      }
+      // This may happen if we ever send legacy buy/sell, but we don't.
+      logger.debug('[DerivBroker] Ignoring non‑CFD order response:', msg);
     }
   }
 
@@ -1028,7 +831,6 @@ class DerivBroker extends EventEmitter {
     try {
       const isImportant = payload.cfd_open_position || payload.cfd_close_position ||
                           payload.cfd_update_position || payload.cfd_get_positions ||
-                          payload.buy || payload.sell || payload.proposal || payload.portfolio ||
                           payload.authorize || payload.active_symbols;
       if (isImportant) {
         logger.info(`[Out] ${payload.req_id || 'no-req-id'} →`, JSON.stringify(redactSensitive(payload), null, 2));
@@ -1208,98 +1010,27 @@ class DerivBroker extends EventEmitter {
     this.emit('orderUpdate', { clientOrderId, status, contractId });
   }
 
-  // ---------- POSITION RECONCILIATION ----------
+  // ---------- POSITION RECONCILIATION (CFD‑only) ----------
   async _reconcilePositions() {
     logger.info('[DerivBroker] Reconciling positions...');
     try {
-      if (this.productType === 'cfd') {
-        const positions = await this.executor.getPositions();
-        logger.info('[Reconcile] CFD positions from API:', JSON.stringify(positions, null, 2));
-        const dbOrders = await Order.find({ status: ORDER_STATUS.FILLED });
-        const dbMap = new Map();
-        for (const ord of dbOrders) {
-          if (ord.contractId) dbMap.set(ord.contractId, ord);
-        }
-        for (const pos of positions) {
-          const contractId = pos.id;
-          const existing = dbMap.get(contractId);
-          if (!existing) {
-            const newOrder = new Order({
-              clientOrderId: generateClientOrderId(),
-              instrument: pos.instrument,
-              side: pos.side,
-              units: pos.units,
-              entryPrice: pos.price,
-              status: ORDER_STATUS.FILLED,
-              contractId: contractId,
-              filledAt: new Date(),
-            });
-            await newOrder.save();
-            this._orders.set(newOrder.clientOrderId, newOrder);
-            this._orderMap.set(contractId, newOrder.clientOrderId);
-            logger.warn(`[Reconcile] Created order for CFD position ${contractId}`);
-          }
-        }
-        for (const [contractId, clientOrderId] of this._orderMap) {
-          const stillOpen = positions.some(p => p.id === contractId);
-          if (!stillOpen) {
-            await this._updateOrderStatus(clientOrderId, ORDER_STATUS.CLOSED);
-            this._orderMap.delete(contractId);
-          }
-        }
-        logger.info('[Reconcile] CFD position reconciliation complete.');
-        return;
-      }
-
-      const response = await this._sendRequest({ portfolio: 1 });
-      let rawPortfolio = response.portfolio || response.contracts || [];
-      if (!Array.isArray(rawPortfolio)) {
-        if (typeof rawPortfolio === 'object' && rawPortfolio !== null) {
-          const keys = Object.keys(rawPortfolio);
-          if (keys.length > 0 && !isNaN(keys[0])) {
-            rawPortfolio = Object.values(rawPortfolio);
-          } else {
-            const maybeArray = Object.values(rawPortfolio).find(v => Array.isArray(v));
-            if (maybeArray) rawPortfolio = maybeArray;
-          }
-        }
-      }
-      if (!Array.isArray(rawPortfolio)) {
-        rawPortfolio = [];
-        logger.warn('[Reconcile] Unable to parse portfolio response; defaulting to empty array.');
-      }
-      if (!this._portfolioLogged) {
-        logger.info('[Reconcile] Portfolio structure (first 2 items):', JSON.stringify(rawPortfolio.slice(0, 2), null, 2));
-        this._portfolioLogged = true;
-      }
-
-      const brokerPositions = rawPortfolio;
+      const positions = await this.executor.getPositions();
+      logger.info('[Reconcile] CFD positions from API:', JSON.stringify(positions, null, 2));
       const dbOrders = await Order.find({ status: ORDER_STATUS.FILLED });
       const dbMap = new Map();
       for (const ord of dbOrders) {
         if (ord.contractId) dbMap.set(ord.contractId, ord);
       }
-
-      for (const pos of brokerPositions) {
-        const contractId = pos.contract_id;
-        if (!contractId) continue;
+      for (const pos of positions) {
+        const contractId = pos.id;
         const existing = dbMap.get(contractId);
         if (!existing) {
-          const side = pos.buy ? 'BUY' : 'SELL';
-          const instrument = fromDerivSymbol(pos.symbol, this.reverseMap) || 'UNKNOWN';
-          const amount = pos.amount || 0;
-          const units = Math.abs(amount) || 0.01;
-          const entryPrice = pos.buy_price || pos.entry_spot || 0;
-          if (isNaN(units) || units <= 0 || !instrument || !side) {
-            logger.warn(`[Reconcile] Skipping position with invalid data: ${JSON.stringify(pos)}`);
-            continue;
-          }
           const newOrder = new Order({
             clientOrderId: generateClientOrderId(),
-            instrument,
-            side,
-            units,
-            entryPrice,
+            instrument: pos.instrument,
+            side: pos.side,
+            units: pos.units,
+            entryPrice: pos.price,
             status: ORDER_STATUS.FILLED,
             contractId: contractId,
             filledAt: new Date(),
@@ -1307,21 +1038,17 @@ class DerivBroker extends EventEmitter {
           await newOrder.save();
           this._orders.set(newOrder.clientOrderId, newOrder);
           this._orderMap.set(contractId, newOrder.clientOrderId);
-          logger.warn(`[Reconcile] Created order for position ${contractId}`);
-        } else {
-          this._orders.set(existing.clientOrderId, existing);
-          this._orderMap.set(contractId, existing.clientOrderId);
+          logger.warn(`[Reconcile] Created order for CFD position ${contractId}`);
         }
       }
-
       for (const [contractId, clientOrderId] of this._orderMap) {
-        const stillOpen = brokerPositions.some(p => p.contract_id === contractId);
+        const stillOpen = positions.some(p => p.id === contractId);
         if (!stillOpen) {
           await this._updateOrderStatus(clientOrderId, ORDER_STATUS.CLOSED);
           this._orderMap.delete(contractId);
         }
       }
-      logger.info('[Reconcile] Position reconciliation complete.');
+      logger.info('[Reconcile] CFD position reconciliation complete.');
     } catch (err) {
       logger.error('[Reconcile] Failed:', err.message);
       throw err;
@@ -1447,38 +1174,34 @@ class DerivBroker extends EventEmitter {
     }));
   }
 
-  // ---------- ORDER PLACEMENT (delegates to executor) ----------
+  // ---------- ORDER PLACEMENT (CFD only) ----------
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null) {
     await this._ensureReady();
     const amount = Math.abs(units);
     if (amount <= 0) throw new Error('Order units must be positive.');
     await this._validateOrderRisk(instrument, units > 0 ? 'BUY' : 'SELL', amount, stopLoss, takeProfit);
     const result = await this.executor.placeMarket(instrument, units, stopLoss, takeProfit);
-    if (this.productType === 'cfd') {
-      const newOrder = new Order({
-        clientOrderId: generateClientOrderId(),
-        instrument,
-        side: units > 0 ? 'BUY' : 'SELL',
-        units: amount,
-        entryPrice: result.price,
-        status: ORDER_STATUS.FILLED,
-        contractId: result.tradeID,
-        filledAt: new Date(),
-      });
-      await newOrder.save();
-      this._orders.set(newOrder.clientOrderId, newOrder);
-      this._orderMap.set(result.tradeID, newOrder.clientOrderId);
-    }
+    // CFD orders are immediately filled, so we store the order
+    const newOrder = new Order({
+      clientOrderId: generateClientOrderId(),
+      instrument,
+      side: units > 0 ? 'BUY' : 'SELL',
+      units: amount,
+      entryPrice: result.price,
+      status: ORDER_STATUS.FILLED,
+      contractId: result.tradeID,
+      filledAt: new Date(),
+    });
+    await newOrder.save();
+    this._orders.set(newOrder.clientOrderId, newOrder);
+    this._orderMap.set(result.tradeID, newOrder.clientOrderId);
     return result;
   }
 
+  // Limit order not supported – fallback to market
   async placeLimitOrder(instrument, units, price, stopLoss = null, takeProfit = null) {
-    await this._ensureReady();
-    const amount = Math.abs(units);
-    if (amount <= 0) throw new Error('Order units must be positive.');
-    if (price <= 0) throw new Error('Price must be positive.');
-    await this._validateOrderRisk(instrument, units > 0 ? 'BUY' : 'SELL', amount, stopLoss, takeProfit);
-    return this.executor.placeLimit(instrument, units, price, stopLoss, takeProfit);
+    logger.warn('[DerivBroker] Limit orders are not supported; falling back to market order.');
+    return this.placeMarketOrder(instrument, units, stopLoss, takeProfit);
   }
 
   async closeTrade(tradeId) {
@@ -1495,43 +1218,12 @@ class DerivBroker extends EventEmitter {
 
   async partialClose(tradeId, units) {
     await this._ensureReady();
-    if (!tradeId) throw new Error('tradeId is required');
-    if (units <= 0) throw new Error('Units must be positive');
-    return this.executor.partialClose(tradeId, units);
+    throw new Error('Partial close is not supported for CFD positions via the public API.');
   }
 
   async getOpenTrades() {
     await this._ensureReady();
-    if (this.productType === 'cfd') {
-      return this.executor.getPositions();
-    }
-    const response = await this._sendRequest({ portfolio: 1 });
-    let contracts = response.portfolio || response.contracts || [];
-    if (!Array.isArray(contracts)) {
-      if (typeof contracts === 'object' && contracts !== null) {
-        const keys = Object.keys(contracts);
-        if (keys.length > 0 && !isNaN(keys[0])) {
-          contracts = Object.values(contracts);
-        } else {
-          const maybeArray = Object.values(contracts).find(v => Array.isArray(v));
-          if (maybeArray) contracts = maybeArray;
-          else contracts = [];
-        }
-      } else {
-        contracts = [];
-      }
-    }
-    return contracts
-      .filter(c => c.contract_id)
-      .map(c => ({
-        id: c.contract_id,
-        instrument: fromDerivSymbol(c.symbol, this.reverseMap) || 'UNKNOWN',
-        side: c.buy ? 'BUY' : 'SELL',
-        price: c.buy_price || c.entry_spot || 0,
-        units: c.buy ? (c.amount || 0) : -(c.amount || 0),
-        unrealizedPL: c.profit_loss || 0,
-        currentPrice: c.current_spot || c.entry_spot || 0,
-      }));
+    return this.executor.getPositions();
   }
 
   async getPositions() { return this.getOpenTrades(); }
@@ -1653,7 +1345,7 @@ class DerivBroker extends EventEmitter {
 }
 
 // ============================================================
-// EXPORT – singleton AND class
+// EXPORT – singleton (CFD‑only) AND class
 // ============================================================
 const brokerInstance = new DerivBroker({
   apiToken: process.env.DERIV_API_TOKEN,
@@ -1672,12 +1364,11 @@ const brokerInstance = new DerivBroker({
   rateLimit: parseFloat(process.env.DERIV_RATE_LIMIT) || 5,
   rateCapacity: parseFloat(process.env.DERIV_RATE_CAPACITY) || 10,
   leverage: parseFloat(process.env.DERIV_LEVERAGE) || 100,
-  duration: process.env.DERIV_DURATION ? parseInt(process.env.DERIV_DURATION) : 60,
   fatalAfterAuthFailures: parseInt(process.env.DERIV_FATAL_AFTER_AUTH_FAILURES) || 3,
   readinessTimeout: parseInt(process.env.DERIV_READINESS_TIMEOUT) || 30000,
   symbolTimeout: parseInt(process.env.DERIV_SYMBOL_TIMEOUT) || 30000,
   heartbeatTimeout: parseInt(process.env.DERIV_HEARTBEAT_TIMEOUT) || 60000,
-  productType: process.env.TRADING_PRODUCT || 'cfd', // backward compatibility
+  // productType is intentionally omitted – we force CFD
 });
 
 // Export both the singleton and the class
