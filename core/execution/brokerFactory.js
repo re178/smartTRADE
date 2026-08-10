@@ -1,5 +1,5 @@
 // core/execution/brokerFactory.js
-// Factory for creating broker instances (Deriv or MT5).
+// Factory for creating broker instances (Deriv only).
 // Supports caching and handles both class and instance exports.
 
 const logger = require('../../infrastructure/logger') || console;
@@ -42,12 +42,12 @@ function getDerivConfig(productType) {
 
 /**
  * Get the broker instance for the given product string.
- * @param {string} product - One of: 'mt5', 'deriv_cfd', 'deriv_multiplier', 'deriv_basic'
- * @returns {object} broker instance (MT5Broker or DerivBroker)
+ * @param {string} product - One of: 'deriv_cfd', 'deriv_multiplier', 'deriv_basic'
+ * @returns {object} broker instance (DerivBroker)
  */
 function getBroker(product) {
   if (!product) {
-    throw new Error('Product must be specified (e.g., "mt5" or "deriv_cfd")');
+    throw new Error('Product must be specified (e.g., "deriv_cfd")');
   }
 
   const key = product.toLowerCase();
@@ -59,58 +59,22 @@ function getBroker(product) {
 
   let broker;
 
-  if (key === 'mt5') {
-    logger.info('[BrokerFactory] Creating MT5Broker');
-    // Require the MT5 broker module – it may export a class or an instance
-    const MT5BrokerModule = require('./mt5Broker');
-
-    // Check if it's a constructor (class) or already an instance
-    if (typeof MT5BrokerModule === 'function') {
-      // It's a class – instantiate with default config (or pass env)
-      // We can optionally pass config from environment if needed
-      const config = {
-        renderUrl: process.env.RENDER_URL,
-        pollInterval: parseInt(process.env.MT5_POLL_INTERVAL) || 1000,
-        heartbeatInterval: parseInt(process.env.MT5_HEARTBEAT_INTERVAL) || 5000,
-        reconnectBaseDelay: parseInt(process.env.MT5_RECONNECT_DELAY) || 2000,
-        maxReconnectDelay: parseInt(process.env.MT5_MAX_RECONNECT_DELAY) || 30000,
-        maxRetries: parseInt(process.env.MT5_MAX_RETRIES) || 3,
-        maxQueueSize: parseInt(process.env.MT5_MAX_QUEUE_SIZE) || 100,
-        circuitBreakerThreshold: parseInt(process.env.MT5_CIRCUIT_BREAKER_THRESHOLD) || 5,
-        circuitBreakerTimeout: parseInt(process.env.MT5_CIRCUIT_BREAKER_TIMEOUT) || 60000,
-        rateLimit: parseFloat(process.env.MT5_RATE_LIMIT) || 5,
-        rateCapacity: parseFloat(process.env.MT5_RATE_CAPACITY) || 10,
-        readinessTimeout: parseInt(process.env.MT5_READINESS_TIMEOUT) || 30000,
-        maxLots: parseFloat(process.env.MT5_MAX_LOTS) || 10,
-        maxExposurePercent: parseFloat(process.env.MT5_MAX_EXPOSURE_PERCENT) || 0.1,
-        dailyLossLimit: parseFloat(process.env.MT5_DAILY_LOSS_LIMIT) || 0.05,
-        duplicateCommandTTL: parseInt(process.env.MT5_DUPLICATE_TTL) || 300000,
-      };
-      broker = new MT5BrokerModule(config);
-    } else {
-      // It's already an instance – use it directly
-      broker = MT5BrokerModule;
-      logger.info('[BrokerFactory] Using existing MT5Broker instance');
+  // ---- Only Deriv is supported now ----
+  if (key.startsWith('deriv_')) {
+    const internalType = key.replace('deriv_', '');
+    if (!['cfd', 'multiplier', 'basic'].includes(internalType)) {
+      throw new Error(`Invalid Deriv product type: ${internalType}`);
     }
+    logger.info(`[BrokerFactory] Creating DerivBroker with productType: ${internalType}`);
+    const config = getDerivConfig(internalType);
+    // DerivBroker is exported as a class (named export) – import it
+    const { DerivBroker } = require('./broker');
+    broker = new DerivBroker(config);
   } 
-  // ---------- DERIV BROKER DISABLED TEMPORARILY ----------
-  // To re-enable, uncomment the block below.
-  // else if (key.startsWith('deriv_')) {
-  //   const internalType = key.replace('deriv_', '');
-  //   if (!['cfd', 'multiplier', 'basic'].includes(internalType)) {
-  //     throw new Error(`Invalid Deriv product type: ${internalType}`);
-  //   }
-  //   logger.info(`[BrokerFactory] Creating DerivBroker with productType: ${internalType}`);
-  //   const config = getDerivConfig(internalType);
-  //   // DerivBroker is exported as a class (named export) – import it
-  //   const { DerivBroker } = require('./broker');
-  //   broker = new DerivBroker(config);
-  // } 
-  else if (key.startsWith('deriv_')) {
-    // Deriv is currently disabled to avoid connection crashes.
+  // ---- MT5 is completely removed ----
+  else if (key === 'mt5') {
     throw new Error(
-      `Deriv broker is temporarily disabled. Only 'mt5' is available at this time. ` +
-      `To re-enable, uncomment the Deriv block in brokerFactory.js and restart.`
+      `MT5 broker is no longer supported. Please use 'deriv_cfd' or other Deriv products.`
     );
   }
   else {
