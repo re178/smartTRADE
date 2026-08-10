@@ -1,6 +1,9 @@
 // core/execution/broker.js – Deriv Broker with Official API
-// Uses: portfolio, proposal, buy, sell, proposal_open_contract
-// Replaces all cfd_* calls.
+// Fully supports current Deriv API fields:
+//   - active_symbols: underlying_symbol, underlying_symbol_name, pip_size
+//   - proposal: underlying_symbol
+//   - portfolio: contracts
+//   - buy, sell, ohlc, ticks
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -76,6 +79,7 @@ function fromDerivSymbol(symbol, reverseMap) {
   return symbol;
 }
 
+// Fallback symbols – used only if discovery fails, but we will throw if no discovery
 const FALLBACK_SYMBOLS = {
   'EUR_USD': 'frxEURUSD',
   'GBP_USD': 'frxGBPUSD',
@@ -319,6 +323,7 @@ class DerivBroker extends EventEmitter {
     this._cbOpenedAt = null;
 
     // ---------- Symbol maps ----------
+    // Initialize with fallback, but will be overwritten on discovery
     this.symbolMap = { ...FALLBACK_SYMBOLS };
     this.reverseMap = {};
     for (const [key, val] of Object.entries(FALLBACK_SYMBOLS)) {
@@ -328,7 +333,8 @@ class DerivBroker extends EventEmitter {
     for (const key of Object.keys(FALLBACK_SYMBOLS)) {
       this.spreadMap[FALLBACK_SYMBOLS[key]] = 0.0001;
     }
-    logger.info(`[DerivBroker] Using fallback symbols (${Object.keys(this.symbolMap).length} pairs).`);
+    this._symbolsDiscovered = false; // flag to ensure we have valid symbols
+    logger.info(`[DerivBroker] Using fallback symbols (${Object.keys(this.symbolMap).length} pairs) – will be replaced by discovery.`);
 
     // ---------- Order tracking ----------
     this._orders = new Map();
@@ -464,21 +470,36 @@ class DerivBroker extends EventEmitter {
                 this._setState(STATE.AUTHENTICATING);
 
                 logger.info('[DerivBroker] Startup: Loading symbols...');
+                let discoverySuccess = false;
                 try {
                   await this._loadSymbolsWithTimeout();
-                  logger.info('[DerivBroker] Startup: Symbols loaded.');
+                  discoverySuccess = true;
+                  logger.info('[DerivBroker] Startup: Symbols loaded successfully.');
                 } catch (err) {
-                  logger.warn('[DerivBroker] Startup: Symbol loading failed, using fallback:', err.message);
+                  logger.error('[DerivBroker] Startup: Symbol loading FAILED:', err.message);
+                  // Do not proceed to READY; we need valid symbols.
+                  this._setState(STATE.FATAL);
+                  this._closeSocket();
+                  reject(new Error(`Symbol discovery failed: ${err.message}`));
+                  return;
                 }
 
-                // ---- CRITICAL FIX: Set READY BEFORE subscribing ----
+                // ---- CRITICAL: Only become READY if symbols were discovered ----
+                if (!this._symbolsDiscovered) {
+                  logger.error('[DerivBroker] No symbols discovered – refusing to start.');
+                  this._setState(STATE.FATAL);
+                  this._closeSocket();
+                  reject(new Error('No symbols discovered from Deriv.'));
+                  return;
+                }
+
                 this._setState(STATE.READY);
                 this._flushQueue();
 
                 // ---- Background startup tasks (non‑blocking) ----
                 setImmediate(async () => {
                   if (this._state === STATE.READY && this._socket && this._socket.readyState === WebSocket.OPEN) {
-                    // Subscribe to default symbols now that we're READY
+                    // Subscribe to discovered symbols
                     try {
                       await this._subscribeDefaultSymbols();
                     } catch (err) {
@@ -778,7 +799,13 @@ class DerivBroker extends EventEmitter {
 
   // ---------- SUBSCRIBE DEFAULT SYMBOLS ----------
   async _subscribeDefaultSymbols() {
+    // Use only discovered symbols
     const symbols = Object.values(this.symbolMap);
+    if (symbols.length === 0) {
+      logger.warn('[DerivBroker] No symbols to subscribe to – skipping.');
+      return;
+    }
+    logger.info(`[DerivBroker] Subscribing to ${symbols.length} symbols...`);
     for (const sym of symbols) {
       try {
         await this.streaming.subscribe('ticks', sym, (tick) => {});
@@ -897,52 +924,89 @@ class DerivBroker extends EventEmitter {
 
   async _loadSymbolsInternal() {
     logger.info('[DerivBroker] Fetching active symbols...');
-    let lastError = null;
-    // First attempt with 'brief'
+    let symbols = null;
+    // First attempt with 'brief' (faster)
     try {
       const response = await this._sendRawRequest({ active_symbols: 'brief' }, 10000);
-      const symbols = response.active_symbols || [];
-      if (symbols.length > 0) {
+      const result = response.active_symbols || [];
+      if (result.length > 0) {
+        symbols = result;
         logger.info(`[Symbols] Loaded ${symbols.length} symbols (brief).`);
-        this._buildSymbolMaps(symbols);
-        this.symbolManager.setSymbols(symbols);
-        return;
+      } else {
+        logger.warn('[DerivBroker] Brief symbols returned empty array.');
       }
     } catch (err) {
-      lastError = err;
       logger.warn('[DerivBroker] Brief symbol request failed:', err.message);
     }
-    // Second attempt with 'full' (was 'all' which is invalid)
-    try {
-      const response = await this._sendRawRequest({ active_symbols: 'full' }, 10000);
-      const symbols = response.active_symbols || [];
-      if (symbols.length > 0) {
-        logger.info(`[Symbols] Loaded ${symbols.length} symbols (full).`);
-        this._buildSymbolMaps(symbols);
-        this.symbolManager.setSymbols(symbols);
-        return;
+
+    // If brief didn't work, try 'full'
+    if (!symbols) {
+      try {
+        const response = await this._sendRawRequest({ active_symbols: 'full' }, 10000);
+        const result = response.active_symbols || [];
+        if (result.length > 0) {
+          symbols = result;
+          logger.info(`[Symbols] Loaded ${symbols.length} symbols (full).`);
+        }
+      } catch (err) {
+        logger.warn('[DerivBroker] Full symbol request failed:', err.message);
       }
-    } catch (err) {
-      lastError = err;
-      logger.warn('[DerivBroker] Full symbol request failed:', err.message);
     }
-    throw lastError || new Error('Failed to load symbols from Deriv API.');
+
+    if (!symbols || symbols.length === 0) {
+      throw new Error('No symbols received from Deriv.');
+    }
+
+    // Build maps using current API fields
+    const built = this._buildSymbolMaps(symbols);
+    if (built === 0) {
+      throw new Error('Symbol discovery succeeded but no forex pairs could be parsed.');
+    }
+
+    this._symbolsDiscovered = true;
+    logger.info(`[DerivBroker] Symbol discovery completed – ${built} forex pairs mapped.`);
+    // Log discovered pairs for debugging
+    const sample = Object.keys(this.symbolMap).slice(0, 5);
+    logger.info(`[Symbols] Sample mappings: ${sample.map(k => `${k} → ${this.symbolMap[k]}`).join(', ')}`);
+    return;
   }
 
+  // ---- New version using current Deriv fields ----
   _buildSymbolMaps(symbols) {
+    let count = 0;
+    // Clear existing maps (we'll replace fallback with discovered ones)
+    this.symbolMap = {};
+    this.reverseMap = {};
+    this.spreadMap = {};
+
     for (const sym of symbols) {
-      const derivSymbol = sym.symbol;
-      const display = sym.display_name || '';
+      // Use current field names
+      const derivSymbol = sym.underlying_symbol || sym.symbol;
+      const display = sym.underlying_symbol_name || sym.display_name || '';
+      const pip = Number(sym.pip_size || sym.pip || 0.0001);
+
+      if (!derivSymbol) continue;
+
+      // Try to extract currency pair from display name, e.g., "EUR/USD"
       const match = display.match(/([A-Z]{3})\/([A-Z]{3})/);
-      if (match) {
-        const ourPair = match[1] + '_' + match[2];
-        this.symbolMap[ourPair] = derivSymbol;
-        this.reverseMap[derivSymbol] = ourPair;
-        const pip = sym.pip || 0.0001;
-        this.spreadMap[derivSymbol] = pip * 0.5;
-      }
+      if (!match) continue;
+
+      const ourPair = match[1] + '_' + match[2];
+      this.symbolMap[ourPair] = derivSymbol;
+      this.reverseMap[derivSymbol] = ourPair;
+      this.spreadMap[derivSymbol] = pip * 0.5;
+      count++;
     }
-    logger.info(`[DerivBroker] Symbol map built: ${Object.keys(this.symbolMap).length} forex pairs.`);
+
+    if (count === 0) {
+      logger.warn('[DerivBroker] No forex pairs found in symbol list.');
+      // Do NOT fallback to hardcoded list – we will throw later.
+    } else {
+      logger.info(`[DerivBroker] Symbol map built: ${count} forex pairs.`);
+    }
+    // Store the discovered symbols in symbolManager
+    this.symbolManager.setSymbols(symbols);
+    return count;
   }
 
   // ---------- ORDER PERSISTENCE ----------
@@ -1165,7 +1229,7 @@ class DerivBroker extends EventEmitter {
       currency: this.accountCurrency || 'USD',
       duration: 60,
       duration_unit: 's',
-      symbol: symbol,
+      underlying_symbol: symbol, // ✅ uses underlying_symbol (current API)
       multiplier: this.getLeverage(symbol) || 100,
     };
     if (stopLoss) proposalPayload.stop_loss = stopLoss;
