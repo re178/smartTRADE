@@ -923,16 +923,19 @@ class DerivBroker extends EventEmitter {
   }
 
   // ============================================================
-  // DIAGNOSTIC VERSION – logs raw active_symbols response structure
+  // FIXED: added product_type: "basic" to active_symbols requests
   // ============================================================
   async _loadSymbolsInternal() {
     logger.info('[DerivBroker] Fetching active symbols...');
     let symbols = null;
     let rawResponse = null;
 
-    // ---- Attempt 1: 'brief' ----
+    // ---- Attempt 1: 'brief' with product_type: "basic" ----
     try {
-      const response = await this._sendRawRequest({ active_symbols: 'brief' }, 10000);
+      const response = await this._sendRawRequest({ 
+        active_symbols: 'brief',
+        product_type: 'basic'
+      }, 10000);
       rawResponse = response;
       // Log structure of the raw response (redact sensitive fields)
       logger.info('[DerivBroker] active_symbols (brief) response keys:', Object.keys(response));
@@ -941,7 +944,7 @@ class DerivBroker extends EventEmitter {
         JSON.stringify({
           msg_type: response.msg_type,
           req_id: response.req_id,
-          echo_req: response.echo_req ? { active_symbols: response.echo_req.active_symbols } : undefined,
+          echo_req: response.echo_req ? { active_symbols: response.echo_req.active_symbols, product_type: response.echo_req.product_type } : undefined,
           active_symbols_count: Array.isArray(response.active_symbols)
             ? response.active_symbols.length
             : typeof response.active_symbols,
@@ -963,10 +966,13 @@ class DerivBroker extends EventEmitter {
       logger.warn('[DerivBroker] Brief symbol request failed:', err.message);
     }
 
-    // ---- Attempt 2: 'full' ----
+    // ---- Attempt 2: 'full' with product_type: "basic" ----
     if (!symbols) {
       try {
-        const response = await this._sendRawRequest({ active_symbols: 'full' }, 10000);
+        const response = await this._sendRawRequest({ 
+          active_symbols: 'full',
+          product_type: 'basic'
+        }, 10000);
         rawResponse = response;
         logger.info('[DerivBroker] active_symbols (full) response keys:', Object.keys(response));
         logger.info(
@@ -974,7 +980,7 @@ class DerivBroker extends EventEmitter {
           JSON.stringify({
             msg_type: response.msg_type,
             req_id: response.req_id,
-            echo_req: response.echo_req ? { active_symbols: response.echo_req.active_symbols } : undefined,
+            echo_req: response.echo_req ? { active_symbols: response.echo_req.active_symbols, product_type: response.echo_req.product_type } : undefined,
             active_symbols_count: Array.isArray(response.active_symbols)
               ? response.active_symbols.length
               : typeof response.active_symbols,
