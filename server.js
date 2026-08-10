@@ -1,6 +1,6 @@
-// server.js – RTS Entry Point with Real‑Time EA Support
-// Exports broadcastToDashboards and broadcastCommandToEA correctly.
-// Includes WebSocket ping (keep‑alive) to prevent dashboard disconnections.
+// server.js – RTS Entry Point (Deriv‑only)
+// No MT5/EA logic. Deriv broker feeds priceBuffer, Price, Account models,
+// and emits events for dashboard WebSocket broadcasts.
 
 require('dotenv').config();
 
@@ -13,11 +13,13 @@ const http = require('http');
 
 const connectDB = require('./config/db');
 const apiRoutes = require('./api/routes');
-const mt5Routes = require('./api/routes/mt5');
+// MT5 routes are no longer imported
 const researchRoutes = require('./api/routes/research');
 const User = require('./models/User');
-const Mt5Price = require('./models/Mt5Price');
-const Mt5Heartbeat = require('./models/Mt5Heartbeat');
+
+// ---------- NEW MODELS ----------
+const Price = require('./models/Price');
+const Account = require('./models/Account');
 
 // ---------- COGNITIVE MODULES ----------
 const priceBuffer = require('./core/data/priceBuffer');
@@ -40,6 +42,9 @@ const otie = require('./core/intelligence/openTradeIntelligenceV5');
 
 // ---------- PERFORMANCE MONITOR ----------
 const performanceMonitor = require('./core/performance/performanceMonitor');
+
+// ---------- BROKER (Deriv) ----------
+const { getBroker } = require('./core/execution/brokerFactory');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -119,12 +124,8 @@ app.use((req, res, next) => {
             req.body = parsed;
             req.repairedRawBody = repaired;
             console.log('✅ JSON repaired successfully.');
-            console.log('   Original (stringified):', JSON.stringify(trimmed));
-            console.log('   Repaired:', repaired);
           } catch (err2) {
             console.error('❌ JSON repair also failed:', err2.message);
-            console.error('   Raw (stringified):', JSON.stringify(trimmed));
-            console.error('   Repaired:', repaired);
             req.body = {};
             req.parseError = err2;
           }
@@ -184,12 +185,12 @@ app.use(async (req, res, next) => {
 
 // ---------- API Routes ----------
 app.use('/api', apiRoutes);
-app.use('/api/mt5', mt5Routes);
+// MT5 routes are no longer mounted
 app.use('/api/research', researchRoutes);
 
 // ---------- Health Check ----------
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'OK', message: 'RTS is running' });
+  res.status(200).json({ status: 'OK', message: 'RTS is running with Deriv broker' });
 });
 
 // ---------- SPA Fallback ----------
@@ -204,11 +205,10 @@ app.get('*', (req, res) => {
 // ---------- Create HTTP server ----------
 const server = http.createServer(app);
 
-// ---------- WebSocket Server (with EA support) ----------
+// ---------- WebSocket Server (dashboard only – no EA) ----------
 const wss = new WebSocket.Server({ server });
 
-// Store connected clients
-const eaClients = new Set();
+// Only dashboard clients
 const dashboardClients = new Set();
 
 // WebSocket ping interval (keep‑alive)
@@ -230,53 +230,37 @@ wss.on('connection', (ws, req) => {
   }
 
   if (type === 'ea') {
-    eaClients.add(ws);
-    console.log('[WebSocket] EA client connected.');
-    // Send a welcome message
-    ws.send(JSON.stringify({ type: 'welcome', message: 'Connected to RTS WebSocket' }));
-
-    ws.on('message', async (message) => {
-      try {
-        const data = JSON.parse(message);
-        await handleEAMessage(ws, data);
-      } catch (err) {
-        console.error('[WebSocket] EA message error:', err.message);
-      }
-    });
-
-    ws.on('close', () => {
-      eaClients.delete(ws);
-      console.log('[WebSocket] EA client disconnected.');
-    });
-  } else {
-    // Dashboard client
-    dashboardClients.add(ws);
-    console.log('[WebSocket] Dashboard client connected.');
-    // Send initial state immediately
-    sendDashboardInitialState(ws);
-
-    ws.on('close', () => {
-      dashboardClients.delete(ws);
-      console.log('[WebSocket] Dashboard client disconnected.');
-    });
+    // No longer accept EA connections – close with a message
+    ws.close(1008, 'EA connections are no longer supported. Use Deriv broker directly.');
+    console.log('[WebSocket] EA connection rejected.');
+    return;
   }
+
+  // Dashboard client
+  dashboardClients.add(ws);
+  console.log('[WebSocket] Dashboard client connected.');
+
+  // Send initial state immediately
+  sendDashboardInitialState(ws);
+
+  ws.on('close', () => {
+    dashboardClients.delete(ws);
+    console.log('[WebSocket] Dashboard client disconnected.');
+  });
 
   ws.on('error', (err) => console.error('[WebSocket] Error:', err.message));
 
-  // Respond to ping messages from client
-  ws.on('pong', () => {
-    // Client is alive, no action needed
-  });
+  // Respond to ping messages from client (keep-alive)
+  ws.on('pong', () => {});
 });
 
 // ---------- WebSocket keep‑alive ----------
 function startWSPing() {
   if (wsPingTimer) clearInterval(wsPingTimer);
   wsPingTimer = setInterval(() => {
-    const allClients = [...eaClients, ...dashboardClients];
-    for (const client of allClients) {
+    for (const client of dashboardClients) {
       if (client.readyState === WebSocket.OPEN) {
-        client.ping(); // send a ping frame
+        client.ping();
       }
     }
   }, WS_PING_INTERVAL);
@@ -291,8 +275,8 @@ async function sendDashboardInitialState(ws) {
 
     const [trades, account, positions] = await Promise.all([
       Trade.find({ status: 'OPEN' }).lean(),
-      accountService.getAccount('mt5'),
-      orderService.getOpenTrades('mt5')
+      accountService.getAccount('deriv_cfd'), // now uses Deriv
+      orderService.getOpenTrades('deriv_cfd')
     ]);
 
     ws.send(JSON.stringify({ type: 'init', data: { trades, account, positions } }));
@@ -300,271 +284,6 @@ async function sendDashboardInitialState(ws) {
   } catch (err) {
     console.error('[WebSocket] Failed to send initial state:', err.message);
   }
-}
-
-// ---- WebSocket message handler for EA ----
-async function handleEAMessage(ws, data) {
-  const { type, commandId, ...payload } = data;
-  const Mt5Command = require('./models/Mt5Command');
-  const Mt5CommandResult = require('./models/Mt5CommandResult');
-  const Trade = require('./models/Trade');
-  const logger = require('./infrastructure/logger') || console;
-
-  switch (type) {
-    case 'ack':
-      // ACK: command received
-      await Mt5Command.findOneAndUpdate(
-        { commandId },
-        { $set: { state: 'RECEIVED', receivedAt: new Date() } }
-      );
-      console.log(`[WebSocket] ACK for ${commandId}`);
-      break;
-
-    case 'executing':
-      await Mt5Command.findOneAndUpdate(
-        { commandId },
-        { $set: { state: 'EXECUTING', executingStartedAt: new Date() } }
-      );
-      console.log(`[WebSocket] EXECUTING for ${commandId}`);
-      break;
-
-    case 'result': {
-      // Result from EA
-      const { success, ticket, deal, price, volume, symbol, side, retcode, retcodeDescription, error } = payload;
-      // Save result
-      await Mt5CommandResult.findOneAndUpdate(
-        { commandId },
-        { commandId, success, ticket, deal, price, volume, symbol, side, retcode, retcodeDescription, error, time: Date.now() },
-        { upsert: true }
-      );
-      // Update command state
-      await Mt5Command.findOneAndUpdate(
-        { commandId },
-        {
-          $set: {
-            state: success ? 'EXECUTED' : 'FAILED',
-            error: success ? null : (error || 'Execution failed'),
-            completedAt: new Date(),
-          }
-        }
-      );
-      // Process result (update Trade, etc.) – reuse logic from mt5Routes POST /orders/result
-      await processCommandResult(commandId, payload);
-      console.log(`[WebSocket] RESULT for ${commandId}: ${success ? 'SUCCESS' : 'FAILED'}`);
-      break;
-    }
-
-    case 'position_update':
-      // Handle real-time position update (opened, modified, closed)
-      await handleSinglePositionUpdate(payload);
-      break;
-
-    case 'account_update':
-      await handleAccountUpdate(payload);
-      break;
-
-    case 'price':
-      // Handle price tick
-      await handlePriceTick(payload);
-      break;
-
-    case 'heartbeat':
-      // Update heartbeat with additional info
-      const { login, status, timestamp, latency, eaVersion, lastTick } = payload;
-      await Mt5Heartbeat.findOneAndUpdate(
-        { login },
-        {
-          login,
-          status,
-          lastHeartbeat: timestamp || Date.now(),
-          latency,
-          eaVersion,
-          lastTick,
-          updatedAt: new Date(),
-        },
-        { upsert: true }
-      );
-      break;
-
-    default:
-      console.log(`[WebSocket] Unknown message type: ${type}`);
-  }
-}
-
-// ---- Helper: process command result (reused from mt5Routes) ----
-async function processCommandResult(commandId, result) {
-  const { success, ticket, deal, price, symbol, side, time, volume } = result;
-  const Mt5Command = require('./models/Mt5Command');
-  const Trade = require('./models/Trade');
-  const selfLearner = require('./core/learning/learner');
-  const logger = require('./infrastructure/logger') || console;
-  const orderService = require('./core/execution/orderService');
-
-  const command = await Mt5Command.findOne({ commandId }).lean();
-  const action = command?.action;
-
-  if (!success || !action) return;
-
-  if (action === 'CLOSE') {
-    const trade = await Trade.findOne({ contractId: ticket });
-    if (trade && trade.status !== 'CLOSED') {
-      trade.status = 'CLOSED';
-      trade.closePrice = price;
-      trade.dealId = deal;
-      trade.closeTime = new Date(time ? time * 1000 : Date.now());
-      trade.pendingClose = false;
-      if (trade.openPrice && trade.lotSize) {
-        const multiplier = trade.side && trade.side.toUpperCase() === 'BUY' ? 1 : -1;
-        trade.realizedProfit = (price - trade.openPrice) * trade.lotSize * multiplier;
-        trade.pnl = trade.realizedProfit;
-      }
-      await trade.save();
-      logger.info(`[WebSocket] Trade ${ticket} finalized as CLOSED at ${price}`);
-      if (trade.decisionId) {
-        try {
-          await selfLearner.updateDecisionOutcome(trade.decisionId, trade);
-        } catch (err) {
-          logger.warn(`[WebSocket] Failed to update decision outcome: ${err.message}`);
-        }
-      }
-      // Broadcast updated positions
-      const openTrades = await orderService.getOpenTrades('mt5');
-      broadcastToDashboards('positions', openTrades);
-      broadcastToDashboards('tradeClosed', { contractId: ticket, price, pl: trade.realizedProfit });
-    }
-  } else if (action === 'MODIFY') {
-    const trade = await Trade.findOne({ contractId: ticket });
-    if (trade && trade.status === 'OPEN') {
-      if (command.stopLoss !== undefined) trade.stopLoss = command.stopLoss;
-      if (command.takeProfit !== undefined) trade.takeProfit = command.takeProfit;
-      await trade.save();
-      logger.info(`[WebSocket] Trade ${ticket} SL/TP updated`);
-      const openTrades = await orderService.getOpenTrades('mt5');
-      broadcastToDashboards('positions', openTrades);
-    }
-  } else if (action === 'PARTIAL') {
-    const trade = await Trade.findOne({ contractId: ticket });
-    if (trade && trade.status === 'OPEN') {
-      if (volume !== undefined && volume > 0) {
-        trade.lotSize = volume;
-        await trade.save();
-        logger.info(`[WebSocket] Trade ${ticket} lotSize reduced to ${volume}`);
-        const openTrades = await orderService.getOpenTrades('mt5');
-        broadcastToDashboards('positions', openTrades);
-      } else {
-        trade.status = 'CLOSED';
-        trade.closePrice = price || trade.currentPrice;
-        trade.closeTime = new Date();
-        trade.pendingClose = false;
-        if (trade.openPrice && trade.lotSize) {
-          const multiplier = trade.side && trade.side.toUpperCase() === 'BUY' ? 1 : -1;
-          trade.realizedProfit = (trade.closePrice - trade.openPrice) * trade.lotSize * multiplier;
-          trade.pnl = trade.realizedProfit;
-        }
-        await trade.save();
-        logger.info(`[WebSocket] Trade ${ticket} closed after partial reduction`);
-        const openTrades = await orderService.getOpenTrades('mt5');
-        broadcastToDashboards('positions', openTrades);
-        broadcastToDashboards('tradeClosed', { contractId: ticket, price: trade.closePrice, pl: trade.realizedProfit });
-      }
-    }
-  }
-}
-
-// ---- Helper: handle single position update ----
-async function handleSinglePositionUpdate(pos) {
-  const Trade = require('./models/Trade');
-  const eventBus = require('./infrastructure/eventBus');
-  const orderService = require('./core/execution/orderService');
-  const { ticket, symbol, type, volume, price, current_price, profit, stop_loss, take_profit, swap, commission, margin, magic, comment, open_time, reason, identifier, login } = pos;
-
-  let trade = await Trade.findOne({ contractId: ticket });
-  if (!trade) {
-    trade = new Trade({
-      contractId: ticket,
-      instrument: symbol,
-      side: type === 'BUY' ? 'buy' : 'sell',
-      lotSize: volume,
-      openPrice: price,
-      openTime: new Date(open_time * 1000),
-      status: 'OPEN',
-      magic,
-      comment,
-      stopLoss: stop_loss || 0,
-      takeProfit: take_profit || 0,
-      swap: swap || 0,
-      commission: commission || 0,
-      margin: margin || 0,
-      login,
-      pendingClose: false,
-      floatingProfit: profit || 0,
-      currentPrice: current_price || price,
-    });
-    await trade.save();
-  } else {
-    trade.currentPrice = current_price;
-    trade.floatingProfit = profit;
-    trade.lotSize = volume;
-    trade.pendingClose = false;
-    if (trade.status === 'OPEN') {
-      trade.stopLoss = stop_loss || 0;
-      trade.takeProfit = take_profit || 0;
-      trade.swap = swap || 0;
-      trade.commission = commission || 0;
-      trade.margin = margin || 0;
-      trade.magic = magic || 0;
-      trade.comment = comment || '';
-      trade.login = login;
-    }
-    await trade.save();
-  }
-  // Emit event for dashboard
-  eventBus.emit('position.updated', { ticket, symbol, type, volume, price, current_price, profit });
-  // Broadcast to dashboards
-  const openTrades = await orderService.getOpenTrades('mt5');
-  broadcastToDashboards('positions', openTrades);
-}
-
-// ---- Helper: handle account update ----
-async function handleAccountUpdate(accountData) {
-  const Mt5Account = require('./models/Mt5Account');
-  const eventBus = require('./infrastructure/eventBus');
-  await Mt5Account.findOneAndUpdate(
-    { login: accountData.login },
-    {
-      ...accountData,
-      updatedAt: new Date(),
-    },
-    { upsert: true }
-  );
-  eventBus.emit('account.fetched', accountData);
-  broadcastToDashboards('account', accountData);
-}
-
-// ---- Helper: handle price tick ----
-async function handlePriceTick(priceData) {
-  const Mt5Price = require('./models/Mt5Price');
-  const eventBus = require('./infrastructure/eventBus');
-  const timeMs = priceData.time ? Number(priceData.time) * 1000 : Date.now();
-  priceBuffer.update(priceData.symbol, priceData.bid, priceData.ask, timeMs);
-  await Mt5Price.findOneAndUpdate(
-    { symbol: priceData.symbol },
-    priceData,
-    { upsert: true, new: true }
-  );
-  eventBus.emit('price.tick', priceData);
-  broadcastToDashboards('price', priceData);
-}
-
-// ---- Function to broadcast new command to all connected EAs ----
-function broadcastCommandToEA(command) {
-  if (eaClients.size === 0) return;
-  const message = JSON.stringify({ type: 'command', data: command });
-  eaClients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(message);
-    }
-  });
 }
 
 // ---- Function to broadcast to all dashboard clients ----
@@ -578,11 +297,7 @@ function broadcastToDashboards(type, data) {
   });
 }
 
-// ---- Export functions for mt5Routes to use ----
-module.exports.broadcastCommandToEA = broadcastCommandToEA;
-module.exports.broadcastToDashboards = broadcastToDashboards;
-
-// ---------- Broadcast functions for dashboard (backward compatibility) ----------
+// ---- Legacy broadcast function for backward compatibility ----
 function broadcast(type, data) {
   broadcastToDashboards(type, data);
 }
@@ -623,48 +338,6 @@ performanceMonitor.on('thresholdsUpdated', (thresholds) => {
 });
 
 // ---------- DEBUG ROUTES ----------
-app.get('/debug/ea-status', async (req, res) => {
-  try {
-    const lastPrice = await Mt5Price.findOne().sort({ time: -1 }).lean();
-    const lastHeartbeat = await Mt5Heartbeat.findOne().sort({ updatedAt: -1 }).lean();
-    res.json({
-      lastPriceReceived: lastPrice || null,
-      lastHeartbeat: lastHeartbeat || null,
-      eaOnline: lastHeartbeat && lastHeartbeat.status === 'online',
-      eaWebSocketConnected: eaClients.size > 0,
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/debug/trigger', async (req, res) => {
-  try {
-    const candleHistory = require('./core/data/candleHistory');
-    const candles = await candleHistory.getHistory('EUR_USD', 'M5', 1);
-    if (!candles || candles.length === 0) {
-      return res.json({ error: 'No candles found in database' });
-    }
-    const candle = candles[0];
-    const closedCandle = {
-      symbol: candle.symbol,
-      timeframe: candle.timeframe,
-      time: candle.time,
-      open: candle.open,
-      high: candle.high,
-      low: candle.low,
-      close: candle.close,
-      volume: candle.volume,
-      source: candle.source || 'broker',
-    };
-    eventBus.emit('candleClosed', closedCandle);
-    candleStore.emit('candleClosed', closedCandle);
-    res.json({ success: true, candle: closedCandle });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 app.get('/debug/status', (req, res) => {
   const lastState = marketStateCache.get('EUR_USD') || null;
   const lastRegime = deepRegime.getLatestRegime('EUR_USD') || null;
@@ -700,6 +373,42 @@ async function startCognitiveEngines() {
   }
 }
 
+// ---------- Start Deriv Broker and connect to events ----------
+async function startDerivBroker() {
+  try {
+    const broker = getBroker('deriv_cfd');
+    console.log('[Deriv] Connecting Deriv broker...');
+    await broker.connect();
+    console.log('[Deriv] Broker connected.');
+
+    // ---- Listen to broker events and broadcast to dashboards ----
+    broker.on('tick', (data) => {
+      broadcastToDashboards('price', data);
+    });
+
+    broker.on('account', async (accountData) => {
+      broadcastToDashboards('account', accountData);
+      // Also store in Account model (already done inside broker, but just in case)
+    });
+
+    broker.on('positions', (positions) => {
+      broadcastToDashboards('positions', positions);
+    });
+
+    broker.on('orderUpdate', (data) => {
+      broadcastToDashboards('orderUpdate', data);
+    });
+
+    // Also periodically emit account/positions if not triggered by events
+    // We can rely on the internal events from broker.
+
+    console.log('[Deriv] Broker event listeners attached.');
+  } catch (err) {
+    console.error('[Deriv] Failed to start Deriv broker:', err.message);
+    // Keep running but with limited functionality; maybe retry later.
+  }
+}
+
 // ---------- Start Server ----------
 async function startServer() {
   await ensureAdmin();
@@ -708,14 +417,13 @@ async function startServer() {
     console.log(`✅ RTS server running on http://localhost:${PORT}`);
     console.log(`📊 Dashboard: http://localhost:${PORT}`);
     console.log(`🔌 API base: http://localhost:${PORT}/api`);
-    console.log(`🟢 MT5 Bridge endpoints: http://localhost:${PORT}/api/mt5`);
     console.log(`🔬 Research endpoints: http://localhost:${PORT}/api/research`);
-    console.log('📡 WebSocket server ready for real‑time signals and EA commands.');
+    console.log(`📡 Deriv REST endpoints: http://localhost:${PORT}/api/deriv`);
     console.log('🧠 CTOS Cognitive Engine: enabled.');
     console.log('📡 Request logging enabled.');
     console.log('🛠️  JSON repair enabled as fallback.');
     console.log('🧹  Null bytes (\\0) stripped from all incoming JSON.');
-    console.log('💾 MT5 data is persistent (MongoDB).');
+    console.log('📦 Deriv broker: active, connected to WebSocket.');
 
     // Start WebSocket ping interval
     startWSPing();
@@ -742,6 +450,9 @@ async function startServer() {
     } catch (err) {
       console.warn('⚠️ Outcome labeler scheduler could not be started:', err.message);
     }
+
+    // ---- Connect Deriv broker after startup ----
+    setTimeout(startDerivBroker, 3000);
   });
 
   // ---- Graceful shutdown ----
