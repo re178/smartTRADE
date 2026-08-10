@@ -1,6 +1,7 @@
 // core/intelligence/openTradeIntelligenceV5.js
 // Event‑driven Trade Intelligence – listens to real‑time events and manages open trades.
-// Preserves all existing scoring, action generation, and broker execution logic.
+// Preserves all existing scoring, action generation, and execution logic.
+// Uses Deriv broker (via brokerFactory) instead of MT5.
 
 const EventEmitter = require('events');
 const axios = require('axios');
@@ -13,9 +14,11 @@ const stateStore = require('./lab/stateStore');
 const deepRegime = require('./deep/regime');
 const marketStateCache = require('../data/marketStateCache');
 const awarenessEngine = require('../awareness/engine');
-const MT5Broker = require('../execution/mt5Broker');
 const eventBus = require('../../infrastructure/eventBus');
 const logger = require('../../infrastructure/logger') || console;
+
+// ---- BROKER FACTORY (Deriv only) ----
+const { getBroker } = require('../execution/brokerFactory');
 
 // ========================================================================
 // CONFIGURATION
@@ -865,12 +868,13 @@ class LearningEngine {
 }
 
 // ========================================================================
-// 13. MAIN OTIE V5 ENGINE – Event‑Driven
+// 13. MAIN OTIE V5 ENGINE – Event‑Driven (Deriv only)
 // ========================================================================
 class OpenTradeIntelligenceV5 extends EventEmitter {
   constructor(broker = null) {
     super();
-    this.broker = broker || new MT5Broker();
+    // Use provided broker, or get the default Deriv broker
+    this.broker = broker || getBroker('deriv_cfd');
     this._timer = null;
     this._isRunning = false;
     this._tradeHistory = {};
@@ -889,6 +893,8 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     this.regretAnalyzer = new RegretAnalyzer();
     this.learningEngine = new LearningEngine();
 
+    // Ensure broker is connected (it will be auto-connected by factory)
+    // but we can call connect() to be safe.
     this.broker.connect().catch(err => {
       logger.error('[OTIE V5] Broker connection failed:', err.message);
     });
@@ -907,7 +913,6 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
         delete this._peakProfit[data.contractId];
         this.actionCompetition.tradeStates[data.contractId] = 'CLOSED';
       }
-      // No evaluation needed, but we could update UI
     });
 
     eventBus.on('position.updated', (data) => {
@@ -916,13 +921,12 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     });
 
     eventBus.on('price.tick', (data) => {
-      // Debounced evaluation per symbol
       if (data.symbol) {
         this._triggerEvaluation(data.symbol);
       }
     });
 
-    // Also listen to awareness engine events (e.g., unusual events)
+    // Also listen to awareness engine events
     awarenessEngine.on('marketAwareness', (data) => {
       if (data.symbol && data.unusualEvents && data.unusualEvents.length > 0) {
         this._triggerEvaluation(data.symbol);
@@ -934,7 +938,7 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     this._scheduleBackgroundJobs();
     this.profileManager.updateAllProfiles().catch(err => logger.warn('[Profiles] Initial update failed:', err.message));
 
-    logger.info('[OTIE V5] Initialized with MT5Broker and event‑driven evaluation.');
+    logger.info('[OTIE V5] Initialized with Deriv broker and event‑driven evaluation.');
   }
 
   _startTimer() {
@@ -968,7 +972,6 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     if (!symbol) return;
     if (this._pendingEvaluations.has(symbol)) return;
     this._pendingEvaluations.add(symbol);
-    // Process after a small delay to coalesce multiple events
     setTimeout(async () => {
       this._pendingEvaluations.delete(symbol);
       await this._evaluateSymbol(symbol).catch(err => {
@@ -995,7 +998,6 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
 
       logger.info(`[OTIE V5] Timer: Found ${openTrades.length} open trade(s).`);
 
-      // Evaluate each trade individually (debounced already)
       for (const trade of openTrades) {
         if (trade.instrument) {
           await this._evaluateTrade(trade);
@@ -1008,12 +1010,11 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     }
   }
 
-  // ---- Evaluate a single symbol (called from event and timer) ----
+  // ---- Evaluate a single symbol ----
   async _evaluateSymbol(symbol) {
     if (this._isRunning) return;
     this._isRunning = true;
     try {
-      // Fetch all open trades for this symbol
       const trades = await Trade.find({
         status: 'OPEN',
         pendingClose: { $ne: true },
@@ -1056,7 +1057,6 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
       return;
     }
 
-    // ---- Risk-based profitR ----
     const riskDistance = Math.abs(trade.openPrice - trade.stopLoss);
     const currentProfitR = (state.price.current - trade.openPrice) * (side === 'BUY' ? 1 : -1) / riskDistance;
 
@@ -1168,7 +1168,7 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     });
   }
 
-  // ---- Execute action via broker (no local DB updates) ----
+  // ---- Execute action via broker ----
   async _executeAction(trade, action) {
     try {
       logger.info(`[OTIE V5] Executing action: ${action.type} on trade ${trade.contractId} (reason: ${action.reason})`);
@@ -1205,7 +1205,7 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
           return;
       }
 
-      if (result && result.success) {
+      if (result && (result.success || result.contract_id || result.position_id)) {
         logger.info(`[OTIE V5] ✅ Action ${action.type} executed successfully for trade ${trade.contractId}`);
         this.emit('otieV5Action', {
           tradeId: trade.contractId,
