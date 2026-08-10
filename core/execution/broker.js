@@ -258,7 +258,7 @@ const BROKER_CAPABILITIES = {
   supportsGuaranteedSL: false,
   supportsOCO: false,
   supportsMarketOrders: true,
-  supportsLimitOrders: false,   // we can implement via proposal with limit order type later
+  supportsLimitOrders: false,
   supportsStopOrders: false,
   supportsDemo: true,
   supportsLive: true,
@@ -295,7 +295,7 @@ class DerivBroker extends EventEmitter {
       heartbeatTimeout: parseInt(config.heartbeatTimeout || process.env.DERIV_HEARTBEAT_TIMEOUT || 60000),
     };
 
-    this.productType = 'cfd'; // we only support CFD for now
+    this.productType = 'cfd';
 
     this.validateConfig();
 
@@ -471,15 +471,20 @@ class DerivBroker extends EventEmitter {
                   logger.warn('[DerivBroker] Startup: Symbol loading failed, using fallback:', err.message);
                 }
 
-                // ---- Subscribe to default symbols for ticks ----
-                await this._subscribeDefaultSymbols();
-
+                // ---- CRITICAL FIX: Set READY BEFORE subscribing ----
                 this._setState(STATE.READY);
                 this._flushQueue();
 
-                // ---- Async startup tasks ----
+                // ---- Background startup tasks (non‑blocking) ----
                 setImmediate(async () => {
                   if (this._state === STATE.READY && this._socket && this._socket.readyState === WebSocket.OPEN) {
+                    // Subscribe to default symbols now that we're READY
+                    try {
+                      await this._subscribeDefaultSymbols();
+                    } catch (err) {
+                      logger.warn('[DerivBroker] Startup: Subscription error:', err.message);
+                    }
+
                     logger.info('[DerivBroker] Startup: Reconciling positions...');
                     try {
                       await this._reconcilePositions();
@@ -489,9 +494,12 @@ class DerivBroker extends EventEmitter {
                     }
 
                     logger.info('[DerivBroker] Startup: Loading pending orders...');
-                    await this._loadPendingOrders()
-                      .then(() => logger.info('[DerivBroker] Startup: Pending orders loaded.'))
-                      .catch((err) => logger.error('[DerivBroker] Startup: Pending orders loading error:', err.message));
+                    try {
+                      await this._loadPendingOrders();
+                      logger.info('[DerivBroker] Startup: Pending orders loaded.');
+                    } catch (err) {
+                      logger.error('[DerivBroker] Startup: Pending orders loading error:', err.message);
+                    }
                   } else {
                     logger.warn('[DerivBroker] Startup: Skipped background tasks – socket not open or not READY.');
                   }
@@ -720,14 +728,11 @@ class DerivBroker extends EventEmitter {
       // ---- PORTFOLIO (positions) ----
       if (msg.portfolio) {
         logger.debug('[In] Portfolio response received.');
-        // The portfolio response is handled by the request promise, but we can also process it here
-        // We'll update cached positions if needed.
         const portfolio = msg.portfolio;
         const contracts = portfolio.contracts || [];
         this._openPositions = contracts
           .filter(c => c.status && (c.status.toLowerCase() === 'open' || c.status.toLowerCase() === 'active'))
           .map(c => this._normalizeContract(c));
-        // Emit positions event if requested
         this.emit('_portfolioUpdated', this._openPositions);
         handled = true;
       }
@@ -735,7 +740,6 @@ class DerivBroker extends EventEmitter {
       // ---- BUY/SELL responses ----
       if (msg.buy) {
         logger.info('[DerivBroker] Buy response received:', JSON.stringify(redactSensitive(msg.buy)));
-        // Could emit order filled
         handled = true;
       }
       if (msg.sell) {
@@ -775,12 +779,9 @@ class DerivBroker extends EventEmitter {
   // ---------- SUBSCRIBE DEFAULT SYMBOLS ----------
   async _subscribeDefaultSymbols() {
     const symbols = Object.values(this.symbolMap);
-    // Subscribe to each symbol for ticks
     for (const sym of symbols) {
       try {
-        await this.streaming.subscribe('ticks', sym, (tick) => {
-          // Already handled globally in _handleMessage, but we need to keep the subscription alive
-        });
+        await this.streaming.subscribe('ticks', sym, (tick) => {});
         logger.debug(`[DerivBroker] Subscribed to ticks for ${sym}`);
       } catch (err) {
         logger.warn(`[DerivBroker] Could not subscribe to ${sym}:`, err.message);
@@ -897,6 +898,7 @@ class DerivBroker extends EventEmitter {
   async _loadSymbolsInternal() {
     logger.info('[DerivBroker] Fetching active symbols...');
     let lastError = null;
+    // First attempt with 'brief'
     try {
       const response = await this._sendRawRequest({ active_symbols: 'brief' }, 10000);
       const symbols = response.active_symbols || [];
@@ -910,18 +912,19 @@ class DerivBroker extends EventEmitter {
       lastError = err;
       logger.warn('[DerivBroker] Brief symbol request failed:', err.message);
     }
+    // Second attempt with 'full' (was 'all' which is invalid)
     try {
-      const response = await this._sendRawRequest({ active_symbols: 'all' }, 10000);
+      const response = await this._sendRawRequest({ active_symbols: 'full' }, 10000);
       const symbols = response.active_symbols || [];
       if (symbols.length > 0) {
-        logger.info(`[Symbols] Loaded ${symbols.length} symbols (all).`);
+        logger.info(`[Symbols] Loaded ${symbols.length} symbols (full).`);
         this._buildSymbolMaps(symbols);
         this.symbolManager.setSymbols(symbols);
         return;
       }
     } catch (err) {
       lastError = err;
-      logger.warn('[DerivBroker] All symbol request failed:', err.message);
+      logger.warn('[DerivBroker] Full symbol request failed:', err.message);
     }
     throw lastError || new Error('Failed to load symbols from Deriv API.');
   }
@@ -979,7 +982,7 @@ class DerivBroker extends EventEmitter {
   async _reconcilePositions() {
     logger.info('[DerivBroker] Reconciling positions from portfolio...');
     try {
-      const positions = await this.getOpenTrades(); // uses portfolio
+      const positions = await this.getOpenTrades();
       logger.info('[Reconcile] Positions from API:', JSON.stringify(positions, null, 2));
       
       const dbOrders = await Order.find({ status: ORDER_STATUS.FILLED });
@@ -988,7 +991,6 @@ class DerivBroker extends EventEmitter {
         if (ord.contractId) dbMap.set(ord.contractId, ord);
       }
       
-      // Create orders for positions not in DB
       for (const pos of positions) {
         const contractId = pos.id;
         if (!dbMap.has(contractId)) {
@@ -1009,7 +1011,6 @@ class DerivBroker extends EventEmitter {
         }
       }
       
-      // Mark orders as closed if position not found
       const openIds = new Set(positions.map(p => p.id));
       for (const [contractId, clientOrderId] of this._orderMap) {
         if (!openIds.has(contractId)) {
@@ -1018,7 +1019,6 @@ class DerivBroker extends EventEmitter {
         }
       }
       
-      // Emit positions
       this.emit('positions', positions);
       logger.info('[Reconcile] Position reconciliation complete.');
     } catch (err) {
@@ -1157,18 +1157,6 @@ class DerivBroker extends EventEmitter {
     const symbol = toDerivSymbol(instrument, this.symbolMap);
     if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
     
-    // Build proposal parameters
-    const proposalParams = {
-      amount: amount,
-      basis: 'stake', // or 'payout'? For CFDs we usually use 'stake'
-      contract_type: side === 'up' ? 'CALL' : 'PUT', // ✅ FIXED syntax error
-      currency: this.accountCurrency || 'USD',
-      duration: 60, // default 1 minute? For CFD we might use 'multiplier'? 
-      // Actually for CFDs, we need to use the multiplier contract type
-      // Let's use 'MULTIPLIER' if available.
-    };
-    // For CFDs, Deriv uses 'MULTIPLIER' contract type with leverage.
-    // We'll use a simpler approach: get a proposal for a multiplier contract.
     const proposalPayload = {
       proposal: 1,
       amount: amount,
@@ -1183,7 +1171,6 @@ class DerivBroker extends EventEmitter {
     if (stopLoss) proposalPayload.stop_loss = stopLoss;
     if (takeProfit) proposalPayload.take_profit = takeProfit;
 
-    // Get proposal
     const proposalResponse = await this._sendRequest(proposalPayload);
     const proposal = proposalResponse.proposal;
     if (!proposal) {
@@ -1192,7 +1179,6 @@ class DerivBroker extends EventEmitter {
     const proposalId = proposal.id;
     const askPrice = proposal.ask_price;
 
-    // Buy the proposal
     const buyPayload = {
       buy: proposalId,
       price: askPrice,
@@ -1206,7 +1192,6 @@ class DerivBroker extends EventEmitter {
     const contractId = buy.contract_id;
     const price = buy.price || 0;
 
-    // Create order record
     const newOrder = new Order({
       clientOrderId: generateClientOrderId(),
       instrument,
@@ -1221,7 +1206,6 @@ class DerivBroker extends EventEmitter {
     this._orders.set(newOrder.clientOrderId, newOrder);
     this._orderMap.set(contractId, newOrder.clientOrderId);
 
-    // Emit positions update
     this.getOpenTrades()
       .then(positions => this.emit('positions', positions))
       .catch(err => logger.error('[DerivBroker] Failed to emit positions after market order:', err.message));
@@ -1240,43 +1224,36 @@ class DerivBroker extends EventEmitter {
     if (!tradeId) throw new Error('tradeId is required');
     const sellPayload = {
       sell: tradeId,
-      price: 0, // market price
+      price: 0,
     };
     const response = await this._sendRequest(sellPayload);
     const sell = response.sell;
     if (!sell) {
       throw new Error('Close trade failed: ' + JSON.stringify(response));
     }
-    // Update order status
     const clientOrderId = this._orderMap.get(tradeId);
     if (clientOrderId) {
       await this._updateOrderStatus(clientOrderId, ORDER_STATUS.CLOSED);
       this._orderMap.delete(tradeId);
     }
-    // Emit positions update
     this.getOpenTrades()
       .then(positions => this.emit('positions', positions))
       .catch(err => logger.error('[DerivBroker] Failed to emit positions after close:', err.message));
     return response;
   }
 
-  // ---- Modify SL/TP (close and reopen? Or use proposal_open_contract?) ----
-  // For now, we implement a workaround: close and reopen with new SL/TP.
-  // This is not ideal but avoids complex update logic.
+  // ---- Modify SL/TP (close and reopen) ----
   async modifySLTP(tradeId, stopLoss, takeProfit) {
     await this._ensureReady();
     if (!tradeId) throw new Error('tradeId is required');
-    // First, get the existing trade details
     const positions = await this.getOpenTrades();
     const pos = positions.find(p => p.id === tradeId);
     if (!pos) {
       throw new Error(`Trade ${tradeId} not found or not open`);
     }
-    // Close it
     await this.closeTrade(tradeId);
-    // Reopen with new SL/TP
     const side = pos.side === 'BUY' ? 1 : -1;
-    const units = pos.units * side; // preserve direction
+    const units = pos.units * side;
     const result = await this.placeMarketOrder(pos.instrument, units, stopLoss, takeProfit);
     return {
       message: 'Modified SL/TP by reopening position',
