@@ -922,31 +922,75 @@ class DerivBroker extends EventEmitter {
     ]);
   }
 
+  // ============================================================
+  // DIAGNOSTIC VERSION – logs raw active_symbols response structure
+  // ============================================================
   async _loadSymbolsInternal() {
     logger.info('[DerivBroker] Fetching active symbols...');
     let symbols = null;
-    // First attempt with 'brief' (faster)
+    let rawResponse = null;
+
+    // ---- Attempt 1: 'brief' ----
     try {
       const response = await this._sendRawRequest({ active_symbols: 'brief' }, 10000);
+      rawResponse = response;
+      // Log structure of the raw response (redact sensitive fields)
+      logger.info('[DerivBroker] active_symbols (brief) response keys:', Object.keys(response));
+      logger.info(
+        '[DerivBroker] active_symbols (brief) payload summary:',
+        JSON.stringify({
+          msg_type: response.msg_type,
+          req_id: response.req_id,
+          echo_req: response.echo_req ? { active_symbols: response.echo_req.active_symbols } : undefined,
+          active_symbols_count: Array.isArray(response.active_symbols)
+            ? response.active_symbols.length
+            : typeof response.active_symbols,
+          active_symbols_type: typeof response.active_symbols,
+          first_keys: response.active_symbols?.[0]
+            ? Object.keys(response.active_symbols[0])
+            : []
+        })
+      );
+
       const result = response.active_symbols || [];
       if (result.length > 0) {
         symbols = result;
         logger.info(`[Symbols] Loaded ${symbols.length} symbols (brief).`);
       } else {
-        logger.warn('[DerivBroker] Brief symbols returned empty array.');
+        logger.warn('[DerivBroker] Brief symbols returned empty array or not an array.');
       }
     } catch (err) {
       logger.warn('[DerivBroker] Brief symbol request failed:', err.message);
     }
 
-    // If brief didn't work, try 'full'
+    // ---- Attempt 2: 'full' ----
     if (!symbols) {
       try {
         const response = await this._sendRawRequest({ active_symbols: 'full' }, 10000);
+        rawResponse = response;
+        logger.info('[DerivBroker] active_symbols (full) response keys:', Object.keys(response));
+        logger.info(
+          '[DerivBroker] active_symbols (full) payload summary:',
+          JSON.stringify({
+            msg_type: response.msg_type,
+            req_id: response.req_id,
+            echo_req: response.echo_req ? { active_symbols: response.echo_req.active_symbols } : undefined,
+            active_symbols_count: Array.isArray(response.active_symbols)
+              ? response.active_symbols.length
+              : typeof response.active_symbols,
+            active_symbols_type: typeof response.active_symbols,
+            first_keys: response.active_symbols?.[0]
+              ? Object.keys(response.active_symbols[0])
+              : []
+          })
+        );
+
         const result = response.active_symbols || [];
         if (result.length > 0) {
           symbols = result;
           logger.info(`[Symbols] Loaded ${symbols.length} symbols (full).`);
+        } else {
+          logger.warn('[DerivBroker] Full symbols returned empty array or not an array.');
         }
       } catch (err) {
         logger.warn('[DerivBroker] Full symbol request failed:', err.message);
@@ -954,10 +998,16 @@ class DerivBroker extends EventEmitter {
     }
 
     if (!symbols || symbols.length === 0) {
+      // Log the raw response as a last resort (redacted)
+      if (rawResponse) {
+        logger.error('[DerivBroker] Full response (redacted):', JSON.stringify(rawResponse, (key, value) => {
+          if (key === 'authorize' || key === 'token' || key === 'api_token') return '***REDACTED***';
+          return value;
+        }));
+      }
       throw new Error('No symbols received from Deriv.');
     }
 
-    // Build maps using current API fields
     const built = this._buildSymbolMaps(symbols);
     if (built === 0) {
       throw new Error('Symbol discovery succeeded but no forex pairs could be parsed.');
@@ -965,13 +1015,11 @@ class DerivBroker extends EventEmitter {
 
     this._symbolsDiscovered = true;
     logger.info(`[DerivBroker] Symbol discovery completed – ${built} forex pairs mapped.`);
-    // Log discovered pairs for debugging
     const sample = Object.keys(this.symbolMap).slice(0, 5);
     logger.info(`[Symbols] Sample mappings: ${sample.map(k => `${k} → ${this.symbolMap[k]}`).join(', ')}`);
-    return;
   }
 
-  // ---- New version using current Deriv fields ----
+  // ---- Build maps using current Deriv fields ----
   _buildSymbolMaps(symbols) {
     let count = 0;
     // Clear existing maps (we'll replace fallback with discovered ones)
