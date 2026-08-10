@@ -1,10 +1,19 @@
-// core/execution/broker.js – Deriv CFD‑only broker (uses cfd_open_position exclusively)
+// core/execution/broker.js – Deriv CFD‑only broker with full data‑pipeline integration
+// - Pushes ticks to priceBuffer (cognitive engine)
+// - Stores prices in Price model (replaces Mt5Price)
+// - Updates Account model (replaces Mt5Account)
+// - Emits 'tick', 'account', 'positions' events for WebSocket broadcasts
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
 const { sleep } = require('../../shared/helpers');
 const logger = require('../../infrastructure/logger') || console;
 const Order = require('../../models/Order');
+
+// ---- NEW IMPORTS for data pipeline ----
+const priceBuffer = require('../../core/data/priceBuffer');
+const Price = require('../../models/Price');
+const Account = require('../../models/Account');
 
 EventEmitter.defaultMaxListeners = 20;
 
@@ -121,7 +130,7 @@ class RateLimiter {
 }
 
 // ============================================================
-// STREAMING MANAGER
+// STREAMING MANAGER (modified to emit events)
 // ============================================================
 class StreamingManager {
   constructor(broker) {
@@ -243,7 +252,7 @@ class SymbolManager {
 }
 
 // ============================================================
-// CFD EXECUTOR (sole executor)
+// CFD EXECUTOR
 // ============================================================
 class CFDExecutor {
   constructor(broker) {
@@ -280,7 +289,6 @@ class CFDExecutor {
     };
   }
 
-  // Limit orders are not supported for CFDs via the public API; we fallback to market.
   async placeLimit(instrument, units, price, stopLoss, takeProfit) {
     logger.warn('[CFDExecutor] Limit orders not supported for CFDs; placing market order with price ignored.');
     return this.placeMarket(instrument, units, stopLoss, takeProfit);
@@ -341,17 +349,17 @@ class CFDExecutor {
 }
 
 // ============================================================
-// MAIN BROKER CLASS (CFD‑only)
+// MAIN BROKER CLASS (CFD‑only with data pipeline)
 // ============================================================
 const BROKER_CAPABILITIES = {
   supportsTrailingStop: false,
   supportsHedging: false,
   supportsNetting: true,
-  supportsPartialClose: false,  // not via API
+  supportsPartialClose: false,
   supportsGuaranteedSL: false,
   supportsOCO: false,
   supportsMarketOrders: true,
-  supportsLimitOrders: false,   // fallback to market
+  supportsLimitOrders: false,
   supportsStopOrders: false,
   supportsDemo: true,
   supportsLive: true,
@@ -388,7 +396,7 @@ class DerivBroker extends EventEmitter {
       heartbeatTimeout: parseInt(config.heartbeatTimeout || process.env.DERIV_HEARTBEAT_TIMEOUT || 60000),
     };
 
-    // Force CFD – ignore any productType setting
+    // Force CFD
     if (config.productType || process.env.TRADING_PRODUCT) {
       logger.warn('[DerivBroker] Ignoring productType setting; CFD is the only supported product.');
     }
@@ -456,7 +464,7 @@ class DerivBroker extends EventEmitter {
     // ---------- Instantiate the CFD executor ----------
     this.executor = new CFDExecutor(this);
 
-    logger.info('[DerivBroker] Created CFD‑only broker.');
+    logger.info('[DerivBroker] Created CFD‑only broker with data pipeline integration.');
   }
 
   validateConfig() {
@@ -538,6 +546,25 @@ class DerivBroker extends EventEmitter {
                   this._account = authResponse.authorize;
                   this.accountCurrency = this._account.currency || 'USD';
                   logger.info('[DerivBroker] Account stored from authorize.');
+
+                  // ---- UPDATE ACCOUNT MODEL ----
+                  try {
+                    await Account.upsertAccount({
+                      accountId: 'default',
+                      balance: parseFloat(this._account.balance) || 0,
+                      equity: parseFloat(this._account.balance) || 0,
+                      currency: this.accountCurrency,
+                      broker: 'deriv',
+                      loginId: this._account.loginid || '',
+                      leverage: parseFloat(this._account.leverage) || 100,
+                      status: 'online',
+                    });
+                    logger.info('[DerivBroker] Account saved to DB.');
+                    // Emit event for dashboards
+                    this.emit('account', await Account.getLatest('default'));
+                  } catch (err) {
+                    logger.error('[DerivBroker] Failed to save account:', err.message);
+                  }
                 }
                 logger.info('[DerivBroker] Authorized.');
                 this._authFailCount = 0;
@@ -562,7 +589,13 @@ class DerivBroker extends EventEmitter {
 
                     logger.info('[DerivBroker] Startup: Reconciling positions...');
                     this._reconcilePositions()
-                      .then(() => logger.info('[DerivBroker] Startup: Positions reconciled.'))
+                      .then(() => {
+                        logger.info('[DerivBroker] Startup: Positions reconciled.');
+                        // Emit positions after reconciliation
+                        this.executor.getPositions()
+                          .then(positions => this.emit('positions', positions))
+                          .catch(err => logger.error('[DerivBroker] Failed to emit positions:', err.message));
+                      })
                       .catch((err) => logger.error('[DerivBroker] Startup: Position reconciliation error:', err.message));
 
                     logger.info('[DerivBroker] Startup: Loading pending orders...');
@@ -737,7 +770,7 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // ---------- MESSAGE HANDLER ----------
+  // ---------- MESSAGE HANDLER (with price pipeline) ----------
   _handleMessage(rawData) {
     try {
       const msg = JSON.parse(rawData);
@@ -775,8 +808,28 @@ class DerivBroker extends EventEmitter {
         handled = true;
       }
 
+      // ---- TICK HANDLER (data pipeline integration) ----
       if (msg.msg_type === 'tick' && msg.tick) {
-        this.streaming.handleTick(msg.tick);
+        const tick = msg.tick;
+        const symbol = tick.symbol;
+        const bid = tick.bid ? parseFloat(tick.bid) : null;
+        const ask = tick.ask ? parseFloat(tick.ask) : null;
+        const time = tick.epoch ? tick.epoch * 1000 : Date.now();
+
+        // 1. Update priceBuffer (cognitive engine)
+        if (bid !== null && ask !== null) {
+          priceBuffer.update(symbol, bid, ask, time);
+
+          // 2. Store in Price model (async)
+          Price.upsertPrice(symbol, bid, ask, time, 'deriv')
+            .catch(err => logger.error('[DerivBroker] Failed to save price:', err.message));
+
+          // 3. Emit tick event for dashboards and other listeners
+          this.emit('tick', { symbol, bid, ask, time });
+        }
+
+        // 4. Let streaming manager handle its own callbacks
+        this.streaming.handleTick(tick);
         handled = true;
       }
 
@@ -786,7 +839,7 @@ class DerivBroker extends EventEmitter {
         handled = true;
       }
 
-      // Still handle portfolio responses if they appear (though not used for CFD)
+      // Portfolio responses – not used for CFD but keep for logging
       if (msg.portfolio || msg.contracts) {
         const portfolio = msg.portfolio || msg.contracts;
         logger.info('[In] Portfolio response (first 2):', JSON.stringify(Array.isArray(portfolio) ? portfolio.slice(0, 2) : portfolio, null, 2));
@@ -807,14 +860,21 @@ class DerivBroker extends EventEmitter {
       const pos = msg.cfd_open_position;
       if (pos.position_id) {
         logger.info('[DerivBroker] CFD position opened:', pos.position_id);
+        // Emit position update
+        this.executor.getPositions()
+          .then(positions => this.emit('positions', positions))
+          .catch(err => logger.error('[DerivBroker] Failed to emit positions after open:', err.message));
       }
       return;
     }
-    // No other order types – we ignore buy/sell responses because we only use CFD
-    if (msg.echo_req && msg.echo_req.client_order_id) {
-      // This may happen if we ever send legacy buy/sell, but we don't.
-      logger.debug('[DerivBroker] Ignoring non‑CFD order response:', msg);
+    if (msg.cfd_close_position) {
+      logger.info('[DerivBroker] CFD position closed.');
+      this.executor.getPositions()
+        .then(positions => this.emit('positions', positions))
+        .catch(err => logger.error('[DerivBroker] Failed to emit positions after close:', err.message));
+      return;
     }
+    logger.debug('[DerivBroker] Ignoring non‑CFD order response:', msg);
   }
 
   // ---------- SEND LOGIC ----------
@@ -1010,7 +1070,7 @@ class DerivBroker extends EventEmitter {
     this.emit('orderUpdate', { clientOrderId, status, contractId });
   }
 
-  // ---------- POSITION RECONCILIATION (CFD‑only) ----------
+  // ---------- POSITION RECONCILIATION ----------
   async _reconcilePositions() {
     logger.info('[DerivBroker] Reconciling positions...');
     try {
@@ -1048,6 +1108,8 @@ class DerivBroker extends EventEmitter {
           this._orderMap.delete(contractId);
         }
       }
+      // Emit positions event after reconciliation
+      this.emit('positions', positions);
       logger.info('[Reconcile] CFD position reconciliation complete.');
     } catch (err) {
       logger.error('[Reconcile] Failed:', err.message);
@@ -1174,14 +1236,13 @@ class DerivBroker extends EventEmitter {
     }));
   }
 
-  // ---------- ORDER PLACEMENT (CFD only) ----------
+  // ---------- ORDER PLACEMENT ----------
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null) {
     await this._ensureReady();
     const amount = Math.abs(units);
     if (amount <= 0) throw new Error('Order units must be positive.');
     await this._validateOrderRisk(instrument, units > 0 ? 'BUY' : 'SELL', amount, stopLoss, takeProfit);
     const result = await this.executor.placeMarket(instrument, units, stopLoss, takeProfit);
-    // CFD orders are immediately filled, so we store the order
     const newOrder = new Order({
       clientOrderId: generateClientOrderId(),
       instrument,
@@ -1195,10 +1256,13 @@ class DerivBroker extends EventEmitter {
     await newOrder.save();
     this._orders.set(newOrder.clientOrderId, newOrder);
     this._orderMap.set(result.tradeID, newOrder.clientOrderId);
+    // Emit positions update
+    this.executor.getPositions()
+      .then(positions => this.emit('positions', positions))
+      .catch(err => logger.error('[DerivBroker] Failed to emit positions after market order:', err.message));
     return result;
   }
 
-  // Limit order not supported – fallback to market
   async placeLimitOrder(instrument, units, price, stopLoss = null, takeProfit = null) {
     logger.warn('[DerivBroker] Limit orders are not supported; falling back to market order.');
     return this.placeMarketOrder(instrument, units, stopLoss, takeProfit);
@@ -1207,7 +1271,12 @@ class DerivBroker extends EventEmitter {
   async closeTrade(tradeId) {
     await this._ensureReady();
     if (!tradeId) throw new Error('tradeId is required');
-    return this.executor.close(tradeId);
+    const result = await this.executor.close(tradeId);
+    // Emit positions update
+    this.executor.getPositions()
+      .then(positions => this.emit('positions', positions))
+      .catch(err => logger.error('[DerivBroker] Failed to emit positions after close:', err.message));
+    return result;
   }
 
   async modifySLTP(tradeId, stopLoss, takeProfit) {
@@ -1345,7 +1414,7 @@ class DerivBroker extends EventEmitter {
 }
 
 // ============================================================
-// EXPORT – singleton (CFD‑only) AND class
+// EXPORT – singleton AND class
 // ============================================================
 const brokerInstance = new DerivBroker({
   apiToken: process.env.DERIV_API_TOKEN,
@@ -1368,9 +1437,7 @@ const brokerInstance = new DerivBroker({
   readinessTimeout: parseInt(process.env.DERIV_READINESS_TIMEOUT) || 30000,
   symbolTimeout: parseInt(process.env.DERIV_SYMBOL_TIMEOUT) || 30000,
   heartbeatTimeout: parseInt(process.env.DERIV_HEARTBEAT_TIMEOUT) || 60000,
-  // productType is intentionally omitted – we force CFD
 });
 
-// Export both the singleton and the class
 module.exports = brokerInstance;
 module.exports.DerivBroker = DerivBroker;
