@@ -1161,7 +1161,7 @@ class DerivBroker extends EventEmitter {
     const proposalParams = {
       amount: amount,
       basis: 'stake', // or 'payout'? For CFDs we usually use 'stake'
-      contract_type: 'CALL' if side === 'up' else 'PUT',
+      contract_type: side === 'up' ? 'CALL' : 'PUT', // ✅ FIXED syntax error
       currency: this.accountCurrency || 'USD',
       duration: 60, // default 1 minute? For CFD we might use 'multiplier'? 
       // Actually for CFDs, we need to use the multiplier contract type
