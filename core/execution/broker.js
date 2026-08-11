@@ -1,5 +1,9 @@
 // core/execution/broker.js – Stable Dual‑WebSocket Deriv Broker
-// Watchlist: only subscribe to specified symbols.
+// - Public WS: persistent, reconnects only on close/error
+// - Auth WS: v3 with `authorize` (legacy, but works; OTP migration planned)
+// - Correct contract types: MULTUP / MULTDOWN
+// - Account enhancement: tradeMode and server from `_account`
+// - Full integration with Account model and priceBuffer
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -12,16 +16,6 @@ const Price = require('../../models/Price');
 const Account = require('../../models/Account');
 
 EventEmitter.defaultMaxListeners = 20;
-
-// ============================================================
-// WATCHLIST – only these symbols will be subscribed for ticks
-// ============================================================
-const WATCHLIST = [
-  'frxEURUSD',
-  'frxGBPUSD',
-  'frxUSDJPY',
-  'frxAUDUSD'
-];
 
 // ============================================================
 // CONSTANTS
@@ -156,7 +150,6 @@ class StreamingManager {
       }
       return;
     }
-    // Wait for public connection to be ready
     await this.broker._ensurePublicReady();
     const response = await this.broker._sendPublicRequest({ [type]: symbol, subscribe: 1 });
     const subscriptionId = response.subscription?.id;
@@ -381,7 +374,8 @@ class DerivBroker extends EventEmitter {
 
     this.capabilities = { ...BROKER_CAPABILITIES };
     this._authFailCount = 0;
-    this._account = null;
+    this._account = null;      // raw authorize response
+    this._accountDetails = null; // balance/margin details
     this._portfolioLogged = false;
     this._openPositions = [];
 
@@ -390,7 +384,6 @@ class DerivBroker extends EventEmitter {
     logger.info('[DerivBroker] Created with stable dual WebSocket architecture.');
     logger.info(`[DerivBroker] Public WS: ${this.config.publicWsUrl}`);
     logger.info(`[DerivBroker] Auth WS: ${this.config.authWsUrl}`);
-    logger.info(`[DerivBroker] Watchlist: ${WATCHLIST.join(', ')}`);
   }
 
   validateConfig() {
@@ -757,6 +750,8 @@ class DerivBroker extends EventEmitter {
                 this._account = authResponse.authorize;
                 this.accountCurrency = this._account.currency || 'USD';
                 logger.info('[DerivBroker] Account stored from authorize.');
+
+                // Initial account save (basic fields)
                 try {
                   await Account.upsertAccount({
                     accountId: 'default',
@@ -766,12 +761,25 @@ class DerivBroker extends EventEmitter {
                     broker: 'deriv',
                     loginId: this._account.loginid || '',
                     leverage: parseFloat(this._account.leverage) || 100,
+                    server: this._account.landing_company_name || '',
+                    tradeMode: this._account.is_virtual ? 1 : 0,
                     status: 'online',
                   });
-                  this.emit('account', await Account.getLatest('default'));
+                  logger.info('[DerivBroker] Initial account saved to DB.');
                 } catch (err) {
                   logger.error('[DerivBroker] Failed to save account:', err.message);
                 }
+
+                // Fetch detailed account (margin, equity)
+                try {
+                  await this._refreshAccount();
+                } catch (err) {
+                  logger.warn('[DerivBroker] Failed to refresh account details:', err.message);
+                }
+
+                // Emit enhanced account
+                const fullAccount = await this.getAccount();
+                this.emit('account', fullAccount);
               }
               logger.info('[DerivBroker] Auth authorized.');
               this._authState = STATE.READY;
@@ -843,6 +851,39 @@ class DerivBroker extends EventEmitter {
     });
   }
 
+  // ---- New: fetch detailed account (balance, margin) ----
+  async _refreshAccount() {
+    try {
+      const response = await this._sendAuthRequest({ balance: 1 });
+      const balance = response.balance;
+      if (balance) {
+        this._accountDetails = balance;
+        await Account.upsertAccount({
+          accountId: 'default',
+          balance: parseFloat(balance.balance) || 0,
+          equity: parseFloat(balance.equity) || 0,
+          marginUsed: parseFloat(balance.margin_used) || 0,
+          marginAvailable: parseFloat(balance.margin_available) || 0,
+          marginLevel: parseFloat(balance.margin_level) || 0,
+          currency: balance.currency || 'USD',
+          broker: 'deriv',
+          loginId: balance.loginid || '',
+          leverage: parseFloat(balance.leverage) || 100,
+          server: balance.server || this._account?.landing_company_name || '',
+          accountName: balance.account_name || '',
+          status: 'online',
+          tradeMode: balance.trade_mode !== undefined ? balance.trade_mode : (this._account?.is_virtual ? 1 : 0),
+        });
+        logger.info('[DerivBroker] Detailed account saved to DB.');
+        // Emit updated account
+        const fullAccount = await this.getAccount();
+        this.emit('account', fullAccount);
+      }
+    } catch (err) {
+      logger.warn('[DerivBroker] Failed to refresh account details:', err.message);
+    }
+  }
+
   _startAuthHeartbeat() {
     this._stopAuthHeartbeat();
     this._authLastPong = Date.now();
@@ -892,7 +933,7 @@ class DerivBroker extends EventEmitter {
       return;
     }
     try {
-      const isImportant = payload.proposal || payload.buy || payload.sell || payload.portfolio || payload.authorize;
+      const isImportant = payload.proposal || payload.buy || payload.sell || payload.portfolio || payload.authorize || payload.balance;
       if (isImportant) {
         logger.info(`[Out Auth] ${payload.req_id || 'no-req-id'} →`, JSON.stringify(redactSensitive(payload), null, 2));
       } else {
@@ -998,6 +1039,12 @@ class DerivBroker extends EventEmitter {
           this.metrics.requestsSent++;
           pending.resolve(msg);
         }
+        handled = true;
+      }
+
+      if (msg.balance) {
+        logger.debug('[In Auth] Balance response received.');
+        // We handle balance in _refreshAccount, not here
         handled = true;
       }
 
@@ -1138,15 +1185,20 @@ class DerivBroker extends EventEmitter {
     return count;
   }
 
-  // ---------- SUBSCRIBE DEFAULT SYMBOLS (only watchlist) ----------
+  // ---------- SUBSCRIBE DEFAULT SYMBOLS (watchlist) ----------
   async _subscribeDefaultSymbols() {
-    // Build a set of valid symbols from the symbolMap (or fallback)
+    // Use the watchlist from the top of the file
+    const WATCHLIST = [
+      'frxEURUSD',
+      'frxGBPUSD',
+      'frxUSDJPY',
+      'frxAUDUSD'
+    ];
     const validSymbols = new Set(Object.values(this.symbolMap));
     const toSubscribe = WATCHLIST.filter(sym => validSymbols.has(sym));
 
     if (toSubscribe.length === 0) {
       logger.warn('[DerivBroker] None of the watchlist symbols are in the symbol map. Subscribing to fallback symbols...');
-      // As a fallback, subscribe to the first 4 fallback symbols
       const fallbackSymbols = Object.values(FALLBACK_SYMBOLS).slice(0, 4);
       for (const sym of fallbackSymbols) {
         try {
@@ -1271,32 +1323,24 @@ class DerivBroker extends EventEmitter {
 
   // ---------- PUBLIC API ----------
 
-  // ---- Get Account ----
+  // ---- Get Account (enhanced) ----
   async getAccount() {
     await this._ensureAuthReady();
-    if (!this._account) {
-      return this._getDefaultAccount();
-    }
-    const acc = this._account;
+    const base = this._account || {};
+    const details = this._accountDetails || {};
     return {
-      id: acc.loginid || 'N/A',
-      balance: acc.balance || '0',
-      currency: acc.currency || 'USD',
-      equity: acc.balance || '0',
-      marginUsed: '0',
-      marginAvailable: acc.balance || '0',
-      createdTime: new Date().toISOString(),
-    };
-  }
-
-  _getDefaultAccount() {
-    return {
-      id: 'DEMO_ACCOUNT',
-      balance: '0',
-      currency: 'USD',
-      equity: '0',
-      marginUsed: '0',
-      marginAvailable: '0',
+      id: base.loginid || details.loginid || 'N/A',
+      login: base.loginid || details.loginid || 'N/A',
+      balance: details.balance || base.balance || '0',
+      currency: details.currency || base.currency || 'USD',
+      equity: details.equity || base.balance || '0',
+      marginUsed: details.margin_used || '0',
+      marginAvailable: details.margin_available || '0',
+      marginLevel: details.margin_level || '0',
+      leverage: details.leverage || base.leverage || '100',
+      server: details.server || base.landing_company_name || '',
+      accountName: details.account_name || base.account_name || '',
+      tradeMode: details.trade_mode !== undefined ? details.trade_mode : (base.is_virtual ? 1 : 0),
       createdTime: new Date().toISOString(),
     };
   }
