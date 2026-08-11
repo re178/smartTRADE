@@ -200,7 +200,7 @@ app.get('/health', (req, res) => {
 // ---------- SPA Fallback (inject API key) ----------
 app.get('*', (req, res) => {
   if (!req.path.startsWith('/api')) {
-    // Inject API key into page
+    // Inject API key into page (optional, not used for WebSocket anymore)
     const apiKey = process.env.MT5_API_KEY || 'change-me-in-production';
     const html = `<!DOCTYPE html>
 <html lang="en">
@@ -243,25 +243,10 @@ const WS_PING_INTERVAL = 30000;
 let wsPingTimer = null;
 
 wss.on('connection', (ws, req) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const type = url.searchParams.get('type') || 'dashboard';
-  const apiKey = url.searchParams.get('apiKey') || '';
-
-  const validApiKey = process.env.MT5_API_KEY || 'change-me-in-production';
-  if (apiKey !== validApiKey) {
-    ws.close(1008, 'Invalid API key');
-    console.log('[WebSocket] Authentication failed.');
-    return;
-  }
-
-  if (type === 'ea') {
-    ws.close(1008, 'EA connections are no longer supported.');
-    console.log('[WebSocket] EA connection rejected.');
-    return;
-  }
-
-  dashboardClients.add(ws);
+  // No authentication – allow all connections
   console.log('[WebSocket] Dashboard client connected.');
+
+  // Send initial state
   sendDashboardInitialState(ws);
 
   ws.on('close', () => {
