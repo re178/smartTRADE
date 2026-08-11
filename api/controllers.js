@@ -1,5 +1,6 @@
 // api/controllers.js – Complete Request Handlers (with Trade History, P&L, and Report Fixes)
 // Updated to broadcast positions and account after trade close, and to handle real‑time updates.
+// Enhanced account with tradeMode and server from broker._account.
 
 const Trade = require('../models/Trade');
 const Order = require('../models/Order');
@@ -49,6 +50,22 @@ function getProduct(req) {
   return req.user?.tradingProduct || process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd';
 }
 
+// ---------- Helper: Enhance account with tradeMode and server ----------
+function enhanceAccount(accountData, broker) {
+  if (!accountData) return accountData;
+  let tradeMode = 0;
+  let server = 'Unknown';
+  if (broker && broker._account) {
+    tradeMode = broker._account.is_virtual !== undefined ? (broker._account.is_virtual ? 1 : 0) : 0;
+    server = broker._account.landing_company_name || 'Unknown';
+  }
+  return {
+    ...accountData,
+    tradeMode,
+    server,
+  };
+}
+
 // ---------- User Preferences ----------
 exports.getPreferences = async (req, res) => {
   try {
@@ -86,13 +103,26 @@ exports.updatePreferences = async (req, res) => {
   }
 };
 
-// ---------- Account ----------
+// ================================================================
+//  ACCOUNT – ENHANCED with tradeMode and server
+// ================================================================
 exports.getAccount = async (req, res) => {
   try {
     const product = getProduct(req);
     const account = await accountService.getAccount(product);
-    res.json(account);
+
+    // Enhance with tradeMode and server from broker's internal state
+    let enhanced = account;
+    try {
+      const broker = getBroker(product);
+      enhanced = enhanceAccount(account, broker);
+    } catch (err) {
+      logger.warn('[getAccount] Could not fetch broker internal state:', err.message);
+    }
+
+    res.json(enhanced);
   } catch (error) {
+    logger.error('[getAccount] Error:', error.message);
     res.status(500).json({ error: error.message });
   }
 };
@@ -170,7 +200,9 @@ exports.getCapabilities = async (req, res) => {
   }
 };
 
-// ---------- Positions & Trades ----------
+// ================================================================
+//  POSITIONS & TRADES – Normalised for frontend
+// ================================================================
 exports.getPositions = async (req, res) => {
   try {
     const product = getProduct(req);
@@ -186,14 +218,30 @@ exports.getTrades = async (req, res) => {
   try {
     const product = getProduct(req);
     const broker = getBroker(product);
-    const trades = await broker.getOpenTrades();
+    const rawTrades = await broker.getOpenTrades();
+    // Normalise to frontend format
+    const trades = rawTrades.map(t => ({
+      id: t.id,
+      instrument: t.instrument,
+      side: t.side,
+      price: t.price,
+      currentPrice: t.currentPrice,
+      units: t.units,
+      unrealizedPL: t.unrealizedPL,
+      stopLoss: t.stopLoss,
+      takeProfit: t.takeProfit,
+      openTime: t.openTime,
+    }));
     res.json(trades);
   } catch (error) {
+    logger.error('[getTrades] Error:', error.message);
     res.status(500).json({ error: error.message });
   }
 };
 
-// ---- FIXED: Trade History with proper field mapping ----
+// ================================================================
+//  TRADE HISTORY – Fixed field mapping
+// ================================================================
 exports.getTradeHistory = async (req, res) => {
   try {
     const trades = await Trade.find({ status: 'CLOSED' }).sort({ closeTime: -1 }).lean();
@@ -210,6 +258,30 @@ exports.getTradeHistory = async (req, res) => {
     res.json(mapped);
   } catch (error) {
     logger.error('[getTradeHistory] Error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+// ================================================================
+//  PENDING ORDERS – Normalised for frontend
+// ================================================================
+exports.getPendingOrders = async (req, res) => {
+  try {
+    const pending = await Order.find({
+      status: { $in: ['PENDING', 'ACCEPTED', 'EXECUTING'] }
+    }).sort({ createdAt: -1 }).lean();
+    const mapped = pending.map(o => ({
+      contractId: o.contractId || o.clientOrderId,
+      instrument: o.instrument,
+      side: o.side,
+      entryPrice: o.entryPrice || o.placedPrice,
+      units: o.units || o.lotSize,
+      status: o.status,
+      clientOrderId: o.clientOrderId,
+    }));
+    res.json(mapped);
+  } catch (error) {
+    logger.error('[getPendingOrders] Error:', error.message);
     res.status(500).json({ error: error.message });
   }
 };
@@ -290,7 +362,10 @@ exports.closeTrade = async (req, res) => {
       const openTrades = await orderService.getOpenTrades(product);
       broadcastToDashboards('positions', openTrades);
       const account = await accountService.getAccount(product);
-      broadcastToDashboards('account', account);
+      // Enhance account before broadcasting
+      const broker = getBroker(product);
+      const enhanced = enhanceAccount(account, broker);
+      broadcastToDashboards('account', enhanced);
     } catch (broadcastErr) {
       logger.warn('[controllers] Failed to broadcast after close:', broadcastErr.message);
     }
@@ -311,6 +386,29 @@ exports.closeTrade = async (req, res) => {
     res.json({ success: true, result });
   } catch (error) {
     logger.error('[closeTrade] Error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+// ---------- Cancel Order ----------
+exports.cancelOrder = async (req, res) => {
+  const { orderId } = req.params;
+  if (!orderId) return res.status(400).json({ error: 'orderId required' });
+  try {
+    const product = getProduct(req);
+    const result = await orderService.cancelOrder(orderId, product);
+    res.json({ success: true, result });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+// ---------- Delete History ----------
+exports.deleteHistory = async (req, res) => {
+  try {
+    const count = await orderService.deleteClosedTrades();
+    res.json({ success: true, deletedCount: count });
+  } catch (error) {
     res.status(500).json({ error: error.message });
   }
 };
@@ -446,48 +544,8 @@ exports.executeSignal = async (req, res) => {
   }
 };
 
-// ---------- Pending Orders ----------
-exports.getPendingOrders = async (req, res) => {
-  try {
-    const pending = await Order.find({
-      status: { $in: ['PENDING', 'ACCEPTED', 'EXECUTING'] }
-    }).sort({ createdAt: -1 });
-    res.json(pending);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-};
-
-exports.cancelOrder = async (req, res) => {
-  const { orderId } = req.params;
-  if (!orderId) return res.status(400).json({ error: 'orderId required' });
-  try {
-    const product = getProduct(req);
-    const result = await orderService.cancelOrder(orderId, product);
-    res.json({ success: true, result });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-};
-
-// ---------- Delete History ----------
-exports.deleteHistory = async (req, res) => {
-  try {
-    const count = await orderService.deleteClosedTrades();
-    res.json({ success: true, deletedCount: count });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-};
-
 // ============================================================
-// RESEARCH CONTROLLERS (unchanged - keep your existing ones)
-// ============================================================
-
-// ... (your existing getDecisionContext, getSimilaritySearch, etc.)
-
-// ============================================================
-// REPORT GENERATION – Fully Implemented with Proper Trade Mapping
+//  REPORT GENERATION – Fully Implemented
 // ============================================================
 
 exports.generateReport = async (req, res) => {
