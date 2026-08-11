@@ -13,11 +13,10 @@ const http = require('http');
 
 const connectDB = require('./config/db');
 const apiRoutes = require('./api/routes');
-// MT5 routes are no longer imported
 const researchRoutes = require('./api/routes/research');
 const User = require('./models/User');
 
-// ---------- NEW MODELS ----------
+// ---------- MODELS ----------
 const Price = require('./models/Price');
 const Account = require('./models/Account');
 
@@ -70,7 +69,7 @@ async function ensureAdmin() {
   }
 }
 
-// ---------- JSON Repair Helper (fallback) ----------
+// ---------- JSON Repair Helper ----------
 function repairJson(raw) {
   let repaired = raw.trim();
   if (repaired.endsWith(',')) {
@@ -96,7 +95,7 @@ function repairJson(raw) {
 // ---------- Middleware ----------
 app.use(cors());
 
-// ---------- Custom body parser: sanitize null bytes & BOM ----------
+// ---------- Custom body parser ----------
 app.use((req, res, next) => {
   let rawBody = '';
   req.on('data', chunk => {
@@ -185,7 +184,6 @@ app.use(async (req, res, next) => {
 
 // ---------- API Routes ----------
 app.use('/api', apiRoutes);
-// MT5 routes are no longer mounted
 app.use('/api/research', researchRoutes);
 
 // ---------- Health Check ----------
@@ -205,23 +203,20 @@ app.get('*', (req, res) => {
 // ---------- Create HTTP server ----------
 const server = http.createServer(app);
 
-// ---------- WebSocket Server (dashboard only – no EA) ----------
+// ---------- WebSocket Server ----------
 const wss = new WebSocket.Server({ server });
 
 // Only dashboard clients
 const dashboardClients = new Set();
 
-// WebSocket ping interval (keep‑alive)
-const WS_PING_INTERVAL = 30000; // 30 seconds
+const WS_PING_INTERVAL = 30000;
 let wsPingTimer = null;
 
 wss.on('connection', (ws, req) => {
-  // Parse URL for client type and API key
   const url = new URL(req.url, `http://${req.headers.host}`);
   const type = url.searchParams.get('type') || 'dashboard';
   const apiKey = url.searchParams.get('apiKey') || '';
 
-  // Authentication
   const validApiKey = process.env.MT5_API_KEY || 'change-me-in-production';
   if (apiKey !== validApiKey) {
     ws.close(1008, 'Invalid API key');
@@ -230,17 +225,13 @@ wss.on('connection', (ws, req) => {
   }
 
   if (type === 'ea') {
-    // No longer accept EA connections – close with a message
-    ws.close(1008, 'EA connections are no longer supported. Use Deriv broker directly.');
+    ws.close(1008, 'EA connections are no longer supported.');
     console.log('[WebSocket] EA connection rejected.');
     return;
   }
 
-  // Dashboard client
   dashboardClients.add(ws);
   console.log('[WebSocket] Dashboard client connected.');
-
-  // Send initial state immediately
   sendDashboardInitialState(ws);
 
   ws.on('close', () => {
@@ -249,8 +240,6 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('error', (err) => console.error('[WebSocket] Error:', err.message));
-
-  // Respond to ping messages from client (keep-alive)
   ws.on('pong', () => {});
 });
 
@@ -266,6 +255,22 @@ function startWSPing() {
   }, WS_PING_INTERVAL);
 }
 
+// ---------- Helper: Enhance account with tradeMode and server ----------
+function enhanceAccount(accountData, broker) {
+  if (!accountData) return accountData;
+  let tradeMode = 0;
+  let server = 'Unknown';
+  if (broker && broker._account) {
+    tradeMode = broker._account.is_virtual !== undefined ? (broker._account.is_virtual ? 1 : 0) : 0;
+    server = broker._account.landing_company_name || 'Unknown';
+  }
+  return {
+    ...accountData,
+    tradeMode,
+    server,
+  };
+}
+
 // ---------- Send initial state to a new dashboard client ----------
 async function sendDashboardInitialState(ws) {
   try {
@@ -275,18 +280,27 @@ async function sendDashboardInitialState(ws) {
 
     const [trades, account, positions] = await Promise.all([
       Trade.find({ status: 'OPEN' }).lean(),
-      accountService.getAccount('deriv_cfd'), // now uses Deriv
+      accountService.getAccount('deriv_cfd'),
       orderService.getOpenTrades('deriv_cfd')
     ]);
 
-    ws.send(JSON.stringify({ type: 'init', data: { trades, account, positions } }));
+    // Enhance account with tradeMode and server
+    let broker;
+    try {
+      broker = getBroker('deriv_cfd');
+    } catch (e) {
+      // ignore
+    }
+    const enhancedAccount = enhanceAccount(account, broker);
+
+    ws.send(JSON.stringify({ type: 'init', data: { trades, account: enhancedAccount, positions } }));
     console.log('[WebSocket] Initial state sent to new dashboard client.');
   } catch (err) {
     console.error('[WebSocket] Failed to send initial state:', err.message);
   }
 }
 
-// ---- Function to broadcast to all dashboard clients ----
+// ---- Broadcast to all dashboard clients ----
 function broadcastToDashboards(type, data) {
   if (dashboardClients.size === 0) return;
   const message = JSON.stringify({ type, data });
@@ -297,7 +311,6 @@ function broadcastToDashboards(type, data) {
   });
 }
 
-// ---- Legacy broadcast function for backward compatibility ----
 function broadcast(type, data) {
   broadcastToDashboards(type, data);
 }
@@ -315,7 +328,7 @@ eventBus.on('position.updated', (data) => broadcast('positionUpdated', data));
 otie.on('otieV5State', (state) => broadcast('otieV5State', state));
 otie.on('otieV5Action', (action) => broadcast('otieV5Action', action));
 
-// ---------- Performance Monitor Integration ----------
+// ---------- Performance Monitor ----------
 eventBus.on('trade.closed', async (data) => {
   try {
     const Trade = require('./models/Trade');
@@ -381,14 +394,15 @@ async function startDerivBroker() {
     await broker.connect();
     console.log('[Deriv] Broker connected.');
 
-    // ---- Listen to broker events and broadcast to dashboards ----
+    // ---- Listen to broker events and broadcast ----
     broker.on('tick', (data) => {
       broadcastToDashboards('price', data);
     });
 
     broker.on('account', async (accountData) => {
-      broadcastToDashboards('account', accountData);
-      // Also store in Account model (already done inside broker, but just in case)
+      // Enhance account with tradeMode and server before broadcasting
+      const enhanced = enhanceAccount(accountData, broker);
+      broadcastToDashboards('account', enhanced);
     });
 
     broker.on('positions', (positions) => {
@@ -399,13 +413,14 @@ async function startDerivBroker() {
       broadcastToDashboards('orderUpdate', data);
     });
 
-    // Also periodically emit account/positions if not triggered by events
-    // We can rely on the internal events from broker.
+    // Also broadcast after any position change from the broker
+    broker.on('_portfolioUpdated', (positions) => {
+      broadcastToDashboards('positions', positions);
+    });
 
     console.log('[Deriv] Broker event listeners attached.');
   } catch (err) {
     console.error('[Deriv] Failed to start Deriv broker:', err.message);
-    // Keep running but with limited functionality; maybe retry later.
   }
 }
 
