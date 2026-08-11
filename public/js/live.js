@@ -1,7 +1,5 @@
-// public/js/live.js – Updated for CTOS Real-time Events with Sound Alerts and Fusion
-// Added OTIE V5 state and action display
-// Added position, account, and init event handlers for real‑time dashboard updates
-// Now updates the central state store (window.updateDashboardState) and removes HTTP polling.
+// public/js/live.js – WebSocket client with API key injection
+// Real‑time events: marketAwareness, regime, decision, fusion, otieV5State, otieV5Action, init, account, positions, price, etc.
 
 (function() {
   'use strict';
@@ -27,7 +25,7 @@
     if (window.SoundManager && typeof window.SoundManager[type] === 'function') {
       window.SoundManager[type]();
     } else {
-      // Fallback: play simple beep
+      // Fallback: simple beep
       try {
         const ctx = new (window.AudioContext || window.webkitAudioContext)();
         const osc = ctx.createOscillator();
@@ -64,7 +62,11 @@
 
   function connectWebSocket() {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}`;
+    // Get API key from injected global
+    const apiKey = window.API_KEY || 'change-me-in-production';
+    const wsUrl = `${protocol}//${window.location.host}?apiKey=${encodeURIComponent(apiKey)}`;
+    console.log('[Live] Connecting to WebSocket with API key:', wsUrl);
+
     try {
       ws = new WebSocket(wsUrl);
     } catch (e) {
@@ -157,9 +159,8 @@
         break;
       case 'otieV5State':
         displayOTIEState(msg.data);
-        // Optionally add to state
         if (window.updateDashboardState) {
-          const currentOTIE = dashboardState?.otieDecisions || [];
+          const currentOTIE = (window.dashboardState?.otieDecisions) || [];
           currentOTIE.unshift(msg.data);
           if (currentOTIE.length > 20) currentOTIE.pop();
           window.updateDashboardState({ otieDecisions: currentOTIE });
@@ -168,29 +169,24 @@
       case 'otieV5Action':
         displayOTIEAction(msg.data);
         if (window.updateDashboardState) {
-          const currentActions = dashboardState?.otieActions || [];
+          const currentActions = (window.dashboardState?.otieActions) || [];
           currentActions.unshift(msg.data);
           if (currentActions.length > 20) currentActions.pop();
           window.updateDashboardState({ otieActions: currentActions });
         }
         break;
       case 'tradeClosed': {
-        // Update state: remove from positions, update history
         if (window.updateDashboardState) {
           const closedId = msg.data.contractId;
-          const currentPositions = dashboardState?.positions || [];
+          const currentPositions = (window.dashboardState?.positions) || [];
           const updatedPositions = currentPositions.filter(p => p.id !== closedId);
           window.updateDashboardState({ positions: updatedPositions });
-          // Also add to history – we can push if we have data, or we can fetch.
-          // For simplicity we'll just let the state store handle it, but we can push manually.
         }
-        // Keep existing sound and notification
         if (typeof addNotification === 'function') addNotification('Trade closed', 'info');
         playSound('tradeClose');
         break;
       }
       case 'trade.placed': {
-        // New trade – positions will update via WebSocket
         playSound('tradeOpen');
         if (typeof addNotification === 'function') addNotification('Trade opened', 'success');
         break;
@@ -204,7 +200,6 @@
       //  REAL‑TIME EVENTS – UPDATE STATE STORE
       // ============================================================
       case 'init': {
-        // Initial state – populates everything at once
         if (window.updateDashboardState) {
           window.updateDashboardState({
             account: msg.data.account,
@@ -212,14 +207,12 @@
             history: msg.data.trades || [],
           });
         }
-        // Also call existing handlers for compatibility
         if (msg.data.account) updateAccount(msg.data.account);
         if (msg.data.positions) updatePositions(msg.data.positions);
         if (msg.data.trades && typeof loadTradeHistory === 'function') loadTradeHistory();
         break;
       }
       case 'positions': {
-        // Update open trades panel and state
         updatePositions(msg.data);
         if (window.updateDashboardState) {
           window.updateDashboardState({ positions: msg.data });
@@ -227,7 +220,6 @@
         break;
       }
       case 'account': {
-        // Update account stats, badge, and state
         updateAccount(msg.data);
         if (window.updateDashboardState) {
           window.updateDashboardState({ account: msg.data });
@@ -235,22 +227,16 @@
         break;
       }
       case 'price': {
-        // Update price panel and state
-        updatePrice(msg.data);
         if (window.updateDashboardState) {
           const symbol = msg.data.symbol;
-          const currentPrices = dashboardState?.prices || {};
+          const currentPrices = (window.dashboardState?.prices) || {};
           currentPrices[symbol] = msg.data;
           window.updateDashboardState({ prices: currentPrices });
         }
         break;
       }
       case 'positionUpdated':
-        // Handle individual position update if needed
-        if (window.updateDashboardState) {
-          // Could merge with existing positions
-          // For simplicity, we'll let the full positions sync handle it
-        }
+        // individual position update; we rely on full positions sync
         break;
 
       default:
@@ -259,7 +245,7 @@
   }
 
   // ============================================================
-  //  DISPLAY FUNCTIONS (unchanged, with minor additions)
+  //  DISPLAY FUNCTIONS
   // ============================================================
 
   function displayAwareness(data) {
@@ -402,7 +388,6 @@
       .then(data => {
         if (data.success) {
           console.log('[Live] Auto‑executed trade:', data);
-          // No need to call loadOpenTrades – WebSocket will update positions
           playSound('tradeOpen');
         } else {
           console.error('[Live] Auto‑execute failed:', data.error);
@@ -575,16 +560,12 @@
     return parseFloat(p).toFixed(5);
   }
 
-  // ---- Update functions for positions and account (also used by state) ----
+  // ---- Update functions for positions and account ----
   function updatePositions(positions) {
-    // positions is an array of open trades from the broker
     console.log('[Live] Positions update:', positions);
-
-    // Update the open trades count badge
     const badge = document.getElementById('positionCount');
     if (badge) badge.textContent = positions ? positions.length : 0;
 
-    // Update the open trades table (if it exists)
     const container = document.getElementById('openTradesContainer');
     if (container) {
       if (!positions || positions.length === 0) {
@@ -646,42 +627,11 @@
       if (typeEl) {
         let type = 'demo';
         const server = account.server || '';
-        if (server.toLowerCase().includes('demo')) {
-          type = 'demo';
-        } else {
-          type = 'real';
-        }
+        type = server.toLowerCase().includes('demo') ? 'demo' : 'real';
         typeEl.textContent = type.toUpperCase();
         typeEl.className = 'account-type ' + type;
       }
     }
-
-    const accountInfo = document.getElementById('accountInfo');
-    if (accountInfo) {
-      accountInfo.innerHTML = `
-        <p><strong>ID:</strong> ${account.id || 'N/A'}</p>
-        <p><strong>Currency:</strong> ${account.currency || 'USD'}</p>
-        <p><strong>Created:</strong> ${account.createdTime ? new Date(account.createdTime).toLocaleDateString() : 'N/A'}</p>
-      `;
-    }
-    const balanceInfo = document.getElementById('balanceInfo');
-    if (balanceInfo) {
-      balanceInfo.innerHTML = `
-        <p><strong>Balance:</strong> ${balance} ${currency}</p>
-        <p><strong>Equity:</strong> ${equity} ${currency}</p>
-        <p><strong>Margin Used:</strong> ${account.marginUsed || 0} ${currency}</p>
-        <p><strong>Margin Available:</strong> ${account.marginAvailable || 0} ${currency}</p>
-      `;
-    }
-  }
-
-  function updatePrice(priceData) {
-    console.log('[Live] Price update:', priceData);
-    // Update price display if needed
-    const priceInfo = document.getElementById('priceInfo');
-    if (!priceInfo) return;
-    // We can update individual symbol if we want, but for simplicity we'll rebuild
-    // (the state store will trigger a full render via app.js)
   }
 
   // ---- Execute signal from card ----
