@@ -923,80 +923,79 @@ class DerivBroker extends EventEmitter {
   }
 
   // ============================================================
-  // FIXED: added product_type: "basic" to active_symbols requests
+  // FIXED: Removed product_type, updated field parsing
   // ============================================================
   async _loadSymbolsInternal() {
     logger.info('[DerivBroker] Fetching active symbols...');
     let symbols = null;
     let rawResponse = null;
 
-    // ---- Attempt 1: 'brief' with product_type: "basic" ----
+    // ---- Attempt 1: 'brief' (no product_type) ----
     try {
-      const response = await this._sendRawRequest({ 
-        active_symbols: 'brief',
-        product_type: 'basic'
-      }, 10000);
+      const response = await this._sendRawRequest({ active_symbols: 'brief' }, 10000);
       rawResponse = response;
       // Log structure of the raw response (redact sensitive fields)
       logger.info('[DerivBroker] active_symbols (brief) response keys:', Object.keys(response));
+      
+      const isArray = Array.isArray(response.active_symbols);
       logger.info(
         '[DerivBroker] active_symbols (brief) payload summary:',
         JSON.stringify({
           msg_type: response.msg_type,
           req_id: response.req_id,
-          echo_req: response.echo_req ? { active_symbols: response.echo_req.active_symbols, product_type: response.echo_req.product_type } : undefined,
-          active_symbols_count: Array.isArray(response.active_symbols)
-            ? response.active_symbols.length
-            : typeof response.active_symbols,
-          active_symbols_type: typeof response.active_symbols,
-          first_keys: response.active_symbols?.[0]
+          echo_req: response.echo_req ? { active_symbols: response.echo_req.active_symbols } : undefined,
+          active_symbols_count: isArray ? response.active_symbols.length : 'not an array',
+          first_keys: isArray && response.active_symbols.length > 0
             ? Object.keys(response.active_symbols[0])
             : []
         })
       );
 
       const result = response.active_symbols || [];
-      if (result.length > 0) {
+      if (isArray && result.length > 0) {
         symbols = result;
         logger.info(`[Symbols] Loaded ${symbols.length} symbols (brief).`);
+        // Log the first symbol to see its structure
+        if (symbols[0]) {
+          logger.info('[DerivBroker] First symbol (brief):', JSON.stringify(symbols[0], null, 2));
+        }
       } else {
-        logger.warn('[DerivBroker] Brief symbols returned empty array or not an array.');
+        logger.warn('[DerivBroker] Brief symbols returned empty or not an array.');
       }
     } catch (err) {
       logger.warn('[DerivBroker] Brief symbol request failed:', err.message);
     }
 
-    // ---- Attempt 2: 'full' with product_type: "basic" ----
+    // ---- Attempt 2: 'full' (no product_type) ----
     if (!symbols) {
       try {
-        const response = await this._sendRawRequest({ 
-          active_symbols: 'full',
-          product_type: 'basic'
-        }, 10000);
+        const response = await this._sendRawRequest({ active_symbols: 'full' }, 10000);
         rawResponse = response;
         logger.info('[DerivBroker] active_symbols (full) response keys:', Object.keys(response));
+        
+        const isArray = Array.isArray(response.active_symbols);
         logger.info(
           '[DerivBroker] active_symbols (full) payload summary:',
           JSON.stringify({
             msg_type: response.msg_type,
             req_id: response.req_id,
-            echo_req: response.echo_req ? { active_symbols: response.echo_req.active_symbols, product_type: response.echo_req.product_type } : undefined,
-            active_symbols_count: Array.isArray(response.active_symbols)
-              ? response.active_symbols.length
-              : typeof response.active_symbols,
-            active_symbols_type: typeof response.active_symbols,
-            first_keys: response.active_symbols?.[0]
+            echo_req: response.echo_req ? { active_symbols: response.echo_req.active_symbols } : undefined,
+            active_symbols_count: isArray ? response.active_symbols.length : 'not an array',
+            first_keys: isArray && response.active_symbols.length > 0
               ? Object.keys(response.active_symbols[0])
               : []
           })
         );
 
         const result = response.active_symbols || [];
-        if (result.length > 0) {
+        if (isArray && result.length > 0) {
           symbols = result;
           logger.info(`[Symbols] Loaded ${symbols.length} symbols (full).`);
+          if (symbols[0]) {
+            logger.info('[DerivBroker] First symbol (full):', JSON.stringify(symbols[0], null, 2));
+          }
         } else {
-          logger.warn('[DerivBroker] Full symbols returned empty array or not an array.');
+          logger.warn('[DerivBroker] Full symbols returned empty or not an array.');
         }
       } catch (err) {
         logger.warn('[DerivBroker] Full symbol request failed:', err.message);
@@ -1025,7 +1024,7 @@ class DerivBroker extends EventEmitter {
     logger.info(`[Symbols] Sample mappings: ${sample.map(k => `${k} → ${this.symbolMap[k]}`).join(', ')}`);
   }
 
-  // ---- Build maps using current Deriv fields ----
+  // ---- Build maps using current Deriv fields (with legacy fallbacks) ----
   _buildSymbolMaps(symbols) {
     let count = 0;
     // Clear existing maps (we'll replace fallback with discovered ones)
@@ -1034,10 +1033,10 @@ class DerivBroker extends EventEmitter {
     this.spreadMap = {};
 
     for (const sym of symbols) {
-      // Use current field names
-      const derivSymbol = sym.underlying_symbol || sym.symbol;
-      const display = sym.underlying_symbol_name || sym.display_name || '';
-      const pip = Number(sym.pip_size || sym.pip || 0.0001);
+      // Use current field names with legacy fallbacks
+      const derivSymbol = sym.underlying_symbol ?? sym.symbol;
+      const display = sym.underlying_symbol_name ?? sym.display_name ?? '';
+      const pip = Number(sym.pip_size ?? sym.pip ?? 0.0001);
 
       if (!derivSymbol) continue;
 
