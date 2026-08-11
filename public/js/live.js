@@ -1,4 +1,4 @@
-// public/js/live.js – WebSocket client with API key injection
+// public/js/live.js – WebSocket client with stable connection and heartbeat
 // Real‑time events: marketAwareness, regime, decision, fusion, otieV5State, otieV5Action, init, account, positions, price, etc.
 
 (function() {
@@ -6,8 +6,12 @@
 
   const WS_RECONNECT_DELAY = 2000;
   const WS_MAX_RECONNECT_DELAY = 30000;
+  const HEARTBEAT_INTERVAL = 25000; // send ping every 25s
+
   let reconnectAttempts = 0;
   let ws = null;
+  let reconnectTimer = null;
+  let heartbeatTimer = null;
 
   // DOM elements
   const awarenessPanel = document.getElementById('awarenessPanel');
@@ -25,7 +29,6 @@
     if (window.SoundManager && typeof window.SoundManager[type] === 'function') {
       window.SoundManager[type]();
     } else {
-      // Fallback: simple beep
       try {
         const ctx = new (window.AudioContext || window.webkitAudioContext)();
         const osc = ctx.createOscillator();
@@ -61,11 +64,15 @@
   }
 
   function connectWebSocket() {
+    // If there's an existing connection, close it first
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      return;
+    }
+
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    // Get API key from injected global
     const apiKey = window.API_KEY || 'change-me-in-production';
     const wsUrl = `${protocol}//${window.location.host}?apiKey=${encodeURIComponent(apiKey)}`;
-    console.log('[Live] Connecting to WebSocket with API key:', wsUrl);
+    console.log('[Live] Connecting to WebSocket:', wsUrl);
 
     try {
       ws = new WebSocket(wsUrl);
@@ -79,34 +86,63 @@
       console.log('[Live] WebSocket connected.');
       reconnectAttempts = 0;
       updateWsStatus(true);
+      // Start heartbeat
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_INTERVAL);
     };
 
     ws.onmessage = function(event) {
       try {
         const msg = JSON.parse(event.data);
+        // Respond to server ping with pong (if needed)
+        if (msg.type === 'ping') {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'pong' }));
+          }
+          return;
+        }
         handleMessage(msg);
       } catch (e) {
         console.error('[Live] Message parse error:', e);
       }
     };
 
-    ws.onclose = function() {
-      console.warn('[Live] WebSocket closed.');
+    ws.onclose = function(event) {
+      console.warn('[Live] WebSocket closed.', event.code, event.reason);
       updateWsStatus(false);
-      scheduleReconnect();
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+      // Only reconnect if the close was not intentional (no reconnect if code 1000)
+      if (event.code !== 1000) {
+        scheduleReconnect();
+      }
     };
 
     ws.onerror = function(err) {
       console.error('[Live] WebSocket error:', err);
+      // ws will close after error, so onclose will handle reconnect
     };
   }
 
+  function sendHeartbeat() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'ping' }));
+    }
+  }
+
   function scheduleReconnect() {
-    if (ws && ws.readyState === WebSocket.OPEN) return;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
     const delay = Math.min(WS_RECONNECT_DELAY * Math.pow(1.5, reconnectAttempts), WS_MAX_RECONNECT_DELAY);
     reconnectAttempts++;
     console.log(`[Live] Reconnecting in ${delay}ms (attempt ${reconnectAttempts})`);
-    setTimeout(connectWebSocket, delay);
+    reconnectTimer = setTimeout(function() {
+      connectWebSocket();
+    }, delay);
   }
 
   // ============================================================
@@ -114,7 +150,6 @@
   // ============================================================
   function handleMessage(msg) {
     switch (msg.type) {
-      // ---- Existing events ----
       case 'marketAwareness':
         displayAwareness(msg.data);
         if (window.updateDashboardState) {
@@ -196,9 +231,6 @@
         if (typeof addNotification === 'function') addNotification('Order rejected: ' + (msg.data.reason || ''), 'danger');
         break;
 
-      // ============================================================
-      //  REAL‑TIME EVENTS – UPDATE STATE STORE
-      // ============================================================
       case 'init': {
         if (window.updateDashboardState) {
           window.updateDashboardState({
@@ -236,7 +268,6 @@
         break;
       }
       case 'positionUpdated':
-        // individual position update; we rely on full positions sync
         break;
 
       default:
@@ -245,9 +276,8 @@
   }
 
   // ============================================================
-  //  DISPLAY FUNCTIONS
+  //  DISPLAY FUNCTIONS (unchanged)
   // ============================================================
-
   function displayAwareness(data) {
     if (!awarenessPanel) return;
     const { symbol, spread, velocity, acceleration, liquidity, unusualEvents, lastUpdated } = data;
@@ -670,6 +700,10 @@
   window.reconnectLive = function() {
     if (ws) ws.close();
     reconnectAttempts = 0;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
     connectWebSocket();
   };
 
