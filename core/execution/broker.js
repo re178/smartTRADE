@@ -1,10 +1,11 @@
 // core/execution/broker.js – Stable Dual‑WebSocket Deriv Broker
 // - Public WS: persistent, reconnects only on close/error
-// - Auth WS: v3 with `authorize` (legacy, but works; OTP migration planned)
+// - Auth WS: v3 with `authorize` (legacy, OTP migration planned)
 // - Correct contract types: MULTUP / MULTDOWN
 // - Account enhancement: tradeMode and server from `_account`
 // - Full integration with Account model and priceBuffer
-// - Symbol loading with timeout and graceful fallback
+// - Robust tick subscription with retry and detailed logging
+// - Watchlist: only 4 symbols
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -93,6 +94,14 @@ const FALLBACK_SYMBOLS = {
   'EUR_JPY': 'frxEURJPY',
   'GBP_JPY': 'frxGBPJPY',
 };
+
+// ─── WATCHLIST – only these symbols are subscribed for ticks ───
+const WATCHLIST = [
+  'frxEURUSD',
+  'frxGBPUSD',
+  'frxUSDJPY',
+  'frxAUDUSD'
+];
 
 function redactSensitive(obj) {
   if (!obj || typeof obj !== 'object') return obj;
@@ -300,7 +309,7 @@ class DerivBroker extends EventEmitter {
       riskValidator: config.riskValidator || null,
       fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || 3),
       readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 30000),
-      symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 10000), // reduced to 10s
+      symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 10000),
       heartbeatTimeout: parseInt(config.heartbeatTimeout || process.env.DERIV_HEARTBEAT_TIMEOUT || 60000),
     };
 
@@ -375,8 +384,8 @@ class DerivBroker extends EventEmitter {
 
     this.capabilities = { ...BROKER_CAPABILITIES };
     this._authFailCount = 0;
-    this._account = null;      // raw authorize response
-    this._accountDetails = null; // balance/margin details
+    this._account = null;
+    this._accountDetails = null;
     this._portfolioLogged = false;
     this._openPositions = [];
 
@@ -385,6 +394,7 @@ class DerivBroker extends EventEmitter {
     logger.info('[DerivBroker] Created with stable dual WebSocket architecture.');
     logger.info(`[DerivBroker] Public WS: ${this.config.publicWsUrl}`);
     logger.info(`[DerivBroker] Auth WS: ${this.config.authWsUrl}`);
+    logger.info(`[DerivBroker] Watchlist symbols: ${WATCHLIST.join(', ')}`);
   }
 
   validateConfig() {
@@ -420,9 +430,27 @@ class DerivBroker extends EventEmitter {
     this._ready = true;
     this.emit('ready');
     this.emit('connected');
-    await this._subscribeDefaultSymbols();
+    // Subscribe to watchlist symbols with retry
+    await this._subscribeWithRetry();
     await this._reconcilePositions();
     await this._loadPendingOrders();
+  }
+
+  // ---- Subscribe with retry ----
+  async _subscribeWithRetry(maxAttempts = 3, delay = 2000) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        await this._subscribeDefaultSymbols();
+        logger.info('[DerivBroker] Subscription successful.');
+        return;
+      } catch (err) {
+        logger.warn(`[DerivBroker] Subscription attempt ${attempt} failed: ${err.message}`);
+        if (attempt < maxAttempts) {
+          await sleep(delay * attempt);
+        }
+      }
+    }
+    logger.error('[DerivBroker] All subscription attempts failed. Ticks may not arrive.');
   }
 
   // ---- Public socket: persistent reconnect on close/error ----
@@ -479,6 +507,10 @@ class DerivBroker extends EventEmitter {
           this._startPublicHeartbeat();
           this._flushPublicQueue();
           this.emit('publicReady');
+          // If broker is already ready, resubscribe after reconnect
+          if (this._ready) {
+            this._subscribeWithRetry().catch(err => logger.warn('Resubscribe after reconnect failed:', err));
+          }
           resolve();
         });
 
@@ -665,12 +697,15 @@ class DerivBroker extends EventEmitter {
         handled = true;
       }
 
+      // ---- TICK HANDLER (data pipeline) ----
       if (msg.msg_type === 'tick' && msg.tick) {
         const tick = msg.tick;
         const symbol = tick.symbol;
         const bid = tick.bid ? parseFloat(tick.bid) : null;
         const ask = tick.ask ? parseFloat(tick.ask) : null;
         const time = tick.epoch ? tick.epoch * 1000 : Date.now();
+
+        logger.debug(`[DerivBroker] Tick received: ${symbol} bid=${bid} ask=${ask}`);
 
         if (bid !== null && ask !== null) {
           priceBuffer.update(symbol, bid, ask, time);
@@ -757,7 +792,6 @@ class DerivBroker extends EventEmitter {
                 this.accountCurrency = this._account.currency || 'USD';
                 logger.info('[DerivBroker] Account stored from authorize.');
 
-                // Initial account save (basic fields)
                 try {
                   await Account.upsertAccount({
                     accountId: 'default',
@@ -776,14 +810,12 @@ class DerivBroker extends EventEmitter {
                   logger.error('[DerivBroker] Failed to save account:', err.message);
                 }
 
-                // Fetch detailed account (margin, equity)
                 try {
                   await this._refreshAccount();
                 } catch (err) {
                   logger.warn('[DerivBroker] Failed to refresh account details:', err.message);
                 }
 
-                // Emit enhanced account
                 const fullAccount = await this.getAccount();
                 this.emit('account', fullAccount);
               }
@@ -857,7 +889,6 @@ class DerivBroker extends EventEmitter {
     });
   }
 
-  // ---- New: fetch detailed account (balance, margin) ----
   async _refreshAccount() {
     try {
       const response = await this._sendAuthRequest({ balance: 1 });
@@ -881,7 +912,6 @@ class DerivBroker extends EventEmitter {
           tradeMode: balance.trade_mode !== undefined ? balance.trade_mode : (this._account?.is_virtual ? 1 : 0),
         });
         logger.info('[DerivBroker] Detailed account saved to DB.');
-        // Emit updated account
         const fullAccount = await this.getAccount();
         this.emit('account', fullAccount);
       }
@@ -1137,7 +1167,7 @@ class DerivBroker extends EventEmitter {
       }
     } catch (err) {
       logger.warn('[DerivBroker] Symbol request failed:', err.message);
-      throw err; // rethrow to trigger timeout/fallback
+      throw err;
     }
 
     if (symbols && symbols.length > 0) {
@@ -1199,12 +1229,7 @@ class DerivBroker extends EventEmitter {
 
   // ---------- SUBSCRIBE DEFAULT SYMBOLS (watchlist) ----------
   async _subscribeDefaultSymbols() {
-    const WATCHLIST = [
-      'frxEURUSD',
-      'frxGBPUSD',
-      'frxUSDJPY',
-      'frxAUDUSD'
-    ];
+    // Check if symbolMap has the symbols
     const validSymbols = new Set(Object.values(this.symbolMap));
     const toSubscribe = WATCHLIST.filter(sym => validSymbols.has(sym));
 
@@ -1226,9 +1251,10 @@ class DerivBroker extends EventEmitter {
     for (const sym of toSubscribe) {
       try {
         await this.streaming.subscribe('ticks', sym, (tick) => {});
-        logger.debug(`[DerivBroker] Subscribed to ticks for ${sym}`);
+        logger.info(`[DerivBroker] Subscribed to ticks for ${sym}`);
       } catch (err) {
         logger.warn(`[DerivBroker] Could not subscribe to ${sym}:`, err.message);
+        // Continue with next symbol
       }
     }
   }
@@ -1695,7 +1721,7 @@ const brokerInstance = new DerivBroker({
   leverage: parseFloat(process.env.DERIV_LEVERAGE) || 100,
   fatalAfterAuthFailures: parseInt(process.env.DERIV_FATAL_AFTER_AUTH_FAILURES) || 3,
   readinessTimeout: parseInt(process.env.DERIV_READINESS_TIMEOUT) || 30000,
-  symbolTimeout: parseInt(process.env.DERIV_SYMBOL_TIMEOUT) || 10000, // 10s
+  symbolTimeout: parseInt(process.env.DERIV_SYMBOL_TIMEOUT) || 10000,
   heartbeatTimeout: parseInt(process.env.DERIV_HEARTBEAT_TIMEOUT) || 60000,
 });
 
