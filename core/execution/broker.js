@@ -1,11 +1,5 @@
 // core/execution/broker.js – Stable Dual‑WebSocket Deriv Broker
-// - Public WS: persistent, reconnects only on close/error
-// - Auth WS: v3 with `authorize` (legacy, OTP migration planned)
-// - Correct contract types: MULTUP / MULTDOWN
-// - Account enhancement: tradeMode and server from `_account`
-// - Full integration with Account model and priceBuffer
-// - Robust tick subscription with retry and detailed logging
-// - Watchlist: only 4 symbols
+// Watchlist: only subscribe to specified symbols.
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -18,6 +12,16 @@ const Price = require('../../models/Price');
 const Account = require('../../models/Account');
 
 EventEmitter.defaultMaxListeners = 20;
+
+// ============================================================
+// WATCHLIST – only these symbols will be subscribed for ticks
+// ============================================================
+const WATCHLIST = [
+  'frxEURUSD',
+  'frxGBPUSD',
+  'frxUSDJPY',
+  'frxAUDUSD'
+];
 
 // ============================================================
 // CONSTANTS
@@ -95,14 +99,6 @@ const FALLBACK_SYMBOLS = {
   'GBP_JPY': 'frxGBPJPY',
 };
 
-// ─── WATCHLIST – only these symbols are subscribed for ticks ───
-const WATCHLIST = [
-  'frxEURUSD',
-  'frxGBPUSD',
-  'frxUSDJPY',
-  'frxAUDUSD'
-];
-
 function redactSensitive(obj) {
   if (!obj || typeof obj !== 'object') return obj;
   const copy = JSON.parse(JSON.stringify(obj));
@@ -160,6 +156,7 @@ class StreamingManager {
       }
       return;
     }
+    // Wait for public connection to be ready
     await this.broker._ensurePublicReady();
     const response = await this.broker._sendPublicRequest({ [type]: symbol, subscribe: 1 });
     const subscriptionId = response.subscription?.id;
@@ -309,7 +306,7 @@ class DerivBroker extends EventEmitter {
       riskValidator: config.riskValidator || null,
       fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || 3),
       readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 30000),
-      symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 10000),
+      symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 30000),
       heartbeatTimeout: parseInt(config.heartbeatTimeout || process.env.DERIV_HEARTBEAT_TIMEOUT || 60000),
     };
 
@@ -385,7 +382,6 @@ class DerivBroker extends EventEmitter {
     this.capabilities = { ...BROKER_CAPABILITIES };
     this._authFailCount = 0;
     this._account = null;
-    this._accountDetails = null;
     this._portfolioLogged = false;
     this._openPositions = [];
 
@@ -394,7 +390,7 @@ class DerivBroker extends EventEmitter {
     logger.info('[DerivBroker] Created with stable dual WebSocket architecture.');
     logger.info(`[DerivBroker] Public WS: ${this.config.publicWsUrl}`);
     logger.info(`[DerivBroker] Auth WS: ${this.config.authWsUrl}`);
-    logger.info(`[DerivBroker] Watchlist symbols: ${WATCHLIST.join(', ')}`);
+    logger.info(`[DerivBroker] Watchlist: ${WATCHLIST.join(', ')}`);
   }
 
   validateConfig() {
@@ -417,40 +413,17 @@ class DerivBroker extends EventEmitter {
       this._connectPublic(),
       this._connectAuth()
     ]);
-    // Symbol loading with timeout and graceful fallback
-    try {
-      await this._loadSymbolsWithTimeout();
-    } catch (err) {
-      logger.warn('[DerivBroker] Symbol discovery failed:', err.message);
-    }
+    await this._loadSymbolsWithTimeout();
     if (!this._symbolsDiscovered) {
-      logger.warn('[DerivBroker] Using fallback symbols.');
+      logger.warn('[DerivBroker] Symbol discovery failed, using fallback symbols.');
       this._useFallbackSymbols();
     }
     this._ready = true;
     this.emit('ready');
     this.emit('connected');
-    // Subscribe to watchlist symbols with retry
-    await this._subscribeWithRetry();
+    await this._subscribeDefaultSymbols();
     await this._reconcilePositions();
     await this._loadPendingOrders();
-  }
-
-  // ---- Subscribe with retry ----
-  async _subscribeWithRetry(maxAttempts = 3, delay = 2000) {
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        await this._subscribeDefaultSymbols();
-        logger.info('[DerivBroker] Subscription successful.');
-        return;
-      } catch (err) {
-        logger.warn(`[DerivBroker] Subscription attempt ${attempt} failed: ${err.message}`);
-        if (attempt < maxAttempts) {
-          await sleep(delay * attempt);
-        }
-      }
-    }
-    logger.error('[DerivBroker] All subscription attempts failed. Ticks may not arrive.');
   }
 
   // ---- Public socket: persistent reconnect on close/error ----
@@ -507,10 +480,6 @@ class DerivBroker extends EventEmitter {
           this._startPublicHeartbeat();
           this._flushPublicQueue();
           this.emit('publicReady');
-          // If broker is already ready, resubscribe after reconnect
-          if (this._ready) {
-            this._subscribeWithRetry().catch(err => logger.warn('Resubscribe after reconnect failed:', err));
-          }
           resolve();
         });
 
@@ -697,15 +666,12 @@ class DerivBroker extends EventEmitter {
         handled = true;
       }
 
-      // ---- TICK HANDLER (data pipeline) ----
       if (msg.msg_type === 'tick' && msg.tick) {
         const tick = msg.tick;
         const symbol = tick.symbol;
         const bid = tick.bid ? parseFloat(tick.bid) : null;
         const ask = tick.ask ? parseFloat(tick.ask) : null;
         const time = tick.epoch ? tick.epoch * 1000 : Date.now();
-
-        logger.debug(`[DerivBroker] Tick received: ${symbol} bid=${bid} ask=${ask}`);
 
         if (bid !== null && ask !== null) {
           priceBuffer.update(symbol, bid, ask, time);
@@ -791,7 +757,6 @@ class DerivBroker extends EventEmitter {
                 this._account = authResponse.authorize;
                 this.accountCurrency = this._account.currency || 'USD';
                 logger.info('[DerivBroker] Account stored from authorize.');
-
                 try {
                   await Account.upsertAccount({
                     accountId: 'default',
@@ -801,23 +766,12 @@ class DerivBroker extends EventEmitter {
                     broker: 'deriv',
                     loginId: this._account.loginid || '',
                     leverage: parseFloat(this._account.leverage) || 100,
-                    server: this._account.landing_company_name || '',
-                    tradeMode: this._account.is_virtual ? 1 : 0,
                     status: 'online',
                   });
-                  logger.info('[DerivBroker] Initial account saved to DB.');
+                  this.emit('account', await Account.getLatest('default'));
                 } catch (err) {
                   logger.error('[DerivBroker] Failed to save account:', err.message);
                 }
-
-                try {
-                  await this._refreshAccount();
-                } catch (err) {
-                  logger.warn('[DerivBroker] Failed to refresh account details:', err.message);
-                }
-
-                const fullAccount = await this.getAccount();
-                this.emit('account', fullAccount);
               }
               logger.info('[DerivBroker] Auth authorized.');
               this._authState = STATE.READY;
@@ -889,37 +843,6 @@ class DerivBroker extends EventEmitter {
     });
   }
 
-  async _refreshAccount() {
-    try {
-      const response = await this._sendAuthRequest({ balance: 1 });
-      const balance = response.balance;
-      if (balance) {
-        this._accountDetails = balance;
-        await Account.upsertAccount({
-          accountId: 'default',
-          balance: parseFloat(balance.balance) || 0,
-          equity: parseFloat(balance.equity) || 0,
-          marginUsed: parseFloat(balance.margin_used) || 0,
-          marginAvailable: parseFloat(balance.margin_available) || 0,
-          marginLevel: parseFloat(balance.margin_level) || 0,
-          currency: balance.currency || 'USD',
-          broker: 'deriv',
-          loginId: balance.loginid || '',
-          leverage: parseFloat(balance.leverage) || 100,
-          server: balance.server || this._account?.landing_company_name || '',
-          accountName: balance.account_name || '',
-          status: 'online',
-          tradeMode: balance.trade_mode !== undefined ? balance.trade_mode : (this._account?.is_virtual ? 1 : 0),
-        });
-        logger.info('[DerivBroker] Detailed account saved to DB.');
-        const fullAccount = await this.getAccount();
-        this.emit('account', fullAccount);
-      }
-    } catch (err) {
-      logger.warn('[DerivBroker] Failed to refresh account details:', err.message);
-    }
-  }
-
   _startAuthHeartbeat() {
     this._stopAuthHeartbeat();
     this._authLastPong = Date.now();
@@ -969,7 +892,7 @@ class DerivBroker extends EventEmitter {
       return;
     }
     try {
-      const isImportant = payload.proposal || payload.buy || payload.sell || payload.portfolio || payload.authorize || payload.balance;
+      const isImportant = payload.proposal || payload.buy || payload.sell || payload.portfolio || payload.authorize;
       if (isImportant) {
         logger.info(`[Out Auth] ${payload.req_id || 'no-req-id'} →`, JSON.stringify(redactSensitive(payload), null, 2));
       } else {
@@ -1078,11 +1001,6 @@ class DerivBroker extends EventEmitter {
         handled = true;
       }
 
-      if (msg.balance) {
-        logger.debug('[In Auth] Balance response received.');
-        handled = true;
-      }
-
       if (msg.portfolio) {
         logger.debug('[In Auth] Portfolio response received.');
         const portfolio = msg.portfolio;
@@ -1139,11 +1057,8 @@ class DerivBroker extends EventEmitter {
     let symbols = null;
 
     try {
-      logger.info('[DerivBroker] Sending active_symbols: brief...');
       const response = await this._sendPublicRequest({ active_symbols: 'brief' }, 10000);
-      logger.info('[DerivBroker] Received active_symbols: brief response.');
       const isArray = Array.isArray(response.active_symbols);
-      logger.info(`[DerivBroker] active_symbols isArray: ${isArray}, length: ${isArray ? response.active_symbols.length : 'N/A'}`);
       if (isArray && response.active_symbols.length > 0) {
         symbols = response.active_symbols;
         logger.info(`[Symbols] Loaded ${symbols.length} symbols (brief).`);
@@ -1152,11 +1067,8 @@ class DerivBroker extends EventEmitter {
         }
       } else {
         logger.warn('[DerivBroker] Brief symbols empty, trying full...');
-        logger.info('[DerivBroker] Sending active_symbols: full...');
         const response2 = await this._sendPublicRequest({ active_symbols: 'full' }, 10000);
-        logger.info('[DerivBroker] Received active_symbols: full response.');
         const isArray2 = Array.isArray(response2.active_symbols);
-        logger.info(`[DerivBroker] active_symbols (full) isArray: ${isArray2}, length: ${isArray2 ? response2.active_symbols.length : 'N/A'}`);
         if (isArray2 && response2.active_symbols.length > 0) {
           symbols = response2.active_symbols;
           logger.info(`[Symbols] Loaded ${symbols.length} symbols (full).`);
@@ -1167,7 +1079,6 @@ class DerivBroker extends EventEmitter {
       }
     } catch (err) {
       logger.warn('[DerivBroker] Symbol request failed:', err.message);
-      throw err;
     }
 
     if (symbols && symbols.length > 0) {
@@ -1227,14 +1138,15 @@ class DerivBroker extends EventEmitter {
     return count;
   }
 
-  // ---------- SUBSCRIBE DEFAULT SYMBOLS (watchlist) ----------
+  // ---------- SUBSCRIBE DEFAULT SYMBOLS (only watchlist) ----------
   async _subscribeDefaultSymbols() {
-    // Check if symbolMap has the symbols
+    // Build a set of valid symbols from the symbolMap (or fallback)
     const validSymbols = new Set(Object.values(this.symbolMap));
     const toSubscribe = WATCHLIST.filter(sym => validSymbols.has(sym));
 
     if (toSubscribe.length === 0) {
       logger.warn('[DerivBroker] None of the watchlist symbols are in the symbol map. Subscribing to fallback symbols...');
+      // As a fallback, subscribe to the first 4 fallback symbols
       const fallbackSymbols = Object.values(FALLBACK_SYMBOLS).slice(0, 4);
       for (const sym of fallbackSymbols) {
         try {
@@ -1251,10 +1163,9 @@ class DerivBroker extends EventEmitter {
     for (const sym of toSubscribe) {
       try {
         await this.streaming.subscribe('ticks', sym, (tick) => {});
-        logger.info(`[DerivBroker] Subscribed to ticks for ${sym}`);
+        logger.debug(`[DerivBroker] Subscribed to ticks for ${sym}`);
       } catch (err) {
         logger.warn(`[DerivBroker] Could not subscribe to ${sym}:`, err.message);
-        // Continue with next symbol
       }
     }
   }
@@ -1360,24 +1271,32 @@ class DerivBroker extends EventEmitter {
 
   // ---------- PUBLIC API ----------
 
-  // ---- Get Account (enhanced) ----
+  // ---- Get Account ----
   async getAccount() {
     await this._ensureAuthReady();
-    const base = this._account || {};
-    const details = this._accountDetails || {};
+    if (!this._account) {
+      return this._getDefaultAccount();
+    }
+    const acc = this._account;
     return {
-      id: base.loginid || details.loginid || 'N/A',
-      login: base.loginid || details.loginid || 'N/A',
-      balance: details.balance || base.balance || '0',
-      currency: details.currency || base.currency || 'USD',
-      equity: details.equity || base.balance || '0',
-      marginUsed: details.margin_used || '0',
-      marginAvailable: details.margin_available || '0',
-      marginLevel: details.margin_level || '0',
-      leverage: details.leverage || base.leverage || '100',
-      server: details.server || base.landing_company_name || '',
-      accountName: details.account_name || base.account_name || '',
-      tradeMode: details.trade_mode !== undefined ? details.trade_mode : (base.is_virtual ? 1 : 0),
+      id: acc.loginid || 'N/A',
+      balance: acc.balance || '0',
+      currency: acc.currency || 'USD',
+      equity: acc.balance || '0',
+      marginUsed: '0',
+      marginAvailable: acc.balance || '0',
+      createdTime: new Date().toISOString(),
+    };
+  }
+
+  _getDefaultAccount() {
+    return {
+      id: 'DEMO_ACCOUNT',
+      balance: '0',
+      currency: 'USD',
+      equity: '0',
+      marginUsed: '0',
+      marginAvailable: '0',
       createdTime: new Date().toISOString(),
     };
   }
@@ -1721,7 +1640,7 @@ const brokerInstance = new DerivBroker({
   leverage: parseFloat(process.env.DERIV_LEVERAGE) || 100,
   fatalAfterAuthFailures: parseInt(process.env.DERIV_FATAL_AFTER_AUTH_FAILURES) || 3,
   readinessTimeout: parseInt(process.env.DERIV_READINESS_TIMEOUT) || 30000,
-  symbolTimeout: parseInt(process.env.DERIV_SYMBOL_TIMEOUT) || 10000,
+  symbolTimeout: parseInt(process.env.DERIV_SYMBOL_TIMEOUT) || 30000,
   heartbeatTimeout: parseInt(process.env.DERIV_HEARTBEAT_TIMEOUT) || 60000,
 });
 
