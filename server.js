@@ -57,11 +57,17 @@ async function ensureAdmin() {
     const adminId = 'admin';
     let admin = await User.findOne({ userId: adminId });
     if (!admin) {
-      const defaultProduct = process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd';
-      admin = new User({ userId: adminId, tradingProduct: defaultProduct });
+      // Explicitly set deriv_cfd as default
+      admin = new User({ userId: adminId, tradingProduct: 'deriv_cfd' });
       await admin.save();
-      console.log('✅ Admin user created with product:', defaultProduct);
+      console.log('✅ Admin user created with product: deriv_cfd');
     } else {
+      // If existing admin has mt5, update to deriv_cfd
+      if (admin.tradingProduct === 'mt5') {
+        admin.tradingProduct = 'deriv_cfd';
+        await admin.save();
+        console.log('✅ Admin product updated to deriv_cfd');
+      }
       console.log('✅ Admin user already exists.');
     }
   } catch (err) {
@@ -191,10 +197,34 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'OK', message: 'RTS is running with Deriv broker' });
 });
 
-// ---------- SPA Fallback ----------
+// ---------- SPA Fallback (inject API key) ----------
 app.get('*', (req, res) => {
   if (!req.path.startsWith('/api')) {
-    res.sendFile('index.html', { root: 'public' });
+    // Inject API key into page
+    const apiKey = process.env.MT5_API_KEY || 'change-me-in-production';
+    const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RTS Trading Dashboard</title>
+  <script>
+    window.API_KEY = '${apiKey}';
+  </script>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/css/styles.css" />
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="/js/config.js"></script>
+  <script src="/js/app.js"></script>
+  <script src="/js/live.js"></script>
+</body>
+</html>`;
+    res.send(html);
   } else {
     res.status(404).json({ error: 'API endpoint not found' });
   }
@@ -456,15 +486,16 @@ async function startServer() {
     // ---- Start Cognitive Engines ----
     setTimeout(startCognitiveEngines, 2000);
 
-    // ---- Start Outcome Labeler Scheduler ----
-    try {
-      const labeler = require('./core/intelligence/lab/outcomeLabeler');
-      const interval = parseInt(process.env.OUTCOME_LABEL_INTERVAL_MS) || 60 * 60 * 1000;
-      labeler.startScheduler(interval);
-      console.log(`✅ Outcome labeler scheduler started (interval: ${interval}ms)`);
-    } catch (err) {
-      console.warn('⚠️ Outcome labeler scheduler could not be started:', err.message);
-    }
+    // ---- Start Outcome Labeler Scheduler (DISABLED) ----
+    // try {
+    //   const labeler = require('./core/intelligence/lab/outcomeLabeler');
+    //   const interval = parseInt(process.env.OUTCOME_LABEL_INTERVAL_MS) || 60 * 60 * 1000;
+    //   labeler.startScheduler(interval);
+    //   console.log(`✅ Outcome labeler scheduler started (interval: ${interval}ms)`);
+    // } catch (err) {
+    //   console.warn('⚠️ Outcome labeler scheduler could not be started:', err.message);
+    // }
+    console.log('⏸️ Outcome labeler scheduler disabled.');
 
     // ---- Connect Deriv broker after startup ----
     setTimeout(startDerivBroker, 3000);
