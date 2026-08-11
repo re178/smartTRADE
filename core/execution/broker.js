@@ -1,8 +1,5 @@
 // core/execution/broker.js – Stable Dual‑WebSocket Deriv Broker
-// - Public WS: persistent, reconnects only on close/error
-// - Auth WS: v3 with `authorize` (legacy, but works; OTP migration planned)
-// - Correct contract types: MULTUP / MULTDOWN
-// - Fallback symbols only if discovery fails
+// Watchlist: only subscribe to specified symbols.
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -15,6 +12,16 @@ const Price = require('../../models/Price');
 const Account = require('../../models/Account');
 
 EventEmitter.defaultMaxListeners = 20;
+
+// ============================================================
+// WATCHLIST – only these symbols will be subscribed for ticks
+// ============================================================
+const WATCHLIST = [
+  'frxEURUSD',
+  'frxGBPUSD',
+  'frxUSDJPY',
+  'frxAUDUSD'
+];
 
 // ============================================================
 // CONSTANTS
@@ -281,9 +288,7 @@ class DerivBroker extends EventEmitter {
     this.config = {
       apiToken: config.apiToken || process.env.DERIV_API_TOKEN,
       appId: appId,
-      // Public endpoint (market data) – stable, persistent
       publicWsUrl: config.publicWsUrl || process.env.DERIV_PUBLIC_WS_URL || `wss://api.derivws.com/trading/v1/options/ws/public`,
-      // Auth endpoint (trading) – legacy v3 for now; will migrate to OTP
       authWsUrl: config.authWsUrl || process.env.DERIV_AUTH_WS_URL || `wss://ws.derivws.com/websockets/v3?app_id=${appId}`,
       connectionTimeout: parseInt(config.connectionTimeout || process.env.DERIV_CONNECTION_TIMEOUT || 30000),
       reconnectBaseDelay: parseInt(config.reconnectBaseDelay || process.env.DERIV_RECONNECT_DELAY || 2000),
@@ -318,7 +323,7 @@ class DerivBroker extends EventEmitter {
     this._publicHeartbeatTimeout = null;
     this._publicLastPong = Date.now();
     this._publicConnectionPromise = null;
-    this._publicReconnectTimer = null; // for persistent reconnect
+    this._publicReconnectTimer = null;
 
     // ---------- Auth socket (trading) ----------
     this._authState = STATE.DISCONNECTED;
@@ -380,11 +385,12 @@ class DerivBroker extends EventEmitter {
     this._portfolioLogged = false;
     this._openPositions = [];
 
-    this._ready = false; // overall readiness
+    this._ready = false;
 
     logger.info('[DerivBroker] Created with stable dual WebSocket architecture.');
     logger.info(`[DerivBroker] Public WS: ${this.config.publicWsUrl}`);
     logger.info(`[DerivBroker] Auth WS: ${this.config.authWsUrl}`);
+    logger.info(`[DerivBroker] Watchlist: ${WATCHLIST.join(', ')}`);
   }
 
   validateConfig() {
@@ -403,24 +409,19 @@ class DerivBroker extends EventEmitter {
 
   // ---------- CONNECTION (overall) ----------
   async connect() {
-    // Connect both sockets in parallel
     await Promise.all([
       this._connectPublic(),
       this._connectAuth()
     ]);
-    // Wait for symbol discovery from public (with fallback)
     await this._loadSymbolsWithTimeout();
     if (!this._symbolsDiscovered) {
       logger.warn('[DerivBroker] Symbol discovery failed, using fallback symbols.');
       this._useFallbackSymbols();
     }
-    // Set overall state to READY
     this._ready = true;
     this.emit('ready');
     this.emit('connected');
-    // Start subscriptions
     await this._subscribeDefaultSymbols();
-    // Reconcile positions using auth connection
     await this._reconcilePositions();
     await this._loadPendingOrders();
   }
@@ -439,7 +440,6 @@ class DerivBroker extends EventEmitter {
 
   _doConnectPublic() {
     return new Promise((resolve, reject) => {
-      // Clear any existing reconnect timer
       if (this._publicReconnectTimer) {
         clearTimeout(this._publicReconnectTimer);
         this._publicReconnectTimer = null;
@@ -456,7 +456,7 @@ class DerivBroker extends EventEmitter {
       }
 
       this._publicState = STATE.CONNECTING;
-      this._closePublicSocket(); // ensure clean
+      this._closePublicSocket();
 
       logger.info(`[DerivBroker] Connecting public WS: ${this.config.publicWsUrl}`);
 
@@ -464,7 +464,6 @@ class DerivBroker extends EventEmitter {
         this._publicSocket = new WebSocket(this.config.publicWsUrl);
         const socket = this._publicSocket;
 
-        // Connection timeout (only for the OPEN event)
         const connectionTimer = setTimeout(() => {
           if (this._publicState !== STATE.CONNECTED) {
             logger.error('[DerivBroker] Public WS connection timeout.');
@@ -488,7 +487,6 @@ class DerivBroker extends EventEmitter {
 
         socket.on('error', (err) => {
           logger.error('[DerivBroker] Public WS error:', err.message);
-          // Do not reject here; the close event will handle reconnection.
         });
 
         socket.on('close', (code, reason) => {
@@ -496,7 +494,6 @@ class DerivBroker extends EventEmitter {
           logger.info(`[DerivBroker] Public WS closed. Code: ${code}, Reason: ${reason || 'No reason'}`);
           this._publicState = STATE.DISCONNECTED;
           this._stopPublicHeartbeat();
-          // Schedule reconnect
           if (this._publicReconnectTimer) clearTimeout(this._publicReconnectTimer);
           this._publicReconnectTimer = setTimeout(() => {
             this._connectPublic().catch(err => logger.error('Public reconnect failed:', err));
@@ -539,7 +536,6 @@ class DerivBroker extends EventEmitter {
       this._publicSocket.terminate();
       this._publicSocket = null;
     }
-    // Reject all pending requests
     for (const [id, pending] of this._publicPendingRequests) {
       clearTimeout(pending.timeout);
       if (pending.reject) pending.reject(new Error('Public connection closed'));
@@ -585,7 +581,6 @@ class DerivBroker extends EventEmitter {
 
   async _sendPublicRequest(payload, timeoutMs = 15000, signal = null) {
     await this._rateLimiter.acquire();
-    // Ensure socket is connected (will trigger reconnect if needed)
     if (this._publicState !== STATE.CONNECTED && this._publicState !== STATE.READY) {
       await this._connectPublic();
     }
@@ -604,7 +599,6 @@ class DerivBroker extends EventEmitter {
         if (attempt < this.config.maxRetries) {
           await sleep(this._getReconnectDelay(attempt));
           if (signal && signal.aborted) throw new Error('Request cancelled');
-          // Ensure socket is still alive; reconnect if necessary
           if (this._publicState !== STATE.CONNECTED) {
             await this._connectPublic();
           }
@@ -655,7 +649,6 @@ class DerivBroker extends EventEmitter {
         logger.error('[In Public] API Error:', JSON.stringify(msg.error, null, 2));
       }
 
-      // Request responses
       if (msg.req_id && this._publicPendingRequests.has(msg.req_id)) {
         const pending = this._publicPendingRequests.get(msg.req_id);
         clearTimeout(pending.timeout);
@@ -673,7 +666,6 @@ class DerivBroker extends EventEmitter {
         handled = true;
       }
 
-      // Ticks
       if (msg.msg_type === 'tick' && msg.tick) {
         const tick = msg.tick;
         const symbol = tick.symbol;
@@ -692,7 +684,6 @@ class DerivBroker extends EventEmitter {
         handled = true;
       }
 
-      // Active symbols
       if (msg.active_symbols !== undefined) {
         logger.debug('[In Public] active_symbols response received.');
         handled = true;
@@ -709,7 +700,6 @@ class DerivBroker extends EventEmitter {
   async _ensurePublicReady() {
     if (this._publicState === STATE.CONNECTED || this._publicState === STATE.READY) return;
     await this._connectPublic();
-    // Wait a bit for subscriptions to settle if needed
     await sleep(200);
   }
 
@@ -761,7 +751,6 @@ class DerivBroker extends EventEmitter {
           this._authState = STATE.CONNECTED;
           this._startAuthHeartbeat();
           this._flushAuthQueue();
-          // Authorize
           this._authorize()
             .then(async (authResponse) => {
               if (authResponse && authResponse.authorize) {
@@ -813,7 +802,6 @@ class DerivBroker extends EventEmitter {
           logger.info(`[DerivBroker] Auth WS closed. Code: ${code}`);
           this._authState = STATE.DISCONNECTED;
           this._stopAuthHeartbeat();
-          // Reconnect auth automatically
           setTimeout(() => {
             this._connectAuth().catch(err => logger.error('Auth reconnect failed:', err));
           }, this._getReconnectDelay(0));
@@ -996,7 +984,6 @@ class DerivBroker extends EventEmitter {
         logger.error('[In Auth] API Error:', JSON.stringify(msg.error, null, 2));
       }
 
-      // Request responses
       if (msg.req_id && this._authPendingRequests.has(msg.req_id)) {
         const pending = this._authPendingRequests.get(msg.req_id);
         clearTimeout(pending.timeout);
@@ -1014,7 +1001,6 @@ class DerivBroker extends EventEmitter {
         handled = true;
       }
 
-      // Portfolio
       if (msg.portfolio) {
         logger.debug('[In Auth] Portfolio response received.');
         const portfolio = msg.portfolio;
@@ -1026,7 +1012,6 @@ class DerivBroker extends EventEmitter {
         handled = true;
       }
 
-      // Buy/Sell
       if (msg.buy) {
         logger.info('[In Auth] Buy response received:', JSON.stringify(redactSensitive(msg.buy)));
         handled = true;
@@ -1153,15 +1138,29 @@ class DerivBroker extends EventEmitter {
     return count;
   }
 
-  // ---------- SUBSCRIBE DEFAULT SYMBOLS ----------
+  // ---------- SUBSCRIBE DEFAULT SYMBOLS (only watchlist) ----------
   async _subscribeDefaultSymbols() {
-    const symbols = Object.values(this.symbolMap);
-    if (symbols.length === 0) {
-      logger.warn('[DerivBroker] No symbols to subscribe to – skipping.');
+    // Build a set of valid symbols from the symbolMap (or fallback)
+    const validSymbols = new Set(Object.values(this.symbolMap));
+    const toSubscribe = WATCHLIST.filter(sym => validSymbols.has(sym));
+
+    if (toSubscribe.length === 0) {
+      logger.warn('[DerivBroker] None of the watchlist symbols are in the symbol map. Subscribing to fallback symbols...');
+      // As a fallback, subscribe to the first 4 fallback symbols
+      const fallbackSymbols = Object.values(FALLBACK_SYMBOLS).slice(0, 4);
+      for (const sym of fallbackSymbols) {
+        try {
+          await this.streaming.subscribe('ticks', sym, (tick) => {});
+          logger.info(`[DerivBroker] Subscribed to fallback symbol: ${sym}`);
+        } catch (err) {
+          logger.warn(`[DerivBroker] Could not subscribe to ${sym}:`, err.message);
+        }
+      }
       return;
     }
-    logger.info(`[DerivBroker] Subscribing to ${symbols.length} symbols...`);
-    for (const sym of symbols) {
+
+    logger.info(`[DerivBroker] Subscribing to watchlist symbols: ${toSubscribe.join(', ')}`);
+    for (const sym of toSubscribe) {
       try {
         await this.streaming.subscribe('ticks', sym, (tick) => {});
         logger.debug(`[DerivBroker] Subscribed to ticks for ${sym}`);
@@ -1403,7 +1402,7 @@ class DerivBroker extends EventEmitter {
       proposal: 1,
       amount: amount,
       basis: 'stake',
-      contract_type: direction, // ✅ MULTUP or MULTDOWN
+      contract_type: direction,
       currency: this.accountCurrency || 'USD',
       duration: 60,
       duration_unit: 's',
