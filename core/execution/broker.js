@@ -1,9 +1,6 @@
-// core/execution/broker.js – Deriv Broker with Official API
-// Fully supports current Deriv API fields:
-//   - active_symbols: underlying_symbol, underlying_symbol_name, pip_size
-//   - proposal: underlying_symbol
-//   - portfolio: contracts
-//   - buy, sell, ohlc, ticks
+// core/execution/broker.js – Dual WebSocket Architecture
+// Public WS: market data (active_symbols, ticks) – no auth
+// Authenticated WS: trading (portfolio, proposal, buy, sell) – requires authorize
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -79,7 +76,7 @@ function fromDerivSymbol(symbol, reverseMap) {
   return symbol;
 }
 
-// Fallback symbols – used only if discovery fails, but we will throw if no discovery
+// Hardcoded fallback symbols (used only if public endpoint fails)
 const FALLBACK_SYMBOLS = {
   'EUR_USD': 'frxEURUSD',
   'GBP_USD': 'frxGBPUSD',
@@ -130,7 +127,7 @@ class RateLimiter {
 }
 
 // ============================================================
-// STREAMING MANAGER
+// STREAMING MANAGER (public ticks)
 // ============================================================
 class StreamingManager {
   constructor(broker) {
@@ -150,8 +147,9 @@ class StreamingManager {
       }
       return;
     }
-    await this.broker._ensureReady();
-    const response = await this.broker._sendRequest({ [type]: symbol, subscribe: 1 });
+    // Wait for public connection to be ready
+    await this.broker._ensurePublicReady();
+    const response = await this.broker._sendPublicRequest({ [type]: symbol, subscribe: 1 });
     const subscriptionId = response.subscription?.id;
     if (!subscriptionId) {
       logger.error(`[Streaming] No subscription ID for ${key}`);
@@ -170,7 +168,7 @@ class StreamingManager {
       sub.callbacks = sub.callbacks.filter(cb => cb !== callback);
       if (sub.callbacks.length > 0) return;
     }
-    await this.broker._sendRequest({ forget: sub.subscriptionId });
+    await this.broker._sendPublicRequest({ forget: sub.subscriptionId });
     this._subscriptions.delete(key);
     this._subscriptionIdMap.delete(sub.subscriptionId);
     this._priceCache.delete(symbol);
@@ -181,14 +179,14 @@ class StreamingManager {
     if (this._subscriptions.size === 0) return;
     logger.info('[Streaming] Restoring subscriptions...');
     try {
-      await this.broker._sendRequest({ forget_all: 'ticks' });
+      await this.broker._sendPublicRequest({ forget_all: 'ticks' });
       logger.info('[Streaming] Cleared old subscriptions.');
     } catch (err) {
       logger.warn('[Streaming] Failed to clear old subscriptions:', err.message);
     }
     for (const [key, sub] of this._subscriptions) {
       try {
-        const response = await this.broker._sendRequest({ [sub.type]: sub.symbol, subscribe: 1 });
+        const response = await this.broker._sendPublicRequest({ [sub.type]: sub.symbol, subscribe: 1 });
         const newId = response.subscription?.id;
         if (newId) {
           this._subscriptionIdMap.delete(sub.subscriptionId);
@@ -241,8 +239,11 @@ class SymbolManager {
 
   setSymbols(symbols) {
     for (const sym of symbols) {
-      this._symbols.set(sym.symbol, sym);
-      if (sym.leverage) this._leverageMap[sym.symbol] = sym.leverage;
+      const key = sym.underlying_symbol ?? sym.symbol;
+      if (key) {
+        this._symbols.set(key, sym);
+        if (sym.leverage) this._leverageMap[key] = sym.leverage;
+      }
     }
   }
 
@@ -252,7 +253,7 @@ class SymbolManager {
 }
 
 // ============================================================
-// MAIN BROKER CLASS (Deriv official API)
+// MAIN BROKER CLASS (Dual WebSocket)
 // ============================================================
 const BROKER_CAPABILITIES = {
   supportsTrailingStop: false,
@@ -278,7 +279,10 @@ class DerivBroker extends EventEmitter {
     this.config = {
       apiToken: config.apiToken || process.env.DERIV_API_TOKEN,
       appId: appId,
-      wsUrl: config.wsUrl || process.env.DERIV_WS_URL || `wss://ws.derivws.com/websockets/v3?app_id=${appId}`,
+      // Public endpoint (market data)
+      publicWsUrl: config.publicWsUrl || process.env.DERIV_PUBLIC_WS_URL || `wss://api.derivws.com/trading/v1/options/ws/public`,
+      // Authenticated endpoint (trading)
+      authWsUrl: config.authWsUrl || process.env.DERIV_AUTH_WS_URL || `wss://ws.derivws.com/websockets/v3?app_id=${appId}`,
       connectionTimeout: parseInt(config.connectionTimeout || process.env.DERIV_CONNECTION_TIMEOUT || 30000),
       reconnectBaseDelay: parseInt(config.reconnectBaseDelay || process.env.DERIV_RECONNECT_DELAY || 2000),
       maxReconnectDelay: parseInt(config.maxReconnectDelay || process.env.DERIV_MAX_RECONNECT_DELAY || 30000),
@@ -303,15 +307,26 @@ class DerivBroker extends EventEmitter {
 
     this.validateConfig();
 
-    // ---------- Core components ----------
-    this._state = STATE.DISCONNECTED;
-    this._socket = null;
-    this._pendingRequests = new Map();
-    this._messageQueue = [];
-    this._heartbeatInterval = null;
-    this._heartbeatTimeout = null;
-    this._lastPong = Date.now();
-    this._connectionPromise = null;
+    // ---------- Public socket (market data) ----------
+    this._publicState = STATE.DISCONNECTED;
+    this._publicSocket = null;
+    this._publicPendingRequests = new Map();
+    this._publicMessageQueue = [];
+    this._publicHeartbeatInterval = null;
+    this._publicHeartbeatTimeout = null;
+    this._publicLastPong = Date.now();
+    this._publicConnectionPromise = null;
+
+    // ---------- Auth socket (trading) ----------
+    this._authState = STATE.DISCONNECTED;
+    this._authSocket = null;
+    this._authPendingRequests = new Map();
+    this._authMessageQueue = [];
+    this._authHeartbeatInterval = null;
+    this._authHeartbeatTimeout = null;
+    this._authLastPong = Date.now();
+    this._authConnectionPromise = null;
+
     this._rateLimiter = new RateLimiter(this.config.rateLimit, this.config.rateCapacity);
 
     this.streaming = new StreamingManager(this);
@@ -323,7 +338,6 @@ class DerivBroker extends EventEmitter {
     this._cbOpenedAt = null;
 
     // ---------- Symbol maps ----------
-    // Initialize with fallback, but will be overwritten on discovery
     this.symbolMap = { ...FALLBACK_SYMBOLS };
     this.reverseMap = {};
     for (const [key, val] of Object.entries(FALLBACK_SYMBOLS)) {
@@ -333,8 +347,7 @@ class DerivBroker extends EventEmitter {
     for (const key of Object.keys(FALLBACK_SYMBOLS)) {
       this.spreadMap[FALLBACK_SYMBOLS[key]] = 0.0001;
     }
-    this._symbolsDiscovered = false; // flag to ensure we have valid symbols
-    logger.info(`[DerivBroker] Using fallback symbols (${Object.keys(this.symbolMap).length} pairs) – will be replaced by discovery.`);
+    this._symbolsDiscovered = false;
 
     // ---------- Order tracking ----------
     this._orders = new Map();
@@ -361,17 +374,18 @@ class DerivBroker extends EventEmitter {
     this._authFailCount = 0;
     this._account = null;
     this._portfolioLogged = false;
-
-    // ---------- State for open positions (cached) ----------
     this._openPositions = [];
 
-    logger.info('[DerivBroker] Created with official Deriv API integration.');
+    logger.info('[DerivBroker] Created with dual WebSocket architecture.');
+    logger.info(`[DerivBroker] Public WS: ${this.config.publicWsUrl}`);
+    logger.info(`[DerivBroker] Auth WS: ${this.config.authWsUrl}`);
   }
 
   validateConfig() {
     if (!this.config.apiToken) throw new Error('DERIV_API_TOKEN is required');
     if (!this.config.appId) throw new Error('DERIV_APP_ID is required');
-    if (!this.config.wsUrl || !this.config.wsUrl.startsWith('ws')) throw new Error('Invalid WebSocket URL');
+    if (!this.config.publicWsUrl || !this.config.publicWsUrl.startsWith('ws')) throw new Error('Invalid public WebSocket URL');
+    if (!this.config.authWsUrl || !this.config.authWsUrl.startsWith('ws')) throw new Error('Invalid auth WebSocket URL');
     if (this.config.maxQueueSize < 1) throw new Error('maxQueueSize must be at least 1');
     if (isNaN(this.config.leverage) || this.config.leverage <= 0) throw new Error('leverage must be positive');
     logger.info('[DerivBroker] Configuration validated.');
@@ -381,353 +395,259 @@ class DerivBroker extends EventEmitter {
     return this.symbolManager.getLeverage(symbol) || this.config.leverage || 100;
   }
 
-  // ---------- CONNECTION ----------
+  // ---------- CONNECTION (overall) ----------
   async connect() {
-    if (this._state === STATE.READY) return;
-    if (this._state === STATE.FATAL) throw new Error('Broker in FATAL state.');
-    if (this._connectionPromise) return this._connectionPromise;
-    this._connectionPromise = this._doConnect();
+    // Connect both sockets in parallel
+    await Promise.all([
+      this._connectPublic(),
+      this._connectAuth()
+    ]);
+    // Wait for symbol discovery from public
+    await this._loadSymbolsWithTimeout();
+    if (!this._symbolsDiscovered) {
+      // Fallback to hardcoded symbols
+      logger.warn('[DerivBroker] Symbol discovery failed, using fallback symbols.');
+      this._useFallbackSymbols();
+    }
+    // Set overall state to READY
+    this._setState(STATE.READY);
+    this.emit('ready');
+    this.emit('connected');
+    // Start subscriptions
+    await this._subscribeDefaultSymbols();
+    // Reconcile positions using auth connection
+    await this._reconcilePositions();
+    await this._loadPendingOrders();
+  }
+
+  // ---- Public socket ----
+  async _connectPublic() {
+    if (this._publicState === STATE.READY) return;
+    if (this._publicConnectionPromise) return this._publicConnectionPromise;
+    this._publicConnectionPromise = this._doConnectPublic();
     try {
-      await this._connectionPromise;
+      await this._publicConnectionPromise;
     } finally {
-      this._connectionPromise = null;
+      this._publicConnectionPromise = null;
     }
   }
 
-  async _doConnect() {
-    this._setState(STATE.CONNECTING);
-    this._closeSocket();
-    logger.info(`[DerivBroker] Connecting to ${this.config.wsUrl}`);
+  async _doConnectPublic() {
+    this._publicState = STATE.CONNECTING;
+    this._closePublicSocket();
+    logger.info(`[DerivBroker] Connecting public WS: ${this.config.publicWsUrl}`);
 
     return new Promise((resolve, reject) => {
       let attempts = 0;
       let connectionTimer = null;
 
       const attemptConnect = async () => {
-        if (this._state === STATE.FATAL) {
-          reject(new Error('FATAL: Broker stopped.'));
-          return;
-        }
-        if (this._state === STATE.READY) {
-          resolve();
-          return;
-        }
+        if (this._publicState === STATE.READY) { resolve(); return; }
         attempts++;
         this.metrics.reconnections++;
         if (attempts > 3) {
-          this._setState(STATE.FATAL);
-          reject(new Error('Connection failed after 3 attempts.'));
+          this._publicState = STATE.FATAL;
+          reject(new Error('Public connection failed after 3 attempts.'));
           return;
         }
-
-        this._setState(STATE.CONNECTING);
-        logger.info(`[DerivBroker] Connection attempt ${attempts}`);
-
-        if (connectionTimer) {
-          clearTimeout(connectionTimer);
-          connectionTimer = null;
-        }
-
+        this._publicState = STATE.CONNECTING;
+        if (connectionTimer) clearTimeout(connectionTimer);
         try {
-          this._socket = new WebSocket(this.config.wsUrl);
-          const socket = this._socket;
-
-          this._resetCircuitBreaker();
+          this._publicSocket = new WebSocket(this.config.publicWsUrl);
+          const socket = this._publicSocket;
           socket.removeAllListeners();
 
           socket.on('open', () => {
-            logger.info('[DerivBroker] WebSocket connected.');
-            this._setState(STATE.CONNECTED);
-            this.metrics.connectedSince = Date.now();
-            this._startHeartbeat();
-
-            this._authorize()
-              .then(async (authResponse) => {
-                if (authResponse && authResponse.authorize) {
-                  this._account = authResponse.authorize;
-                  this.accountCurrency = this._account.currency || 'USD';
-                  logger.info('[DerivBroker] Account stored from authorize.');
-
-                  try {
-                    await Account.upsertAccount({
-                      accountId: 'default',
-                      balance: parseFloat(this._account.balance) || 0,
-                      equity: parseFloat(this._account.balance) || 0,
-                      currency: this.accountCurrency,
-                      broker: 'deriv',
-                      loginId: this._account.loginid || '',
-                      leverage: parseFloat(this._account.leverage) || 100,
-                      status: 'online',
-                    });
-                    logger.info('[DerivBroker] Account saved to DB.');
-                    this.emit('account', await Account.getLatest('default'));
-                  } catch (err) {
-                    logger.error('[DerivBroker] Failed to save account:', err.message);
-                  }
-                }
-                logger.info('[DerivBroker] Authorized.');
-                this._authFailCount = 0;
-                this._setState(STATE.AUTHENTICATING);
-
-                logger.info('[DerivBroker] Startup: Loading symbols...');
-                let discoverySuccess = false;
-                try {
-                  await this._loadSymbolsWithTimeout();
-                  discoverySuccess = true;
-                  logger.info('[DerivBroker] Startup: Symbols loaded successfully.');
-                } catch (err) {
-                  logger.error('[DerivBroker] Startup: Symbol loading FAILED:', err.message);
-                  // Do not proceed to READY; we need valid symbols.
-                  this._setState(STATE.FATAL);
-                  this._closeSocket();
-                  reject(new Error(`Symbol discovery failed: ${err.message}`));
-                  return;
-                }
-
-                // ---- CRITICAL: Only become READY if symbols were discovered ----
-                if (!this._symbolsDiscovered) {
-                  logger.error('[DerivBroker] No symbols discovered – refusing to start.');
-                  this._setState(STATE.FATAL);
-                  this._closeSocket();
-                  reject(new Error('No symbols discovered from Deriv.'));
-                  return;
-                }
-
-                this._setState(STATE.READY);
-                this._flushQueue();
-
-                // ---- Background startup tasks (non‑blocking) ----
-                setImmediate(async () => {
-                  if (this._state === STATE.READY && this._socket && this._socket.readyState === WebSocket.OPEN) {
-                    // Subscribe to discovered symbols
-                    try {
-                      await this._subscribeDefaultSymbols();
-                    } catch (err) {
-                      logger.warn('[DerivBroker] Startup: Subscription error:', err.message);
-                    }
-
-                    logger.info('[DerivBroker] Startup: Reconciling positions...');
-                    try {
-                      await this._reconcilePositions();
-                      logger.info('[DerivBroker] Startup: Positions reconciled.');
-                    } catch (err) {
-                      logger.error('[DerivBroker] Startup: Position reconciliation error:', err.message);
-                    }
-
-                    logger.info('[DerivBroker] Startup: Loading pending orders...');
-                    try {
-                      await this._loadPendingOrders();
-                      logger.info('[DerivBroker] Startup: Pending orders loaded.');
-                    } catch (err) {
-                      logger.error('[DerivBroker] Startup: Pending orders loading error:', err.message);
-                    }
-                  } else {
-                    logger.warn('[DerivBroker] Startup: Skipped background tasks – socket not open or not READY.');
-                  }
-                });
-
-                this.emit('ready');
-                this.emit('connected');
-                resolve();
-              })
-              .catch((err) => {
-                logger.error('[DerivBroker] Authorization failed:', err.message);
-                this._authFailCount++;
-                if (this._authFailCount >= this.config.fatalAfterAuthFailures) {
-                  logger.error(`[DerivBroker] Too many auth failures (${this._authFailCount}). FATAL.`);
-                  this._setState(STATE.FATAL);
-                  this._closeSocket();
-                  reject(new Error(`Authorization failed ${this._authFailCount} times.`));
-                  return;
-                }
-                this._setState(STATE.FAILED);
-                this._closeSocket();
-                setTimeout(() => attemptConnect(), this._getReconnectDelay(attempts));
-              });
+            logger.info('[DerivBroker] Public WS connected.');
+            this._publicState = STATE.CONNECTED;
+            this._startPublicHeartbeat();
+            this._flushPublicQueue();
+            this.emit('publicReady');
+            resolve();
           });
 
-          socket.on('message', (data) => this._handleMessage(data));
-          socket.on('error', (err) => logger.error('[DerivBroker] WebSocket error:', err.message));
+          socket.on('message', (data) => this._handlePublicMessage(data));
+          socket.on('error', (err) => logger.error('[DerivBroker] Public WS error:', err.message));
           socket.on('close', (code, reason) => {
-            logger.info(`[DerivBroker] WebSocket closed. Code: ${code}, Reason: ${reason || 'No reason'}`);
-            if (connectionTimer) {
-              clearTimeout(connectionTimer);
-              connectionTimer = null;
-            }
-            if (this._state === STATE.READY || this._state === STATE.CONNECTED || this._state === STATE.AUTHENTICATING) {
-              this._setState(STATE.RECONNECTING);
-              setTimeout(() => attemptConnect(), this._getReconnectDelay(attempts));
-            } else if (this._state === STATE.CONNECTING || this._state === STATE.CONNECTED) {
-              reject(new Error(`WebSocket closed unexpectedly: ${code}`));
-            }
+            logger.info(`[DerivBroker] Public WS closed. Code: ${code}`);
+            this._publicState = STATE.DISCONNECTED;
+            if (connectionTimer) clearTimeout(connectionTimer);
+            setTimeout(() => attemptConnect(), this._getReconnectDelay(attempts));
           });
 
           connectionTimer = setTimeout(() => {
-            logger.error('[DerivBroker] Connection attempt timed out.');
-            this._closeSocket();
-            reject(new Error('Connection attempt timed out'));
+            logger.error('[DerivBroker] Public WS connection timeout.');
+            this._closePublicSocket();
+            reject(new Error('Public connection timeout'));
           }, this.config.connectionTimeout);
 
-          this.once('connected', () => {
-            if (connectionTimer) {
-              clearTimeout(connectionTimer);
-              connectionTimer = null;
-            }
-          });
-
         } catch (err) {
-          this._setState(STATE.FAILED);
+          this._publicState = STATE.FAILED;
           reject(err);
         }
       };
-
       attemptConnect();
     });
   }
 
-  _setState(newState) {
-    const old = this._state;
-    this._state = newState;
-    logger.debug(`[DerivBroker] State: ${old} → ${newState}`);
-    this.emit('stateChange', { from: old, to: newState });
-  }
-
-  // ---------- AUTHORIZATION ----------
-  _authorize() {
-    return new Promise((resolve, reject) => {
-      const reqId = generateRequestId();
-      const payload = { authorize: this.config.apiToken, req_id: reqId };
-      const timeout = setTimeout(() => {
-        if (this._pendingRequests.has(reqId)) {
-          this._pendingRequests.delete(reqId);
-          reject(new Error('Authorize timeout'));
-        }
-      }, 10000);
-
-      this._pendingRequests.set(reqId, {
-        resolve: (msg) => {
-          clearTimeout(timeout);
-          const safeMsg = redactSensitive(msg);
-          logger.info('[Auth] Authorization response:', JSON.stringify(safeMsg, null, 2));
-          resolve(msg);
-        },
-        reject: (err) => { clearTimeout(timeout); reject(err); },
-        timeout,
-        sentAt: Date.now(),
-        cancel: () => {},
-        signal: null,
-      });
-
-      this._sendRaw(payload);
-    });
-  }
-
-  _getReconnectDelay(attempt) {
-    const base = this.config.reconnectBaseDelay;
-    const max = this.config.maxReconnectDelay;
-    const delay = Math.min(base * Math.pow(2, attempt), max);
-    const jitter = delay * (0.8 + 0.4 * Math.random());
-    return Math.round(jitter);
-  }
-
-  // ---------- CIRCUIT BREAKER ----------
-  _recordFailure() {
-    if (this._cbState === CB_STATE.OPEN) return;
-    this._cbFailureCount++;
-    if (this._cbFailureCount >= this.config.circuitBreakerThreshold) {
-      this._cbState = CB_STATE.OPEN;
-      this._cbOpenedAt = Date.now();
-      logger.warn('[DerivBroker] Circuit breaker OPEN.');
-      setTimeout(() => {
-        this._cbState = CB_STATE.HALF_OPEN;
-        logger.warn('[DerivBroker] Circuit breaker HALF-OPEN.');
-      }, this.config.circuitBreakerTimeout);
-    }
-  }
-
-  _resetCircuitBreaker() {
-    this._cbState = CB_STATE.CLOSED;
-    this._cbFailureCount = 0;
-    this._cbOpenedAt = null;
-  }
-
-  _isRequestAllowed() {
-    if (this._cbState === CB_STATE.OPEN) return false;
-    return true;
-  }
-
-  // ---------- HEARTBEAT ----------
-  _startHeartbeat() {
-    this._stopHeartbeat();
-    this._lastPong = Date.now();
-    this._heartbeatInterval = setInterval(() => {
-      if (this._state === STATE.READY || this._state === STATE.CONNECTED) {
-        this._sendRaw({ ping: 1 });
-        this.metrics.lastHeartbeat = Date.now();
+  _startPublicHeartbeat() {
+    this._stopPublicHeartbeat();
+    this._publicLastPong = Date.now();
+    this._publicHeartbeatInterval = setInterval(() => {
+      if (this._publicState === STATE.READY || this._publicState === STATE.CONNECTED) {
+        this._sendPublicRaw({ ping: 1 });
       }
     }, 30000);
-
-    this._heartbeatTimeout = setInterval(() => {
-      const now = Date.now();
-      if (now - this._lastPong > this.config.heartbeatTimeout) {
-        logger.warn('[DerivBroker] Heartbeat timeout – no pong received. Reconnecting...');
-        this.metrics.heartbeatMisses++;
-        this._closeSocket();
-        this.connect().catch(err => logger.error('[DerivBroker] Reconnect after heartbeat timeout failed:', err));
+    this._publicHeartbeatTimeout = setInterval(() => {
+      if (Date.now() - this._publicLastPong > this.config.heartbeatTimeout) {
+        logger.warn('[DerivBroker] Public WS heartbeat timeout, reconnecting.');
+        this._closePublicSocket();
+        this._connectPublic().catch(err => logger.error('Public reconnect failed:', err));
       }
     }, 10000);
   }
 
-  _stopHeartbeat() {
-    if (this._heartbeatInterval) {
-      clearInterval(this._heartbeatInterval);
-      this._heartbeatInterval = null;
+  _stopPublicHeartbeat() {
+    if (this._publicHeartbeatInterval) clearInterval(this._publicHeartbeatInterval);
+    if (this._publicHeartbeatTimeout) clearInterval(this._publicHeartbeatTimeout);
+  }
+
+  _closePublicSocket() {
+    this._stopPublicHeartbeat();
+    if (this._publicSocket) {
+      this._publicSocket.removeAllListeners();
+      this._publicSocket.terminate();
+      this._publicSocket = null;
     }
-    if (this._heartbeatTimeout) {
-      clearInterval(this._heartbeatTimeout);
-      this._heartbeatTimeout = null;
+    for (const [id, pending] of this._publicPendingRequests) {
+      clearTimeout(pending.timeout);
+      if (pending.reject) pending.reject(new Error('Public connection closed'));
+      this._publicPendingRequests.delete(id);
+    }
+    if (this._publicState !== STATE.DISCONNECTED && this._publicState !== STATE.FATAL) {
+      this._publicState = STATE.DISCONNECTED;
     }
   }
 
-  // ---------- MESSAGE HANDLER ----------
-  _handleMessage(rawData) {
+  _sendPublicRaw(payload) {
+    if (!this._publicSocket || this._publicSocket.readyState !== WebSocket.OPEN) {
+      if (this._publicMessageQueue.length < this.config.maxQueueSize) {
+        this._publicMessageQueue.push({ payload, timestamp: Date.now() });
+      } else {
+        logger.error('[DerivBroker] Public queue full, dropping message.');
+      }
+      return;
+    }
+    try {
+      const isImportant = payload.active_symbols || payload.ticks || payload.ohlc;
+      if (isImportant) {
+        logger.info(`[Out Public] ${payload.req_id || 'no-req-id'} →`, JSON.stringify(redactSensitive(payload), null, 2));
+      } else {
+        logger.debug(`[Out Public] ${payload.req_id || 'no-req-id'} →`, JSON.stringify(redactSensitive(payload)));
+      }
+      this._publicSocket.send(JSON.stringify(payload));
+    } catch (err) {
+      logger.error('[DerivBroker] Public send error:', err.message);
+      if (this._publicMessageQueue.length < this.config.maxQueueSize) {
+        this._publicMessageQueue.push({ payload, timestamp: Date.now() });
+      }
+    }
+  }
+
+  _flushPublicQueue() {
+    while (this._publicMessageQueue.length > 0) {
+      const item = this._publicMessageQueue.shift();
+      this._sendPublicRaw(item.payload);
+    }
+  }
+
+  async _sendPublicRequest(payload, timeoutMs = 15000, signal = null) {
+    await this._rateLimiter.acquire();
+    if (this._publicState !== STATE.READY && this._publicState !== STATE.CONNECTED) {
+      await this._connectPublic();
+    }
+    if (!this._publicSocket || this._publicSocket.readyState !== WebSocket.OPEN) {
+      throw new Error('Public WebSocket not open');
+    }
+    let lastError = null;
+    for (let attempt = 1; attempt <= this.config.maxRetries; attempt++) {
+      try {
+        if (signal && signal.aborted) throw new Error('Request cancelled');
+        const result = await this._sendPublicRawRequest(payload, timeoutMs, signal);
+        return result;
+      } catch (err) {
+        lastError = err;
+        logger.warn(`[DerivBroker] Public request failed (attempt ${attempt}):`, err.message);
+        if (attempt < this.config.maxRetries) {
+          await sleep(this._getReconnectDelay(attempt));
+          if (signal && signal.aborted) throw new Error('Request cancelled');
+          await this._connectPublic();
+        }
+      }
+    }
+    throw lastError;
+  }
+
+  _sendPublicRawRequest(payload, timeoutMs = 15000, signal = null) {
+    return new Promise((resolve, reject) => {
+      const reqId = generateRequestId();
+      const msg = { ...payload, req_id: reqId };
+      const timeout = setTimeout(() => {
+        if (this._publicPendingRequests.has(reqId)) {
+          this._publicPendingRequests.delete(reqId);
+          reject(new Error(`Public request timed out (${timeoutMs}ms)`));
+        }
+      }, timeoutMs);
+      const onCancel = () => {
+        clearTimeout(timeout);
+        if (this._publicPendingRequests.has(reqId)) {
+          this._publicPendingRequests.delete(reqId);
+          reject(new Error('Request cancelled'));
+        }
+      };
+      if (signal) signal.addEventListener('abort', onCancel, { once: true });
+      this._publicPendingRequests.set(reqId, {
+        resolve, reject, timeout, sentAt: Date.now(), cancel: onCancel, signal,
+      });
+      this._sendPublicRaw(msg);
+    });
+  }
+
+  _handlePublicMessage(rawData) {
     try {
       const msg = JSON.parse(rawData);
-      logger.debug('[In]', JSON.stringify(redactSensitive(msg)));
+      logger.debug('[In Public]', JSON.stringify(redactSensitive(msg)));
 
       let handled = false;
 
       if (msg.pong) {
-        this._lastPong = Date.now();
-        this.metrics.lastPong = this._lastPong;
+        this._publicLastPong = Date.now();
         handled = true;
       }
 
       if (msg.error) {
-        logger.error('[In] API Error:', JSON.stringify(msg.error, null, 2));
+        logger.error('[In Public] API Error:', JSON.stringify(msg.error, null, 2));
       }
 
       // Handle request responses
-      if (msg.req_id && this._pendingRequests.has(msg.req_id)) {
-        const pending = this._pendingRequests.get(msg.req_id);
+      if (msg.req_id && this._publicPendingRequests.has(msg.req_id)) {
+        const pending = this._publicPendingRequests.get(msg.req_id);
         clearTimeout(pending.timeout);
-        this._pendingRequests.delete(msg.req_id);
+        this._publicPendingRequests.delete(msg.req_id);
         const latency = Date.now() - pending.sentAt;
         this.metrics.totalLatency += latency;
         this.metrics.latencyCount++;
         if (msg.error) {
           this.metrics.requestsFailed++;
-          this._recordFailure();
           pending.reject(new Error(`Deriv API error: ${msg.error.code} - ${msg.error.message}`));
         } else {
           this.metrics.requestsSent++;
-          this._resetCircuitBreaker();
           pending.resolve(msg);
         }
         handled = true;
       }
 
-      // ---- TICK HANDLER (data pipeline) ----
+      // Ticks
       if (msg.msg_type === 'tick' && msg.tick) {
         const tick = msg.tick;
         const symbol = tick.symbol;
@@ -746,9 +666,325 @@ class DerivBroker extends EventEmitter {
         handled = true;
       }
 
-      // ---- PORTFOLIO (positions) ----
+      // Active symbols
+      if (msg.active_symbols !== undefined) {
+        logger.debug('[In Public] active_symbols response received.');
+        handled = true;
+      }
+
+      if (!handled) {
+        logger.debug('[In Public] Unhandled message type:', JSON.stringify(redactSensitive(msg), null, 2));
+      }
+    } catch (err) {
+      logger.error('[In Public] Parse error:', err.message);
+    }
+  }
+
+  async _ensurePublicReady() {
+    if (this._publicState === STATE.READY || this._publicState === STATE.CONNECTED) return;
+    await this._connectPublic();
+    // Wait a bit for it to be truly ready
+    await sleep(100);
+  }
+
+  // ---- Auth socket ----
+  async _connectAuth() {
+    if (this._authState === STATE.READY) return;
+    if (this._authConnectionPromise) return this._authConnectionPromise;
+    this._authConnectionPromise = this._doConnectAuth();
+    try {
+      await this._authConnectionPromise;
+    } finally {
+      this._authConnectionPromise = null;
+    }
+  }
+
+  async _doConnectAuth() {
+    this._authState = STATE.CONNECTING;
+    this._closeAuthSocket();
+    logger.info(`[DerivBroker] Connecting auth WS: ${this.config.authWsUrl}`);
+
+    return new Promise((resolve, reject) => {
+      let attempts = 0;
+      let connectionTimer = null;
+
+      const attemptConnect = async () => {
+        if (this._authState === STATE.READY) { resolve(); return; }
+        attempts++;
+        this.metrics.reconnections++;
+        if (attempts > 3) {
+          this._authState = STATE.FATAL;
+          reject(new Error('Auth connection failed after 3 attempts.'));
+          return;
+        }
+        this._authState = STATE.CONNECTING;
+        if (connectionTimer) clearTimeout(connectionTimer);
+        try {
+          this._authSocket = new WebSocket(this.config.authWsUrl);
+          const socket = this._authSocket;
+          socket.removeAllListeners();
+
+          socket.on('open', () => {
+            logger.info('[DerivBroker] Auth WS connected.');
+            this._authState = STATE.CONNECTED;
+            this._startAuthHeartbeat();
+            this._flushAuthQueue();
+            // Authorize
+            this._authorize()
+              .then(async (authResponse) => {
+                if (authResponse && authResponse.authorize) {
+                  this._account = authResponse.authorize;
+                  this.accountCurrency = this._account.currency || 'USD';
+                  logger.info('[DerivBroker] Account stored from authorize.');
+                  try {
+                    await Account.upsertAccount({
+                      accountId: 'default',
+                      balance: parseFloat(this._account.balance) || 0,
+                      equity: parseFloat(this._account.balance) || 0,
+                      currency: this.accountCurrency,
+                      broker: 'deriv',
+                      loginId: this._account.loginid || '',
+                      leverage: parseFloat(this._account.leverage) || 100,
+                      status: 'online',
+                    });
+                    this.emit('account', await Account.getLatest('default'));
+                  } catch (err) {
+                    logger.error('[DerivBroker] Failed to save account:', err.message);
+                  }
+                }
+                logger.info('[DerivBroker] Auth authorized.');
+                this._authState = STATE.READY;
+                this.emit('authReady');
+                resolve();
+              })
+              .catch((err) => {
+                logger.error('[DerivBroker] Authorization failed:', err.message);
+                this._authFailCount++;
+                if (this._authFailCount >= this.config.fatalAfterAuthFailures) {
+                  this._authState = STATE.FATAL;
+                  this._closeAuthSocket();
+                  reject(new Error(`Authorization failed ${this._authFailCount} times.`));
+                  return;
+                }
+                this._authState = STATE.FAILED;
+                this._closeAuthSocket();
+                setTimeout(() => attemptConnect(), this._getReconnectDelay(attempts));
+              });
+          });
+
+          socket.on('message', (data) => this._handleAuthMessage(data));
+          socket.on('error', (err) => logger.error('[DerivBroker] Auth WS error:', err.message));
+          socket.on('close', (code, reason) => {
+            logger.info(`[DerivBroker] Auth WS closed. Code: ${code}`);
+            this._authState = STATE.DISCONNECTED;
+            if (connectionTimer) clearTimeout(connectionTimer);
+            setTimeout(() => attemptConnect(), this._getReconnectDelay(attempts));
+          });
+
+          connectionTimer = setTimeout(() => {
+            logger.error('[DerivBroker] Auth WS connection timeout.');
+            this._closeAuthSocket();
+            reject(new Error('Auth connection timeout'));
+          }, this.config.connectionTimeout);
+
+        } catch (err) {
+          this._authState = STATE.FAILED;
+          reject(err);
+        }
+      };
+      attemptConnect();
+    });
+  }
+
+  _authorize() {
+    return new Promise((resolve, reject) => {
+      const reqId = generateRequestId();
+      const payload = { authorize: this.config.apiToken, req_id: reqId };
+      const timeout = setTimeout(() => {
+        if (this._authPendingRequests.has(reqId)) {
+          this._authPendingRequests.delete(reqId);
+          reject(new Error('Authorize timeout'));
+        }
+      }, 10000);
+
+      this._authPendingRequests.set(reqId, {
+        resolve: (msg) => {
+          clearTimeout(timeout);
+          const safeMsg = redactSensitive(msg);
+          logger.info('[Auth] Authorization response:', JSON.stringify(safeMsg, null, 2));
+          resolve(msg);
+        },
+        reject: (err) => { clearTimeout(timeout); reject(err); },
+        timeout,
+        sentAt: Date.now(),
+        cancel: () => {},
+        signal: null,
+      });
+
+      this._sendAuthRaw(payload);
+    });
+  }
+
+  _startAuthHeartbeat() {
+    this._stopAuthHeartbeat();
+    this._authLastPong = Date.now();
+    this._authHeartbeatInterval = setInterval(() => {
+      if (this._authState === STATE.READY || this._authState === STATE.CONNECTED) {
+        this._sendAuthRaw({ ping: 1 });
+      }
+    }, 30000);
+    this._authHeartbeatTimeout = setInterval(() => {
+      if (Date.now() - this._authLastPong > this.config.heartbeatTimeout) {
+        logger.warn('[DerivBroker] Auth WS heartbeat timeout, reconnecting.');
+        this._closeAuthSocket();
+        this._connectAuth().catch(err => logger.error('Auth reconnect failed:', err));
+      }
+    }, 10000);
+  }
+
+  _stopAuthHeartbeat() {
+    if (this._authHeartbeatInterval) clearInterval(this._authHeartbeatInterval);
+    if (this._authHeartbeatTimeout) clearInterval(this._authHeartbeatTimeout);
+  }
+
+  _closeAuthSocket() {
+    this._stopAuthHeartbeat();
+    if (this._authSocket) {
+      this._authSocket.removeAllListeners();
+      this._authSocket.terminate();
+      this._authSocket = null;
+    }
+    for (const [id, pending] of this._authPendingRequests) {
+      clearTimeout(pending.timeout);
+      if (pending.reject) pending.reject(new Error('Auth connection closed'));
+      this._authPendingRequests.delete(id);
+    }
+    if (this._authState !== STATE.DISCONNECTED && this._authState !== STATE.FATAL) {
+      this._authState = STATE.DISCONNECTED;
+    }
+  }
+
+  _sendAuthRaw(payload) {
+    if (!this._authSocket || this._authSocket.readyState !== WebSocket.OPEN) {
+      if (this._authMessageQueue.length < this.config.maxQueueSize) {
+        this._authMessageQueue.push({ payload, timestamp: Date.now() });
+      } else {
+        logger.error('[DerivBroker] Auth queue full, dropping message.');
+      }
+      return;
+    }
+    try {
+      const isImportant = payload.proposal || payload.buy || payload.sell || payload.portfolio || payload.authorize;
+      if (isImportant) {
+        logger.info(`[Out Auth] ${payload.req_id || 'no-req-id'} →`, JSON.stringify(redactSensitive(payload), null, 2));
+      } else {
+        logger.debug(`[Out Auth] ${payload.req_id || 'no-req-id'} →`, JSON.stringify(redactSensitive(payload)));
+      }
+      this._authSocket.send(JSON.stringify(payload));
+    } catch (err) {
+      logger.error('[DerivBroker] Auth send error:', err.message);
+      if (this._authMessageQueue.length < this.config.maxQueueSize) {
+        this._authMessageQueue.push({ payload, timestamp: Date.now() });
+      }
+    }
+  }
+
+  _flushAuthQueue() {
+    while (this._authMessageQueue.length > 0) {
+      const item = this._authMessageQueue.shift();
+      this._sendAuthRaw(item.payload);
+    }
+  }
+
+  async _sendAuthRequest(payload, timeoutMs = 15000, signal = null) {
+    await this._rateLimiter.acquire();
+    if (this._authState !== STATE.READY) {
+      await this._connectAuth();
+    }
+    if (!this._authSocket || this._authSocket.readyState !== WebSocket.OPEN) {
+      throw new Error('Auth WebSocket not open');
+    }
+    let lastError = null;
+    for (let attempt = 1; attempt <= this.config.maxRetries; attempt++) {
+      try {
+        if (signal && signal.aborted) throw new Error('Request cancelled');
+        const result = await this._sendAuthRawRequest(payload, timeoutMs, signal);
+        return result;
+      } catch (err) {
+        lastError = err;
+        logger.warn(`[DerivBroker] Auth request failed (attempt ${attempt}):`, err.message);
+        if (attempt < this.config.maxRetries) {
+          await sleep(this._getReconnectDelay(attempt));
+          if (signal && signal.aborted) throw new Error('Request cancelled');
+          await this._connectAuth();
+        }
+      }
+    }
+    throw lastError;
+  }
+
+  _sendAuthRawRequest(payload, timeoutMs = 15000, signal = null) {
+    return new Promise((resolve, reject) => {
+      const reqId = generateRequestId();
+      const msg = { ...payload, req_id: reqId };
+      const timeout = setTimeout(() => {
+        if (this._authPendingRequests.has(reqId)) {
+          this._authPendingRequests.delete(reqId);
+          reject(new Error(`Auth request timed out (${timeoutMs}ms)`));
+        }
+      }, timeoutMs);
+      const onCancel = () => {
+        clearTimeout(timeout);
+        if (this._authPendingRequests.has(reqId)) {
+          this._authPendingRequests.delete(reqId);
+          reject(new Error('Request cancelled'));
+        }
+      };
+      if (signal) signal.addEventListener('abort', onCancel, { once: true });
+      this._authPendingRequests.set(reqId, {
+        resolve, reject, timeout, sentAt: Date.now(), cancel: onCancel, signal,
+      });
+      this._sendAuthRaw(msg);
+    });
+  }
+
+  _handleAuthMessage(rawData) {
+    try {
+      const msg = JSON.parse(rawData);
+      logger.debug('[In Auth]', JSON.stringify(redactSensitive(msg)));
+
+      let handled = false;
+
+      if (msg.pong) {
+        this._authLastPong = Date.now();
+        handled = true;
+      }
+
+      if (msg.error) {
+        logger.error('[In Auth] API Error:', JSON.stringify(msg.error, null, 2));
+      }
+
+      // Request responses
+      if (msg.req_id && this._authPendingRequests.has(msg.req_id)) {
+        const pending = this._authPendingRequests.get(msg.req_id);
+        clearTimeout(pending.timeout);
+        this._authPendingRequests.delete(msg.req_id);
+        const latency = Date.now() - pending.sentAt;
+        this.metrics.totalLatency += latency;
+        this.metrics.latencyCount++;
+        if (msg.error) {
+          this.metrics.requestsFailed++;
+          pending.reject(new Error(`Deriv API error: ${msg.error.code} - ${msg.error.message}`));
+        } else {
+          this.metrics.requestsSent++;
+          pending.resolve(msg);
+        }
+        handled = true;
+      }
+
+      // Portfolio
       if (msg.portfolio) {
-        logger.debug('[In] Portfolio response received.');
+        logger.debug('[In Auth] Portfolio response received.');
         const portfolio = msg.portfolio;
         const contracts = portfolio.contracts || [];
         this._openPositions = contracts
@@ -758,48 +994,134 @@ class DerivBroker extends EventEmitter {
         handled = true;
       }
 
-      // ---- BUY/SELL responses ----
+      // Buy/Sell
       if (msg.buy) {
-        logger.info('[DerivBroker] Buy response received:', JSON.stringify(redactSensitive(msg.buy)));
+        logger.info('[In Auth] Buy response received:', JSON.stringify(redactSensitive(msg.buy)));
         handled = true;
       }
       if (msg.sell) {
-        logger.info('[DerivBroker] Sell response received:', JSON.stringify(redactSensitive(msg.sell)));
+        logger.info('[In Auth] Sell response received:', JSON.stringify(redactSensitive(msg.sell)));
         handled = true;
       }
       if (msg.proposal) {
-        logger.debug('[DerivBroker] Proposal response received.');
+        logger.debug('[In Auth] Proposal response received.');
         handled = true;
       }
 
       if (!handled) {
-        logger.debug('[In] Unhandled message type:', JSON.stringify(redactSensitive(msg), null, 2));
+        logger.debug('[In Auth] Unhandled message type:', JSON.stringify(redactSensitive(msg), null, 2));
       }
     } catch (err) {
-      logger.error('[In] Parse error:', err.message);
+      logger.error('[In Auth] Parse error:', err.message);
     }
   }
 
-  // ---------- Normalize a contract from portfolio ----------
-  _normalizeContract(contract) {
-    return {
-      id: contract.contract_id,
-      instrument: fromDerivSymbol(contract.underlying_symbol || contract.symbol, this.reverseMap) || 'UNKNOWN',
-      side: contract.direction === 'up' ? 'BUY' : (contract.direction === 'down' ? 'SELL' : 'UNKNOWN'),
-      price: contract.entry_price || 0,
-      units: contract.amount || 0,
-      unrealizedPL: contract.profit_loss || 0,
-      currentPrice: contract.current_spot || contract.entry_price || 0,
-      stopLoss: contract.stop_loss || 0,
-      takeProfit: contract.take_profit || 0,
-      openTime: contract.start_time ? contract.start_time * 1000 : Date.now(),
-      raw: contract,
-    };
+  async _ensureAuthReady() {
+    if (this._authState === STATE.READY) return;
+    await this._connectAuth();
+    // Wait for authorization
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Auth ready timeout')), this.config.readinessTimeout);
+      this.once('authReady', () => { clearTimeout(timeout); resolve(); });
+    });
+  }
+
+  // ---------- Symbol loading (public) ----------
+  async _loadSymbolsWithTimeout() {
+    return Promise.race([
+      this._loadSymbolsInternal(),
+      sleep(this.config.symbolTimeout).then(() => {
+        throw new Error(`Symbol loading timed out after ${this.config.symbolTimeout}ms`);
+      })
+    ]);
+  }
+
+  async _loadSymbolsInternal() {
+    logger.info('[DerivBroker] Fetching active symbols from public WS...');
+    let symbols = null;
+
+    try {
+      const response = await this._sendPublicRequest({ active_symbols: 'brief' }, 10000);
+      const isArray = Array.isArray(response.active_symbols);
+      if (isArray && response.active_symbols.length > 0) {
+        symbols = response.active_symbols;
+        logger.info(`[Symbols] Loaded ${symbols.length} symbols (brief).`);
+        if (symbols[0]) {
+          logger.info('[DerivBroker] First symbol (brief):', JSON.stringify(symbols[0], null, 2));
+        }
+      } else {
+        logger.warn('[DerivBroker] Brief symbols empty, trying full...');
+        const response2 = await this._sendPublicRequest({ active_symbols: 'full' }, 10000);
+        const isArray2 = Array.isArray(response2.active_symbols);
+        if (isArray2 && response2.active_symbols.length > 0) {
+          symbols = response2.active_symbols;
+          logger.info(`[Symbols] Loaded ${symbols.length} symbols (full).`);
+          if (symbols[0]) {
+            logger.info('[DerivBroker] First symbol (full):', JSON.stringify(symbols[0], null, 2));
+          }
+        }
+      }
+    } catch (err) {
+      logger.warn('[DerivBroker] Symbol request failed:', err.message);
+    }
+
+    if (symbols && symbols.length > 0) {
+      this._buildSymbolMaps(symbols);
+      this._symbolsDiscovered = true;
+      logger.info(`[DerivBroker] Symbol discovery completed – ${Object.keys(this.symbolMap).length} forex pairs mapped.`);
+      const sample = Object.keys(this.symbolMap).slice(0, 5);
+      logger.info(`[Symbols] Sample mappings: ${sample.map(k => `${k} → ${this.symbolMap[k]}`).join(', ')}`);
+    } else {
+      throw new Error('No symbols received from Deriv.');
+    }
+  }
+
+  _useFallbackSymbols() {
+    logger.warn('[DerivBroker] Using FALLBACK_SYMBOLS.');
+    this.symbolMap = { ...FALLBACK_SYMBOLS };
+    this.reverseMap = {};
+    this.spreadMap = {};
+    for (const [key, val] of Object.entries(FALLBACK_SYMBOLS)) {
+      this.reverseMap[val] = key;
+      this.spreadMap[val] = 0.0001;
+    }
+    this._symbolsDiscovered = true;
+    logger.info(`[DerivBroker] Fallback symbols loaded: ${Object.keys(this.symbolMap).length} pairs.`);
+  }
+
+  _buildSymbolMaps(symbols) {
+    let count = 0;
+    this.symbolMap = {};
+    this.reverseMap = {};
+    this.spreadMap = {};
+
+    for (const sym of symbols) {
+      const derivSymbol = sym.underlying_symbol ?? sym.symbol;
+      const display = sym.underlying_symbol_name ?? sym.display_name ?? '';
+      const pip = Number(sym.pip_size ?? sym.pip ?? 0.0001);
+
+      if (!derivSymbol) continue;
+      const match = display.match(/([A-Z]{3})\/([A-Z]{3})/);
+      if (!match) continue;
+
+      const ourPair = match[1] + '_' + match[2];
+      this.symbolMap[ourPair] = derivSymbol;
+      this.reverseMap[derivSymbol] = ourPair;
+      this.spreadMap[derivSymbol] = pip * 0.5;
+      count++;
+    }
+
+    if (count === 0) {
+      logger.warn('[DerivBroker] No forex pairs found in symbol list.');
+    } else {
+      logger.info(`[DerivBroker] Symbol map built: ${count} forex pairs.`);
+    }
+    this.symbolManager.setSymbols(symbols);
+    return count;
   }
 
   // ---------- SUBSCRIBE DEFAULT SYMBOLS ----------
   async _subscribeDefaultSymbols() {
-    // Use only discovered symbols
     const symbols = Object.values(this.symbolMap);
     if (symbols.length === 0) {
       logger.warn('[DerivBroker] No symbols to subscribe to – skipping.');
@@ -814,252 +1136,6 @@ class DerivBroker extends EventEmitter {
         logger.warn(`[DerivBroker] Could not subscribe to ${sym}:`, err.message);
       }
     }
-  }
-
-  // ---------- SEND LOGIC ----------
-  _sendRaw(payload) {
-    if (!this._socket || this._socket.readyState !== WebSocket.OPEN) {
-      if (this._messageQueue.length < this.config.maxQueueSize) {
-        this._messageQueue.push({ payload, timestamp: Date.now() });
-        logger.debug('[DerivBroker] Message queued (socket not open)');
-      } else {
-        logger.error('[DerivBroker] Queue full, dropping message.');
-      }
-      return;
-    }
-    try {
-      const isImportant = payload.authorize || payload.active_symbols || payload.buy || payload.sell || payload.proposal || payload.portfolio;
-      if (isImportant) {
-        logger.info(`[Out] ${payload.req_id || 'no-req-id'} →`, JSON.stringify(redactSensitive(payload), null, 2));
-      } else {
-        logger.debug(`[Out] ${payload.req_id || 'no-req-id'} →`, JSON.stringify(redactSensitive(payload)));
-      }
-      this._socket.send(JSON.stringify(payload));
-    } catch (err) {
-      logger.error('[DerivBroker] Send error:', err.message);
-      if (this._messageQueue.length < this.config.maxQueueSize) {
-        this._messageQueue.push({ payload, timestamp: Date.now() });
-      }
-    }
-  }
-
-  async _sendRequest(payload, timeoutMs = 15000, signal = null) {
-    await this._rateLimiter.acquire();
-    if (this._state === STATE.FATAL) throw new Error('Broker in FATAL state.');
-    if (this._state !== STATE.READY) await this._ensureReady();
-    if (!this._socket || this._socket.readyState !== WebSocket.OPEN) throw new Error('WebSocket not open');
-    if (!this._isRequestAllowed()) throw new Error('Circuit breaker is OPEN');
-
-    let lastError = null;
-    for (let attempt = 1; attempt <= this.config.maxRetries; attempt++) {
-      try {
-        if (signal && signal.aborted) throw new Error('Request cancelled');
-        const result = await this._sendRawRequest(payload, timeoutMs, signal);
-        if (this._cbState === CB_STATE.HALF_OPEN) this._resetCircuitBreaker();
-        return result;
-      } catch (err) {
-        lastError = err;
-        logger.warn(`[DerivBroker] Request failed (attempt ${attempt}):`, err.message);
-        if (attempt < this.config.maxRetries) {
-          await sleep(this._getReconnectDelay(attempt));
-          if (signal && signal.aborted) throw new Error('Request cancelled');
-          await this.connect();
-        }
-      }
-    }
-    this._recordFailure();
-    throw lastError;
-  }
-
-  _sendRawRequest(payload, timeoutMs = 15000, signal = null) {
-    return new Promise((resolve, reject) => {
-      const reqId = generateRequestId();
-      const msg = { ...payload, req_id: reqId };
-      const timeout = setTimeout(() => {
-        if (this._pendingRequests.has(reqId)) {
-          this._pendingRequests.delete(reqId);
-          reject(new Error(`Request timed out (${timeoutMs}ms)`));
-        }
-      }, timeoutMs);
-      const onCancel = () => {
-        clearTimeout(timeout);
-        if (this._pendingRequests.has(reqId)) {
-          this._pendingRequests.delete(reqId);
-          reject(new Error('Request cancelled'));
-        }
-      };
-      if (signal) signal.addEventListener('abort', onCancel, { once: true });
-      this._pendingRequests.set(reqId, {
-        resolve, reject, timeout, sentAt: Date.now(), cancel: onCancel, signal,
-      });
-      logger.debug(`[DerivBroker] Sending: ${JSON.stringify(msg)}`);
-      this._sendRaw(msg);
-    });
-  }
-
-  _flushQueue() {
-    const now = Date.now();
-    const maxAge = 300000;
-    while (this._messageQueue.length > 0) {
-      const item = this._messageQueue[0];
-      if (now - item.timestamp > maxAge) {
-        this._messageQueue.shift();
-        logger.warn('[DerivBroker] Discarded expired queued message');
-        continue;
-      }
-      this._sendRaw(item.payload);
-      this._messageQueue.shift();
-    }
-  }
-
-  // ---------- SYMBOL LOADING ----------
-  async _loadSymbolsWithTimeout() {
-    return Promise.race([
-      this._loadSymbolsInternal(),
-      sleep(this.config.symbolTimeout).then(() => {
-        throw new Error(`Symbol loading timed out after ${this.config.symbolTimeout}ms`);
-      })
-    ]);
-  }
-
-  // ============================================================
-  // FIXED: Removed product_type, updated field parsing
-  // ============================================================
-  async _loadSymbolsInternal() {
-    logger.info('[DerivBroker] Fetching active symbols...');
-    let symbols = null;
-    let rawResponse = null;
-
-    // ---- Attempt 1: 'brief' (no product_type) ----
-    try {
-      const response = await this._sendRawRequest({ active_symbols: 'brief' }, 10000);
-      rawResponse = response;
-      // Log structure of the raw response (redact sensitive fields)
-      logger.info('[DerivBroker] active_symbols (brief) response keys:', Object.keys(response));
-      
-      const isArray = Array.isArray(response.active_symbols);
-      logger.info(
-        '[DerivBroker] active_symbols (brief) payload summary:',
-        JSON.stringify({
-          msg_type: response.msg_type,
-          req_id: response.req_id,
-          echo_req: response.echo_req ? { active_symbols: response.echo_req.active_symbols } : undefined,
-          active_symbols_count: isArray ? response.active_symbols.length : 'not an array',
-          first_keys: isArray && response.active_symbols.length > 0
-            ? Object.keys(response.active_symbols[0])
-            : []
-        })
-      );
-
-      const result = response.active_symbols || [];
-      if (isArray && result.length > 0) {
-        symbols = result;
-        logger.info(`[Symbols] Loaded ${symbols.length} symbols (brief).`);
-        // Log the first symbol to see its structure
-        if (symbols[0]) {
-          logger.info('[DerivBroker] First symbol (brief):', JSON.stringify(symbols[0], null, 2));
-        }
-      } else {
-        logger.warn('[DerivBroker] Brief symbols returned empty or not an array.');
-      }
-    } catch (err) {
-      logger.warn('[DerivBroker] Brief symbol request failed:', err.message);
-    }
-
-    // ---- Attempt 2: 'full' (no product_type) ----
-    if (!symbols) {
-      try {
-        const response = await this._sendRawRequest({ active_symbols: 'full' }, 10000);
-        rawResponse = response;
-        logger.info('[DerivBroker] active_symbols (full) response keys:', Object.keys(response));
-        
-        const isArray = Array.isArray(response.active_symbols);
-        logger.info(
-          '[DerivBroker] active_symbols (full) payload summary:',
-          JSON.stringify({
-            msg_type: response.msg_type,
-            req_id: response.req_id,
-            echo_req: response.echo_req ? { active_symbols: response.echo_req.active_symbols } : undefined,
-            active_symbols_count: isArray ? response.active_symbols.length : 'not an array',
-            first_keys: isArray && response.active_symbols.length > 0
-              ? Object.keys(response.active_symbols[0])
-              : []
-          })
-        );
-
-        const result = response.active_symbols || [];
-        if (isArray && result.length > 0) {
-          symbols = result;
-          logger.info(`[Symbols] Loaded ${symbols.length} symbols (full).`);
-          if (symbols[0]) {
-            logger.info('[DerivBroker] First symbol (full):', JSON.stringify(symbols[0], null, 2));
-          }
-        } else {
-          logger.warn('[DerivBroker] Full symbols returned empty or not an array.');
-        }
-      } catch (err) {
-        logger.warn('[DerivBroker] Full symbol request failed:', err.message);
-      }
-    }
-
-    if (!symbols || symbols.length === 0) {
-      // Log the raw response as a last resort (redacted)
-      if (rawResponse) {
-        logger.error('[DerivBroker] Full response (redacted):', JSON.stringify(rawResponse, (key, value) => {
-          if (key === 'authorize' || key === 'token' || key === 'api_token') return '***REDACTED***';
-          return value;
-        }));
-      }
-      throw new Error('No symbols received from Deriv.');
-    }
-
-    const built = this._buildSymbolMaps(symbols);
-    if (built === 0) {
-      throw new Error('Symbol discovery succeeded but no forex pairs could be parsed.');
-    }
-
-    this._symbolsDiscovered = true;
-    logger.info(`[DerivBroker] Symbol discovery completed – ${built} forex pairs mapped.`);
-    const sample = Object.keys(this.symbolMap).slice(0, 5);
-    logger.info(`[Symbols] Sample mappings: ${sample.map(k => `${k} → ${this.symbolMap[k]}`).join(', ')}`);
-  }
-
-  // ---- Build maps using current Deriv fields (with legacy fallbacks) ----
-  _buildSymbolMaps(symbols) {
-    let count = 0;
-    // Clear existing maps (we'll replace fallback with discovered ones)
-    this.symbolMap = {};
-    this.reverseMap = {};
-    this.spreadMap = {};
-
-    for (const sym of symbols) {
-      // Use current field names with legacy fallbacks
-      const derivSymbol = sym.underlying_symbol ?? sym.symbol;
-      const display = sym.underlying_symbol_name ?? sym.display_name ?? '';
-      const pip = Number(sym.pip_size ?? sym.pip ?? 0.0001);
-
-      if (!derivSymbol) continue;
-
-      // Try to extract currency pair from display name, e.g., "EUR/USD"
-      const match = display.match(/([A-Z]{3})\/([A-Z]{3})/);
-      if (!match) continue;
-
-      const ourPair = match[1] + '_' + match[2];
-      this.symbolMap[ourPair] = derivSymbol;
-      this.reverseMap[derivSymbol] = ourPair;
-      this.spreadMap[derivSymbol] = pip * 0.5;
-      count++;
-    }
-
-    if (count === 0) {
-      logger.warn('[DerivBroker] No forex pairs found in symbol list.');
-      // Do NOT fallback to hardcoded list – we will throw later.
-    } else {
-      logger.info(`[DerivBroker] Symbol map built: ${count} forex pairs.`);
-    }
-    // Store the discovered symbols in symbolManager
-    this.symbolManager.setSymbols(symbols);
-    return count;
   }
 
   // ---------- ORDER PERSISTENCE ----------
@@ -1095,7 +1171,7 @@ class DerivBroker extends EventEmitter {
     this.emit('orderUpdate', { clientOrderId, status, contractId });
   }
 
-  // ---------- POSITION RECONCILIATION (using portfolio) ----------
+  // ---------- POSITION RECONCILIATION (auth) ----------
   async _reconcilePositions() {
     logger.info('[DerivBroker] Reconciling positions from portfolio...');
     try {
@@ -1144,13 +1220,29 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // ---------- PUBLIC API (using official Deriv calls) ----------
+  // ---------- Normalize contract ----------
+  _normalizeContract(contract) {
+    return {
+      id: contract.contract_id,
+      instrument: fromDerivSymbol(contract.underlying_symbol || contract.symbol, this.reverseMap) || 'UNKNOWN',
+      side: contract.direction === 'up' ? 'BUY' : (contract.direction === 'down' ? 'SELL' : 'UNKNOWN'),
+      price: contract.entry_price || 0,
+      units: contract.amount || 0,
+      unrealizedPL: contract.profit_loss || 0,
+      currentPrice: contract.current_spot || contract.entry_price || 0,
+      stopLoss: contract.stop_loss || 0,
+      takeProfit: contract.take_profit || 0,
+      openTime: contract.start_time ? contract.start_time * 1000 : Date.now(),
+      raw: contract,
+    };
+  }
+
+  // ---------- PUBLIC API ----------
 
   // ---- Get Account ----
   async getAccount() {
-    await this._ensureReady();
+    await this._ensureAuthReady();
     if (!this._account) {
-      logger.warn('[DerivBroker] Account not yet available, returning default.');
       return this._getDefaultAccount();
     }
     const acc = this._account;
@@ -1177,9 +1269,9 @@ class DerivBroker extends EventEmitter {
     };
   }
 
-  // ---- Get Prices ----
+  // ---- Get Prices (from public) ----
   async getPrices(instruments) {
-    await this._ensureReady();
+    await this._ensurePublicReady();
     const results = [];
     for (const pair of instruments) {
       const symbol = toDerivSymbol(pair, this.symbolMap);
@@ -1197,7 +1289,7 @@ class DerivBroker extends EventEmitter {
         });
         continue;
       }
-      const response = await this._sendRequest({ ticks: symbol });
+      const response = await this._sendPublicRequest({ ticks: symbol });
       const tick = response.tick;
       let bid, ask;
       if (tick.bid !== undefined && tick.ask !== undefined) {
@@ -1219,9 +1311,9 @@ class DerivBroker extends EventEmitter {
     return results;
   }
 
-  // ---- Get Candles ----
+  // ---- Get Candles (from public) ----
   async getCandles(instrument, count = 100, granularity = 'M5') {
-    await this._ensureReady();
+    await this._ensurePublicReady();
     const symbol = toDerivSymbol(instrument, this.symbolMap);
     if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
     const intervalMap = {
@@ -1231,7 +1323,7 @@ class DerivBroker extends EventEmitter {
     const seconds = intervalMap[granularity] || 300;
     const end = Math.floor(Date.now() / 1000);
     const start = end - (count * seconds + 10);
-    const response = await this._sendRequest({
+    const response = await this._sendPublicRequest({
       ohlc: symbol,
       interval: seconds,
       start: start,
@@ -1246,11 +1338,11 @@ class DerivBroker extends EventEmitter {
     }));
   }
 
-  // ---- Get Open Trades (using portfolio) ----
+  // ---- Get Open Trades (auth) ----
   async getOpenTrades() {
-    await this._ensureReady();
+    await this._ensureAuthReady();
     try {
-      const response = await this._sendRequest({ portfolio: 1 });
+      const response = await this._sendAuthRequest({ portfolio: 1 });
       const portfolio = response.portfolio || {};
       const contracts = portfolio.contracts || [];
       const openContracts = contracts.filter(c => 
@@ -1265,9 +1357,9 @@ class DerivBroker extends EventEmitter {
 
   async getPositions() { return this.getOpenTrades(); }
 
-  // ---- Place Market Order (using proposal + buy) ----
+  // ---- Place Market Order (auth) ----
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null) {
-    await this._ensureReady();
+    await this._ensureAuthReady();
     const amount = Math.abs(units);
     if (amount <= 0) throw new Error('Order units must be positive.');
     const side = units > 0 ? 'up' : 'down';
@@ -1282,13 +1374,13 @@ class DerivBroker extends EventEmitter {
       currency: this.accountCurrency || 'USD',
       duration: 60,
       duration_unit: 's',
-      underlying_symbol: symbol, // ✅ uses underlying_symbol (current API)
+      underlying_symbol: symbol,
       multiplier: this.getLeverage(symbol) || 100,
     };
     if (stopLoss) proposalPayload.stop_loss = stopLoss;
     if (takeProfit) proposalPayload.take_profit = takeProfit;
 
-    const proposalResponse = await this._sendRequest(proposalPayload);
+    const proposalResponse = await this._sendAuthRequest(proposalPayload);
     const proposal = proposalResponse.proposal;
     if (!proposal) {
       throw new Error('Failed to get proposal: ' + JSON.stringify(proposalResponse));
@@ -1300,7 +1392,7 @@ class DerivBroker extends EventEmitter {
       buy: proposalId,
       price: askPrice,
     };
-    const buyResponse = await this._sendRequest(buyPayload);
+    const buyResponse = await this._sendAuthRequest(buyPayload);
     const buy = buyResponse.buy;
     if (!buy || !buy.contract_id) {
       throw new Error('Buy failed: ' + JSON.stringify(buyResponse));
@@ -1335,15 +1427,15 @@ class DerivBroker extends EventEmitter {
     };
   }
 
-  // ---- Close Trade (using sell) ----
+  // ---- Close Trade (auth) ----
   async closeTrade(tradeId) {
-    await this._ensureReady();
+    await this._ensureAuthReady();
     if (!tradeId) throw new Error('tradeId is required');
     const sellPayload = {
       sell: tradeId,
       price: 0,
     };
-    const response = await this._sendRequest(sellPayload);
+    const response = await this._sendAuthRequest(sellPayload);
     const sell = response.sell;
     if (!sell) {
       throw new Error('Close trade failed: ' + JSON.stringify(response));
@@ -1359,9 +1451,9 @@ class DerivBroker extends EventEmitter {
     return response;
   }
 
-  // ---- Modify SL/TP (close and reopen) ----
+  // ---- Modify SL/TP (auth) ----
   async modifySLTP(tradeId, stopLoss, takeProfit) {
-    await this._ensureReady();
+    await this._ensureAuthReady();
     if (!tradeId) throw new Error('tradeId is required');
     const positions = await this.getOpenTrades();
     const pos = positions.find(p => p.id === tradeId);
@@ -1390,23 +1482,28 @@ class DerivBroker extends EventEmitter {
     return this.placeMarketOrder(instrument, units, stopLoss, takeProfit);
   }
 
-  // ---- Health & State ----
-  isConnected() { return this._state === STATE.READY || this._state === STATE.CONNECTED; }
-  isAuthorized() { return this._state === STATE.READY || this._state === STATE.AUTHENTICATING; }
+  // ---- Health ----
+  isConnected() {
+    return this._publicState === STATE.READY || this._publicState === STATE.CONNECTED;
+  }
+  isAuthorized() {
+    return this._authState === STATE.READY || this._authState === STATE.CONNECTED;
+  }
 
   getHealth() {
-    const avgLatency = this.metrics.latencyCount > 0 ? this.metrics.totalLatency / this.metrics.latencyCount : 0;
     return {
-      state: this._state,
+      state: this._state || 'UNKNOWN',
+      publicState: this._publicState,
+      authState: this._authState,
       connected: this.isConnected(),
       authorized: this.isAuthorized(),
       circuitBreaker: this._cbState,
       reconnectCount: this.metrics.reconnections,
-      queueSize: this._messageQueue.length,
-      pendingRequests: this._pendingRequests.size,
+      queueSize: this._publicMessageQueue.length + this._authMessageQueue.length,
+      pendingRequests: this._publicPendingRequests.size + this._authPendingRequests.size,
       lastHeartbeat: this.metrics.lastHeartbeat,
       lastPong: this.metrics.lastPong,
-      averageLatency: avgLatency,
+      averageLatency: this.metrics.latencyCount > 0 ? this.metrics.totalLatency / this.metrics.latencyCount : 0,
       uptime: this.metrics.connectedSince ? Date.now() - this.metrics.connectedSince : 0,
       orders: {
         placed: this.metrics.ordersPlaced,
@@ -1440,74 +1537,27 @@ class DerivBroker extends EventEmitter {
 
   async disconnect() {
     logger.info('[DerivBroker] Disconnecting gracefully...');
-    this._stopHeartbeat();
-    const subs = Array.from(this.streaming._subscriptions.keys());
-    for (const key of subs) {
-      const sub = this.streaming._subscriptions.get(key);
-      try {
-        await this._sendRequest({ forget: sub.subscriptionId });
-      } catch (e) {}
-      this.streaming._subscriptions.delete(key);
-    }
-    for (const [id, pending] of this._pendingRequests) {
-      clearTimeout(pending.timeout);
-      if (pending.reject) pending.reject(new Error('Disconnected'));
-      this._pendingRequests.delete(id);
-    }
-    if (this._socket) {
-      this._socket.close();
-      await new Promise((resolve) => {
-        this._socket.once('close', resolve);
-        setTimeout(resolve, 5000);
-      });
-      this._socket = null;
-    }
-    this._setState(STATE.DISCONNECTED);
-    this._messageQueue = [];
+    this._closePublicSocket();
+    this._closeAuthSocket();
+    this._publicState = STATE.DISCONNECTED;
+    this._authState = STATE.DISCONNECTED;
     logger.info('[DerivBroker] Disconnected.');
   }
 
-  _closeSocket() {
-    this._stopHeartbeat();
-    if (this._socket) {
-      this._socket.removeAllListeners();
-      this._socket.terminate();
-      this._socket = null;
-    }
-    for (const [id, pending] of this._pendingRequests) {
-      clearTimeout(pending.timeout);
-      if (pending.reject) pending.reject(new Error('Connection closed'));
-      this._pendingRequests.delete(id);
-    }
-    if (this._state !== STATE.DISCONNECTED && this._state !== STATE.FATAL) {
-      this._setState(STATE.DISCONNECTED);
-    }
+  // ---- Utility ----
+  _setState(newState) {
+    this._state = newState;
   }
 
-  _ensureReady() {
-    if (this._state === STATE.READY) return Promise.resolve();
-    if (this._state === STATE.FATAL) return Promise.reject(new Error('Broker in FATAL state.'));
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.removeListener('ready', onReady);
-        reject(new Error(`Broker did not become ready within ${this.config.readinessTimeout}ms`));
-      }, this.config.readinessTimeout);
-      const onReady = () => {
-        clearTimeout(timeout);
-        resolve();
-      };
-      this.once('ready', onReady);
-      if (this._state === STATE.DISCONNECTED || this._state === STATE.CONNECTING) {
-        this.connect().catch((err) => {
-          clearTimeout(timeout);
-          this.removeListener('ready', onReady);
-          reject(err);
-        });
-      }
-    });
+  _getReconnectDelay(attempt) {
+    const base = this.config.reconnectBaseDelay;
+    const max = this.config.maxReconnectDelay;
+    const delay = Math.min(base * Math.pow(2, attempt), max);
+    const jitter = delay * (0.8 + 0.4 * Math.random());
+    return Math.round(jitter);
   }
 
-  // ---------- RISK VALIDATION (unchanged) ----------
+  // ---- Risk validation ----
   async _validateOrderRisk(instrument, side, units, stopLoss, takeProfit) {
     if (this.config.riskValidator) {
       const result = await this.config.riskValidator({
@@ -1530,12 +1580,13 @@ class DerivBroker extends EventEmitter {
 }
 
 // ============================================================
-// EXPORT – singleton AND class
+// EXPORT – singleton
 // ============================================================
 const brokerInstance = new DerivBroker({
   apiToken: process.env.DERIV_API_TOKEN,
   appId: process.env.DERIV_APP_ID,
-  wsUrl: process.env.DERIV_WS_URL,
+  publicWsUrl: process.env.DERIV_PUBLIC_WS_URL || `wss://api.derivws.com/trading/v1/options/ws/public`,
+  authWsUrl: process.env.DERIV_AUTH_WS_URL || `wss://ws.derivws.com/websockets/v3?app_id=${process.env.DERIV_APP_ID || '1089'}`,
   connectionTimeout: parseInt(process.env.DERIV_CONNECTION_TIMEOUT) || 30000,
   reconnectBaseDelay: parseInt(process.env.DERIV_RECONNECT_DELAY) || 2000,
   maxReconnectDelay: parseInt(process.env.DERIV_MAX_RECONNECT_DELAY) || 30000,
