@@ -1,6 +1,8 @@
-// core/execution/broker.js – Dual WebSocket Architecture
-// Public WS: market data (active_symbols, ticks) – no auth
-// Authenticated WS: trading (portfolio, proposal, buy, sell) – requires authorize
+// core/execution/broker.js – Stable Dual‑WebSocket Deriv Broker
+// - Public WS: persistent, reconnects only on close/error
+// - Auth WS: v3 with `authorize` (legacy, but works; OTP migration planned)
+// - Correct contract types: MULTUP / MULTDOWN
+// - Fallback symbols only if discovery fails
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -76,7 +78,7 @@ function fromDerivSymbol(symbol, reverseMap) {
   return symbol;
 }
 
-// Hardcoded fallback symbols (used only if public endpoint fails)
+// Hardcoded fallback symbols – used only if public discovery fails
 const FALLBACK_SYMBOLS = {
   'EUR_USD': 'frxEURUSD',
   'GBP_USD': 'frxGBPUSD',
@@ -253,7 +255,7 @@ class SymbolManager {
 }
 
 // ============================================================
-// MAIN BROKER CLASS (Dual WebSocket)
+// MAIN BROKER CLASS (Stable Dual WebSocket)
 // ============================================================
 const BROKER_CAPABILITIES = {
   supportsTrailingStop: false,
@@ -279,9 +281,9 @@ class DerivBroker extends EventEmitter {
     this.config = {
       apiToken: config.apiToken || process.env.DERIV_API_TOKEN,
       appId: appId,
-      // Public endpoint (market data)
+      // Public endpoint (market data) – stable, persistent
       publicWsUrl: config.publicWsUrl || process.env.DERIV_PUBLIC_WS_URL || `wss://api.derivws.com/trading/v1/options/ws/public`,
-      // Authenticated endpoint (trading)
+      // Auth endpoint (trading) – legacy v3 for now; will migrate to OTP
       authWsUrl: config.authWsUrl || process.env.DERIV_AUTH_WS_URL || `wss://ws.derivws.com/websockets/v3?app_id=${appId}`,
       connectionTimeout: parseInt(config.connectionTimeout || process.env.DERIV_CONNECTION_TIMEOUT || 30000),
       reconnectBaseDelay: parseInt(config.reconnectBaseDelay || process.env.DERIV_RECONNECT_DELAY || 2000),
@@ -316,6 +318,7 @@ class DerivBroker extends EventEmitter {
     this._publicHeartbeatTimeout = null;
     this._publicLastPong = Date.now();
     this._publicConnectionPromise = null;
+    this._publicReconnectTimer = null; // for persistent reconnect
 
     // ---------- Auth socket (trading) ----------
     this._authState = STATE.DISCONNECTED;
@@ -348,6 +351,7 @@ class DerivBroker extends EventEmitter {
       this.spreadMap[FALLBACK_SYMBOLS[key]] = 0.0001;
     }
     this._symbolsDiscovered = false;
+    this._symbolsLoaded = false;
 
     // ---------- Order tracking ----------
     this._orders = new Map();
@@ -376,7 +380,9 @@ class DerivBroker extends EventEmitter {
     this._portfolioLogged = false;
     this._openPositions = [];
 
-    logger.info('[DerivBroker] Created with dual WebSocket architecture.');
+    this._ready = false; // overall readiness
+
+    logger.info('[DerivBroker] Created with stable dual WebSocket architecture.');
     logger.info(`[DerivBroker] Public WS: ${this.config.publicWsUrl}`);
     logger.info(`[DerivBroker] Auth WS: ${this.config.authWsUrl}`);
   }
@@ -402,15 +408,14 @@ class DerivBroker extends EventEmitter {
       this._connectPublic(),
       this._connectAuth()
     ]);
-    // Wait for symbol discovery from public
+    // Wait for symbol discovery from public (with fallback)
     await this._loadSymbolsWithTimeout();
     if (!this._symbolsDiscovered) {
-      // Fallback to hardcoded symbols
       logger.warn('[DerivBroker] Symbol discovery failed, using fallback symbols.');
       this._useFallbackSymbols();
     }
     // Set overall state to READY
-    this._setState(STATE.READY);
+    this._ready = true;
     this.emit('ready');
     this.emit('connected');
     // Start subscriptions
@@ -420,9 +425,9 @@ class DerivBroker extends EventEmitter {
     await this._loadPendingOrders();
   }
 
-  // ---- Public socket ----
+  // ---- Public socket: persistent reconnect on close/error ----
   async _connectPublic() {
-    if (this._publicState === STATE.READY) return;
+    if (this._publicState === STATE.READY || this._publicState === STATE.CONNECTED) return;
     if (this._publicConnectionPromise) return this._publicConnectionPromise;
     this._publicConnectionPromise = this._doConnectPublic();
     try {
@@ -432,61 +437,76 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  async _doConnectPublic() {
-    this._publicState = STATE.CONNECTING;
-    this._closePublicSocket();
-    logger.info(`[DerivBroker] Connecting public WS: ${this.config.publicWsUrl}`);
-
+  _doConnectPublic() {
     return new Promise((resolve, reject) => {
-      let attempts = 0;
-      let connectionTimer = null;
+      // Clear any existing reconnect timer
+      if (this._publicReconnectTimer) {
+        clearTimeout(this._publicReconnectTimer);
+        this._publicReconnectTimer = null;
+      }
 
-      const attemptConnect = async () => {
-        if (this._publicState === STATE.READY) { resolve(); return; }
-        attempts++;
-        this.metrics.reconnections++;
-        if (attempts > 3) {
-          this._publicState = STATE.FATAL;
-          reject(new Error('Public connection failed after 3 attempts.'));
-          return;
-        }
-        this._publicState = STATE.CONNECTING;
-        if (connectionTimer) clearTimeout(connectionTimer);
-        try {
-          this._publicSocket = new WebSocket(this.config.publicWsUrl);
-          const socket = this._publicSocket;
-          socket.removeAllListeners();
+      if (this._publicState === STATE.FATAL) {
+        reject(new Error('Public WS in FATAL state.'));
+        return;
+      }
 
-          socket.on('open', () => {
-            logger.info('[DerivBroker] Public WS connected.');
-            this._publicState = STATE.CONNECTED;
-            this._startPublicHeartbeat();
-            this._flushPublicQueue();
-            this.emit('publicReady');
-            resolve();
-          });
+      if (this._publicSocket && this._publicSocket.readyState === WebSocket.OPEN) {
+        resolve();
+        return;
+      }
 
-          socket.on('message', (data) => this._handlePublicMessage(data));
-          socket.on('error', (err) => logger.error('[DerivBroker] Public WS error:', err.message));
-          socket.on('close', (code, reason) => {
-            logger.info(`[DerivBroker] Public WS closed. Code: ${code}`);
-            this._publicState = STATE.DISCONNECTED;
-            if (connectionTimer) clearTimeout(connectionTimer);
-            setTimeout(() => attemptConnect(), this._getReconnectDelay(attempts));
-          });
+      this._publicState = STATE.CONNECTING;
+      this._closePublicSocket(); // ensure clean
 
-          connectionTimer = setTimeout(() => {
+      logger.info(`[DerivBroker] Connecting public WS: ${this.config.publicWsUrl}`);
+
+      try {
+        this._publicSocket = new WebSocket(this.config.publicWsUrl);
+        const socket = this._publicSocket;
+
+        // Connection timeout (only for the OPEN event)
+        const connectionTimer = setTimeout(() => {
+          if (this._publicState !== STATE.CONNECTED) {
             logger.error('[DerivBroker] Public WS connection timeout.');
-            this._closePublicSocket();
-            reject(new Error('Public connection timeout'));
-          }, this.config.connectionTimeout);
+            socket.terminate();
+            this._publicState = STATE.FAILED;
+            reject(new Error('Public WS connection timeout'));
+          }
+        }, this.config.connectionTimeout);
 
-        } catch (err) {
-          this._publicState = STATE.FAILED;
-          reject(err);
-        }
-      };
-      attemptConnect();
+        socket.on('open', () => {
+          clearTimeout(connectionTimer);
+          logger.info('[DerivBroker] Public WS connected.');
+          this._publicState = STATE.CONNECTED;
+          this._startPublicHeartbeat();
+          this._flushPublicQueue();
+          this.emit('publicReady');
+          resolve();
+        });
+
+        socket.on('message', (data) => this._handlePublicMessage(data));
+
+        socket.on('error', (err) => {
+          logger.error('[DerivBroker] Public WS error:', err.message);
+          // Do not reject here; the close event will handle reconnection.
+        });
+
+        socket.on('close', (code, reason) => {
+          clearTimeout(connectionTimer);
+          logger.info(`[DerivBroker] Public WS closed. Code: ${code}, Reason: ${reason || 'No reason'}`);
+          this._publicState = STATE.DISCONNECTED;
+          this._stopPublicHeartbeat();
+          // Schedule reconnect
+          if (this._publicReconnectTimer) clearTimeout(this._publicReconnectTimer);
+          this._publicReconnectTimer = setTimeout(() => {
+            this._connectPublic().catch(err => logger.error('Public reconnect failed:', err));
+          }, this._getReconnectDelay(0));
+        });
+
+      } catch (err) {
+        this._publicState = STATE.FAILED;
+        reject(err);
+      }
     });
   }
 
@@ -494,7 +514,7 @@ class DerivBroker extends EventEmitter {
     this._stopPublicHeartbeat();
     this._publicLastPong = Date.now();
     this._publicHeartbeatInterval = setInterval(() => {
-      if (this._publicState === STATE.READY || this._publicState === STATE.CONNECTED) {
+      if (this._publicState === STATE.CONNECTED || this._publicState === STATE.READY) {
         this._sendPublicRaw({ ping: 1 });
       }
     }, 30000);
@@ -519,6 +539,7 @@ class DerivBroker extends EventEmitter {
       this._publicSocket.terminate();
       this._publicSocket = null;
     }
+    // Reject all pending requests
     for (const [id, pending] of this._publicPendingRequests) {
       clearTimeout(pending.timeout);
       if (pending.reject) pending.reject(new Error('Public connection closed'));
@@ -533,6 +554,7 @@ class DerivBroker extends EventEmitter {
     if (!this._publicSocket || this._publicSocket.readyState !== WebSocket.OPEN) {
       if (this._publicMessageQueue.length < this.config.maxQueueSize) {
         this._publicMessageQueue.push({ payload, timestamp: Date.now() });
+        logger.debug('[DerivBroker] Public message queued (socket not open)');
       } else {
         logger.error('[DerivBroker] Public queue full, dropping message.');
       }
@@ -563,7 +585,8 @@ class DerivBroker extends EventEmitter {
 
   async _sendPublicRequest(payload, timeoutMs = 15000, signal = null) {
     await this._rateLimiter.acquire();
-    if (this._publicState !== STATE.READY && this._publicState !== STATE.CONNECTED) {
+    // Ensure socket is connected (will trigger reconnect if needed)
+    if (this._publicState !== STATE.CONNECTED && this._publicState !== STATE.READY) {
       await this._connectPublic();
     }
     if (!this._publicSocket || this._publicSocket.readyState !== WebSocket.OPEN) {
@@ -581,7 +604,10 @@ class DerivBroker extends EventEmitter {
         if (attempt < this.config.maxRetries) {
           await sleep(this._getReconnectDelay(attempt));
           if (signal && signal.aborted) throw new Error('Request cancelled');
-          await this._connectPublic();
+          // Ensure socket is still alive; reconnect if necessary
+          if (this._publicState !== STATE.CONNECTED) {
+            await this._connectPublic();
+          }
         }
       }
     }
@@ -629,7 +655,7 @@ class DerivBroker extends EventEmitter {
         logger.error('[In Public] API Error:', JSON.stringify(msg.error, null, 2));
       }
 
-      // Handle request responses
+      // Request responses
       if (msg.req_id && this._publicPendingRequests.has(msg.req_id)) {
         const pending = this._publicPendingRequests.get(msg.req_id);
         clearTimeout(pending.timeout);
@@ -681,13 +707,13 @@ class DerivBroker extends EventEmitter {
   }
 
   async _ensurePublicReady() {
-    if (this._publicState === STATE.READY || this._publicState === STATE.CONNECTED) return;
+    if (this._publicState === STATE.CONNECTED || this._publicState === STATE.READY) return;
     await this._connectPublic();
-    // Wait a bit for it to be truly ready
-    await sleep(100);
+    // Wait a bit for subscriptions to settle if needed
+    await sleep(200);
   }
 
-  // ---- Auth socket ----
+  // ---- Auth socket (legacy v3 with authorize) ----
   async _connectAuth() {
     if (this._authState === STATE.READY) return;
     if (this._authConnectionPromise) return this._authConnectionPromise;
@@ -699,100 +725,104 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  async _doConnectAuth() {
-    this._authState = STATE.CONNECTING;
-    this._closeAuthSocket();
-    logger.info(`[DerivBroker] Connecting auth WS: ${this.config.authWsUrl}`);
-
+  _doConnectAuth() {
     return new Promise((resolve, reject) => {
-      let attempts = 0;
-      let connectionTimer = null;
+      if (this._authState === STATE.FATAL) {
+        reject(new Error('Auth WS in FATAL state.'));
+        return;
+      }
 
-      const attemptConnect = async () => {
-        if (this._authState === STATE.READY) { resolve(); return; }
-        attempts++;
-        this.metrics.reconnections++;
-        if (attempts > 3) {
-          this._authState = STATE.FATAL;
-          reject(new Error('Auth connection failed after 3 attempts.'));
-          return;
-        }
-        this._authState = STATE.CONNECTING;
-        if (connectionTimer) clearTimeout(connectionTimer);
-        try {
-          this._authSocket = new WebSocket(this.config.authWsUrl);
-          const socket = this._authSocket;
-          socket.removeAllListeners();
+      if (this._authSocket && this._authSocket.readyState === WebSocket.OPEN) {
+        resolve();
+        return;
+      }
 
-          socket.on('open', () => {
-            logger.info('[DerivBroker] Auth WS connected.');
-            this._authState = STATE.CONNECTED;
-            this._startAuthHeartbeat();
-            this._flushAuthQueue();
-            // Authorize
-            this._authorize()
-              .then(async (authResponse) => {
-                if (authResponse && authResponse.authorize) {
-                  this._account = authResponse.authorize;
-                  this.accountCurrency = this._account.currency || 'USD';
-                  logger.info('[DerivBroker] Account stored from authorize.');
-                  try {
-                    await Account.upsertAccount({
-                      accountId: 'default',
-                      balance: parseFloat(this._account.balance) || 0,
-                      equity: parseFloat(this._account.balance) || 0,
-                      currency: this.accountCurrency,
-                      broker: 'deriv',
-                      loginId: this._account.loginid || '',
-                      leverage: parseFloat(this._account.leverage) || 100,
-                      status: 'online',
-                    });
-                    this.emit('account', await Account.getLatest('default'));
-                  } catch (err) {
-                    logger.error('[DerivBroker] Failed to save account:', err.message);
-                  }
-                }
-                logger.info('[DerivBroker] Auth authorized.');
-                this._authState = STATE.READY;
-                this.emit('authReady');
-                resolve();
-              })
-              .catch((err) => {
-                logger.error('[DerivBroker] Authorization failed:', err.message);
-                this._authFailCount++;
-                if (this._authFailCount >= this.config.fatalAfterAuthFailures) {
-                  this._authState = STATE.FATAL;
-                  this._closeAuthSocket();
-                  reject(new Error(`Authorization failed ${this._authFailCount} times.`));
-                  return;
-                }
-                this._authState = STATE.FAILED;
-                this._closeAuthSocket();
-                setTimeout(() => attemptConnect(), this._getReconnectDelay(attempts));
-              });
-          });
+      this._authState = STATE.CONNECTING;
+      this._closeAuthSocket();
 
-          socket.on('message', (data) => this._handleAuthMessage(data));
-          socket.on('error', (err) => logger.error('[DerivBroker] Auth WS error:', err.message));
-          socket.on('close', (code, reason) => {
-            logger.info(`[DerivBroker] Auth WS closed. Code: ${code}`);
-            this._authState = STATE.DISCONNECTED;
-            if (connectionTimer) clearTimeout(connectionTimer);
-            setTimeout(() => attemptConnect(), this._getReconnectDelay(attempts));
-          });
+      logger.info(`[DerivBroker] Connecting auth WS: ${this.config.authWsUrl}`);
 
-          connectionTimer = setTimeout(() => {
+      try {
+        this._authSocket = new WebSocket(this.config.authWsUrl);
+        const socket = this._authSocket;
+
+        const connectionTimer = setTimeout(() => {
+          if (this._authState !== STATE.CONNECTED) {
             logger.error('[DerivBroker] Auth WS connection timeout.');
-            this._closeAuthSocket();
-            reject(new Error('Auth connection timeout'));
-          }, this.config.connectionTimeout);
+            socket.terminate();
+            this._authState = STATE.FAILED;
+            reject(new Error('Auth WS connection timeout'));
+          }
+        }, this.config.connectionTimeout);
 
-        } catch (err) {
-          this._authState = STATE.FAILED;
-          reject(err);
-        }
-      };
-      attemptConnect();
+        socket.on('open', () => {
+          clearTimeout(connectionTimer);
+          logger.info('[DerivBroker] Auth WS connected.');
+          this._authState = STATE.CONNECTED;
+          this._startAuthHeartbeat();
+          this._flushAuthQueue();
+          // Authorize
+          this._authorize()
+            .then(async (authResponse) => {
+              if (authResponse && authResponse.authorize) {
+                this._account = authResponse.authorize;
+                this.accountCurrency = this._account.currency || 'USD';
+                logger.info('[DerivBroker] Account stored from authorize.');
+                try {
+                  await Account.upsertAccount({
+                    accountId: 'default',
+                    balance: parseFloat(this._account.balance) || 0,
+                    equity: parseFloat(this._account.balance) || 0,
+                    currency: this.accountCurrency,
+                    broker: 'deriv',
+                    loginId: this._account.loginid || '',
+                    leverage: parseFloat(this._account.leverage) || 100,
+                    status: 'online',
+                  });
+                  this.emit('account', await Account.getLatest('default'));
+                } catch (err) {
+                  logger.error('[DerivBroker] Failed to save account:', err.message);
+                }
+              }
+              logger.info('[DerivBroker] Auth authorized.');
+              this._authState = STATE.READY;
+              this.emit('authReady');
+              resolve();
+            })
+            .catch((err) => {
+              logger.error('[DerivBroker] Authorization failed:', err.message);
+              this._authFailCount++;
+              if (this._authFailCount >= this.config.fatalAfterAuthFailures) {
+                this._authState = STATE.FATAL;
+                this._closeAuthSocket();
+                reject(new Error(`Authorization failed ${this._authFailCount} times.`));
+                return;
+              }
+              this._authState = STATE.FAILED;
+              this._closeAuthSocket();
+              setTimeout(() => {
+                this._connectAuth().catch(err => logger.error('Auth reconnect failed:', err));
+              }, this._getReconnectDelay(0));
+            });
+        });
+
+        socket.on('message', (data) => this._handleAuthMessage(data));
+        socket.on('error', (err) => logger.error('[DerivBroker] Auth WS error:', err.message));
+        socket.on('close', (code, reason) => {
+          clearTimeout(connectionTimer);
+          logger.info(`[DerivBroker] Auth WS closed. Code: ${code}`);
+          this._authState = STATE.DISCONNECTED;
+          this._stopAuthHeartbeat();
+          // Reconnect auth automatically
+          setTimeout(() => {
+            this._connectAuth().catch(err => logger.error('Auth reconnect failed:', err));
+          }, this._getReconnectDelay(0));
+        });
+
+      } catch (err) {
+        this._authState = STATE.FAILED;
+        reject(err);
+      }
     });
   }
 
@@ -916,7 +946,9 @@ class DerivBroker extends EventEmitter {
         if (attempt < this.config.maxRetries) {
           await sleep(this._getReconnectDelay(attempt));
           if (signal && signal.aborted) throw new Error('Request cancelled');
-          await this._connectAuth();
+          if (this._authState !== STATE.READY) {
+            await this._connectAuth();
+          }
         }
       }
     }
@@ -1019,7 +1051,6 @@ class DerivBroker extends EventEmitter {
   async _ensureAuthReady() {
     if (this._authState === STATE.READY) return;
     await this._connectAuth();
-    // Wait for authorization
     await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('Auth ready timeout')), this.config.readinessTimeout);
       this.once('authReady', () => { clearTimeout(timeout); resolve(); });
@@ -1068,6 +1099,7 @@ class DerivBroker extends EventEmitter {
     if (symbols && symbols.length > 0) {
       this._buildSymbolMaps(symbols);
       this._symbolsDiscovered = true;
+      this._symbolsLoaded = true;
       logger.info(`[DerivBroker] Symbol discovery completed – ${Object.keys(this.symbolMap).length} forex pairs mapped.`);
       const sample = Object.keys(this.symbolMap).slice(0, 5);
       logger.info(`[Symbols] Sample mappings: ${sample.map(k => `${k} → ${this.symbolMap[k]}`).join(', ')}`);
@@ -1086,6 +1118,7 @@ class DerivBroker extends EventEmitter {
       this.spreadMap[val] = 0.0001;
     }
     this._symbolsDiscovered = true;
+    this._symbolsLoaded = true;
     logger.info(`[DerivBroker] Fallback symbols loaded: ${Object.keys(this.symbolMap).length} pairs.`);
   }
 
@@ -1357,12 +1390,12 @@ class DerivBroker extends EventEmitter {
 
   async getPositions() { return this.getOpenTrades(); }
 
-  // ---- Place Market Order (auth) ----
+  // ---- Place Market Order (auth) – CORRECTED CONTRACT TYPES ----
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null) {
     await this._ensureAuthReady();
     const amount = Math.abs(units);
     if (amount <= 0) throw new Error('Order units must be positive.');
-    const side = units > 0 ? 'up' : 'down';
+    const direction = units > 0 ? 'MULTUP' : 'MULTDOWN';
     const symbol = toDerivSymbol(instrument, this.symbolMap);
     if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
     
@@ -1370,7 +1403,7 @@ class DerivBroker extends EventEmitter {
       proposal: 1,
       amount: amount,
       basis: 'stake',
-      contract_type: 'MULTIPLIER',
+      contract_type: direction, // ✅ MULTUP or MULTDOWN
       currency: this.accountCurrency || 'USD',
       duration: 60,
       duration_unit: 's',
@@ -1483,20 +1516,29 @@ class DerivBroker extends EventEmitter {
   }
 
   // ---- Health ----
-  isConnected() {
-    return this._publicState === STATE.READY || this._publicState === STATE.CONNECTED;
+  isMarketDataConnected() {
+    return this._publicState === STATE.CONNECTED || this._publicState === STATE.READY;
   }
+
+  isTradingReady() {
+    return this._authState === STATE.READY;
+  }
+
+  isConnected() {
+    return this.isMarketDataConnected() && this.isTradingReady();
+  }
+
   isAuthorized() {
-    return this._authState === STATE.READY || this._authState === STATE.CONNECTED;
+    return this.isTradingReady();
   }
 
   getHealth() {
     return {
-      state: this._state || 'UNKNOWN',
       publicState: this._publicState,
       authState: this._authState,
-      connected: this.isConnected(),
-      authorized: this.isAuthorized(),
+      marketDataConnected: this.isMarketDataConnected(),
+      tradingReady: this.isTradingReady(),
+      ready: this._ready,
       circuitBreaker: this._cbState,
       reconnectCount: this.metrics.reconnections,
       queueSize: this._publicMessageQueue.length + this._authMessageQueue.length,
@@ -1541,14 +1583,11 @@ class DerivBroker extends EventEmitter {
     this._closeAuthSocket();
     this._publicState = STATE.DISCONNECTED;
     this._authState = STATE.DISCONNECTED;
+    this._ready = false;
     logger.info('[DerivBroker] Disconnected.');
   }
 
   // ---- Utility ----
-  _setState(newState) {
-    this._state = newState;
-  }
-
   _getReconnectDelay(attempt) {
     const base = this.config.reconnectBaseDelay;
     const max = this.config.maxReconnectDelay;
