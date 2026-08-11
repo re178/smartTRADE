@@ -4,6 +4,7 @@
 // - Correct contract types: MULTUP / MULTDOWN
 // - Account enhancement: tradeMode and server from `_account`
 // - Full integration with Account model and priceBuffer
+// - Symbol loading with timeout and graceful fallback
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -299,7 +300,7 @@ class DerivBroker extends EventEmitter {
       riskValidator: config.riskValidator || null,
       fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || 3),
       readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 30000),
-      symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 30000),
+      symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 10000), // reduced to 10s
       heartbeatTimeout: parseInt(config.heartbeatTimeout || process.env.DERIV_HEARTBEAT_TIMEOUT || 60000),
     };
 
@@ -406,9 +407,14 @@ class DerivBroker extends EventEmitter {
       this._connectPublic(),
       this._connectAuth()
     ]);
-    await this._loadSymbolsWithTimeout();
+    // Symbol loading with timeout and graceful fallback
+    try {
+      await this._loadSymbolsWithTimeout();
+    } catch (err) {
+      logger.warn('[DerivBroker] Symbol discovery failed:', err.message);
+    }
     if (!this._symbolsDiscovered) {
-      logger.warn('[DerivBroker] Symbol discovery failed, using fallback symbols.');
+      logger.warn('[DerivBroker] Using fallback symbols.');
       this._useFallbackSymbols();
     }
     this._ready = true;
@@ -1044,7 +1050,6 @@ class DerivBroker extends EventEmitter {
 
       if (msg.balance) {
         logger.debug('[In Auth] Balance response received.');
-        // We handle balance in _refreshAccount, not here
         handled = true;
       }
 
@@ -1104,8 +1109,11 @@ class DerivBroker extends EventEmitter {
     let symbols = null;
 
     try {
+      logger.info('[DerivBroker] Sending active_symbols: brief...');
       const response = await this._sendPublicRequest({ active_symbols: 'brief' }, 10000);
+      logger.info('[DerivBroker] Received active_symbols: brief response.');
       const isArray = Array.isArray(response.active_symbols);
+      logger.info(`[DerivBroker] active_symbols isArray: ${isArray}, length: ${isArray ? response.active_symbols.length : 'N/A'}`);
       if (isArray && response.active_symbols.length > 0) {
         symbols = response.active_symbols;
         logger.info(`[Symbols] Loaded ${symbols.length} symbols (brief).`);
@@ -1114,8 +1122,11 @@ class DerivBroker extends EventEmitter {
         }
       } else {
         logger.warn('[DerivBroker] Brief symbols empty, trying full...');
+        logger.info('[DerivBroker] Sending active_symbols: full...');
         const response2 = await this._sendPublicRequest({ active_symbols: 'full' }, 10000);
+        logger.info('[DerivBroker] Received active_symbols: full response.');
         const isArray2 = Array.isArray(response2.active_symbols);
+        logger.info(`[DerivBroker] active_symbols (full) isArray: ${isArray2}, length: ${isArray2 ? response2.active_symbols.length : 'N/A'}`);
         if (isArray2 && response2.active_symbols.length > 0) {
           symbols = response2.active_symbols;
           logger.info(`[Symbols] Loaded ${symbols.length} symbols (full).`);
@@ -1126,6 +1137,7 @@ class DerivBroker extends EventEmitter {
       }
     } catch (err) {
       logger.warn('[DerivBroker] Symbol request failed:', err.message);
+      throw err; // rethrow to trigger timeout/fallback
     }
 
     if (symbols && symbols.length > 0) {
@@ -1187,7 +1199,6 @@ class DerivBroker extends EventEmitter {
 
   // ---------- SUBSCRIBE DEFAULT SYMBOLS (watchlist) ----------
   async _subscribeDefaultSymbols() {
-    // Use the watchlist from the top of the file
     const WATCHLIST = [
       'frxEURUSD',
       'frxGBPUSD',
@@ -1684,7 +1695,7 @@ const brokerInstance = new DerivBroker({
   leverage: parseFloat(process.env.DERIV_LEVERAGE) || 100,
   fatalAfterAuthFailures: parseInt(process.env.DERIV_FATAL_AFTER_AUTH_FAILURES) || 3,
   readinessTimeout: parseInt(process.env.DERIV_READINESS_TIMEOUT) || 30000,
-  symbolTimeout: parseInt(process.env.DERIV_SYMBOL_TIMEOUT) || 30000,
+  symbolTimeout: parseInt(process.env.DERIV_SYMBOL_TIMEOUT) || 10000, // 10s
   heartbeatTimeout: parseInt(process.env.DERIV_HEARTBEAT_TIMEOUT) || 60000,
 });
 
