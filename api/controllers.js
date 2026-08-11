@@ -1,6 +1,7 @@
 // api/controllers.js – Complete Request Handlers (with Trade History, P&L, and Report Fixes)
 // Updated to broadcast positions and account after trade close, and to handle real‑time updates.
 // Enhanced account with tradeMode and server from broker._account.
+// Product default: deriv_cfd.
 
 const Trade = require('../models/Trade');
 const Order = require('../models/Order');
@@ -47,7 +48,11 @@ async function getPerformanceLearner() {
 
 // ---------- Helper to get product from request ----------
 function getProduct(req) {
-  return req.user?.tradingProduct || process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd';
+  // If user has a preference, use it; otherwise default to deriv_cfd
+  if (req.user && req.user.tradingProduct) {
+    return req.user.tradingProduct;
+  }
+  return process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd';
 }
 
 // ---------- Helper: Enhance account with tradeMode and server ----------
@@ -72,7 +77,8 @@ exports.getPreferences = async (req, res) => {
     const userId = req.user?.id || 'admin';
     let user = await User.findOne({ userId });
     if (!user) {
-      user = new User({ userId, tradingProduct: process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd' });
+      // Default to deriv_cfd
+      user = new User({ userId, tradingProduct: 'deriv_cfd' });
       await user.save();
     }
     res.json({ tradingProduct: user.tradingProduct });
