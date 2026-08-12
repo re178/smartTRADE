@@ -2,6 +2,7 @@
 // Market Awareness Engine – runs on every tick.
 // Observes: spread, velocity, acceleration, liquidity, micro‑structure.
 // Updates MarketStateCache (RAM) every tick, persists to MongoDB periodically.
+// DEBUG: Added detailed logging to verify tick processing and event emission.
 
 const priceBuffer = require('../data/priceBuffer');
 const marketStateCache = require('../data/marketStateCache');
@@ -9,32 +10,28 @@ const logger = require('../../infrastructure/logger') || console;
 
 // Configuration
 const CONFIG = {
-  // Velocity: rolling window (in ticks) for average price change
   VELOCITY_WINDOW: 5,
-  // Acceleration: change in velocity over last N ticks
   ACCELERATION_WINDOW: 3,
-  // Liquidity proxy: tick frequency (ticks per second)
   LIQUIDITY_WINDOW_MS: 1000,
-  // Spread smoothing: exponential moving average factor
   SPREAD_SMA_ALPHA: 0.3,
 };
 
 class MarketAwarenessEngine {
   constructor() {
-    // Internal state per symbol
-    this._state = new Map(); // symbol -> { priceHistory, tickTimes, spreadEMA, velocityHistory }
+    this._state = new Map(); // symbol -> internal state
+    this._tickCount = 0;
 
     // Listen to every tick from the price buffer
     priceBuffer.on('tick', (tick) => {
+      this._tickCount++;
+      console.log(`[MarketAwareness] Tick #${this._tickCount} received for ${tick.symbol} at ${new Date(tick.time).toISOString()}`);
       this._processTick(tick);
     });
 
     logger.info('[MarketAwarenessEngine] Initialized, listening to ticks.');
+    console.log('[MarketAwarenessEngine] ✅ Listener attached to priceBuffer.');
   }
 
-  /**
-   * Process a single tick.
-   */
   _processTick(tick) {
     const { symbol, bid, ask, mid, time } = tick;
     const spread = ask - bid;
@@ -46,6 +43,7 @@ class MarketAwarenessEngine {
         tickTimes: [],
         spreadEMA: null,
         velocityHistory: [],
+        liquidityHistory: [],
         lastTickTime: time,
       });
     }
@@ -59,7 +57,6 @@ class MarketAwarenessEngine {
 
     // 3. Update tick times (for liquidity)
     state.tickTimes.push(time);
-    // Keep only last 2 seconds of ticks for liquidity calculation
     const cutoff = time - CONFIG.LIQUIDITY_WINDOW_MS * 2;
     while (state.tickTimes.length > 0 && state.tickTimes[0] < cutoff) {
       state.tickTimes.shift();
@@ -72,7 +69,7 @@ class MarketAwarenessEngine {
       state.spreadEMA = state.spreadEMA * (1 - CONFIG.SPREAD_SMA_ALPHA) + spread * CONFIG.SPREAD_SMA_ALPHA;
     }
 
-    // 5. Compute velocity (price change per tick, averaged over window)
+    // 5. Compute velocity
     let velocity = 0;
     if (state.priceHistory.length >= CONFIG.VELOCITY_WINDOW) {
       const recent = state.priceHistory.slice(-CONFIG.VELOCITY_WINDOW);
@@ -85,7 +82,7 @@ class MarketAwarenessEngine {
       state.velocityHistory.shift();
     }
 
-    // 6. Compute acceleration (change in velocity)
+    // 6. Compute acceleration
     let acceleration = 0;
     if (state.velocityHistory.length >= CONFIG.ACCELERATION_WINDOW) {
       const recentVels = state.velocityHistory.slice(-CONFIG.ACCELERATION_WINDOW);
@@ -104,10 +101,16 @@ class MarketAwarenessEngine {
         liquidity = (recentTicks.length - 1) / duration;
       }
     }
-    // Normalise liquidity to a 0-1 scale (assuming max ~20 ticks/sec for forex)
     liquidity = Math.min(1, liquidity / 20);
 
-    // 8. Update the market state cache
+    // Store liquidity history for unusual detection
+    state.liquidityHistory.push(liquidity);
+    if (state.liquidityHistory.length > 50) state.liquidityHistory.shift();
+
+    // 8. Detect unusual events
+    const unusual = this._detectUnusual({ velocity, acceleration, spread, liquidity }, state);
+
+    // 9. Update the market state cache
     const stateUpdate = {
       symbol,
       bid,
@@ -117,54 +120,46 @@ class MarketAwarenessEngine {
       velocity,
       acceleration,
       liquidity,
+      unusual,
       lastUpdated: new Date(time),
     };
 
-    // Also detect unusual events (spike, velocity burst)
-    const isUnusual = this._detectUnusual(stateUpdate, state);
-    if (isUnusual) {
-      stateUpdate.unusual = isUnusual;
-    }
+    // Log computed metrics for debugging
+    console.log(`[MarketAwareness] ${symbol}: spread=${spread.toFixed(5)}, velocity=${velocity.toFixed(6)}, acceleration=${acceleration.toFixed(6)}, liquidity=${liquidity.toFixed(3)}, unusual=${unusual ? unusual.join(',') : 'none'}`);
 
     marketStateCache.update(symbol, stateUpdate);
 
-    // 9. Emit an event for interested subscribers (e.g., dashboard)
-    this.emit('marketAwareness', { symbol, ...stateUpdate });
+    // 10. Emit marketAwareness event
+    const awarenessEvent = { symbol, ...stateUpdate };
+    this.emit('marketAwareness', awarenessEvent);
+    console.log(`[MarketAwareness] ✅ Emitted marketAwareness for ${symbol}`);
 
     // Update last tick time
     state.lastTickTime = time;
   }
 
-  /**
-   * Detect unusual market events.
-   */
   _detectUnusual(update, state) {
     const { velocity, acceleration, spread, liquidity } = update;
     const events = [];
 
-    // Velocity burst: price moving faster than 2x average
+    // Velocity burst
     const avgVelocity = state.velocityHistory.reduce((a, b) => a + b, 0) / state.velocityHistory.length || 0;
     if (Math.abs(velocity) > Math.abs(avgVelocity) * 3 && Math.abs(velocity) > 0.0001) {
       events.push('velocity_burst');
     }
 
-    // Spread spike: spread > 2x EMA
+    // Spread spike
     if (spread > (state.spreadEMA || 0) * 2.5 && spread > 0.0002) {
       events.push('spread_spike');
     }
 
     // Liquidity drop
-    if (liquidity < 0.1 && state.liquidityHistory && state.liquidityHistory.length > 10) {
+    if (state.liquidityHistory.length > 10) {
       const avgLiquidity = state.liquidityHistory.reduce((a, b) => a + b, 0) / state.liquidityHistory.length;
       if (avgLiquidity > 0.3 && liquidity < avgLiquidity * 0.3) {
         events.push('liquidity_drop');
       }
     }
-
-    // Store liquidity history for comparison
-    if (!state.liquidityHistory) state.liquidityHistory = [];
-    state.liquidityHistory.push(liquidity);
-    if (state.liquidityHistory.length > 50) state.liquidityHistory.shift();
 
     return events.length > 0 ? events : null;
   }
@@ -175,4 +170,5 @@ const EventEmitter = require('events');
 Object.setPrototypeOf(MarketAwarenessEngine.prototype, EventEmitter.prototype);
 
 // Singleton
-module.exports = new MarketAwarenessEngine();
+const engine = new MarketAwarenessEngine();
+module.exports = engine;
