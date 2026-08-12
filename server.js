@@ -57,12 +57,10 @@ async function ensureAdmin() {
     const adminId = 'admin';
     let admin = await User.findOne({ userId: adminId });
     if (!admin) {
-      // Explicitly set deriv_cfd as default
       admin = new User({ userId: adminId, tradingProduct: 'deriv_cfd' });
       await admin.save();
       console.log('✅ Admin user created with product: deriv_cfd');
     } else {
-      // If existing admin has mt5, update to deriv_cfd
       if (admin.tradingProduct === 'mt5') {
         admin.tradingProduct = 'deriv_cfd';
         await admin.save();
@@ -197,34 +195,11 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'OK', message: 'RTS is running with Deriv broker' });
 });
 
-// ---------- SPA Fallback (inject API key) ----------
+// ---------- SPA Fallback (no API key injection) ----------
 app.get('*', (req, res) => {
   if (!req.path.startsWith('/api')) {
-    // Inject API key into page (optional, not used for WebSocket anymore)
-    const apiKey = process.env.MT5_API_KEY || 'change-me-in-production';
-    const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>RTS Trading Dashboard</title>
-  <script>
-    window.API_KEY = '${apiKey}';
-  </script>
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet" />
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/css/styles.css" />
-</head>
-<body>
-  <div id="root"></div>
-  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-  <script src="/js/config.js"></script>
-  <script src="/js/app.js"></script>
-  <script src="/js/live.js"></script>
-</body>
-</html>`;
-    res.send(html);
+    // Serve the main HTML without injecting any API key
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
   } else {
     res.status(404).json({ error: 'API endpoint not found' });
   }
@@ -299,7 +274,6 @@ async function sendDashboardInitialState(ws) {
       orderService.getOpenTrades('deriv_cfd')
     ]);
 
-    // Enhance account with tradeMode and server
     let broker;
     try {
       broker = getBroker('deriv_cfd');
@@ -415,7 +389,6 @@ async function startDerivBroker() {
     });
 
     broker.on('account', async (accountData) => {
-      // Enhance account with tradeMode and server before broadcasting
       const enhanced = enhanceAccount(accountData, broker);
       broadcastToDashboards('account', enhanced);
     });
@@ -428,7 +401,6 @@ async function startDerivBroker() {
       broadcastToDashboards('orderUpdate', data);
     });
 
-    // Also broadcast after any position change from the broker
     broker.on('_portfolioUpdated', (positions) => {
       broadcastToDashboards('positions', positions);
     });
@@ -455,7 +427,6 @@ async function startServer() {
     console.log('🧹  Null bytes (\\0) stripped from all incoming JSON.');
     console.log('📦 Deriv broker: active, connected to WebSocket.');
 
-    // Start WebSocket ping interval
     startWSPing();
 
     // ---- Initialise Data Orchestrator and State Store ----
@@ -472,14 +443,6 @@ async function startServer() {
     setTimeout(startCognitiveEngines, 2000);
 
     // ---- Start Outcome Labeler Scheduler (DISABLED) ----
-    // try {
-    //   const labeler = require('./core/intelligence/lab/outcomeLabeler');
-    //   const interval = parseInt(process.env.OUTCOME_LABEL_INTERVAL_MS) || 60 * 60 * 1000;
-    //   labeler.startScheduler(interval);
-    //   console.log(`✅ Outcome labeler scheduler started (interval: ${interval}ms)`);
-    // } catch (err) {
-    //   console.warn('⚠️ Outcome labeler scheduler could not be started:', err.message);
-    // }
     console.log('⏸️ Outcome labeler scheduler disabled.');
 
     // ---- Connect Deriv broker after startup ----
