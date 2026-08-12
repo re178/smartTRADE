@@ -1,6 +1,5 @@
-// public/js/app.js – Dashboard Logic (Full with Stats Update, P&L Fix, Sounds, Report)
-// Refactored to be fully event‑driven using a central state store.
-// HTTP polling removed – all updates come from WebSocket (live.js).
+// public/js/app.js – Dashboard Logic (Fully Event-Driven)
+// All updates come from WebSocket (live.js). HTTP is only for manual actions.
 
 // ---- Configuration ----
 const HISTORY_PAGE_SIZE = 20;
@@ -53,9 +52,10 @@ const SoundManager = {
   }
 };
 
-// ---- API helper (for initial load and manual actions) ----
+// ---- API helper (for manual actions) ----
 async function fetchJson(url, options = {}) {
-  const res = await fetch(url, {
+  const fullUrl = (CONFIG.API_BASE || '') + url;
+  const res = await fetch(fullUrl, {
     headers: { 'Content-Type': 'application/json' },
     ...options
   });
@@ -128,11 +128,10 @@ function renderAccountWidget() {
   const elEquity = document.getElementById('statEquity');
   if (elBalance) elBalance.textContent = `${balance} ${currency}`;
   if (elEquity) elEquity.textContent = `${equity} ${currency}`;
-  // Update account badge if present
+  // Update account badge
   if (window.updateAccountBadge) {
     window.updateAccountBadge(acc);
   } else {
-    // fallback manual update
     const idEl = document.getElementById('accountId');
     const typeEl = document.getElementById('accountTypeLabel');
     const currencyEl = document.getElementById('accountCurrency');
@@ -178,7 +177,6 @@ function renderPositionsWidget() {
     document.getElementById('statOpenPL').textContent = '—';
     return;
   }
-  // Build table (could be incremental but for simplicity we rebuild)
   let html = `<table class="table table-striped"><thead><tr>
     <th>ID</th><th>Pair</th><th>Side</th><th>Open Price</th>
     <th>Current Price</th><th>Units</th><th>P/L</th><th>Action</th>
@@ -226,8 +224,6 @@ function renderStatsWidget() {
 }
 
 function renderPriceWidgets() {
-  // If you have a price panel, update it incrementally
-  // For now, we'll just update the priceInfo element if it exists
   const priceInfo = document.getElementById('priceInfo');
   if (!priceInfo) return;
   const prices = dashboardState.prices || {};
@@ -251,12 +247,9 @@ function renderOpenTradesWidget() {
 }
 
 function renderHistoryWidget() {
-  // This can be more complex; for now we keep the existing loadTradeHistory logic
-  // but we'll call it from state updates. Since history is large, we may keep the
-  // existing filtering/pagination logic but we'll make it data-driven.
-  // We'll just call loadTradeHistory(historyPage) when history changes.
-  // We'll let the existing loadTradeHistory function handle it (but remove its fetch).
-  // We'll override it to use dashboardState.history.
+  // This is handled by the separate history table rendering (renderHistoryTable)
+  // We'll just call renderHistoryTable() which uses dashboardState.history
+  renderHistoryTable();
 }
 
 function renderPendingOrdersWidget() {
@@ -286,9 +279,7 @@ function renderPendingOrdersWidget() {
 }
 
 function renderSignalWidget() {
-  // LiveSignalPanel is already updated by live.js's displayDecision
-  // We just ensure the DOM is updated when state changes.
-  // Since live.js already renders, we don't duplicate.
+  // Handled by live.js directly
 }
 
 function renderRegimeWidget() {
@@ -404,8 +395,7 @@ function renderFusionWidget() {
 }
 
 function renderOTIEWidget() {
-  // Already handled by live.js's displayOTIEState and displayOTIEAction
-  // We'll not duplicate.
+  // Handled by live.js directly
 }
 
 function renderBeliefWidget() {
@@ -437,59 +427,48 @@ function renderBeliefWidget() {
 window.updateDashboardState = updateDashboardState;
 
 // ================================================================
-// 3. OVERRIDE EXISTING LOAD FUNCTIONS TO USE STATE
+// 3. MANUAL REFRESH (HTTP)
 // ================================================================
-// We'll keep the original functions but make them no‑op if they were called from setInterval.
-// However, we will remove the intervals entirely.
-// For manual refresh, we can keep a refresh function that fetches from server.
-
 async function refreshAllData() {
   try {
     const [account, positions, history, pending] = await Promise.all([
-      fetchJson(`${CONFIG.API_BASE}/api/account`),
-      fetchJson(`${CONFIG.API_BASE}/api/trades`),
-      fetchJson(`${CONFIG.API_BASE}/api/trade-history`),
-      fetchJson(`${CONFIG.API_BASE}/api/pending-orders`),
+      fetchJson('/api/account'),
+      fetchJson('/api/trades'),
+      fetchJson('/api/trade-history'),
+      fetchJson('/api/pending-orders'),
     ]);
     updateDashboardState({ account, positions, history, pendingOrders: pending });
   } catch (e) {
     console.error('Manual refresh error:', e);
   }
 }
-
-// ---- Expose refresh for manual use ----
 window.refreshDashboard = refreshAllData;
 
-// ---- Override loadOpenTrades, loadAccount, etc. to use state (for backward compatibility) ----
+// ---- Override old load functions to use state ----
 window.loadOpenTrades = function() {
-  // No-op: positions come from WebSocket
   console.warn('loadOpenTrades is deprecated – positions are updated via WebSocket');
 };
 window.loadAccount = function() {
-  // No-op: account comes from WebSocket
   console.warn('loadAccount is deprecated – account is updated via WebSocket');
 };
 window.loadTradeHistory = function() {
-  // No-op: history comes from WebSocket
   console.warn('loadTradeHistory is deprecated – history is updated via WebSocket');
 };
 window.loadPendingOrders = function() {
-  // No-op: pending orders come from WebSocket
   console.warn('loadPendingOrders is deprecated – pending orders are updated via WebSocket');
 };
 window.loadPrices = function() {
-  // No-op: prices come from WebSocket
   console.warn('loadPrices is deprecated – prices are updated via WebSocket');
 };
 
-// ---- But keep closeTrade, cancelPending, etc. (they use HTTP) ----
+// ---- Close trade and cancel order (HTTP) ----
 window.closeTrade = async function(tradeId) {
   if (!confirm(`Close trade ${tradeId}?`)) return;
   try {
-    await fetchJson(`${CONFIG.API_BASE}/api/close/${tradeId}`, { method: 'PUT' });
+    await fetchJson(`/api/close/${tradeId}`, { method: 'PUT' });
     SoundManager.tradeClose();
     alert('Trade closed successfully.');
-    // The WebSocket will update positions, so no need to refresh.
+    // WebSocket will update positions automatically.
   } catch (e) {
     alert('Error closing trade: ' + e.message);
     SoundManager.reject();
@@ -499,7 +478,7 @@ window.closeTrade = async function(tradeId) {
 window.cancelPending = async function(orderId) {
   if (!confirm(`Cancel order ${orderId}?`)) return;
   try {
-    await fetchJson(`${CONFIG.API_BASE}/api/order/${orderId}`, { method: 'DELETE' });
+    await fetchJson(`/api/order/${orderId}`, { method: 'DELETE' });
     alert('Order cancelled successfully.');
     // WebSocket will update pending orders.
   } catch (e) {
@@ -508,46 +487,8 @@ window.cancelPending = async function(orderId) {
 };
 
 // ================================================================
-// 4. EXISTING UI EVENT BINDINGS (unchanged)
+// 4. HISTORY TABLE RENDERING (uses dashboardState.history)
 // ================================================================
-document.getElementById('getSignalBtn')?.addEventListener('click', async function() {
-  // ... unchanged ...
-});
-
-document.getElementById('tradeForm')?.addEventListener('submit', async function(e) {
-  // ... unchanged (but after placing order, WebSocket updates will handle the rest) ...
-});
-
-document.getElementById('autoTradeForm')?.addEventListener('submit', async function(e) {
-  // ... unchanged ...
-});
-
-// ---- Refresh buttons ----
-document.getElementById('refreshTrades')?.addEventListener('click', refreshAllData);
-document.getElementById('refreshHistory')?.addEventListener('click', refreshAllData);
-document.getElementById('refreshPending')?.addEventListener('click', refreshAllData);
-
-// ---- History filter & pagination (use state data) ----
-document.getElementById('applyHistoryFilter')?.addEventListener('click', function() {
-  // We'll re-implement using state
-  applyHistoryFilters();
-});
-document.getElementById('resetHistoryFilter')?.addEventListener('click', function() {
-  document.getElementById('historyFrom').value = '';
-  document.getElementById('historyTo').value = '';
-  document.getElementById('historySymbol').value = '';
-  document.getElementById('historySide').value = '';
-  document.getElementById('historyStatus').value = '';
-  applyHistoryFilters();
-});
-document.getElementById('prevPage')?.addEventListener('click', function() {
-  if (historyPage > 1) { historyPage--; renderHistoryTable(); }
-});
-document.getElementById('nextPage')?.addEventListener('click', function() {
-  if (historyPage < historyTotalPages) { historyPage++; renderHistoryTable(); }
-});
-
-// ---- History filtering logic (using state) ----
 function applyHistoryFilters() {
   historyPage = 1;
   renderHistoryTable();
@@ -627,64 +568,156 @@ function renderHistoryTable() {
 }
 
 // ================================================================
-// 5. INITIAL LOAD (HTTP once)
-// ================================================================
-async function initialLoad() {
-  try {
-    const [account, positions, history, pending] = await Promise.all([
-      fetchJson(`${CONFIG.API_BASE}/api/account`),
-      fetchJson(`${CONFIG.API_BASE}/api/trades`),
-      fetchJson(`${CONFIG.API_BASE}/api/trade-history`),
-      fetchJson(`${CONFIG.API_BASE}/api/pending-orders`),
-    ]);
-    updateDashboardState({ account, positions, history, pendingOrders: pending });
-  } catch (e) {
-    console.error('Initial load error:', e);
-  }
-}
-
-// ================================================================
-// 6. STARTUP
+// 5. UI EVENT BINDINGS
 // ================================================================
 document.addEventListener('DOMContentLoaded', async function() {
   // Load product preference
   await loadProductPreference();
-  // Initial data load
-  await initialLoad();
-  // Bind remaining UI events
-  // ... (signal, trade form, auto-trade, etc.) – those are already bound above
-  // Delete history button
+
+  // Initial data load via HTTP (optional – WebSocket will also send init)
+  await refreshAllData();
+
+  // ---- Signal Generator ----
+  document.getElementById('getSignalBtn')?.addEventListener('click', async function() {
+    const pair = document.getElementById('signalPair').value.trim();
+    const strategy = document.getElementById('signalStrategy').value;
+    if (!pair) { alert('Please enter a pair.'); return; }
+    try {
+      const result = await fetchJson(`/api/signal?symbol=${encodeURIComponent(pair)}&strategy=${encodeURIComponent(strategy)}`);
+      const container = document.getElementById('signalResult');
+      if (result.signal) {
+        container.innerHTML = `
+          <div class="alert alert-${result.signal === 'BUY' ? 'success' : result.signal === 'SELL' ? 'danger' : 'secondary'}">
+            <strong>${result.signal}</strong> (${result.confidence || 0}%)<br>
+            <small>${result.reason || ''}</small>
+          </div>
+        `;
+      } else {
+        container.innerHTML = `<div class="alert alert-info">${result.message || 'No signal available.'}</div>`;
+      }
+    } catch (e) {
+      alert('Error fetching signal: ' + e.message);
+    }
+  });
+
+  // ---- Trade Form ----
+  document.getElementById('tradeForm')?.addEventListener('submit', async function(e) {
+    e.preventDefault();
+    if (isSubmitting) return;
+    isSubmitting = true;
+    const pair = document.getElementById('tradePair').value.trim();
+    const side = document.getElementById('tradeSide').value;
+    const lot = parseFloat(document.getElementById('tradeLot').value);
+    const sl = parseFloat(document.getElementById('tradeSL').value) || null;
+    const tp = parseFloat(document.getElementById('tradeTP').value) || null;
+    if (!pair || !lot || lot <= 0) { alert('Please fill in all required fields.'); isSubmitting = false; return; }
+    try {
+      const response = await fetchJson('/api/trade', {
+        method: 'POST',
+        body: JSON.stringify({ pair, side, lotSize: lot, stopLoss: sl, takeProfit: tp })
+      });
+      alert('Trade placed successfully!');
+      SoundManager.tradeOpen();
+      // WebSocket will update positions automatically.
+    } catch (e) {
+      alert('Error placing trade: ' + e.message);
+      SoundManager.reject();
+    }
+    isSubmitting = false;
+  });
+
+  // ---- Auto-Trade Form ----
+  document.getElementById('autoTradeForm')?.addEventListener('submit', async function(e) {
+    e.preventDefault();
+    if (isAutoSubmitting) return;
+    isAutoSubmitting = true;
+    const pair = document.getElementById('autoPair').value.trim();
+    const risk = parseFloat(document.getElementById('autoRisk').value);
+    const strategy = document.getElementById('autoStrategy').value;
+    if (!pair || !risk || risk <= 0) { alert('Please fill in all fields.'); isAutoSubmitting = false; return; }
+    try {
+      const response = await fetchJson('/api/auto-trade', {
+        method: 'POST',
+        body: JSON.stringify({ pair, riskPercent: risk, strategy })
+      });
+      alert('Auto-trade placed successfully!');
+      SoundManager.tradeOpen();
+    } catch (e) {
+      alert('Error auto-trading: ' + e.message);
+      SoundManager.reject();
+    }
+    isAutoSubmitting = false;
+  });
+
+  // ---- History filter ----
+  document.getElementById('applyHistoryFilter')?.addEventListener('click', applyHistoryFilters);
+  document.getElementById('resetHistoryFilter')?.addEventListener('click', function() {
+    document.getElementById('historyFrom').value = '';
+    document.getElementById('historyTo').value = '';
+    document.getElementById('historySymbol').value = '';
+    document.getElementById('historySide').value = '';
+    document.getElementById('historyStatus').value = '';
+    applyHistoryFilters();
+  });
+
+  // ---- Pagination ----
+  document.getElementById('prevPage')?.addEventListener('click', function() {
+    if (historyPage > 1) { historyPage--; renderHistoryTable(); }
+  });
+  document.getElementById('nextPage')?.addEventListener('click', function() {
+    if (historyPage < historyTotalPages) { historyPage++; renderHistoryTable(); }
+  });
+
+  // ---- Refresh buttons ----
+  document.getElementById('refreshTrades')?.addEventListener('click', refreshAllData);
+  document.getElementById('refreshHistory')?.addEventListener('click', refreshAllData);
+  document.getElementById('refreshPending')?.addEventListener('click', refreshAllData);
+
+  // ---- Delete history ----
   document.getElementById('deleteHistoryBtn')?.addEventListener('click', async function() {
     if (!confirm('Delete all closed trades from history? This cannot be undone.')) return;
     try {
-      const result = await fetchJson(`${CONFIG.API_BASE}/api/history`, { method: 'DELETE' });
+      const result = await fetchJson('/api/history', { method: 'DELETE' });
       alert(`Deleted ${result.deletedCount} closed trades.`);
-      // Refresh history from server (or we can update state directly)
       refreshAllData();
     } catch (e) {
       alert('Error deleting history: ' + e.message);
     }
   });
-  // Test notification
+
+  // ---- Test notification ----
   document.getElementById('testNotificationBtn')?.addEventListener('click', async function() {
     try {
-      const result = await fetchJson(`${CONFIG.API_BASE}/api/test-email`, { method: 'POST' });
+      const result = await fetchJson('/api/test-email', { method: 'POST' });
       alert('Test email sent! Check your inbox.');
     } catch (e) {
       alert('Error sending test email: ' + e.message);
     }
   });
-  // Export CSV
-  document.getElementById('exportCSVBtn')?.addEventListener('click', exportHistoryCSV);
-  // Report generation
-  document.getElementById('generateReportBtn')?.addEventListener('click', generateReport);
 
-  // ---- Override decision inspector ----
-  window.openDecisionInspector = openDecisionInspector;
+  // ---- Export CSV ----
+  document.getElementById('exportCSVBtn')?.addEventListener('click', function() {
+    if (typeof window.exportHistoryCSV === 'function') {
+      window.exportHistoryCSV();
+    } else {
+      alert('CSV export function not available.');
+    }
+  });
+
+  // ---- Report generation ----
+  document.getElementById('generateReportBtn')?.addEventListener('click', function() {
+    if (typeof window.generateReport === 'function') {
+      window.generateReport();
+      const modal = bootstrap.Modal.getInstance(document.getElementById('reportModal'));
+      if (modal) modal.hide();
+    } else {
+      alert('Report generation function not loaded.');
+    }
+  });
 });
 
 // ================================================================
-// 7. EXPORT FUNCTIONS FOR live.js
+// 6. EXPOSE FUNCTIONS FOR live.js
 // ================================================================
 window.SoundManager = SoundManager;
 window.updatePositionBadge = function(count) {
@@ -697,12 +730,51 @@ window.updateApiStatus = function(connected) {
   if (dot) dot.className = 'dot ' + (connected ? 'connected' : 'disconnected');
   if (text) text.textContent = connected ? 'Connected' : 'Disconnected';
 };
-window.exportHistoryCSV = exportHistoryCSV;
-window.updateAccountBadge = updateAccountBadge;
-
-// ---- Listen for danger signals ----
-window.addEventListener('dangerSignal', function() {
-  SoundManager.danger();
-});
+window.updateAccountBadge = function(account) {
+  // This is defined in the HTML script for backward compatibility.
+  // We'll call it if it exists.
+  if (typeof window._updateAccountBadge === 'function') {
+    window._updateAccountBadge(account);
+  } else {
+    // Fallback: update the badge elements directly.
+    const idEl = document.getElementById('accountId');
+    const typeEl = document.getElementById('accountTypeLabel');
+    const currencyEl = document.getElementById('accountCurrency');
+    if (account) {
+      if (idEl) idEl.textContent = account.id || account.login || '—';
+      if (currencyEl) currencyEl.textContent = account.currency || 'USD';
+      if (typeEl) {
+        let type = 'demo';
+        const server = account.server || '';
+        type = server.toLowerCase().includes('demo') ? 'demo' : 'real';
+        typeEl.textContent = type.toUpperCase();
+        typeEl.className = 'account-type ' + type;
+      }
+    }
+  }
+};
+window.exportHistoryCSV = function() {
+  const history = dashboardState.history || [];
+  if (history.length === 0) { alert('No history to export.'); return; }
+  let csv = 'Pair,Side,Entry Price,Exit Price,Lot,P/L,Status,Date\n';
+  history.forEach(t => {
+    csv += `${t.pair},${t.side},${t.entryPrice},${t.exitPrice},${t.lotSize},${t.pnl},${t.status},${new Date(t.date).toISOString()}\n`;
+  });
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `trade_history_${new Date().toISOString().slice(0,10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+};
+window.generateReport = function() {
+  // Placeholder – implement as needed
+  alert('Report generation is not fully implemented yet.');
+};
+window.openDecisionInspector = function(decisionId) {
+  // Placeholder
+  alert('Decision inspector will be implemented in a future update.');
+};
 
 console.log('✅ App.js loaded – fully event‑driven.');
