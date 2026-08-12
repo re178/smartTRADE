@@ -199,7 +199,7 @@
     .account-badge .account-type.demo { background: var(--warning); }
     .account-badge .account-type.real { background: var(--success); }
 
-    /* ---- Notification centre (unchanged ID) ---- */
+    /* ---- Notification centre ---- */
     .notif-btn {
       position: relative;
       background: transparent;
@@ -567,7 +567,7 @@
       </h1>
     </div>
     <div class="header-actions">
-      <!-- Account Badge (Real/Demo) -->
+      <!-- Account Badge -->
       <div class="account-badge" id="accountBadge">
         <i class="fas fa-user-circle"></i>
         <span id="accountId">—</span>
@@ -1174,7 +1174,6 @@
     if (account.tradeMode === 0 || account.server?.toLowerCase().includes('demo') === false) {
       type = 'real';
     }
-    // If server contains 'Demo', it's demo
     if (account.server && account.server.toLowerCase().includes('demo')) {
       type = 'demo';
     }
@@ -1201,19 +1200,14 @@
   }
 
   // Also listen for WebSocket 'account' events
-  const wsHandler = window.handleMessage;
-  if (wsHandler) {
-    const origHandle = wsHandler;
-    // We'll add an event listener to live.js's message handler via a custom event
-    document.addEventListener('wsAccountUpdate', function(e) {
-      updateAccountBadge(e.detail);
-    });
-  }
+  document.addEventListener('wsAccountUpdate', function(e) {
+    updateAccountBadge(e.detail);
+  });
 
-  // Since we cannot easily patch live.js from here, we'll use a MutationObserver
-  // or just call updateAccountBadge after a short delay.
+  // Initial account badge fetch
   setTimeout(() => {
-    fetchJson(`${CONFIG.API_BASE}/api/account`)
+    fetch('/api/account')
+      .then(res => res.json())
       .then(acc => updateAccountBadge(acc))
       .catch(() => {});
   }, 1000);
