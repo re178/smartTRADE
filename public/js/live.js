@@ -1,5 +1,6 @@
 // public/js/live.js – WebSocket client with stable connection and heartbeat
 // Real‑time events: marketAwareness, regime, decision, fusion, otieV5State, otieV5Action, init, account, positions, price, etc.
+// No API key required – connects directly to the server.
 
 (function() {
   'use strict';
@@ -13,7 +14,7 @@
   let reconnectTimer = null;
   let heartbeatTimer = null;
 
-  // DOM elements
+  // DOM elements (these exist in index.html)
   const awarenessPanel = document.getElementById('awarenessPanel');
   const hypothesisPanel = document.getElementById('hypothesisPanel');
   const knowledgePanel = document.getElementById('knowledgePanel');
@@ -53,6 +54,11 @@
     return upper;
   }
 
+  function formatPrice(p) {
+    if (p === undefined || p === null) return 'N/A';
+    return parseFloat(p).toFixed(5);
+  }
+
   function updateWsStatus(connected) {
     if (wsStatus) {
       wsStatus.textContent = connected ? '🟢 Live' : '🔴 Disconnected';
@@ -69,9 +75,8 @@
       return;
     }
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const apiKey = window.API_KEY || 'change-me-in-production';
-    const wsUrl = `${protocol}//${window.location.host}?apiKey=${encodeURIComponent(apiKey)}`;
+    // Use the WebSocket URL from config (auto-detected)
+    const wsUrl = CONFIG.WS_URL;
     console.log('[Live] Connecting to WebSocket:', wsUrl);
 
     try {
@@ -149,6 +154,7 @@
   //  MAIN MESSAGE HANDLER – UPDATED WITH STATE STORE
   // ============================================================
   function handleMessage(msg) {
+    // Update state store and render all widgets
     switch (msg.type) {
       case 'marketAwareness':
         displayAwareness(msg.data);
@@ -156,42 +162,35 @@
           window.updateDashboardState({ awareness: msg.data });
         }
         break;
+
       case 'regime':
         displayRegime(msg.data);
         if (window.updateDashboardState) {
           window.updateDashboardState({ regime: msg.data });
         }
         break;
-      case 'hypothesisCreated':
-        addHypothesis(msg.data);
-        break;
-      case 'hypothesisResolved':
-        updateHypothesis(msg.data);
-        break;
-      case 'knowledge':
-        displayKnowledge(msg.data);
-        break;
+
       case 'decision':
         displayDecision(msg.data);
         if (window.updateDashboardState) {
           window.updateDashboardState({ liveSignal: msg.data });
         }
         break;
+
       case 'fusion':
         displayFusion(msg.data);
         if (window.updateDashboardState) {
           window.updateDashboardState({ fusion: msg.data });
         }
         break;
-      case 'marketClosed':
-        displayMarketClosed(msg.data);
-        break;
+
       case 'metrics':
         displayMetrics(msg.data);
         if (window.updateDashboardState) {
           window.updateDashboardState({ metrics: msg.data });
         }
         break;
+
       case 'otieV5State':
         displayOTIEState(msg.data);
         if (window.updateDashboardState) {
@@ -201,6 +200,7 @@
           window.updateDashboardState({ otieDecisions: currentOTIE });
         }
         break;
+
       case 'otieV5Action':
         displayOTIEAction(msg.data);
         if (window.updateDashboardState) {
@@ -210,6 +210,7 @@
           window.updateDashboardState({ otieActions: currentActions });
         }
         break;
+
       case 'tradeClosed': {
         if (window.updateDashboardState) {
           const closedId = msg.data.contractId;
@@ -217,15 +218,18 @@
           const updatedPositions = currentPositions.filter(p => p.id !== closedId);
           window.updateDashboardState({ positions: updatedPositions });
         }
+        // Show notification if available
         if (typeof addNotification === 'function') addNotification('Trade closed', 'info');
         playSound('tradeClose');
         break;
       }
+
       case 'trade.placed': {
         playSound('tradeOpen');
         if (typeof addNotification === 'function') addNotification('Trade opened', 'success');
         break;
       }
+
       case 'order.rejected':
         playSound('reject');
         if (typeof addNotification === 'function') addNotification('Order rejected: ' + (msg.data.reason || ''), 'danger');
@@ -241,9 +245,10 @@
         }
         if (msg.data.account) updateAccount(msg.data.account);
         if (msg.data.positions) updatePositions(msg.data.positions);
-        if (msg.data.trades && typeof loadTradeHistory === 'function') loadTradeHistory();
+        if (msg.data.trades && typeof renderHistoryTable === 'function') renderHistoryTable();
         break;
       }
+
       case 'positions': {
         updatePositions(msg.data);
         if (window.updateDashboardState) {
@@ -251,6 +256,7 @@
         }
         break;
       }
+
       case 'account': {
         updateAccount(msg.data);
         if (window.updateDashboardState) {
@@ -258,6 +264,7 @@
         }
         break;
       }
+
       case 'price': {
         if (window.updateDashboardState) {
           const symbol = msg.data.symbol;
@@ -267,7 +274,9 @@
         }
         break;
       }
+
       case 'positionUpdated':
+        // Could update positions if needed – currently handled by 'positions'
         break;
 
       default:
@@ -276,8 +285,9 @@
   }
 
   // ============================================================
-  //  DISPLAY FUNCTIONS (unchanged)
+  //  DISPLAY FUNCTIONS (Direct DOM updates)
   // ============================================================
+
   function displayAwareness(data) {
     if (!awarenessPanel) return;
     const { symbol, spread, velocity, acceleration, liquidity, unusualEvents, lastUpdated } = data;
@@ -310,56 +320,6 @@
     `;
   }
 
-  function addHypothesis(hypothesis) {
-    if (!hypothesisPanel) return;
-    const { id, symbol, type, status, createdAt } = hypothesis;
-    const el = document.createElement('div');
-    el.className = 'alert alert-info hypothesis-item';
-    el.dataset.id = id;
-    el.innerHTML = `
-      <strong>Hypothesis #${id}</strong> (${symbol})<br>
-      Type: ${type}<br>
-      Status: ${status}<br>
-      Created: ${new Date(createdAt).toLocaleString()}
-    `;
-    hypothesisPanel.prepend(el);
-    while (hypothesisPanel.children.length > 10) {
-      hypothesisPanel.removeChild(hypothesisPanel.lastChild);
-    }
-  }
-
-  function updateHypothesis(hypothesis) {
-    if (!hypothesisPanel) return;
-    const { id, status, outcome, resolvedAt } = hypothesis;
-    const items = hypothesisPanel.querySelectorAll(`.hypothesis-item[data-id="${id}"]`);
-    if (items.length > 0) {
-      const el = items[0];
-      const statusClass = status === 'confirmed' ? 'success' : (status === 'rejected' ? 'danger' : 'secondary');
-      el.className = `alert alert-${statusClass} hypothesis-item`;
-      el.innerHTML = `
-        <strong>Hypothesis #${id}</strong> (${hypothesis.symbol})<br>
-        Type: ${hypothesis.type}<br>
-        Status: <strong>${status}</strong> (conf: ${outcome?.confidence || 0}%)<br>
-        Resolved: ${new Date(resolvedAt).toLocaleString()}
-      `;
-    }
-  }
-
-  function displayKnowledge(knowledge) {
-    if (!knowledgePanel) return;
-    const { symbol, indicator, valueRange, outcome, confidence, lastUpdated } = knowledge;
-    knowledgePanel.innerHTML = `
-      <div class="card">
-        <div class="card-body">
-          <h6 class="card-title">Knowledge (${symbol})</h6>
-          <p>${indicator} ${valueRange} → ${outcome}</p>
-          <p>Confidence: ${(confidence * 100).toFixed(0)}%</p>
-          <p class="small text-muted">${new Date(lastUpdated).toLocaleString()}</p>
-        </div>
-      </div>
-    `;
-  }
-
   function displayDecision(decision) {
     if (!liveSignalPanel) return;
     const decisionId = decision.decisionId || decision._id || decision.id;
@@ -382,7 +342,7 @@
     const sideLabel = side || 'NO TRADE';
     const formattedSymbol = formatSymbol(symbol);
 
-    let html = `<div class="alert alert-${alertClass} live-signal-card" data-symbol="${formattedSymbol}" data-side="${side}" data-entry="${entryPrice}" data-sl="${stopLoss}" data-tp="${takeProfit}" data-lot="${recommendedLotSize || 0.01}" data-decision-id="${decisionId}">`;
+    let html = `<div class="live-signal-card ${side.toLowerCase()}" data-symbol="${formattedSymbol}" data-side="${side}" data-entry="${entryPrice}" data-sl="${stopLoss}" data-tp="${takeProfit}" data-lot="${recommendedLotSize || 0.01}" data-decision-id="${decisionId}">`;
     html += `<h5><strong>${sideLabel}</strong> ${formattedSymbol} (${confidence}% confidence)</h5>`;
     if (side && side !== 'NO_TRADE') {
       html += `<p>Entry: ${formatPrice(entryPrice)} | SL: ${formatPrice(stopLoss)} | TP: ${formatPrice(takeProfit)}</p>`;
@@ -399,6 +359,7 @@
     html += `</div>`;
     liveSignalPanel.innerHTML = html;
 
+    // Auto‑execute if toggle is on
     const toggle = document.getElementById('autoExecuteToggle');
     if (toggle && toggle.checked && side && side !== 'NO_TRADE') {
       console.log('[Live] Auto‑executing signal for', formattedSymbol, side);
@@ -434,10 +395,8 @@
   function displayFusion(fusion) {
     if (!fusionPanel) return;
     const { symbol, verdict, confidence, agreement, timeframeBreakdown, reasons, session } = fusion;
-
     const verdictClass = verdict === 'bullish' ? 'success' : (verdict === 'bearish' ? 'danger' : 'secondary');
     const verdictIcon = verdict === 'bullish' ? '📈' : (verdict === 'bearish' ? '📉' : '➖');
-
     let html = `
       <div class="row">
         <div class="col-md-6">
@@ -457,29 +416,8 @@
           </ul>
         </div>
       </div>
-      <div class="mt-2">
-        <button class="btn btn-sm btn-outline-secondary" onclick="window.showTimeframeDetails('${symbol}')">
-          <i class="fas fa-table"></i> Show Timeframe Details
-        </button>
-      </div>
     `;
     fusionPanel.innerHTML = html;
-  }
-
-  window.showTimeframeDetails = function(symbol) {
-    console.log('Fetch details for', symbol);
-    alert('Timeframe details will be displayed here (to be implemented).');
-  };
-
-  function displayMarketClosed(data) {
-    if (!liveSignalPanel) return;
-    liveSignalPanel.innerHTML = `
-      <div class="alert alert-warning">
-        <h5><i class="fas fa-hourglass-end"></i> Market Closed</h5>
-        <p>${data.reason}</p>
-        <p><strong>Next open:</strong> ${data.nextOpen ? new Date(data.nextOpen).toLocaleString() : 'Unknown'}</p>
-      </div>
-    `;
   }
 
   function displayMetrics(metrics) {
@@ -585,11 +523,6 @@
     }, 5000);
   }
 
-  function formatPrice(p) {
-    if (p === undefined || p === null) return 'N/A';
-    return parseFloat(p).toFixed(5);
-  }
-
   // ---- Update functions for positions and account ----
   function updatePositions(positions) {
     console.log('[Live] Positions update:', positions);
@@ -674,10 +607,23 @@
     const sl = parseFloat(card.dataset.sl) || null;
     const tp = parseFloat(card.dataset.tp) || null;
     const lot = parseFloat(card.dataset.lot) || 0.01;
-    if (typeof window.fillTradeForm === 'function') {
-      window.fillTradeForm(symbol, side, entry, sl, tp, lot);
+    // Fill the trade form if available
+    const pairInput = document.getElementById('tradePair');
+    const sideSelect = document.getElementById('tradeSide');
+    const lotInput = document.getElementById('tradeLot');
+    const slInput = document.getElementById('tradeSL');
+    const tpInput = document.getElementById('tradeTP');
+    if (pairInput && sideSelect && lotInput) {
+      pairInput.value = symbol;
+      sideSelect.value = side;
+      lotInput.value = lot;
+      if (slInput) slInput.value = sl;
+      if (tpInput) tpInput.value = tp;
+      // Switch to trading tab
+      const tradingTab = document.querySelector('.sidebar-nav .nav-item[data-section="trading"]');
+      if (tradingTab) tradingTab.click();
     } else {
-      alert('Trade form fill function not available.');
+      alert('Trade form not available.');
     }
   };
 
@@ -697,6 +643,7 @@
   // Start WebSocket connection
   connectWebSocket();
 
+  // Expose reconnect function
   window.reconnectLive = function() {
     if (ws) ws.close();
     reconnectAttempts = 0;
