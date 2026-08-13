@@ -479,6 +479,12 @@ class DerivBroker extends EventEmitter {
           this._publicState = STATE.CONNECTED;
           this._startPublicHeartbeat();
           this._flushPublicQueue();
+
+          // ✅ FIX: Restore streaming subscriptions after reconnect
+          this.streaming.restoreSubscriptions().catch(err => {
+            logger.warn('[DerivBroker] Failed to restore subscriptions:', err.message);
+          });
+
           this.emit('publicReady');
           resolve();
         });
