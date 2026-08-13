@@ -247,8 +247,6 @@ function renderOpenTradesWidget() {
 }
 
 function renderHistoryWidget() {
-  // This is handled by the separate history table rendering (renderHistoryTable)
-  // We'll just call renderHistoryTable() which uses dashboardState.history
   renderHistoryTable();
 }
 
@@ -468,7 +466,6 @@ window.closeTrade = async function(tradeId) {
     await fetchJson(`/api/close/${tradeId}`, { method: 'PUT' });
     SoundManager.tradeClose();
     alert('Trade closed successfully.');
-    // WebSocket will update positions automatically.
   } catch (e) {
     alert('Error closing trade: ' + e.message);
     SoundManager.reject();
@@ -480,7 +477,6 @@ window.cancelPending = async function(orderId) {
   try {
     await fetchJson(`/api/order/${orderId}`, { method: 'DELETE' });
     alert('Order cancelled successfully.');
-    // WebSocket will update pending orders.
   } catch (e) {
     alert('Error cancelling order: ' + e.message);
   }
@@ -557,7 +553,6 @@ function renderHistoryTable() {
   html += '</tbody></table></div>';
   container.innerHTML = html;
 
-  // Insert total P&L above the table
   if (filtered.length > 0) {
     const totalRow = document.createElement('div');
     totalRow.id = 'totalPnLDisplay';
@@ -571,8 +566,16 @@ function renderHistoryTable() {
 // 5. UI EVENT BINDINGS
 // ================================================================
 document.addEventListener('DOMContentLoaded', async function() {
-  // Load product preference
-  await loadProductPreference();
+  // Safe loadProductPreference
+  try {
+    if (typeof loadProductPreference === 'function') {
+      await loadProductPreference();
+    } else {
+      console.warn('[App] loadProductPreference not defined, skipping.');
+    }
+  } catch (e) {
+    console.warn('[App] Error loading product preference:', e);
+  }
 
   // Initial data load via HTTP (optional – WebSocket will also send init)
   await refreshAllData();
@@ -612,13 +615,12 @@ document.addEventListener('DOMContentLoaded', async function() {
     const tp = parseFloat(document.getElementById('tradeTP').value) || null;
     if (!pair || !lot || lot <= 0) { alert('Please fill in all required fields.'); isSubmitting = false; return; }
     try {
-      const response = await fetchJson('/api/trade', {
+      await fetchJson('/api/trade', {
         method: 'POST',
         body: JSON.stringify({ pair, side, lotSize: lot, stopLoss: sl, takeProfit: tp })
       });
       alert('Trade placed successfully!');
       SoundManager.tradeOpen();
-      // WebSocket will update positions automatically.
     } catch (e) {
       alert('Error placing trade: ' + e.message);
       SoundManager.reject();
@@ -636,7 +638,7 @@ document.addEventListener('DOMContentLoaded', async function() {
     const strategy = document.getElementById('autoStrategy').value;
     if (!pair || !risk || risk <= 0) { alert('Please fill in all fields.'); isAutoSubmitting = false; return; }
     try {
-      const response = await fetchJson('/api/auto-trade', {
+      await fetchJson('/api/auto-trade', {
         method: 'POST',
         body: JSON.stringify({ pair, riskPercent: risk, strategy })
       });
@@ -688,7 +690,7 @@ document.addEventListener('DOMContentLoaded', async function() {
   // ---- Test notification ----
   document.getElementById('testNotificationBtn')?.addEventListener('click', async function() {
     try {
-      const result = await fetchJson('/api/test-email', { method: 'POST' });
+      await fetchJson('/api/test-email', { method: 'POST' });
       alert('Test email sent! Check your inbox.');
     } catch (e) {
       alert('Error sending test email: ' + e.message);
@@ -731,12 +733,9 @@ window.updateApiStatus = function(connected) {
   if (text) text.textContent = connected ? 'Connected' : 'Disconnected';
 };
 window.updateAccountBadge = function(account) {
-  // This is defined in the HTML script for backward compatibility.
-  // We'll call it if it exists.
   if (typeof window._updateAccountBadge === 'function') {
     window._updateAccountBadge(account);
   } else {
-    // Fallback: update the badge elements directly.
     const idEl = document.getElementById('accountId');
     const typeEl = document.getElementById('accountTypeLabel');
     const currencyEl = document.getElementById('accountCurrency');
@@ -769,11 +768,9 @@ window.exportHistoryCSV = function() {
   URL.revokeObjectURL(url);
 };
 window.generateReport = function() {
-  // Placeholder – implement as needed
   alert('Report generation is not fully implemented yet.');
 };
 window.openDecisionInspector = function(decisionId) {
-  // Placeholder
   alert('Decision inspector will be implemented in a future update.');
 };
 
