@@ -198,7 +198,6 @@ app.get('/health', (req, res) => {
 // ---------- SPA Fallback (no API key injection) ----------
 app.get('*', (req, res) => {
   if (!req.path.startsWith('/api')) {
-    // Serve the main HTML without injecting any API key
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
   } else {
     res.status(404).json({ error: 'API endpoint not found' });
@@ -289,15 +288,26 @@ async function sendDashboardInitialState(ws) {
   }
 }
 
-// ---- Broadcast to all dashboard clients ----
+// ============================================================
+//  BROADCAST FUNCTIONS WITH DEBUG LOGS
+// ============================================================
 function broadcastToDashboards(type, data) {
-  if (dashboardClients.size === 0) return;
+  console.log(`[Broadcast] Attempting to broadcast "${type}" to ${dashboardClients.size} clients`);
+  if (dashboardClients.size === 0) {
+    console.warn(`[Broadcast] No dashboard clients connected.`);
+    return;
+  }
   const message = JSON.stringify({ type, data });
+  let sent = 0;
   dashboardClients.forEach((client) => {
     if (client.readyState === WebSocket.OPEN) {
       client.send(message);
+      sent++;
+    } else {
+      console.warn(`[Broadcast] Client not open, state: ${client.readyState}`);
     }
   });
+  console.log(`[Broadcast] Sent "${type}" to ${sent} clients`);
 }
 
 function broadcast(type, data) {
