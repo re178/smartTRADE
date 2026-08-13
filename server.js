@@ -220,6 +220,9 @@ wss.on('connection', (ws, req) => {
   // No authentication – allow all connections
   console.log('[WebSocket] Dashboard client connected.');
 
+  // ✅ FIX: Register this client for broadcasts
+  dashboardClients.add(ws);
+
   // Send initial state
   sendDashboardInitialState(ws);
 
@@ -288,9 +291,7 @@ async function sendDashboardInitialState(ws) {
   }
 }
 
-// ============================================================
-//  BROADCAST FUNCTIONS WITH DEBUG LOGS
-// ============================================================
+// ---- Broadcast functions with debug logs ----
 function broadcastToDashboards(type, data) {
   console.log(`[Broadcast] Attempting to broadcast "${type}" to ${dashboardClients.size} clients`);
   if (dashboardClients.size === 0) {
@@ -320,8 +321,10 @@ deepRegime.on('regime', (regime) => broadcast('regime', regime));
 decisionEngine.on('decision', (decision) => broadcast('decision', decision));
 eventBus.on('account.fetched', (account) => broadcast('account', account));
 eventBus.on('trade.closed', (data) => broadcast('tradeClosed', data));
-eventBus.on('order.placed', (data) => broadcast('orderPlaced', data));
-eventBus.on('position.updated', (data) => broadcast('positionUpdated', data));
+
+// ✅ FIX: Align event names with frontend expectations
+eventBus.on('order.placed', (data) => broadcast('trade.placed', data));
+eventBus.on('position.updated', (data) => broadcast('positions', data));
 
 // ---------- OTIE V5 Event Broadcasts ----------
 otie.on('otieV5State', (state) => broadcast('otieV5State', state));
