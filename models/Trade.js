@@ -1,4 +1,7 @@
 // models/Trade.js
+// Trade schema for tracking open and closed trades.
+// EXTENDED: Added Multiplier-specific fields.
+
 const mongoose = require('mongoose');
 
 const TradeSchema = new mongoose.Schema(
@@ -161,7 +164,7 @@ const TradeSchema = new mongoose.Schema(
       default: 0,
     },
 
-    // ---- NEW fields required by OTIE V5 ----
+    // ---- NEW fields required by OTIE V5 (kept) ----
     atrAtEntry: {
       type: Number,
       default: null,
@@ -177,8 +180,72 @@ const TradeSchema = new mongoose.Schema(
       default: 0,
       description: 'Maximum unrealized profit reached (in account currency)',
     },
-    // Internal flag used by OTIE (not persisted, but can be stored if needed)
-    // _partialClosed: { type: Boolean, default: false } // optional
+
+    // =============================================================
+    //  NEW FIELDS FOR MULTIPLIER TRADING
+    // =============================================================
+    // ---- Stake (amount risked) ----
+    stake: {
+      type: Number,
+      default: null,
+      description: 'Stake amount in account currency (for Multiplier trades)',
+    },
+
+    // ---- Multiplier (leverage) ----
+    multiplier: {
+      type: Number,
+      default: null,
+      description: 'Multiplier applied to the stake (for Multiplier trades)',
+    },
+
+    // ---- Duration (in seconds) ----
+    duration: {
+      type: Number,
+      default: null,
+      description: 'Duration of the Multiplier contract in seconds',
+    },
+
+    // ---- Knockout level (stop-loss price) ----
+    knockoutLevel: {
+      type: Number,
+      default: null,
+      description: 'Knockout price level (for Multiplier trades)',
+    },
+
+    // ---- Take-profit level ----
+    takeProfitLevel: {
+      type: Number,
+      default: null,
+      description: 'Take-profit price level (for Multiplier trades)',
+    },
+
+    // ---- Entry Thesis (prediction snapshot) ----
+    entryThesis: {
+      // Store the prediction that triggered the trade
+      direction: { type: String, enum: ['up', 'down', 'neutral'], default: null },
+      probability: { type: Number, default: null },
+      expectedMove: { type: Number, default: null },
+      expectedAdverse: { type: Number, default: null },
+      regime: { type: String, default: null },
+      sampleSize: { type: Number, default: null },
+      timestamp: { type: Date, default: null },
+    },
+
+    // ---- Trade Economics (snapshot at entry) ----
+    tradeEconomicsAtEntry: {
+      expectedValue: { type: Number, default: null },
+      evOverStake: { type: Number, default: null },
+      probabilityOfProfit: { type: Number, default: null },
+      probabilityOfLoss: { type: Number, default: null },
+    },
+
+    // ---- Thesis Monitor State ----
+    thesisMonitorState: {
+      // Latest evaluation from thesis monitor
+      lastEvaluation: { type: Date, default: null },
+      thesisValid: { type: Boolean, default: true },
+      reason: { type: String, default: '' },
+    },
   },
   {
     timestamps: true,
@@ -191,5 +258,10 @@ TradeSchema.index({ contractId: 1, status: 1 });
 TradeSchema.index({ decisionId: 1 });
 TradeSchema.index({ openTime: -1 });
 TradeSchema.index({ closeTime: -1 });
+
+// ---- NEW INDEXES for Multiplier fields ----
+TradeSchema.index({ stake: 1, multiplier: 1 });
+TradeSchema.index({ knockoutLevel: 1 });
+TradeSchema.index({ 'thesisMonitorState.thesisValid': 1 });
 
 module.exports = mongoose.model('Trade', TradeSchema);
