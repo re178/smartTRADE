@@ -1,10 +1,14 @@
-// public/js/live.js – WebSocket client with debug logs
+// public/js/live.js – WebSocket client with stable connection and heartbeat
+// Real‑time events: marketAwareness, regime, decision, fusion, otieV5State, otieV5Action,
+// init, account, positions, price, prediction, opportunity, etc.
+// Updated for Multiplier prediction events.
+
 (function() {
   'use strict';
 
   const WS_RECONNECT_DELAY = 2000;
   const WS_MAX_RECONNECT_DELAY = 30000;
-  const HEARTBEAT_INTERVAL = 25000;
+  const HEARTBEAT_INTERVAL = 25000; // send ping every 25s
 
   let reconnectAttempts = 0;
   let ws = null;
@@ -21,15 +25,29 @@
   const fusionPanel = document.getElementById('fusionPanel');
   const wsStatus = document.getElementById('wsStatus');
   const otieContent = document.getElementById('otieContent');
+  const predictionPanel = document.getElementById('predictionPanel');
+  const opportunityPanel = document.getElementById('opportunityPanel');
 
   // ---- SoundManager (global from app.js) ----
   function playSound(type) {
     if (window.SoundManager && typeof window.SoundManager[type] === 'function') {
       window.SoundManager[type]();
+    } else {
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.frequency.value = type === 'tradeOpen' ? 600 : (type === 'reject' ? 300 : 800);
+        gain.gain.value = 0.3;
+        osc.start();
+        osc.stop(ctx.currentTime + 0.3);
+      } catch (e) {}
     }
   }
 
-  // ---- Helper functions ----
+  // ---- Helper: formatSymbol ----
   function formatSymbol(symbol) {
     if (!symbol || typeof symbol !== 'string') return symbol;
     const upper = symbol.toUpperCase().trim();
@@ -54,10 +72,13 @@
     }
   }
 
-  // ---- WebSocket connection ----
   function connectWebSocket() {
-    if (ws && ws.readyState === WebSocket.OPEN) return;
+    // If there's an existing connection, close it first
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      return;
+    }
 
+    // Use the WebSocket URL from config (auto-detected)
     const wsUrl = CONFIG.WS_URL;
     console.log('[Live] Connecting to WebSocket:', wsUrl);
 
@@ -73,6 +94,7 @@
       console.log('[Live] WebSocket connected.');
       reconnectAttempts = 0;
       updateWsStatus(true);
+      // Start heartbeat
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_INTERVAL);
     };
@@ -80,8 +102,7 @@
     ws.onmessage = function(event) {
       try {
         const msg = JSON.parse(event.data);
-        // Log every message type for debugging
-        console.log('[Live] Received message type:', msg.type);
+        // Respond to server ping with pong (if needed)
         if (msg.type === 'ping') {
           if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'pong' }));
@@ -101,6 +122,7 @@
         clearInterval(heartbeatTimer);
         heartbeatTimer = null;
       }
+      // Only reconnect if the close was not intentional (no reconnect if code 1000)
       if (event.code !== 1000) {
         scheduleReconnect();
       }
@@ -108,6 +130,7 @@
 
     ws.onerror = function(err) {
       console.error('[Live] WebSocket error:', err);
+      // ws will close after error, so onclose will handle reconnect
     };
   }
 
@@ -131,12 +154,70 @@
   }
 
   // ============================================================
-  //  MAIN MESSAGE HANDLER
+  //  MAIN MESSAGE HANDLER – WITH NEW PREDICTION & OPPORTUNITY
   // ============================================================
   function handleMessage(msg) {
+    // Log received message type for debugging
+    console.log('[Live] Received message type:', msg.type);
+
+    // Update state store and render all widgets
     switch (msg.type) {
+      // ============================================================
+      //  NEW: Prediction and Opportunity events
+      // ============================================================
+      case 'prediction':
+        console.log('[Live] ✅ Prediction received:', msg.data);
+        // The prediction panel will be updated via app.js renderPredictionWidget
+        if (window.updateDashboardState) {
+          window.updateDashboardState({ prediction: msg.data });
+        }
+        break;
+
+      case 'opportunity':
+        console.log('[Live] ✅ Opportunity received:', msg.data);
+        if (window.updateDashboardState) {
+          window.updateDashboardState({ opportunity: msg.data });
+        }
+        // If opportunity is tradable and auto-execute is on, we could auto-trade here
+        if (msg.data.tradable && document.getElementById('autoExecuteToggle')?.checked) {
+          console.log('[Live] Auto‑executing opportunity:', msg.data);
+          // Auto-execution logic – calls the same API as manual trade
+          // We'll use the same /api/trade endpoint but with the Multiplier fields
+          fetch('/api/trade', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              pair: msg.data.prediction?.symbol || 'EUR_USD',
+              side: msg.data.direction,
+              stake: msg.data.stake,
+              multiplier: msg.data.multiplier,
+              duration: msg.data.duration,
+              knockoutLevel: msg.data.knockoutLevel,
+              takeProfitLevel: msg.data.takeProfitLevel,
+              product: 'deriv_cfd',
+            })
+          })
+          .then(res => res.json())
+          .then(data => {
+            if (data.success) {
+              console.log('[Live] Auto‑executed Multiplier trade:', data);
+              playSound('tradeOpen');
+            } else {
+              console.error('[Live] Auto‑execute failed:', data.error);
+              playSound('reject');
+            }
+          })
+          .catch(err => {
+            console.error('[Live] Auto‑execute error:', err);
+            playSound('reject');
+          });
+        }
+        break;
+
+      // ============================================================
+      //  EXISTING EVENTS (preserved)
+      // ============================================================
       case 'marketAwareness':
-        console.log('[Live] ✅ marketAwareness received:', msg.data);
         displayAwareness(msg.data);
         if (window.updateDashboardState) {
           window.updateDashboardState({ awareness: msg.data });
@@ -144,15 +225,25 @@
         break;
 
       case 'regime':
-        console.log('[Live] Regime received:', msg.data);
         displayRegime(msg.data);
         if (window.updateDashboardState) {
           window.updateDashboardState({ regime: msg.data });
         }
         break;
 
+      case 'hypothesisCreated':
+        addHypothesis(msg.data);
+        break;
+
+      case 'hypothesisResolved':
+        updateHypothesis(msg.data);
+        break;
+
+      case 'knowledge':
+        displayKnowledge(msg.data);
+        break;
+
       case 'decision':
-        console.log('[Live] Decision received:', msg.data);
         displayDecision(msg.data);
         if (window.updateDashboardState) {
           window.updateDashboardState({ liveSignal: msg.data });
@@ -166,6 +257,10 @@
         }
         break;
 
+      case 'marketClosed':
+        displayMarketClosed(msg.data);
+        break;
+
       case 'metrics':
         displayMetrics(msg.data);
         if (window.updateDashboardState) {
@@ -175,32 +270,48 @@
 
       case 'otieV5State':
         displayOTIEState(msg.data);
+        if (window.updateDashboardState) {
+          const currentOTIE = (window.dashboardState?.otieDecisions) || [];
+          currentOTIE.unshift(msg.data);
+          if (currentOTIE.length > 20) currentOTIE.pop();
+          window.updateDashboardState({ otieDecisions: currentOTIE });
+        }
         break;
 
       case 'otieV5Action':
         displayOTIEAction(msg.data);
+        if (window.updateDashboardState) {
+          const currentActions = (window.dashboardState?.otieActions) || [];
+          currentActions.unshift(msg.data);
+          if (currentActions.length > 20) currentActions.pop();
+          window.updateDashboardState({ otieActions: currentActions });
+        }
         break;
 
-      case 'tradeClosed':
+      case 'tradeClosed': {
         if (window.updateDashboardState) {
           const closedId = msg.data.contractId;
           const currentPositions = (window.dashboardState?.positions) || [];
           const updatedPositions = currentPositions.filter(p => p.id !== closedId);
           window.updateDashboardState({ positions: updatedPositions });
         }
+        if (typeof addNotification === 'function') addNotification('Trade closed', 'info');
         playSound('tradeClose');
         break;
+      }
 
-      case 'trade.placed':
+      case 'trade.placed': {
         playSound('tradeOpen');
+        if (typeof addNotification === 'function') addNotification('Trade opened', 'success');
         break;
+      }
 
       case 'order.rejected':
         playSound('reject');
+        if (typeof addNotification === 'function') addNotification('Order rejected: ' + (msg.data.reason || ''), 'danger');
         break;
 
-      case 'init':
-        console.log('[Live] Init received:', msg.data);
+      case 'init': {
         if (window.updateDashboardState) {
           window.updateDashboardState({
             account: msg.data.account,
@@ -212,31 +323,36 @@
         if (msg.data.positions) updatePositions(msg.data.positions);
         if (msg.data.trades && typeof renderHistoryTable === 'function') renderHistoryTable();
         break;
+      }
 
-      case 'positions':
-        console.log('[Live] Positions update:', msg.data);
+      case 'positions': {
         updatePositions(msg.data);
         if (window.updateDashboardState) {
           window.updateDashboardState({ positions: msg.data });
         }
         break;
+      }
 
-      case 'account':
-        console.log('[Live] Account update:', msg.data);
+      case 'account': {
         updateAccount(msg.data);
         if (window.updateDashboardState) {
           window.updateDashboardState({ account: msg.data });
         }
         break;
+      }
 
-      case 'price':
-        console.log('[Live] Price update:', msg.data);
+      case 'price': {
         if (window.updateDashboardState) {
           const symbol = msg.data.symbol;
           const currentPrices = (window.dashboardState?.prices) || {};
           currentPrices[symbol] = msg.data;
           window.updateDashboardState({ prices: currentPrices });
         }
+        break;
+      }
+
+      case 'positionUpdated':
+        // Could update positions if needed – currently handled by 'positions'
         break;
 
       default:
@@ -245,14 +361,10 @@
   }
 
   // ============================================================
-  //  DISPLAY FUNCTIONS
+  //  DISPLAY FUNCTIONS (existing – unchanged)
   // ============================================================
   function displayAwareness(data) {
-    if (!awarenessPanel) {
-      console.warn('[Live] awarenessPanel not found');
-      return;
-    }
-    console.log('[Live] Updating awareness panel with:', data);
+    if (!awarenessPanel) return;
     const { symbol, spread, velocity, acceleration, liquidity, unusualEvents, lastUpdated } = data;
     const events = unusualEvents ? unusualEvents.join(', ') : 'None';
     awarenessPanel.innerHTML = `
@@ -278,6 +390,56 @@
           <p class="card-text"><strong>${name}</strong> (${confidence}%)</p>
           <p class="small">${description || ''}</p>
           <p class="small text-muted">${symbol} | ${new Date(timestamp).toLocaleString()}</p>
+        </div>
+      </div>
+    `;
+  }
+
+  function addHypothesis(hypothesis) {
+    if (!hypothesisPanel) return;
+    const { id, symbol, type, status, createdAt } = hypothesis;
+    const el = document.createElement('div');
+    el.className = 'alert alert-info hypothesis-item';
+    el.dataset.id = id;
+    el.innerHTML = `
+      <strong>Hypothesis #${id}</strong> (${symbol})<br>
+      Type: ${type}<br>
+      Status: ${status}<br>
+      Created: ${new Date(createdAt).toLocaleString()}
+    `;
+    hypothesisPanel.prepend(el);
+    while (hypothesisPanel.children.length > 10) {
+      hypothesisPanel.removeChild(hypothesisPanel.lastChild);
+    }
+  }
+
+  function updateHypothesis(hypothesis) {
+    if (!hypothesisPanel) return;
+    const { id, status, outcome, resolvedAt } = hypothesis;
+    const items = hypothesisPanel.querySelectorAll(`.hypothesis-item[data-id="${id}"]`);
+    if (items.length > 0) {
+      const el = items[0];
+      const statusClass = status === 'confirmed' ? 'success' : (status === 'rejected' ? 'danger' : 'secondary');
+      el.className = `alert alert-${statusClass} hypothesis-item`;
+      el.innerHTML = `
+        <strong>Hypothesis #${id}</strong> (${hypothesis.symbol})<br>
+        Type: ${hypothesis.type}<br>
+        Status: <strong>${status}</strong> (conf: ${outcome?.confidence || 0}%)<br>
+        Resolved: ${new Date(resolvedAt).toLocaleString()}
+      `;
+    }
+  }
+
+  function displayKnowledge(knowledge) {
+    if (!knowledgePanel) return;
+    const { symbol, indicator, valueRange, outcome, confidence, lastUpdated } = knowledge;
+    knowledgePanel.innerHTML = `
+      <div class="card">
+        <div class="card-body">
+          <h6 class="card-title">Knowledge (${symbol})</h6>
+          <p>${indicator} ${valueRange} → ${outcome}</p>
+          <p>Confidence: ${(confidence * 100).toFixed(0)}%</p>
+          <p class="small text-muted">${new Date(lastUpdated).toLocaleString()}</p>
         </div>
       </div>
     `;
@@ -321,45 +483,15 @@
     html += `<p class="text-muted small mt-2">${new Date(timestamp).toLocaleString()}</p>`;
     html += `</div>`;
     liveSignalPanel.innerHTML = html;
-
-    // Auto‑execute if toggle is on
-    const toggle = document.getElementById('autoExecuteToggle');
-    if (toggle && toggle.checked && side && side !== 'NO_TRADE') {
-      console.log('[Live] Auto‑executing signal for', formattedSymbol, side);
-      fetch('/api/execute-signal', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          pair: formattedSymbol,
-          side: side,
-          entryPrice: entryPrice,
-          stopLoss: stopLoss,
-          takeProfit: takeProfit,
-          lotSize: recommendedLotSize || 0.01
-        })
-      })
-      .then(res => res.json())
-      .then(data => {
-        if (data.success) {
-          console.log('[Live] Auto‑executed trade:', data);
-          playSound('tradeOpen');
-        } else {
-          console.error('[Live] Auto‑execute failed:', data.error);
-          playSound('reject');
-        }
-      })
-      .catch(err => {
-        console.error('[Live] Auto‑execute error:', err);
-        playSound('reject');
-      });
-    }
   }
 
   function displayFusion(fusion) {
     if (!fusionPanel) return;
     const { symbol, verdict, confidence, agreement, timeframeBreakdown, reasons, session } = fusion;
+
     const verdictClass = verdict === 'bullish' ? 'success' : (verdict === 'bearish' ? 'danger' : 'secondary');
     const verdictIcon = verdict === 'bullish' ? '📈' : (verdict === 'bearish' ? '📉' : '➖');
+
     let html = `
       <div class="row">
         <div class="col-md-6">
@@ -381,6 +513,22 @@
       </div>
     `;
     fusionPanel.innerHTML = html;
+  }
+
+  window.showTimeframeDetails = function(symbol) {
+    console.log('Fetch details for', symbol);
+    alert('Timeframe details will be displayed here (to be implemented).');
+  };
+
+  function displayMarketClosed(data) {
+    if (!liveSignalPanel) return;
+    liveSignalPanel.innerHTML = `
+      <div class="alert alert-warning">
+        <h5><i class="fas fa-hourglass-end"></i> Market Closed</h5>
+        <p>${data.reason}</p>
+        <p><strong>Next open:</strong> ${data.nextOpen ? new Date(data.nextOpen).toLocaleString() : 'Unknown'}</p>
+      </div>
+    `;
   }
 
   function displayMetrics(metrics) {
@@ -570,6 +718,7 @@
     const sl = parseFloat(card.dataset.sl) || null;
     const tp = parseFloat(card.dataset.tp) || null;
     const lot = parseFloat(card.dataset.lot) || 0.01;
+    // Fill the trade form if available
     const pairInput = document.getElementById('tradePair');
     const sideSelect = document.getElementById('tradeSide');
     const lotInput = document.getElementById('tradeLot');
@@ -581,6 +730,7 @@
       lotInput.value = lot;
       if (slInput) slInput.value = sl;
       if (tpInput) tpInput.value = tp;
+      // Switch to trading tab
       const tradingTab = document.querySelector('.sidebar-nav .nav-item[data-section="trading"]');
       if (tradingTab) tradingTab.click();
     } else {
@@ -614,4 +764,5 @@
     }
     connectWebSocket();
   };
+
 })();
