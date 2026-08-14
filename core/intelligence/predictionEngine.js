@@ -2,6 +2,7 @@
 // Prediction Engine – Converts market state into a probability distribution of future path.
 // Uses enhanced StateStore to retrieve analogues with path data.
 // Outputs a Prediction object for use by Opportunity Engine.
+// VERIFIED: Integrated with server pipeline.
 
 const stateStore = require('./lab/stateStore');
 const deepMarketState = require('./deep/marketState');
