@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>RTS Trading Dashboard</title>
+  <title>RTS Trading Dashboard – Multiplier Edition</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet" />
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
@@ -338,17 +338,41 @@
     .stat-change.positive { color: var(--success); }
     .stat-change.negative { color: var(--danger); }
 
-    /* ──────────── LIVE SIGNAL ──────────── */
-    .live-signal-card {
-      padding: 16px 20px;
-      border-radius: 10px;
-      border-left: 4px solid var(--primary);
-      background: #f8fafc;
-      transition: background 0.2s;
+    /* ──────────── PREDICTION & OPPORTUNITY ──────────── */
+    .prediction-bar {
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      flex-wrap: wrap;
     }
-    .live-signal-card.buy { border-left-color: var(--success); background: #f0fdf4; }
-    .live-signal-card.sell { border-left-color: var(--danger); background: #fef2f2; }
-    .live-signal-card.neutral { border-left-color: #94a3b8; background: #f8fafc; }
+    .prediction-bar .prob-block {
+      background: #f1f5f9;
+      border-radius: 8px;
+      padding: 8px 16px;
+      text-align: center;
+      min-width: 80px;
+    }
+    .prediction-bar .prob-block .value {
+      font-size: 1.5rem;
+      font-weight: 700;
+    }
+    .prediction-bar .prob-block .label {
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+    }
+    .prob-up .value { color: var(--success); }
+    .prob-down .value { color: var(--danger); }
+    .prob-neutral .value { color: var(--warning); }
+
+    .opportunity-card {
+      border-left: 4px solid var(--primary);
+      padding: 12px 16px;
+      background: #f8fafc;
+      border-radius: 8px;
+    }
+    .opportunity-card.trade { border-left-color: var(--success); background: #f0fdf4; }
+    .opportunity-card.no-trade { border-left-color: var(--danger); background: #fef2f2; }
 
     /* ──────────── TRADE HISTORY ──────────── */
     .history-filters {
@@ -496,7 +520,7 @@
     <i class="fas fa-chart-line"></i>
     <div>
       RTS
-      <span>v2.1</span>
+      <span>v3.0 Multiplier</span>
     </div>
   </div>
 
@@ -518,8 +542,8 @@
     </button>
 
     <div class="nav-label">Intelligence</div>
-    <button class="nav-item" data-section="signals">
-      <i class="fas fa-bolt"></i> Live Signals
+    <button class="nav-item" data-section="prediction">
+      <i class="fas fa-brain"></i> Prediction
     </button>
     <button class="nav-item" data-section="regime">
       <i class="fas fa-flag"></i> Market Regime
@@ -653,13 +677,43 @@
       </div>
     </div>
 
+    <!-- ===== NEW: Prediction Panel ===== -->
+    <div class="row g-3 mb-3">
+      <div class="col-12">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title"><i class="fas fa-brain text-primary"></i> Market Prediction</span>
+            <span class="badge bg-info">Real‑time</span>
+          </div>
+          <div class="card-body" id="predictionPanel">
+            <p class="text-muted">Waiting for prediction data...</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== NEW: Opportunity Panel ===== -->
+    <div class="row g-3 mb-3">
+      <div class="col-12">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title"><i class="fas fa-bullseye text-success"></i> Trade Opportunity</span>
+            <span class="badge bg-secondary">EV‑Based</span>
+          </div>
+          <div class="card-body" id="opportunityPanel">
+            <p class="text-muted">Waiting for opportunity data...</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Live Signal & Regime & Metrics -->
     <div class="row g-3">
       <div class="col-lg-6">
         <div class="card">
           <div class="card-header">
-            <span class="card-title"><i class="fas fa-bolt text-warning"></i> Live Signal</span>
-            <span class="badge bg-info">Real‑time</span>
+            <span class="card-title"><i class="fas fa-bolt text-warning"></i> Live Signal (Legacy)</span>
+            <span class="badge bg-secondary">CFD</span>
           </div>
           <div class="card-body" id="liveSignalPanel">
             <p class="text-muted">Waiting for live signals...</p>
@@ -679,21 +733,6 @@
           <div class="card-header"><span class="card-title"><i class="fas fa-chart-bar"></i> Live Metrics</span></div>
           <div class="card-body" id="metricsPanel">
             <p class="text-muted">Waiting for metrics...</p>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Fusion Panel (Multi-Timeframe Consensus) -->
-    <div class="row g-3 mt-3">
-      <div class="col-12">
-        <div class="card">
-          <div class="card-header">
-            <span class="card-title"><i class="fas fa-layer-group text-primary"></i> Multi‑Timeframe Fusion</span>
-            <span class="badge bg-secondary">Consensus</span>
-          </div>
-          <div class="card-body" id="fusionPanel">
-            <p class="text-muted">Waiting for timeframe assessments...</p>
           </div>
         </div>
       </div>
@@ -755,7 +794,7 @@
       </div>
       <div class="col-lg-6">
         <div class="card">
-          <div class="card-header"><span class="card-title"><i class="fas fa-rocket"></i> Execute Trade</span></div>
+          <div class="card-header"><span class="card-title"><i class="fas fa-rocket"></i> Execute Multiplier Trade</span></div>
           <div class="card-body">
             <form id="tradeForm">
               <div class="row g-2">
@@ -763,18 +802,20 @@
                 <div class="col-6"><label class="form-label small">Side</label>
                   <select class="form-select" id="tradeSide"><option value="BUY">BUY</option><option value="SELL">SELL</option></select>
                 </div>
-                <div class="col-4"><label class="form-label small">Lot Size</label><input type="number" step="0.01" class="form-control" id="tradeLot" value="0.01" required /></div>
-                <div class="col-4"><label class="form-label small">Stop Loss</label><input type="number" step="0.00001" class="form-control" id="tradeSL" placeholder="Optional" /></div>
-                <div class="col-4"><label class="form-label small">Take Profit</label><input type="number" step="0.00001" class="form-control" id="tradeTP" placeholder="Optional" /></div>
+                <div class="col-4"><label class="form-label small">Stake ($)</label><input type="number" step="0.01" class="form-control" id="tradeStake" value="10" required /></div>
+                <div class="col-4"><label class="form-label small">Multiplier</label><input type="number" step="1" class="form-control" id="tradeMultiplier" value="10" required /></div>
+                <div class="col-4"><label class="form-label small">Duration (sec)</label><input type="number" step="10" class="form-control" id="tradeDuration" value="300" required /></div>
+                <div class="col-6"><label class="form-label small">Knockout (SL)</label><input type="number" step="0.00001" class="form-control" id="tradeKnockout" placeholder="Optional" /></div>
+                <div class="col-6"><label class="form-label small">Take Profit</label><input type="number" step="0.00001" class="form-control" id="tradeTP" placeholder="Optional" /></div>
               </div>
-              <button type="submit" class="btn btn-success w-100 mt-3"><i class="fas fa-paper-plane"></i> Place Order</button>
+              <button type="submit" class="btn btn-success w-100 mt-3"><i class="fas fa-paper-plane"></i> Place Multiplier Order</button>
             </form>
             <hr />
             <form id="autoTradeForm">
               <div class="row g-2">
-                <div class="col-5"><label class="form-label small">Pair</label><input type="text" class="form-control" id="autoPair" value="EUR_USD" required /></div>
+                <div class="col-4"><label class="form-label small">Pair</label><input type="text" class="form-control" id="autoPair" value="EUR_USD" required /></div>
                 <div class="col-3"><label class="form-label small">Risk %</label><input type="number" step="0.1" class="form-control" id="autoRisk" value="1" required /></div>
-                <div class="col-4"><label class="form-label small">Strategy</label>
+                <div class="col-5"><label class="form-label small">Strategy</label>
                   <select class="form-select" id="autoStrategy">
                     <option value="sma">SMA</option><option value="ema">EMA</option>
                     <option value="rsi">RSI</option><option value="macd">MACD</option>
@@ -806,6 +847,23 @@
               <label class="btn btn-outline-primary flex-fill m-1"><input type="radio" name="product" value="deriv_basic" onchange="window.handleProductChange(event)" /> Deriv Basic</label>
             </div>
             <small class="text-muted">Switching applies to all subsequent trades and account data.</small>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== PREDICTION SECTION ===== -->
+  <div id="section-prediction" class="section-content" style="display:none;">
+    <div class="row">
+      <div class="col-12">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title"><i class="fas fa-brain text-primary"></i> Prediction Details</span>
+            <button class="btn btn-sm btn-outline-secondary" id="refreshPrediction"><i class="fas fa-sync-alt"></i> Refresh</button>
+          </div>
+          <div class="card-body" id="predictionDetailPanel">
+            <p class="text-muted">Waiting for prediction data...</p>
           </div>
         </div>
       </div>
@@ -911,7 +969,7 @@
     </div>
   </div>
 
-  <!-- ===== TRADE MANAGEMENT SECTION (OTIE V5) ===== -->
+  <!-- ===== TRADE MANAGEMENT SECTION (OTIE) ===== -->
   <div id="section-trademanagement" class="section-content" style="display:none;">
     <div class="card">
       <div class="card-header">
@@ -1045,6 +1103,7 @@
   const sections = {
     dashboard: document.getElementById('section-dashboard'),
     trading: document.getElementById('section-trading'),
+    prediction: document.getElementById('section-prediction'),
     positions: document.getElementById('section-positions'),
     history: document.getElementById('section-history'),
     research: document.getElementById('section-research'),
@@ -1057,6 +1116,7 @@
   const sectionNames = {
     dashboard: 'Dashboard',
     trading: 'Trading',
+    prediction: 'Prediction',
     positions: 'Positions',
     history: 'Trade History',
     research: 'Research Lab',
@@ -1169,7 +1229,6 @@
     if (idEl) idEl.textContent = account.id || account.login || '—';
     if (currencyEl) currencyEl.textContent = account.currency || 'USD';
 
-    // Determine real/demo
     let type = 'demo';
     if (account.tradeMode === 0 || account.server?.toLowerCase().includes('demo') === false) {
       type = 'real';
@@ -1182,27 +1241,6 @@
       typeEl.className = 'account-type ' + type;
     }
   }
-
-  // Listen for account updates from app.js or WebSocket
-  // The existing loadAccount function already updates the stat cards.
-  // We'll also override loadAccount to update the badge.
-  const originalLoadAccount = window.loadAccount;
-  if (originalLoadAccount) {
-    window.loadAccount = async function() {
-      await originalLoadAccount();
-      try {
-        const acc = await fetchJson(`${CONFIG.API_BASE}/api/account`);
-        updateAccountBadge(acc);
-      } catch (e) {
-        console.error('Failed to update account badge:', e);
-      }
-    };
-  }
-
-  // Also listen for WebSocket 'account' events
-  document.addEventListener('wsAccountUpdate', function(e) {
-    updateAccountBadge(e.detail);
-  });
 
   // Initial account badge fetch
   setTimeout(() => {
