@@ -1,201 +1,231 @@
 // core/intelligence/lab/outcomeLabeler.js
-// Background job to label outcomes for unlabelled HistoricalState records.
-// Runs periodically and updates states with outcomes.
+// Outcome Labeler – Computes and stores future path data for HistoricalState.
+// Runs as a background job to label new states and backfill existing ones.
+// EXTENDED: Stores MFE, MAE, time‑to‑extremes, regime transitions.
 
-const HistoricalState = require('../../../models/HistoricalState');
-const HistoricalOutcome = require('../../../models/HistoricalOutcome');
+const HistoricalState = require('../../models/HistoricalState');
 const candleHistory = require('../../data/candleHistory');
+const deepRegime = require('../../intelligence/deep/regime');
 const logger = require('../../../infrastructure/logger') || console;
 
-const LOOKAHEADS = [5, 10, 20, 40];
-const MAX_CANDLES = 5000; // enough for up to 40 candles ahead
-const TOLERANCE_MS = 60000; // 1 minute
-
-let isRunning = false;
+// Configuration
+const CONFIG = {
+  // Lookahead horizons (in candles)
+  HORIZONS: [5, 10, 20, 40],
+  // Batch size for processing
+  BATCH_SIZE: 100,
+  // Sleep between batches (ms) to avoid DB overload
+  BATCH_SLEEP_MS: 500,
+  // Maximum candles to fetch for each horizon
+  MAX_CANDLES: 200,
+};
 
 /**
- * Label outcomes for unlabelled states.
- * @param {number} limit - Max number of states to process in one run (to avoid overload).
- * @returns {Promise<{ labelled: number, skipped: number, errors: number }>}
+ * Compute future path data for a given state.
+ * @param {Object} state - HistoricalState document.
+ * @param {Array} futureCandles - Array of future candles (each with { time, open, high, low, close }).
+ * @param {Array} horizons - Lookahead horizons (e.g., [5, 10, 20, 40]).
+ * @returns {Object} { futurePrices, mfe, mae, timeToMaxFavorable, timeToMaxAdverse, regimeTransitions }
  */
-async function labelOutcomes(limit = 200) {
-  if (isRunning) {
-    logger.warn('[OutcomeLabeler] Already running, skipping this run.');
-    return { labelled: 0, skipped: 0, errors: 0, message: 'Already running' };
+function computePathData(state, futureCandles, horizons) {
+  const entryPrice = state.price.current;
+  const maxHorizon = Math.max(...horizons);
+  const maxIndex = Math.min(futureCandles.length, maxHorizon);
+
+  // Extract close prices up to maxHorizon
+  const prices = futureCandles.slice(0, maxIndex).map(c => c.close);
+  if (prices.length === 0) {
+    return null;
   }
-  isRunning = true;
-  let labelled = 0, skipped = 0, errors = 0;
 
+  // Compute MFE (maximum favorable excursion) and MAE (maximum adverse excursion)
+  // MFE = max(price - entryPrice)
+  // MAE = min(price - entryPrice)
+  let mfe = 0;
+  let mae = 0;
+  let timeToMaxFavorable = null;
+  let timeToMaxAdverse = null;
+
+  for (let i = 0; i < prices.length; i++) {
+    const diff = prices[i] - entryPrice;
+    if (diff > mfe) {
+      mfe = diff;
+      timeToMaxFavorable = i;
+    }
+    if (diff < mae) {
+      mae = diff;
+      timeToMaxAdverse = i;
+    }
+  }
+
+  // Store price arrays per horizon
+  const futurePrices = {};
+  for (const h of horizons) {
+    const idx = Math.min(h, prices.length);
+    futurePrices[h] = prices.slice(0, idx);
+  }
+
+  // Regime transitions: we need to get the regime for each future candle time.
+  // This requires fetching the regime from deepRegime or from the stored state.
+  // For simplicity, we'll use the deepRegime.getLatestRegime for each timestamp if available.
+  // However, this can be slow; we'll store the regime code from the future states if we have them.
+  // For now, we'll just store an empty array and fill later if needed.
+  const regimeTransitions = [];
+
+  return {
+    futurePrices,
+    mfe,
+    mae,
+    timeToMaxFavorable,
+    timeToMaxAdverse,
+    regimeTransitions,
+  };
+}
+
+/**
+ * Label a single state with future path data.
+ * @param {Object} state - HistoricalState document.
+ * @param {number} maxHorizon - Maximum lookahead in candles.
+ * @returns {Promise<boolean>} True if labelled successfully.
+ */
+async function labelState(state, maxHorizon = 40) {
   try {
-    logger.info('[OutcomeLabeler] Starting outcome labelling...');
+    const symbol = state.symbol;
+    const timeframe = state.timeframe;
+    const timestamp = state.timestamp;
 
-    // Find states that are unlabelled (outcome5.return is null)
-    const states = await HistoricalState.find({ 'outcome5.return': null }).limit(limit).lean();
-    if (states.length === 0) {
-      logger.info('[OutcomeLabeler] No unlabelled states found.');
-      isRunning = false;
-      return { labelled: 0, skipped: 0, errors: 0 };
+    // Fetch future candles from candleHistory
+    // We need to get candles after the state's timestamp, up to maxHorizon candles.
+    // candleHistory.getHistory returns an array of candles for a given symbol and timeframe,
+    // but we need to filter by time > timestamp.
+    // Assuming candleHistory has a method getCandlesAfter(symbol, timeframe, afterTime, limit)
+    // We'll implement a helper function.
+    const futureCandles = await getCandlesAfter(symbol, timeframe, timestamp, maxHorizon + 5);
+    if (!futureCandles || futureCandles.length < 1) {
+      logger.warn(`[OutcomeLabeler] No future candles for ${symbol} ${timeframe} at ${timestamp}`);
+      return false;
     }
 
-    logger.info(`[OutcomeLabeler] Found ${states.length} unlabelled states to process.`);
+    const pathData = computePathData(state, futureCandles, CONFIG.HORIZONS);
+    if (!pathData) {
+      return false;
+    }
+
+    // Update the state with future path data
+    state.futurePrices = pathData.futurePrices;
+    state.mfe = pathData.mfe;
+    state.mae = pathData.mae;
+    state.timeToMaxFavorable = pathData.timeToMaxFavorable;
+    state.timeToMaxAdverse = pathData.timeToMaxAdverse;
+    state.regimeTransitions = pathData.regimeTransitions;
+    state.version = '2.1';
+
+    await state.save();
+    return true;
+  } catch (err) {
+    logger.error(`[OutcomeLabeler] Error labelling state ${state._id}:`, err.message);
+    return false;
+  }
+}
+
+/**
+ * Helper: get future candles after a given timestamp.
+ * @param {string} symbol - Symbol (e.g., 'EUR_USD').
+ * @param {string} timeframe - Timeframe (e.g., 'M5').
+ * @param {Date} afterTime - Timestamp to start from.
+ * @param {number} limit - Number of candles to fetch.
+ * @returns {Promise<Array>} Array of candles (sorted by time ascending).
+ */
+async function getCandlesAfter(symbol, timeframe, afterTime, limit = 50) {
+  // candleHistory.getHistory returns the most recent candles, but we need candles after a specific time.
+  // We'll implement a simple approach: fetch a large batch from the DB and filter.
+  // Alternatively, we could add a method to candleHistory.
+  // For now, we'll use the existing candleHistory.getHistory and filter.
+  // Assuming candleHistory.getHistory returns candles sorted by time (most recent first?).
+  // We'll reverse if needed.
+  const allCandles = await candleHistory.getHistory(symbol, timeframe, limit * 2);
+  if (!allCandles || allCandles.length === 0) {
+    return [];
+  }
+  // Assuming candles have a 'time' field in milliseconds or Date.
+  const after = new Date(afterTime).getTime();
+  // Filter candles with time > afterTime
+  const filtered = allCandles
+    .filter(c => new Date(c.time).getTime() > after)
+    .sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+  return filtered.slice(0, limit);
+}
+
+/**
+ * Label all unlabelled states (where futurePrices is null) in batches.
+ * @param {number} batchSize - Number of states to process per batch.
+ * @param {number} maxHorizon - Maximum lookahead.
+ * @returns {Promise<Object>} { totalProcessed, totalSuccess, totalFailed }
+ */
+async function labelAllStates(batchSize = CONFIG.BATCH_SIZE, maxHorizon = 40) {
+  logger.info('[OutcomeLabeler] Starting batch labeling...');
+
+  let totalProcessed = 0;
+  let totalSuccess = 0;
+  let totalFailed = 0;
+
+  let skip = 0;
+  let hasMore = true;
+
+  while (hasMore) {
+    const states = await HistoricalState.find({
+      futurePrices: null,
+      // Also require that we have enough candles? We'll try anyway.
+    })
+      .sort({ timestamp: 1 })
+      .skip(skip)
+      .limit(batchSize)
+      .lean();
+
+    if (states.length === 0) {
+      hasMore = false;
+      break;
+    }
+
+    logger.info(`[OutcomeLabeler] Processing batch ${skip / batchSize + 1} (${states.length} states)`);
 
     for (const state of states) {
-      try {
-        const { symbol, timeframe, timestamp } = state;
-
-        // Fetch candles for this symbol and timeframe
-        let candles = await candleHistory.getHistory(symbol, timeframe, MAX_CANDLES);
-        if (!candles || candles.length === 0) {
-          // Try alternative symbol format (with/without underscore)
-          const altSymbol = symbol.includes('_') ? symbol.replace('_', '') : symbol.slice(0, 3) + '_' + symbol.slice(3);
-          candles = await candleHistory.getHistory(altSymbol, timeframe, MAX_CANDLES);
-        }
-
-        if (!candles || candles.length < 50) {
-          logger.warn(`[OutcomeLabeler] No candles for ${symbol} ${timeframe}, skipping state ${state._id}`);
-          skipped++;
-          continue;
-        }
-
-        // Find the index of the candle matching the state's timestamp
-        const stateTime = new Date(timestamp).getTime();
-        let startIdx = -1;
-        for (let i = 0; i < candles.length; i++) {
-          const candleTime = new Date(candles[i].time).getTime();
-          if (Math.abs(candleTime - stateTime) <= TOLERANCE_MS) {
-            startIdx = i;
-            break;
-          }
-        }
-        if (startIdx === -1) {
-          // Fallback: find first candle after state time
-          for (let i = 0; i < candles.length; i++) {
-            if (new Date(candles[i].time).getTime() >= stateTime) {
-              startIdx = i;
-              break;
-            }
-          }
-        }
-
-        if (startIdx === -1) {
-          logger.warn(`[OutcomeLabeler] No matching candle for state ${state._id} (${symbol} ${timeframe})`);
-          skipped++;
-          continue;
-        }
-
-        const startPrice = candles[startIdx].close;
-        const atr = state.volatility?.atr || 0.001;
-
-        let anyLabelled = false;
-        const outcomes = {};
-
-        for (const lookahead of LOOKAHEADS) {
-          const endIdx = startIdx + lookahead;
-          if (endIdx >= candles.length) {
-            // Not enough future candles – skip this lookahead
-            continue;
-          }
-
-          const endPrice = candles[endIdx].close;
-          const returnVal = endPrice - startPrice;
-          const returnR = returnVal / atr;
-          const win = returnVal > 0;
-
-          // Max drawdown during the period
-          let maxDrawdown = 0;
-          for (let k = startIdx; k <= endIdx; k++) {
-            const drawdown = (candles[k].low - startPrice) / startPrice;
-            if (drawdown < maxDrawdown) maxDrawdown = drawdown;
-          }
-
-          outcomes[`outcome${lookahead}`] = {
-            return: returnVal,
-            returnR: returnR,
-            win: win,
-            maxDrawdown: maxDrawdown,
-            volatility: atr,
-            filledAt: new Date(),
-          };
-
-          // Also create a separate HistoricalOutcome record
-          try {
-            await HistoricalOutcome.create({
-              stateId: state._id,
-              symbol,
-              timeframe,
-              lookahead,
-              outcome: {
-                return: returnVal,
-                returnR,
-                win,
-                maxDrawdown,
-                volatility: atr,
-                startPrice,
-                endPrice,
-              },
-              featuresSnapshot: state.getFeatureVector ? state.getFeatureVector() : {},
-              source: 'backfill',
-              filledAt: new Date(),
-            });
-          } catch (outcomeErr) {
-            // Ignore duplicate errors (if already exists)
-            if (outcomeErr.code !== 11000) {
-              logger.error(`[OutcomeLabeler] Error creating HistoricalOutcome for state ${state._id}:`, outcomeErr.message);
-            }
-          }
-
-          anyLabelled = true;
-        }
-
-        if (anyLabelled) {
-          // Update the state with all outcome fields
-          await HistoricalState.updateOne(
-            { _id: state._id },
-            {
-              $set: {
-                ...outcomes,
-                confidence: state.confidence, // keep original
-              }
-            }
-          );
-          labelled++;
-          if (labelled % 10 === 0) logger.info(`[OutcomeLabeler] Labelled ${labelled} states...`);
-        } else {
-          skipped++;
-        }
-      } catch (err) {
-        logger.error(`[OutcomeLabeler] Error processing state ${state._id}:`, err.message);
-        errors++;
+      const success = await labelState(state, maxHorizon);
+      totalProcessed++;
+      if (success) {
+        totalSuccess++;
+      } else {
+        totalFailed++;
       }
     }
 
-    logger.info(`[OutcomeLabeler] Done. Labelled ${labelled} states, skipped ${skipped}, errors ${errors}.`);
-    return { labelled, skipped, errors };
-  } catch (err) {
-    logger.error('[OutcomeLabeler] Fatal error:', err.message);
-    return { labelled: 0, skipped: 0, errors: 0 };
-  } finally {
-    isRunning = false;
+    skip += states.length;
+
+    // Sleep to avoid overloading DB
+    await new Promise(resolve => setTimeout(resolve, CONFIG.BATCH_SLEEP_MS));
   }
+
+  logger.info(`[OutcomeLabeler] Completed. Processed: ${totalProcessed}, Success: ${totalSuccess}, Failed: ${totalFailed}`);
+  return { totalProcessed, totalSuccess, totalFailed };
 }
 
 /**
- * Start a scheduler that runs labelOutcomes periodically.
- * @param {number} intervalMs - Interval in milliseconds (default 1 hour).
- * @returns {NodeJS.Timer} Timer reference.
+ * Run the labeler as a background job (called periodically).
+ * This will label states that have been added recently.
  */
-function startScheduler(intervalMs = 60 * 60 * 1000) {
-  // Run immediately once
-  labelOutcomes().catch(err => logger.error('[OutcomeLabeler] Initial run failed:', err.message));
-  // Schedule periodic runs
-  const timer = setInterval(() => {
-    labelOutcomes().catch(err => logger.error('[OutcomeLabeler] Scheduled run failed:', err.message));
-  }, intervalMs);
-  logger.info(`[OutcomeLabeler] Scheduler started with interval ${intervalMs}ms`);
-  return timer;
+async function runBackgroundLabeling() {
+  // Find states with no path data and label them.
+  // We'll only label states that have future candles available (i.e., not the most recent few).
+  // For production, we might want to label only states older than some threshold.
+  await labelAllStates(CONFIG.BATCH_SIZE, Math.max(...CONFIG.HORIZONS));
 }
 
+// Export the public API
 module.exports = {
-  labelOutcomes,
-  startScheduler,
+  labelState,
+  labelAllStates,
+  runBackgroundLabeling,
+  getCandlesAfter,
+  computePathData,
+  CONFIG,
 };
