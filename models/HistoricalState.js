@@ -2,6 +2,7 @@
 // Append‑only collection for market state snapshots.
 // Each record represents a complete view of the market at a point in time.
 // Outcomes are filled later via background jobs.
+// EXTENDED: Added future path fields for Multiplier prediction.
 
 const mongoose = require('mongoose');
 
@@ -139,15 +140,14 @@ const HistoricalStateSchema = new mongoose.Schema(
       trendConfidence: { type: Number, min: 0, max: 100, default: 50 },
     },
 
-    // ---- Confidence & Edge (computed later) ----
+    // ---- Confidence & Edge ----
     confidence: { type: Number, min: 0, max: 100, default: 50 },
     reason: { type: String, default: '' },
 
-    // ---- OUTCOMES (filled later by background job) ----
+    // ---- OUTCOMES (existing, kept) ----
     outcome5: {
-      // Return after 5 candles (in price units)
       return: { type: Number, default: null },
-      returnR: { type: Number, default: null }, // Return in R multiples
+      returnR: { type: Number, default: null },
       win: { type: Boolean, default: null },
       maxDrawdown: { type: Number, default: null },
       volatility: { type: Number, default: null },
@@ -178,6 +178,52 @@ const HistoricalStateSchema = new mongoose.Schema(
       filledAt: { type: Date, default: null },
     },
 
+    // =============================================================
+    //  NEW FIELDS FOR MULTIPLIER PREDICTION (Future Path Data)
+    // =============================================================
+    // ---- Future price path (array of close prices for N candles) ----
+    // Horizon-specific: index 0 = 1 candle ahead, index 1 = 2 candles, etc.
+    futurePrices: {
+      type: [Number],
+      default: null,
+      comment: 'Array of future close prices (1,2,...,N candles ahead)',
+    },
+
+    // ---- Maximum Favorable Excursion (MFE) ----
+    mfe: {
+      type: Number,
+      default: null,
+      comment: 'Maximum favorable price movement (in price units) over the lookahead',
+    },
+
+    // ---- Maximum Adverse Excursion (MAE) ----
+    mae: {
+      type: Number,
+      default: null,
+      comment: 'Maximum adverse price movement (in price units) over the lookahead',
+    },
+
+    // ---- Time to max favorable (in candle count) ----
+    timeToMaxFavorable: {
+      type: Number,
+      default: null,
+      comment: 'Candle index (0-based) when MFE was reached',
+    },
+
+    // ---- Time to max adverse (in candle count) ----
+    timeToMaxAdverse: {
+      type: Number,
+      default: null,
+      comment: 'Candle index (0-based) when MAE was reached',
+    },
+
+    // ---- Regime transitions during the lookahead ----
+    regimeTransitions: {
+      type: [String],
+      default: [],
+      comment: 'List of regime codes observed during the lookahead',
+    },
+
     // ---- Metadata ----
     source: {
       type: String,
@@ -186,12 +232,11 @@ const HistoricalStateSchema = new mongoose.Schema(
     },
     version: {
       type: String,
-      default: '2.0',
+      default: '2.1', // updated to reflect new fields
     },
   },
   {
     timestamps: true,
-    // Optimize for append‑only and query performance
     autoIndex: true,
   }
 );
@@ -200,7 +245,7 @@ const HistoricalStateSchema = new mongoose.Schema(
 // Compound index for fast retrieval by symbol + timeframe + timestamp
 HistoricalStateSchema.index({ symbol: 1, timeframe: 1, timestamp: -1 });
 
-// Index for similarity search (features will be queried together)
+// Index for similarity search
 HistoricalStateSchema.index({
   'symbol': 1,
   'timeframe': 1,
@@ -225,10 +270,15 @@ HistoricalStateSchema.index({
   'outcome5.win': 1,
 });
 
-// TTL index: auto‑delete states older than 2 years (configurable)
+// ---- NEW INDEXES for future path data ----
+// For quick retrieval of states with path data
+HistoricalStateSchema.index({ 'futurePrices': 1 });
+HistoricalStateSchema.index({ 'mfe': 1, 'mae': 1 });
+
+// TTL index: auto‑delete states older than 2 years
 HistoricalStateSchema.index(
   { timestamp: 1 },
-  { expireAfterSeconds: 60 * 60 * 24 * 365 * 2 } // 2 years
+  { expireAfterSeconds: 60 * 60 * 24 * 365 * 2 }
 );
 
 // ---- Methods ----
@@ -242,6 +292,13 @@ HistoricalStateSchema.methods.isFullyLabelled = function() {
     this.outcome20.return !== null &&
     this.outcome40.return !== null
   );
+};
+
+/**
+ * Check if future path data is available.
+ */
+HistoricalStateSchema.methods.hasPathData = function() {
+  return this.futurePrices !== null && this.futurePrices.length > 0;
 };
 
 /**
@@ -272,23 +329,15 @@ HistoricalStateSchema.methods.getFeatureVector = function() {
 // ---- Statics ----
 /**
  * Find similar states based on feature similarity.
- * @param {Object} queryFeatures - Feature vector to compare.
- * @param {number} k - Number of similar states to return.
- * @param {Object} filter - Additional filter (symbol, timeframe, etc.).
- * @returns {Promise<Array>} Array of similar states with similarity score.
+ * (placeholder – actual implementation will use MongoDB aggregation or vector search)
  */
 HistoricalStateSchema.statics.findSimilar = async function(queryFeatures, k = 100, filter = {}) {
-  // This is a placeholder – actual implementation will use:
-  // - MongoDB $vectorSearch (Atlas) if available
-  // - Euclidean distance on normalized features (fallback)
-  // - FAISS or other vector index for production
-
-  // For now, return an empty array (to be implemented in StateStore)
+  // This will be implemented in StateStore using the new path data.
   return [];
 };
 
 /**
- * Get outcome statistics for a set of states.
+ * Get outcome statistics for a set of states (including path data).
  */
 HistoricalStateSchema.statics.getOutcomeStats = async function(stateIds, lookahead = 'outcome5') {
   const states = await this.find(
