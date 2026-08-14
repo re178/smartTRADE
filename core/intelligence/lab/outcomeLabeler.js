@@ -3,7 +3,7 @@
 // Runs as a background job to label new states and backfill existing ones.
 // EXTENDED: Stores MFE, MAE, time‑to‑extremes, regime transitions.
 
-const HistoricalState = require('../../models/HistoricalState');
+const HistoricalState = require('../../../models/HistoricalState');
 const candleHistory = require('../../data/candleHistory');
 const deepRegime = require('../../intelligence/deep/regime');
 const logger = require('../../../infrastructure/logger') || console;
