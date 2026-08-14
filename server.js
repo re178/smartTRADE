@@ -1,6 +1,6 @@
 // server.js – RTS Entry Point (Deriv‑only)
-// No MT5/EA logic. Deriv broker feeds priceBuffer, Price, Account models,
-// and emits events for dashboard WebSocket broadcasts.
+// INTEGRATED: Prediction Engine, Opportunity Engine, Risk Engine.
+// Now broadcasts 'prediction' and 'opportunity' events to dashboard.
 
 require('dotenv').config();
 
@@ -20,7 +20,7 @@ const User = require('./models/User');
 const Price = require('./models/Price');
 const Account = require('./models/Account');
 
-// ---------- COGNITIVE MODULES ----------
+// ---------- COGNITIVE MODULES (Legacy) ----------
 const priceBuffer = require('./core/data/priceBuffer');
 const candleStore = require('./core/data/candleStore');
 const marketStateCache = require('./core/data/marketStateCache');
@@ -32,6 +32,11 @@ const eventBus = require('./infrastructure/eventBus');
 // ---------- DATA ORCHESTRATOR & STATE STORE ----------
 const { dataOrchestrator } = require('./core/data/dataOrchestrator');
 const stateStore = require('./core/intelligence/lab/stateStore');
+
+// ---------- NEW MULTIPLIER ENGINES ----------
+const predictionEngine = require('./core/intelligence/predictionEngine');
+const opportunityEngine = require('./core/intelligence/opportunityEngine');
+const riskEngine = require('./core/risk/riskEngine');
 
 // ---------- OUTCOME LABELER ----------
 const { startScheduler } = require('./core/intelligence/lab/outcomeLabeler');
@@ -220,7 +225,7 @@ wss.on('connection', (ws, req) => {
   // No authentication – allow all connections
   console.log('[WebSocket] Dashboard client connected.');
 
-  // ✅ FIX: Register this client for broadcasts
+  // Register this client for broadcasts
   dashboardClients.add(ws);
 
   // Send initial state
@@ -352,6 +357,110 @@ performanceMonitor.on('thresholdsUpdated', (thresholds) => {
   }
 });
 
+// ============================================================
+//  NEW: PREDICTION / OPPORTUNITY PIPELINE
+// ============================================================
+
+// Symbols to watch for predictions (from the watchlist used by broker)
+const WATCHED_SYMBOLS = ['EUR_USD', 'GBP_USD', 'USD_JPY', 'AUD_USD'];
+
+/**
+ * Run the prediction pipeline for a given symbol.
+ * This is called on timer and on candle closes.
+ */
+async function runPredictionPipeline(symbol) {
+  try {
+    // 1. Get current market state
+    const state = await require('./core/intelligence/deep/marketState').compute(symbol, 'M5', 200);
+    if (!state) {
+      console.log(`[Pipeline] No state for ${symbol}, skipping.`);
+      return;
+    }
+
+    // 2. Get account and positions
+    const product = 'deriv_cfd';
+    const broker = getBroker(product);
+    const account = await broker.getAccount();
+    const positions = await broker.getOpenTrades();
+
+    // 3. Get market data (current price, spread)
+    const marketData = {
+      currentPrice: state.price.current,
+      spread: state.awareness?.spread || 0,
+      timestamp: new Date().toISOString(),
+    };
+
+    // 4. Run Prediction Engine
+    const prediction = await predictionEngine.predict(state, symbol);
+    if (!prediction) {
+      console.log(`[Pipeline] No prediction for ${symbol}, skipping.`);
+      return;
+    }
+
+    // Broadcast prediction
+    broadcastToDashboards('prediction', prediction);
+
+    // 5. Run Opportunity Engine (only if prediction is valid)
+    const opportunity = await opportunityEngine.evaluate(
+      prediction,
+      account,
+      positions,
+      marketData,
+      { riskPerTradePct: parseFloat(process.env.RISK_PER_TRADE_PCT) || 1.0 }
+    );
+
+    // Broadcast opportunity
+    broadcastToDashboards('opportunity', opportunity);
+
+    console.log(`[Pipeline] ${symbol}: Prediction/opportunity broadcast.`);
+  } catch (err) {
+    console.error(`[Pipeline] Error for ${symbol}:`, err.message);
+  }
+}
+
+/**
+ * Run the prediction pipeline for all watched symbols.
+ */
+async function runPredictionPipelineAll() {
+  console.log('[Pipeline] Running prediction pipeline for all symbols...');
+  for (const symbol of WATCHED_SYMBOLS) {
+    await runPredictionPipeline(symbol);
+  }
+}
+
+// ---------- Hook pipeline to candle closes ----------
+candleStore.on('candleClosed', async (candle) => {
+  // Only run on M5 candles (or M15 if you prefer)
+  if (candle.timeframe === 'M5') {
+    const symbol = candle.symbol;
+    if (WATCHED_SYMBOLS.includes(symbol)) {
+      console.log(`[Pipeline] Triggered by candle close for ${symbol}`);
+      await runPredictionPipeline(symbol);
+    }
+  }
+});
+
+// ---------- Hook pipeline to decision timer ----------
+// We'll reuse the decisionEngine's timer or create our own.
+// Since decisionEngine already has a 30s timer, we can run the pipeline there.
+// We'll keep the existing timer and also run the pipeline.
+// To avoid duplication, we'll run the pipeline on a separate interval.
+
+let pipelineTimer = null;
+
+function startPipelineTimer() {
+  if (pipelineTimer) clearInterval(pipelineTimer);
+  const intervalMs = parseInt(process.env.PREDICTION_INTERVAL_MS) || 30000;
+  pipelineTimer = setInterval(() => {
+    runPredictionPipelineAll().catch(err => {
+      console.error('[Pipeline] Timer error:', err.message);
+    });
+  }, intervalMs);
+  console.log(`[Pipeline] Timer started (${intervalMs}ms)`);
+}
+
+// ============================================================
+
 // ---------- DEBUG ROUTES ----------
 app.get('/debug/status', (req, res) => {
   const lastState = marketStateCache.get('EUR_USD') || null;
@@ -439,6 +548,7 @@ async function startServer() {
     console.log('🛠️  JSON repair enabled as fallback.');
     console.log('🧹  Null bytes (\\0) stripped from all incoming JSON.');
     console.log('📦 Deriv broker: active, connected to WebSocket.');
+    console.log('🧪 Prediction/Opportunity Pipeline: enabled.');
 
     startWSPing();
 
@@ -455,6 +565,9 @@ async function startServer() {
     // ---- Start Cognitive Engines ----
     setTimeout(startCognitiveEngines, 2000);
 
+    // ---- Start Prediction Pipeline Timer ----
+    startPipelineTimer();
+
     // ---- Start Outcome Labeler Scheduler (DISABLED) ----
     console.log('⏸️ Outcome labeler scheduler disabled.');
 
@@ -466,6 +579,7 @@ async function startServer() {
   process.on('SIGINT', async () => {
     console.log('\n🛑 Received SIGINT, shutting down gracefully...');
     if (wsPingTimer) clearInterval(wsPingTimer);
+    if (pipelineTimer) clearInterval(pipelineTimer);
     try {
       await dataOrchestrator.shutdown();
       if (otie && typeof otie.stop === 'function') otie.stop();
@@ -479,6 +593,7 @@ async function startServer() {
   process.on('SIGTERM', async () => {
     console.log('\n🛑 Received SIGTERM, shutting down gracefully...');
     if (wsPingTimer) clearInterval(wsPingTimer);
+    if (pipelineTimer) clearInterval(pipelineTimer);
     try {
       await dataOrchestrator.shutdown();
       if (otie && typeof otie.stop === 'function') otie.stop();
