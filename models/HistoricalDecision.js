@@ -2,6 +2,7 @@
 // Append‑only collection for every trading decision.
 // Stores the full context: features, contributions, counter‑arguments, and outcome.
 // Used for decision lineage, performance analysis, and confidence calibration.
+// EXTENDED: Added prediction fields for Multiplier decision system.
 
 const mongoose = require('mongoose');
 
@@ -28,7 +29,7 @@ const HistoricalDecisionSchema = new mongoose.Schema(
       default: Date.now,
     },
 
-    // ---- Decision ----
+    // ---- Decision (legacy) ----
     decision: {
       type: String,
       enum: ['BUY', 'SELL', 'NO_TRADE'],
@@ -43,33 +44,21 @@ const HistoricalDecisionSchema = new mongoose.Schema(
     expectedValue: {
       type: Number,
       default: 0,
-      comment: 'Expected value in R multiples',
+      comment: 'Expected value in R multiples (legacy)',
     },
     probability: {
       type: Number,
       min: 0,
       max: 1,
       default: 0.5,
-      comment: 'Estimated probability of winning',
+      comment: 'Estimated probability of winning (legacy)',
     },
 
-    // ---- Trade Parameters (only if decision is BUY/SELL) ----
-    entryPrice: {
-      type: Number,
-      default: null,
-    },
-    stopLoss: {
-      type: Number,
-      default: null,
-    },
-    takeProfit: {
-      type: Number,
-      default: null,
-    },
-    recommendedLotSize: {
-      type: Number,
-      default: null,
-    },
+    // ---- Trade Parameters (if decision is BUY/SELL) ----
+    entryPrice: { type: Number, default: null },
+    stopLoss: { type: Number, default: null },
+    takeProfit: { type: Number, default: null },
+    recommendedLotSize: { type: Number, default: null },
 
     // ---- Feature Snapshot (full MarketState at decision time) ----
     features: {
@@ -191,59 +180,108 @@ const HistoricalDecisionSchema = new mongoose.Schema(
       },
     },
 
-    // ---- Outcome (filled later) ----
+    // =============================================================
+    //  NEW FIELDS FOR MULTIPLIER PREDICTION
+    // =============================================================
+    // ---- Prediction Distribution ----
+    prediction: {
+      // Probability distribution
+      up: { type: Number, min: 0, max: 1, default: 0.33 },
+      down: { type: Number, min: 0, max: 1, default: 0.33 },
+      neutral: { type: Number, min: 0, max: 1, default: 0.34 },
+      // Expected moves
+      expectedMove: { type: Number, default: 0 },
+      expectedAdverse: { type: Number, default: 0 },
+      expectedFavorable: { type: Number, default: 0 },
+      // Path statistics
+      mfe: { type: Number, default: null },
+      mae: { type: Number, default: null },
+      timeToMaxFavorable: { type: Number, default: null },
+      timeToMaxAdverse: { type: Number, default: null },
+      // Horizon (in candles)
+      horizon: { type: Number, default: 5 },
+      // Sample details
+      sampleSize: { type: Number, default: 0 },
+      averageSimilarity: { type: Number, default: 0 },
+      // Regime at prediction time
+      regimeCode: { type: String, default: 'NEUTRAL' },
+    },
+
+    // ---- Calibrated Confidence ----
+    calibratedConfidence: {
+      type: Number,
+      min: 0,
+      max: 100,
+      default: 50,
+      comment: 'Probability calibrated against historical calibration curve',
+    },
+
+    // ---- Trade Economics (Multiplier specific) ----
+    tradeEconomics: {
+      // Probability of reaching TP
+      probabilityOfProfit: { type: Number, min: 0, max: 1, default: 0 },
+      // Probability of hitting SL/knockout
+      probabilityOfLoss: { type: Number, min: 0, max: 1, default: 0 },
+      // Probability of other outcomes (expiry, etc.)
+      probabilityOfOther: { type: Number, min: 0, max: 1, default: 0 },
+      // Expected value in absolute currency
+      expectedValue: { type: Number, default: 0 },
+      // Expected value / stake (percentage)
+      evOverStake: { type: Number, default: 0 },
+      // Recommended stake
+      recommendedStake: { type: Number, default: 0 },
+      // Recommended multiplier
+      recommendedMultiplier: { type: Number, default: 0 },
+      // Recommended duration (seconds)
+      recommendedDuration: { type: Number, default: 0 },
+      // Knockout and take-profit levels
+      knockoutLevel: { type: Number, default: null },
+      takeProfitLevel: { type: Number, default: null },
+    },
+
+    // ---- NO TRADE Reason Taxonomy ----
+    noTradeReason: {
+      type: String,
+      enum: [
+        'NONE',
+        'LOW_PROBABILITY',
+        'NEGATIVE_EV',
+        'HIGH_MAE',
+        'LOW_SAMPLE',
+        'POOR_SIMILARITY',
+        'HIGH_SPREAD',
+        'HIGH_VOLATILITY',
+        'REGIME_UNSTABLE',
+        'DURATION_UNFAVORABLE',
+        'RISK_LIMIT',
+        'CORRELATED_EXPOSURE',
+        'BROKER_UNAVAILABLE',
+        'STALE_DATA',
+        'PROPOSAL_REJECTED',
+        'MODEL_UNCERTAINTY',
+      ],
+      default: 'NONE',
+    },
+
+    // ---- Decision Chain (for traceability) ----
+    decisionChain: {
+      type: String,
+      default: '',
+      comment: 'Comma-separated list of decision modules that contributed (e.g., "prediction,opportunity,risk,gate")',
+    },
+
+    // ---- Outcome (legacy, kept) ----
     outcome: {
-      // Whether the trade was executed
-      executed: {
-        type: Boolean,
-        default: false,
-      },
-      // Trade ID (if executed)
-      tradeId: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: 'Trade',
-        default: null,
-      },
-      // Actual P&L (in account currency)
-      pnl: {
-        type: Number,
-        default: null,
-      },
-      // Actual return in R multiples
-      returnR: {
-        type: Number,
-        default: null,
-      },
-      // Win/Loss
-      win: {
-        type: Boolean,
-        default: null,
-      },
-      // Exit price
-      exitPrice: {
-        type: Number,
-        default: null,
-      },
-      // Exit time
-      exitTime: {
-        type: Date,
-        default: null,
-      },
-      // Max adverse excursion (MAE)
-      mae: {
-        type: Number,
-        default: null,
-      },
-      // Max favourable excursion (MFE)
-      mfe: {
-        type: Number,
-        default: null,
-      },
-      // Filled at (when outcome was recorded)
-      filledAt: {
-        type: Date,
-        default: null,
-      },
+      executed: { type: Boolean, default: false },
+      tradeId: { type: mongoose.Schema.Types.ObjectId, ref: 'Trade', default: null },
+      pnl: { type: Number, default: null },
+      returnR: { type: Number, default: null },
+      win: { type: Boolean, default: null },
+      exitPrice: { type: Number, default: null },
+      exitTime: { type: Date, default: null },
+      mae: { type: Number, default: null },
+      mfe: { type: Number, default: null },
+      filledAt: { type: Date, default: null },
     },
 
     // ---- Metadata ----
@@ -254,7 +292,7 @@ const HistoricalDecisionSchema = new mongoose.Schema(
     },
     version: {
       type: String,
-      default: '2.0',
+      default: '3.0', // Updated to reflect Multiplier prediction
     },
   },
   {
@@ -263,7 +301,7 @@ const HistoricalDecisionSchema = new mongoose.Schema(
   }
 );
 
-// ---- Indexes ----
+// ---- Indexes (existing, plus new ones) ----
 // Compound index for fast retrieval
 HistoricalDecisionSchema.index({ symbol: 1, timeframe: 1, timestamp: -1 });
 
@@ -283,7 +321,13 @@ HistoricalDecisionSchema.index({
 // Index for decision lineage queries
 HistoricalDecisionSchema.index({ 'lineage.generatedBy': 1 });
 
-// TTL: auto‑delete decisions older than 5 years (configurable)
+// ---- NEW INDEXES for prediction queries ----
+HistoricalDecisionSchema.index({ 'prediction.up': 1, 'prediction.down': 1 });
+HistoricalDecisionSchema.index({ 'calibratedConfidence': 1 });
+HistoricalDecisionSchema.index({ 'tradeEconomics.expectedValue': 1 });
+HistoricalDecisionSchema.index({ 'noTradeReason': 1 });
+
+// TTL: auto‑delete decisions older than 5 years
 HistoricalDecisionSchema.index(
   { timestamp: 1 },
   { expireAfterSeconds: 60 * 60 * 24 * 365 * 5 }
@@ -299,7 +343,6 @@ HistoricalDecisionSchema.methods.hasOutcome = function() {
 
 /**
  * Mark the decision as executed.
- * @param {Object} trade - Trade object.
  */
 HistoricalDecisionSchema.methods.markExecuted = function(trade) {
   this.outcome.executed = true;
@@ -309,7 +352,6 @@ HistoricalDecisionSchema.methods.markExecuted = function(trade) {
 
 /**
  * Fill the outcome from a trade result.
- * @param {Object} result - { pnl, returnR, win, exitPrice, exitTime, mae, mfe }
  */
 HistoricalDecisionSchema.methods.fillOutcome = function(result) {
   this.outcome.pnl = result.pnl !== undefined ? result.pnl : null;
@@ -356,8 +398,7 @@ HistoricalDecisionSchema.statics.getPerformance = async function(symbol, timefra
 };
 
 /**
- * Get decisions grouped by confidence bucket.
- * Used for confidence calibration.
+ * Get decisions grouped by confidence bucket (for calibration).
  */
 HistoricalDecisionSchema.statics.getCalibrationData = async function(buckets = 10) {
   const pipeline = [
