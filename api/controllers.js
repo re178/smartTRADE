@@ -1,7 +1,6 @@
-// api/controllers.js – Complete Request Handlers (with Trade History, P&L, and Report Fixes)
-// Updated to broadcast positions and account after trade close, and to handle real‑time updates.
-// Enhanced account with tradeMode and server from broker._account.
-// Product default: deriv_cfd.
+// api/controllers.js – Complete Request Handlers (with Multiplier support)
+// Updated to accept stake, multiplier, duration, knockoutLevel, takeProfitLevel.
+// Falls back to legacy lotSize/stopLoss for backward compatibility.
 
 const Trade = require('../models/Trade');
 const Order = require('../models/Order');
@@ -292,61 +291,111 @@ exports.getPendingOrders = async (req, res) => {
   }
 };
 
-// ---------- Manual Order ----------
+// ================================================================
+//  PLACE ORDER – Multiplier-aware
+// ================================================================
 exports.placeOrder = async (req, res) => {
-  const { pair, side, lotSize, stopLoss, takeProfit } = req.body;
+  const {
+    pair,
+    side,
+    // Legacy CFD fields
+    lotSize,
+    stopLoss,
+    takeProfit,
+    // New Multiplier fields
+    stake,
+    multiplier,
+    duration,
+    knockoutLevel,
+    takeProfitLevel,
+    product: overrideProduct,
+  } = req.body;
 
   try {
-    const product = getProduct(req);
+    const product = overrideProduct || getProduct(req);
     const instrument = pair.toUpperCase();
     const currentPrice = await marketProvider.getCurrentPrice(instrument, product);
 
-    const validation = validateOrderInput({
-      pair: instrument,
-      side,
-      lotSize,
-      stopLoss: stopLoss || null,
-      takeProfit: takeProfit || null,
-      currentPrice,
-    });
-    if (!validation.valid) {
-      return res.status(400).json({ error: validation.message });
+    // Determine if this is a Multiplier trade (stake provided) or CFD trade (lotSize provided)
+    const isMultiplier = stake !== undefined && stake !== null && stake > 0;
+    const isCFD = lotSize !== undefined && lotSize !== null && lotSize > 0;
+
+    if (!isMultiplier && !isCFD) {
+      return res.status(400).json({ error: 'Either stake (Multiplier) or lotSize (CFD) must be provided.' });
+    }
+
+    let orderResult;
+
+    if (isMultiplier) {
+      // ---- Multiplier trade ----
+      // Validate Multiplier parameters
+      if (!multiplier || multiplier < 1) {
+        return res.status(400).json({ error: 'Multiplier must be at least 1' });
+      }
+      if (!duration || duration < 10) {
+        return res.status(400).json({ error: 'Duration must be at least 10 seconds' });
+      }
+
+      // Call orderService with Multiplier fields
+      orderResult = await orderService.placeMarketOrder(
+        instrument,
+        side,
+        stake,                  // stake instead of lotSize
+        multiplier,
+        duration,
+        knockoutLevel || null,
+        takeProfitLevel || null,
+        product
+      );
+    } else {
+      // ---- CFD trade (legacy) ----
+      // Validate CFD parameters
+      const validation = validateOrderInput({
+        pair: instrument,
+        side,
+        lotSize,
+        stopLoss: stopLoss || null,
+        takeProfit: takeProfit || null,
+        currentPrice,
+      });
+      if (!validation.valid) {
+        return res.status(400).json({ error: validation.message });
+      }
+
+      const broker = getBroker(product);
+      const account = await broker.getAccount();
+      const currentPositions = await broker.getOpenTrades();
+
+      const signal = {
+        pair: instrument,
+        side,
+        entryPrice: currentPrice,
+        stopLoss: stopLoss || null,
+        takeProfit: takeProfit || null,
+        recommendedLotSize: lotSize,
+      };
+
+      const approval = await portfolioManager.canOpenTrade(signal, parseFloat(account.balance), currentPositions);
+      if (!approval.allowed) {
+        return res.status(400).json({ error: approval.reason });
+      }
+
+      orderResult = await orderService.placeMarketOrder(
+        instrument, side, lotSize, stopLoss || null, takeProfit || null, product
+      );
+    }
+
+    // ---- Common post-order steps ----
+    const trade = await Trade.findOne({ contractId: orderResult.contractId });
+    if (!trade) {
+      logger.warn(`[placeOrder] Trade not found by contractId ${orderResult.contractId}`);
+      return res.json({ success: true, raw: orderResult, trade: null });
     }
 
     const broker = getBroker(product);
     const account = await broker.getAccount();
-    const currentPositions = await broker.getOpenTrades();
-
-    const signal = {
-      pair: instrument,
-      side,
-      entryPrice: currentPrice,
-      stopLoss: stopLoss || null,
-      takeProfit: takeProfit || null,
-      recommendedLotSize: lotSize,
-    };
-
-    const approval = await portfolioManager.canOpenTrade(signal, parseFloat(account.balance), currentPositions);
-    if (!approval.allowed) {
-      return res.status(400).json({ error: approval.reason });
-    }
-
-    const orderResult = await orderService.placeMarketOrder(
-      instrument, side, lotSize, stopLoss || null, takeProfit || null, product
-    );
-
-    const trade = await Trade.findOne({ contractId: orderResult.contractId });
-    if (!trade) {
-      const fallbackTrade = await Trade.findOne({ instrument }).sort({ openTime: -1 });
-      if (fallbackTrade) {
-        logger.warn(`[placeOrder] Trade not found by contractId ${orderResult.contractId}, using most recent trade ${fallbackTrade.contractId}`);
-        notifyTrade('OPENED', fallbackTrade, account).catch(err => logger.error('[Notification] Error:', err.message));
-        return res.json({ success: true, trade: fallbackTrade, raw: orderResult });
-      }
-      return res.status(500).json({ error: 'Order placed but trade record not found' });
-    }
-
     notifyTrade('OPENED', trade, account).catch(err => logger.error('[Notification] Error:', err.message));
+
     res.json({ success: true, trade, raw: orderResult });
   } catch (error) {
     logger.error('[placeOrder] Error:', error.message);
@@ -434,7 +483,7 @@ exports.getSignal = async (req, res) => {
   }
 };
 
-// ---------- Auto Trade ----------
+// ---------- Auto Trade (Multiplier-aware) ----------
 exports.autoTrade = async (req, res) => {
   const { pair, riskPercent = 1, strategy = 'sma', ...params } = req.body;
   if (!pair) return res.status(400).json({ error: 'pair required' });
@@ -447,33 +496,62 @@ exports.autoTrade = async (req, res) => {
 
     const currentPrice = signal.entryPrice;
 
-    const validation = validateOrderInput({
-      pair: instrument,
-      side: signal.side,
-      lotSize: signal.recommendedLotSize || 0.01,
-      stopLoss: signal.stopLoss || null,
-      takeProfit: signal.takeProfit || null,
-      currentPrice,
-    });
-    if (!validation.valid) {
-      return res.json({ success: false, message: validation.message });
+    // Determine if we should use Multiplier mode (if stake, multiplier, duration provided)
+    const { stake, multiplier, duration, knockoutLevel, takeProfitLevel } = req.body;
+    const isMultiplier = stake !== undefined && stake !== null && stake > 0;
+
+    let orderResult;
+    if (isMultiplier) {
+      // Multiplier auto-trade
+      if (!multiplier || multiplier < 1) {
+        return res.json({ success: false, message: 'Multiplier must be at least 1' });
+      }
+      if (!duration || duration < 10) {
+        return res.json({ success: false, message: 'Duration must be at least 10 seconds' });
+      }
+
+      orderResult = await orderService.placeMarketOrder(
+        instrument,
+        signal.side,
+        stake,
+        multiplier,
+        duration,
+        knockoutLevel || null,
+        takeProfitLevel || null,
+        product,
+        null,
+        true
+      );
+    } else {
+      // CFD auto-trade (legacy)
+      const validation = validateOrderInput({
+        pair: instrument,
+        side: signal.side,
+        lotSize: signal.recommendedLotSize || 0.01,
+        stopLoss: signal.stopLoss || null,
+        takeProfit: signal.takeProfit || null,
+        currentPrice,
+      });
+      if (!validation.valid) {
+        return res.json({ success: false, message: validation.message });
+      }
+
+      const broker = getBroker(product);
+      const account = await broker.getAccount();
+      const currentPositions = await broker.getOpenTrades();
+
+      const approval = await portfolioManager.canOpenTrade(signal, parseFloat(account.balance), currentPositions);
+      if (!approval.allowed) return res.json({ success: false, message: approval.reason });
+
+      let lotSize = signal.recommendedLotSize;
+      if (!lotSize) {
+        lotSize = await riskManager.calculateLotSize(instrument, signal.entryPrice, signal.stopLoss, riskPercent, 1000, product);
+      }
+
+      orderResult = await orderService.placeMarketOrder(
+        instrument, signal.side, lotSize, signal.stopLoss, signal.takeProfit, product, null, true
+      );
     }
-
-    const broker = getBroker(product);
-    const account = await broker.getAccount();
-    const currentPositions = await broker.getOpenTrades();
-
-    const approval = await portfolioManager.canOpenTrade(signal, parseFloat(account.balance), currentPositions);
-    if (!approval.allowed) return res.json({ success: false, message: approval.reason });
-
-    let lotSize = signal.recommendedLotSize;
-    if (!lotSize) {
-      lotSize = await riskManager.calculateLotSize(instrument, signal.entryPrice, signal.stopLoss, riskPercent, 1000, product);
-    }
-
-    const orderResult = await orderService.placeMarketOrder(
-      instrument, signal.side, lotSize, signal.stopLoss, signal.takeProfit, product, null, true
-    );
 
     const trade = await Trade.findOne({ contractId: orderResult.contractId });
     if (!trade) {
@@ -481,7 +559,10 @@ exports.autoTrade = async (req, res) => {
       return res.json({ success: true, raw: orderResult, trade: null });
     }
 
+    const broker = getBroker(product);
+    const account = await broker.getAccount();
     notifyTrade('OPENED', trade, account).catch(err => logger.error('[Notification] Error:', err.message));
+
     res.json({ success: true, signal, trade, raw: orderResult });
   } catch (error) {
     logger.error('[autoTrade] Error:', error.message);
@@ -489,12 +570,24 @@ exports.autoTrade = async (req, res) => {
   }
 };
 
-// ---------- Execute Live Signal ----------
+// ---------- Execute Live Signal (Multiplier-aware) ----------
 exports.executeSignal = async (req, res) => {
-  const { pair, side, entryPrice, stopLoss, takeProfit, lotSize } = req.body;
+  const {
+    pair,
+    side,
+    entryPrice,
+    stopLoss,
+    takeProfit,
+    lotSize,
+    stake,
+    multiplier,
+    duration,
+    knockoutLevel,
+    takeProfitLevel,
+  } = req.body;
 
-  if (!pair || !side || !lotSize) {
-    return res.status(400).json({ error: 'pair, side, and lotSize are required' });
+  if (!pair || !side) {
+    return res.status(400).json({ error: 'pair and side are required' });
   }
 
   const formattedPair = formatSymbol(pair);
@@ -512,26 +605,55 @@ exports.executeSignal = async (req, res) => {
       currentPrice = await marketProvider.getCurrentPrice(instrument, product);
     }
 
-    const validation = validateOrderInput({
-      pair: instrument,
-      side: cleanSide,
-      lotSize,
-      stopLoss: stopLoss || null,
-      takeProfit: takeProfit || null,
-      currentPrice,
-    });
-    if (!validation.valid) {
-      return res.status(400).json({ error: validation.message });
-    }
+    const isMultiplier = stake !== undefined && stake !== null && stake > 0;
 
-    const orderResult = await orderService.placeMarketOrder(
-      instrument,
-      cleanSide,
-      parseFloat(lotSize),
-      stopLoss || null,
-      takeProfit || null,
-      product
-    );
+    let orderResult;
+    if (isMultiplier) {
+      // Multiplier signal execution
+      if (!multiplier || multiplier < 1) {
+        return res.status(400).json({ error: 'Multiplier must be at least 1' });
+      }
+      if (!duration || duration < 10) {
+        return res.status(400).json({ error: 'Duration must be at least 10 seconds' });
+      }
+
+      orderResult = await orderService.placeMarketOrder(
+        instrument,
+        cleanSide,
+        stake,
+        multiplier,
+        duration,
+        knockoutLevel || null,
+        takeProfitLevel || null,
+        product
+      );
+    } else {
+      // CFD signal execution (legacy)
+      if (!lotSize || lotSize <= 0) {
+        return res.status(400).json({ error: 'lotSize is required for CFD trade' });
+      }
+
+      const validation = validateOrderInput({
+        pair: instrument,
+        side: cleanSide,
+        lotSize,
+        stopLoss: stopLoss || null,
+        takeProfit: takeProfit || null,
+        currentPrice,
+      });
+      if (!validation.valid) {
+        return res.status(400).json({ error: validation.message });
+      }
+
+      orderResult = await orderService.placeMarketOrder(
+        instrument,
+        cleanSide,
+        parseFloat(lotSize),
+        stopLoss || null,
+        takeProfit || null,
+        product
+      );
+    }
 
     const trade = await Trade.findOne({ contractId: orderResult.contractId });
     if (!trade) {
@@ -603,7 +725,7 @@ exports.generateReport = async (req, res) => {
       metrics,
       account,
       verificationCode: reportHash,
-      systemName: 'RTS/CTOS v2.0',
+      systemName: 'RTS/CTOS v3.0 (Multiplier)',
     });
 
     res.setHeader('Content-Type', 'application/pdf');
