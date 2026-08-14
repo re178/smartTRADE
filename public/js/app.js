@@ -1,5 +1,6 @@
 // public/js/app.js – Dashboard Logic (Fully Event-Driven)
 // All updates come from WebSocket (live.js). HTTP is only for manual actions.
+// Updated for Multiplier trading: stake, multiplier, duration, knockout.
 
 // ---- Configuration ----
 const HISTORY_PAGE_SIZE = 20;
@@ -71,7 +72,7 @@ function formatPrice(p) {
 }
 
 // ================================================================
-// 1. CLIENT STATE STORE
+// 1. CLIENT STATE STORE (extended)
 // ================================================================
 const dashboardState = {
   account: null,
@@ -92,6 +93,9 @@ const dashboardState = {
   profitFactor: 0,
   openTradeCount: 0,
   totalUnrealizedPL: 0,
+  // ---- NEW fields ----
+  prediction: null,
+  opportunity: null,
 };
 
 // ---- State update triggers UI rendering ----
@@ -116,6 +120,8 @@ function renderAllWidgets() {
   renderFusionWidget();
   renderOTIEWidget();
   renderBeliefWidget();
+  renderPredictionWidget();    // NEW
+  renderOpportunityWidget();   // NEW
 }
 
 function renderAccountWidget() {
@@ -419,6 +425,123 @@ function renderBeliefWidget() {
   `;
 }
 
+// ============================================================
+//  NEW: Prediction Widget
+// ============================================================
+function renderPredictionWidget() {
+  const prediction = dashboardState.prediction;
+  const panel = document.getElementById('predictionPanel');
+  if (!panel) return;
+  if (!prediction) {
+    panel.innerHTML = '<p class="text-muted">Waiting for prediction data...</p>';
+    return;
+  }
+
+  const { probabilities, expectedMove, expectedAdverse, expectedFavorable, mfe, mae, sampleSize, calibratedConfidence, marketQuality } = prediction;
+  const upPct = (probabilities?.up || 0) * 100;
+  const downPct = (probabilities?.down || 0) * 100;
+  const neutralPct = (probabilities?.neutral || 0) * 100;
+
+  panel.innerHTML = `
+    <div class="row">
+      <div class="col-md-8">
+        <div class="prediction-bar">
+          <div class="prob-block prob-up">
+            <div class="value">${upPct.toFixed(0)}%</div>
+            <div class="label">UP</div>
+          </div>
+          <div class="prob-block prob-down">
+            <div class="value">${downPct.toFixed(0)}%</div>
+            <div class="label">DOWN</div>
+          </div>
+          <div class="prob-block prob-neutral">
+            <div class="value">${neutralPct.toFixed(0)}%</div>
+            <div class="label">NEUTRAL</div>
+          </div>
+          <div style="margin-left:auto; text-align:right;">
+            <div><small>Calibrated Confidence: <strong>${calibratedConfidence || 0}%</strong></small></div>
+            <div><small>Sample: <strong>${sampleSize || 0}</strong> analogues</small></div>
+          </div>
+        </div>
+        <div class="mt-2">
+          <small>Expected Move: <strong>${(expectedMove * 10000).toFixed(1)} pips</strong> | Favorable: <strong>${(expectedFavorable * 10000).toFixed(1)} pips</strong> | Adverse: <strong>${(expectedAdverse * 10000).toFixed(1)} pips</strong></small>
+        </div>
+        <div class="mt-1">
+          <small>MFE: <strong>${(mfe * 10000).toFixed(1)} pips</strong> | MAE: <strong>${(mae * 10000).toFixed(1)} pips</strong> | Market Quality: <strong>${marketQuality || 50}/100</strong></small>
+        </div>
+      </div>
+      <div class="col-md-4">
+        <div style="background:#f1f5f9; border-radius:8px; padding:8px 12px;">
+          <small><strong>Time to Max Favorable:</strong> ${prediction.timeToMaxFavorable !== null ? prediction.timeToMaxFavorable + ' candles' : '—'}</small><br>
+          <small><strong>Time to Max Adverse:</strong> ${prediction.timeToMaxAdverse !== null ? prediction.timeToMaxAdverse + ' candles' : '—'}</small><br>
+          <small><strong>Similarity:</strong> ${prediction.averageSimilarity !== undefined ? prediction.averageSimilarity.toFixed(3) : '—'}</small>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// ============================================================
+//  NEW: Opportunity Widget
+// ============================================================
+function renderOpportunityWidget() {
+  const opp = dashboardState.opportunity;
+  const panel = document.getElementById('opportunityPanel');
+  if (!panel) return;
+  if (!opp) {
+    panel.innerHTML = '<p class="text-muted">Waiting for opportunity data...</p>';
+    return;
+  }
+
+  const { tradable, reason, direction, stake, multiplier, duration, entryPrice, knockoutLevel, takeProfitLevel, tradeEconomics, riskMetrics } = opp;
+
+  if (!tradable) {
+    panel.innerHTML = `
+      <div class="opportunity-card no-trade">
+        <div class="d-flex justify-content-between align-items-center">
+          <div>
+            <h6 class="mb-1"><i class="fas fa-times-circle text-danger"></i> NO TRADE</h6>
+            <p class="mb-0 small">${reason || 'Trade does not meet criteria'}</p>
+            <p class="mb-0 small text-muted">${opp.message || ''}</p>
+          </div>
+          <span class="badge bg-danger">Rejected</span>
+        </div>
+      </div>
+    `;
+    return;
+  }
+
+  const probTP = (tradeEconomics?.probTP || 0) * 100;
+  const probSL = (tradeEconomics?.probSL || 0) * 100;
+  const probOther = (tradeEconomics?.probOther || 0) * 100;
+  const ev = tradeEconomics?.ev || 0;
+  const evOverStake = tradeEconomics?.evOverStake || 0;
+
+  panel.innerHTML = `
+    <div class="opportunity-card trade">
+      <div class="row">
+        <div class="col-md-6">
+          <h6 class="mb-1"><i class="fas fa-check-circle text-success"></i> TRADE OPPORTUNITY</h6>
+          <p class="mb-1"><strong>${direction}</strong> ${opp.prediction?.symbol || ''} | Stake: $${stake.toFixed(2)} | Multiplier: ${multiplier}x | Duration: ${duration}s</p>
+          <p class="mb-1 small">Entry: ${formatPrice(entryPrice)} | Knockout: ${formatPrice(knockoutLevel)} | TP: ${formatPrice(takeProfitLevel)}</p>
+          <p class="mb-0 small">${reason || 'Approved'}</p>
+        </div>
+        <div class="col-md-6">
+          <div class="row small">
+            <div class="col-6"><strong>P(TP):</strong> ${probTP.toFixed(0)}%</div>
+            <div class="col-6"><strong>P(SL):</strong> ${probSL.toFixed(0)}%</div>
+            <div class="col-6"><strong>P(Other):</strong> ${probOther.toFixed(0)}%</div>
+            <div class="col-6"><strong>EV:</strong> $${ev.toFixed(2)}</div>
+            <div class="col-6"><strong>EV / Stake:</strong> ${(evOverStake * 100).toFixed(1)}%</div>
+            <div class="col-6"><strong>Max Loss:</strong> $${riskMetrics?.maxLoss || stake}</div>
+            <div class="col-6"><strong>Target Profit:</strong> $${riskMetrics?.targetProfit || 0}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 // ================================================================
 // 2. EXPOSE STATE UPDATE TO live.js
 // ================================================================
@@ -563,7 +686,7 @@ function renderHistoryTable() {
 }
 
 // ================================================================
-// 5. UI EVENT BINDINGS
+// 5. UI EVENT BINDINGS (updated for Multiplier fields)
 // ================================================================
 document.addEventListener('DOMContentLoaded', async function() {
   // Safe loadProductPreference
@@ -603,24 +726,46 @@ document.addEventListener('DOMContentLoaded', async function() {
     }
   });
 
-  // ---- Trade Form ----
+  // ---- Trade Form (Multiplier) ----
   document.getElementById('tradeForm')?.addEventListener('submit', async function(e) {
     e.preventDefault();
     if (isSubmitting) return;
     isSubmitting = true;
     const pair = document.getElementById('tradePair').value.trim();
     const side = document.getElementById('tradeSide').value;
-    const lot = parseFloat(document.getElementById('tradeLot').value);
-    const sl = parseFloat(document.getElementById('tradeSL').value) || null;
+    const stake = parseFloat(document.getElementById('tradeStake').value);
+    const multiplier = parseFloat(document.getElementById('tradeMultiplier').value);
+    const duration = parseInt(document.getElementById('tradeDuration').value);
+    const knockout = parseFloat(document.getElementById('tradeKnockout').value) || null;
     const tp = parseFloat(document.getElementById('tradeTP').value) || null;
-    if (!pair || !lot || lot <= 0) { alert('Please fill in all required fields.'); isSubmitting = false; return; }
+
+    if (!pair || !stake || stake <= 0 || !multiplier || multiplier < 1 || !duration || duration < 10) {
+      alert('Please fill in all required fields correctly.');
+      isSubmitting = false;
+      return;
+    }
+
     try {
-      await fetchJson('/api/trade', {
+      // Use the new endpoint `/api/multiplier-trade` or adapt existing `/api/trade`
+      // For now, we'll use the existing `/api/trade` but with new fields.
+      // The backend controllers need to be updated to accept these fields.
+      // We'll send them as part of the request body.
+      const response = await fetchJson('/api/trade', {
         method: 'POST',
-        body: JSON.stringify({ pair, side, lotSize: lot, stopLoss: sl, takeProfit: tp })
+        body: JSON.stringify({
+          pair,
+          side,
+          stake,
+          multiplier,
+          duration,
+          knockoutLevel: knockout,
+          takeProfitLevel: tp,
+          product: document.getElementById('currentProduct')?.textContent || 'deriv_cfd',
+        })
       });
-      alert('Trade placed successfully!');
+      alert('Multiplier trade placed successfully!');
       SoundManager.tradeOpen();
+      // WebSocket will update positions automatically.
     } catch (e) {
       alert('Error placing trade: ' + e.message);
       SoundManager.reject();
@@ -638,7 +783,7 @@ document.addEventListener('DOMContentLoaded', async function() {
     const strategy = document.getElementById('autoStrategy').value;
     if (!pair || !risk || risk <= 0) { alert('Please fill in all fields.'); isAutoSubmitting = false; return; }
     try {
-      await fetchJson('/api/auto-trade', {
+      const response = await fetchJson('/api/auto-trade', {
         method: 'POST',
         body: JSON.stringify({ pair, riskPercent: risk, strategy })
       });
@@ -774,4 +919,4 @@ window.openDecisionInspector = function(decisionId) {
   alert('Decision inspector will be implemented in a future update.');
 };
 
-console.log('✅ App.js loaded – fully event‑driven.');
+console.log('✅ App.js loaded – fully event‑driven with Multiplier support.');
