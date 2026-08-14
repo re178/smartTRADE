@@ -2,6 +2,7 @@
 // Risk Engine – Centralised risk management for Multiplier trading.
 // Handles account, trade, portfolio, and safety risks.
 // Returns approval/rejection with detailed reason.
+// VERIFIED: Integrated with opportunityEngine and pipeline.
 
 const { getBroker } = require('../execution/brokerFactory');
 const accountService = require('../portfolio/accountService');
@@ -31,14 +32,10 @@ const CONFIG = {
 
 /**
  * Validate a trade against all risk rules.
- * @param {Object} tradeParams - { symbol, direction, stake, multiplier, duration, knockoutLevel, takeProfitLevel }
- * @param {Object} account - Account object (balance, equity, currency).
- * @param {Array} openPositions - Array of open positions.
- * @param {Object} marketData - { currentPrice, spread, timestamp }.
- * @param {Object} dailyStats - { dailyPnL, consecutiveLosses, maxDrawdown }.
+ * @param {Object} tradeParams - { symbol, direction, stake, multiplier, duration, knockoutLevel, takeProfitLevel, account, openPositions, marketData }
  * @returns {Promise<Object>} { approved: boolean, reason: string, message: string, adjustedParams?: Object }
  */
-async function validateTrade(tradeParams, account, openPositions = [], marketData = {}, dailyStats = {}) {
+async function validateTrade(tradeParams) {
   const {
     symbol,
     direction,
@@ -47,6 +44,9 @@ async function validateTrade(tradeParams, account, openPositions = [], marketDat
     duration,
     knockoutLevel,
     takeProfitLevel,
+    account = {},
+    openPositions = [],
+    marketData = {},
   } = tradeParams;
 
   // ---- 1. Basic input validation ----
@@ -85,7 +85,8 @@ async function validateTrade(tradeParams, account, openPositions = [], marketDat
     };
   }
 
-  // Daily loss limit
+  // Daily loss limit – fetch daily stats
+  const dailyStats = await getDailyStats(symbol);
   const dailyLoss = dailyStats.dailyPnL || 0;
   const maxDailyLoss = balance * (CONFIG.MAX_DAILY_LOSS_PCT / 100);
   if (dailyLoss < -maxDailyLoss) {
@@ -254,9 +255,7 @@ async function validateTrade(tradeParams, account, openPositions = [], marketDat
     approved: true,
     reason: 'ALL_CHECKS_PASSED',
     message: 'Trade passes all risk checks.',
-    adjustedParams: {
-      // Could adjust stake or multiplier here if needed
-    },
+    adjustedParams: null,
   };
 }
 
@@ -264,7 +263,7 @@ async function validateTrade(tradeParams, account, openPositions = [], marketDat
  * Get current daily statistics (PnL, consecutive losses, drawdown).
  * @param {string} symbol - Optional symbol filter.
  * @param {string} product - Trading product.
- * @returns {Promise<Object>} { dailyPnL, consecutiveLosses, maxDrawdown, totalTrades }
+ * @returns {Promise<Object>} { dailyPnL, consecutiveLosses, maxDrawdown, totalTrades, wins, losses, winRate }
  */
 async function getDailyStats(symbol = null, product = 'deriv_cfd') {
   const Trade = require('../../models/Trade');
@@ -312,32 +311,8 @@ async function getDailyStats(symbol = null, product = 'deriv_cfd') {
   };
 }
 
-/**
- * Get account balance and equity (convenience wrapper).
- * @param {string} product - Trading product.
- * @returns {Promise<Object>} Account object.
- */
-async function getAccount(product = 'deriv_cfd') {
-  return accountService.getAccount(product);
-}
-
-/**
- * Get open positions (convenience wrapper).
- * @param {string} product - Trading product.
- * @returns {Promise<Array>} Array of open positions.
- */
-async function getOpenPositions(product = 'deriv_cfd') {
-  const broker = getBroker(product);
-  if (!broker.isConnected()) {
-    await broker.connect();
-  }
-  return broker.getOpenTrades();
-}
-
 module.exports = {
   validateTrade,
   getDailyStats,
-  getAccount,
-  getOpenPositions,
   CONFIG,
 };
