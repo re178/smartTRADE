@@ -1,5 +1,6 @@
 // scripts/migrateHistoricalStatesFast.js
-// High‑performance migration – fixed connection and removed deprecated options.
+// High‑performance migration for adding future path data to HistoricalState.
+// Corrected for horizon‑specific futurePrices, binary search, and sufficient candle loading.
 
 require('dotenv').config();
 const mongoose = require('mongoose');
@@ -8,15 +9,14 @@ const candleHistory = require('../core/data/candleHistory');
 
 // ---- Configuration ----
 const CONFIG = {
-  BATCH_SIZE: 500,
-  BULK_WRITE_SIZE: 1000,
-  CONCURRENCY: 10,
-  MAX_CANDLES: 45,
-  HORIZONS: [5, 10, 20, 40],
-  MONGO_URI: process.env.MONGO_URI || 'mongodb://localhost:27017/rts',
+  BATCH_SIZE: 500,           // States per batch for processing
+  BULK_WRITE_SIZE: 1000,     // States per bulk MongoDB update
+  CONCURRENCY: 8,            // Parallel batch processes
+  HORIZONS: [5, 10, 20, 40], // Lookaheads
+  // We will load all available candles for each group; no fixed limit.
 };
 
-// ---- Progress Bar ----
+// ---- Simple Progress Bar ----
 class ProgressBar {
   constructor(total, label = 'Processing') {
     this.total = total;
@@ -39,13 +39,38 @@ class ProgressBar {
   }
 }
 
-// ---- Helper: compute path data ----
-function computePathData(state, candlePrices, horizons) {
+// ---- Binary Search Helper ----
+// Returns the index of the first candle time >= target time.
+function binarySearch(times, target) {
+  let lo = 0, hi = times.length - 1;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (times[mid] < target) lo = mid + 1;
+    else hi = mid;
+  }
+  return (lo < times.length && times[lo] >= target) ? lo : -1;
+}
+
+// ---- Compute Path Data for a Given State ----
+function computePathData(state, candlePrices, candleTimes, stateTime, horizons) {
   const entryPrice = state.price.current;
   const maxHorizon = Math.max(...horizons);
-  const prices = candlePrices.slice(0, maxHorizon);
-  if (prices.length === 0) return null;
 
+  // Locate state index using binary search on candleTimes
+  let startIdx = binarySearch(candleTimes, stateTime);
+  if (startIdx === -1) return null;
+  // We want the candle *after* the state time (future)
+  const futureStart = startIdx + 1;
+  if (futureStart >= candlePrices.length) return null;
+
+  // Extract prices up to maxHorizon
+  const prices = candlePrices.slice(futureStart, futureStart + maxHorizon);
+  if (prices.length < maxHorizon) {
+    // Not enough future candles for full horizon
+    return null;
+  }
+
+  // Compute MFE/MAE for the entire path (up to maxHorizon)
   let mfe = 0, mae = 0;
   let timeToMaxFavorable = null, timeToMaxAdverse = null;
   for (let i = 0; i < prices.length; i++) {
@@ -54,6 +79,7 @@ function computePathData(state, candlePrices, horizons) {
     if (diff < mae) { mae = diff; timeToMaxAdverse = i; }
   }
 
+  // Build horizon-specific arrays
   const futurePrices = {};
   for (const h of horizons) {
     const idx = Math.min(h, prices.length);
@@ -66,114 +92,152 @@ function computePathData(state, candlePrices, horizons) {
     mae,
     timeToMaxFavorable,
     timeToMaxAdverse,
-    regimeTransitions: [],
+    regimeTransitions: [], // placeholder; can be added later
   };
 }
 
-// ---- Helper: fetch candles between dates ----
-async function getCandlesBetween(symbol, timeframe, startDate, endDate, limit = 5000) {
-  const candles = await candleHistory.getHistory(symbol, timeframe, limit);
-  if (!candles || candles.length === 0) return [];
-  const ascending = candles.slice().reverse();
-  const start = new Date(startDate).getTime();
-  const end = new Date(endDate).getTime();
-  const endBuffer = end + 60 * 60 * 1000;
-  return ascending.filter(c => {
-    const t = new Date(c.time).getTime();
-    return t >= start && t <= endBuffer;
-  });
+// ---- Fetch All Candles for a Group (symbol, timeframe) ----
+async function loadAllCandlesForGroup(symbol, timeframe) {
+  // Fetch a large batch – we assume we have enough in DB.
+  // candleHistory.getHistory returns most recent first; we reverse.
+  const candles = await candleHistory.getHistory(symbol, timeframe, 20000);
+  if (!candles || candles.length === 0) return null;
+  // Sort ascending by time
+  const sorted = candles.slice().reverse();
+  // Ensure each candle has numeric time and close
+  const valid = sorted.filter(c =>
+    c.time && c.close !== undefined && typeof c.close === 'number'
+  );
+  if (valid.length < 2) return null;
+  return valid;
 }
 
-// ---- Main migration ----
+// ---- Main Migration ----
 async function runMigration() {
   console.log('==================================================');
-  console.log('  HIGH‑PERFORMANCE HISTORICAL STATE MIGRATION');
+  console.log('  HISTORICAL STATE PATH MIGRATION (Corrected)');
   console.log('==================================================\n');
 
-  // 1. Connect to MongoDB (removed deprecated options)
-  console.log(`Connecting to ${CONFIG.MONGO_URI}...`);
-  try {
-    await mongoose.connect(CONFIG.MONGO_URI);
-    console.log('✅ Connected.\n');
-  } catch (err) {
-    console.error('❌ Failed to connect to MongoDB. Please check your MONGO_URI in .env');
-    console.error(`   Error: ${err.message}`);
-    process.exit(1);
-  }
+  const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/rts';
+  console.log(`Connecting to ${MONGO_URI}...`);
+  await mongoose.connect(MONGO_URI);
+  console.log('✅ Connected.\n');
 
-  // 2. Count unprocessed states
-  const total = await HistoricalState.countDocuments({ futurePrices: null });
+  // Count total unprocessed states (futurePrices is null or incomplete)
+  // We will consider a state unprocessed if futurePrices.5 is null or empty.
+  const total = await HistoricalState.countDocuments({
+    $or: [
+      { 'futurePrices.5': { $exists: false } },
+      { 'futurePrices.5': null },
+      { 'futurePrices.5': { $size: 0 } }
+    ]
+  });
+
   if (total === 0) {
     console.log('✅ All states already have future path data. Nothing to do.');
     process.exit(0);
   }
-  console.log(`📊 Found ${total} unprocessed states.`);
+  console.log(`📊 Found ${total} unprocessed states.\n`);
 
-  // 3. Group states by (symbol, timeframe)
-  console.log('🔍 Grouping states by symbol and timeframe...');
+  // ---- Group states by (symbol, timeframe) ----
+  console.log('🔍 Grouping states...');
   const groups = await HistoricalState.aggregate([
-    { $match: { futurePrices: null } },
-    { $group: { _id: { symbol: '$symbol', timeframe: '$timeframe' }, count: { $sum: 1 } } },
-    { $sort: { count: -1 } },
+    {
+      $match: {
+        $or: [
+          { 'futurePrices.5': { $exists: false } },
+          { 'futurePrices.5': null },
+          { 'futurePrices.5': { $size: 0 } }
+        ]
+      }
+    },
+    {
+      $group: {
+        _id: { symbol: '$symbol', timeframe: '$timeframe' },
+        count: { $sum: 1 },
+        // Get earliest and latest timestamps to load candles
+        earliest: { $min: '$timestamp' },
+        latest: { $max: '$timestamp' }
+      }
+    },
+    { $sort: { count: -1 } }
   ]);
 
-  console.log(`   Found ${groups.length} unique (symbol, timeframe) groups.\n`);
+  console.log(`   Found ${groups.length} groups.\n`);
 
-  // 4. Process each group
   const progress = new ProgressBar(total, 'Migration');
+  let totalProcessed = 0;
+  let totalSkipped = 0;
+  let totalInsufficient = 0;
 
   for (const group of groups) {
-    const { symbol, timeframe } = group._id;
-    console.log(`\n📦 Processing ${symbol} ${timeframe} (${group.count} states)`);
+    const { symbol, timeframe, count, earliest, latest } = group._id;
+    console.log(`\n📦 Processing ${symbol} ${timeframe} (${count} states)`);
 
-    // 4a. Fetch states for this group
+    // ---- Load all candles for this group ----
+    const candles = await loadAllCandlesForGroup(symbol, timeframe);
+    if (!candles || candles.length < 50) {
+      console.warn(`   ⚠️ Insufficient candles for ${symbol} ${timeframe}, skipping group.`);
+      totalSkipped += count;
+      continue;
+    }
+
+    const candleTimes = candles.map(c => new Date(c.time).getTime());
+    const candlePrices = candles.map(c => c.close);
+
+    // Check if we have enough candles after the latest state
+    const latestTime = new Date(latest).getTime();
+    const lastIdx = candleTimes.findIndex(t => t >= latestTime);
+    if (lastIdx === -1) {
+      console.warn(`   ⚠️ Latest state time not found in candles, skipping group.`);
+      totalSkipped += count;
+      continue;
+    }
+    const futureAvailable = candleTimes.length - (lastIdx + 1);
+    const needed = Math.max(...CONFIG.HORIZONS);
+    if (futureAvailable < needed) {
+      console.warn(`   ⚠️ Not enough future candles after latest state (need ${needed}, have ${futureAvailable}), skipping group.`);
+      totalSkipped += count;
+      continue;
+    }
+
+    // ---- Fetch states in batches ----
     const states = await HistoricalState.find({
       symbol,
       timeframe,
-      futurePrices: null,
+      $or: [
+        { 'futurePrices.5': { $exists: false } },
+        { 'futurePrices.5': null },
+        { 'futurePrices.5': { $size: 0 } }
+      ]
     })
       .sort({ timestamp: 1 })
       .lean();
 
     if (states.length === 0) continue;
 
-    const earliest = states[0].timestamp;
-    const latest = states[states.length - 1].timestamp;
-
-    // 4b. Pre‑load candles for this group
-    const allCandles = await getCandlesBetween(symbol, timeframe, earliest, latest, 5000);
-    if (!allCandles || allCandles.length === 0) {
-      console.warn(`   ⚠️ No candles found for ${symbol} ${timeframe}, skipping group.`);
-      continue;
-    }
-
-    const candleTimes = allCandles.map(c => new Date(c.time).getTime());
-    const candlePrices = allCandles.map(c => c.close);
-
-    // 4c. Process in parallel batches
+    // Process in batches with concurrency
     const batches = [];
     for (let i = 0; i < states.length; i += CONFIG.BATCH_SIZE) {
       batches.push(states.slice(i, i + CONFIG.BATCH_SIZE));
     }
 
-    let processed = 0;
-    const concurrency = CONFIG.CONCURRENCY;
-
     const processBatch = async (batch) => {
-      const batchUpdates = [];
+      const updates = [];
       for (const state of batch) {
         const stateTime = new Date(state.timestamp).getTime();
-        let startIdx = candleTimes.findIndex(t => t >= stateTime);
-        if (startIdx === -1) continue;
-        const futureIdx = startIdx + 1;
-        if (futureIdx >= candlePrices.length) continue;
-        const futurePrices = candlePrices.slice(futureIdx, futureIdx + CONFIG.MAX_CANDLES);
-        if (futurePrices.length === 0) continue;
-
-        const pathData = computePathData(state, futurePrices, CONFIG.HORIZONS);
-        if (!pathData) continue;
-
-        batchUpdates.push({
+        const pathData = computePathData(
+          state,
+          candlePrices,
+          candleTimes,
+          stateTime,
+          CONFIG.HORIZONS
+        );
+        if (!pathData) {
+          // Not enough future candles for this state
+          continue;
+        }
+        updates.push({
           updateOne: {
             filter: { _id: state._id },
             update: {
@@ -190,35 +254,71 @@ async function runMigration() {
           },
         });
       }
-      return batchUpdates;
+      return updates;
     };
 
-    // Process batches with concurrency limit
-    for (let i = 0; i < batches.length; i += concurrency) {
-      const concurrentBatches = batches.slice(i, i + concurrency);
+    // Run concurrently
+    let groupProcessed = 0;
+    let groupInsufficient = 0;
+
+    for (let i = 0; i < batches.length; i += CONFIG.CONCURRENCY) {
+      const concurrentBatches = batches.slice(i, i + CONFIG.CONCURRENCY);
       const results = await Promise.all(concurrentBatches.map(batch => processBatch(batch)));
+
       for (const updates of results) {
-        if (updates.length > 0) {
+        if (updates.length === 0) continue;
+        // Bulk write
+        try {
           await HistoricalState.bulkWrite(updates);
-          processed += updates.length;
-          progress.update(updates.length);
+          const count = updates.length;
+          groupProcessed += count;
+          totalProcessed += count;
+          progress.update(count);
+        } catch (err) {
+          console.error(`   ❌ Bulk write error: ${err.message}`);
+          // Fallback to individual updates
+          for (const update of updates) {
+            try {
+              await HistoricalState.updateOne(update.filter, update.update);
+              groupProcessed++;
+              totalProcessed++;
+              progress.update(1);
+            } catch (e) {
+              console.error(`      Failed for state ${update.filter._id}: ${e.message}`);
+              groupInsufficient++;
+            }
+          }
         }
       }
     }
 
-    console.log(`   ✅ Processed ${processed} states for ${symbol} ${timeframe}`);
+    totalInsufficient += groupInsufficient;
+    console.log(`   ✅ Processed ${groupProcessed} states, insufficient future data: ${groupInsufficient}`);
   }
 
   console.log('\n==================================================');
-  console.log('✅ Migration completed successfully!');
-  console.log(`   Total states processed: ${progress.done}`);
-  const remaining = await HistoricalState.countDocuments({ futurePrices: null });
+  console.log('✅ MIGRATION COMPLETE');
+  console.log(`   Total processed: ${totalProcessed}`);
+  console.log(`   Total skipped (no candles): ${totalSkipped}`);
+  console.log(`   Total insufficient future data: ${totalInsufficient}`);
+
+  // Verify final count of states with full path data
+  const remaining = await HistoricalState.countDocuments({
+    $or: [
+      { 'futurePrices.5': { $exists: false } },
+      { 'futurePrices.5': null },
+      { 'futurePrices.5': { $size: 0 } }
+    ]
+  });
+
   if (remaining > 0) {
-    console.warn(`⚠️ ${remaining} states remain unprocessed. You may need to run the script again.`);
+    console.warn(`⚠️ ${remaining} states still lack future path data.`);
+    console.warn('   This may be due to insufficient candles. You may need to re-run with more candles.');
   } else {
     console.log('🎉 All states now have future path data.');
   }
   console.log('==================================================');
+
   process.exit(0);
 }
 
