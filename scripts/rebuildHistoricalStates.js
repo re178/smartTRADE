@@ -9,7 +9,7 @@ const { performance } = require('perf_hooks');
 
 // ---- Import Models ----
 const HistoricalState = require('../models/HistoricalState');
-const HistoricalCandle = mongoose.model('HistoricalCandle', require('../models/HistoricalCandle'));
+const HistoricalCandle = mongoose.model('HistoricalCandle') ;
 
 // ---- Import Indicator Engine (from your codebase) ----
 const {
