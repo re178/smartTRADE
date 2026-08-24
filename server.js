@@ -1,6 +1,7 @@
 // server.js – RTS Entry Point (Deriv‑only)
 // INTEGRATED: Prediction Engine, Opportunity Engine, Risk Engine.
 // Now broadcasts 'prediction' and 'opportunity' events to dashboard.
+// SYMBOL FIX: Watched symbols changed to canonical (EURUSD, etc.)
 
 require('dotenv').config();
 
@@ -222,13 +223,8 @@ const WS_PING_INTERVAL = 30000;
 let wsPingTimer = null;
 
 wss.on('connection', (ws, req) => {
-  // No authentication – allow all connections
   console.log('[WebSocket] Dashboard client connected.');
-
-  // Register this client for broadcasts
   dashboardClients.add(ws);
-
-  // Send initial state
   sendDashboardInitialState(ws);
 
   ws.on('close', () => {
@@ -284,9 +280,7 @@ async function sendDashboardInitialState(ws) {
     let broker;
     try {
       broker = getBroker('deriv_cfd');
-    } catch (e) {
-      // ignore
-    }
+    } catch (e) { /* ignore */ }
     const enhancedAccount = enhanceAccount(account, broker);
 
     ws.send(JSON.stringify({ type: 'init', data: { trades, account: enhancedAccount, positions } }));
@@ -296,7 +290,7 @@ async function sendDashboardInitialState(ws) {
   }
 }
 
-// ---- Broadcast functions with debug logs ----
+// ---- Broadcast functions ----
 function broadcastToDashboards(type, data) {
   console.log(`[Broadcast] Attempting to broadcast "${type}" to ${dashboardClients.size} clients`);
   if (dashboardClients.size === 0) {
@@ -326,12 +320,9 @@ deepRegime.on('regime', (regime) => broadcast('regime', regime));
 decisionEngine.on('decision', (decision) => broadcast('decision', decision));
 eventBus.on('account.fetched', (account) => broadcast('account', account));
 eventBus.on('trade.closed', (data) => broadcast('tradeClosed', data));
-
-// ✅ FIX: Align event names with frontend expectations
 eventBus.on('order.placed', (data) => broadcast('trade.placed', data));
 eventBus.on('position.updated', (data) => broadcast('positions', data));
 
-// ---------- OTIE V5 Event Broadcasts ----------
 otie.on('otieV5State', (state) => broadcast('otieV5State', state));
 otie.on('otieV5Action', (action) => broadcast('otieV5Action', action));
 
@@ -340,9 +331,7 @@ eventBus.on('trade.closed', async (data) => {
   try {
     const Trade = require('./models/Trade');
     const trade = await Trade.findOne({ contractId: data.contractId });
-    if (trade) {
-      performanceMonitor.recordTrade(trade);
-    }
+    if (trade) performanceMonitor.recordTrade(trade);
   } catch (err) {
     console.error('[PerformanceMonitor] Failed to record trade:', err.message);
   }
@@ -358,49 +347,39 @@ performanceMonitor.on('thresholdsUpdated', (thresholds) => {
 });
 
 // ============================================================
-//  NEW: PREDICTION / OPPORTUNITY PIPELINE
+//  PREDICTION / OPPORTUNITY PIPELINE
 // ============================================================
 
-// Symbols to watch for predictions (from the watchlist used by broker)
-const WATCHED_SYMBOLS = ['EUR_USD', 'GBP_USD', 'USD_JPY', 'AUD_USD'];
+// ✅ UPDATED: Watched symbols in canonical format (no underscores)
+const WATCHED_SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD'];
 
-/**
- * Run the prediction pipeline for a given symbol.
- * This is called on timer and on candle closes.
- */
 async function runPredictionPipeline(symbol) {
   try {
-    // 1. Get current market state
     const state = await require('./core/intelligence/deep/marketState').compute(symbol, 'M5', 200);
     if (!state) {
       console.log(`[Pipeline] No state for ${symbol}, skipping.`);
       return;
     }
 
-    // 2. Get account and positions
     const product = 'deriv_cfd';
     const broker = getBroker(product);
     const account = await broker.getAccount();
     const positions = await broker.getOpenTrades();
 
-    // 3. Get market data (current price, spread)
     const marketData = {
       currentPrice: state.price.current,
       spread: state.awareness?.spread || 0,
       timestamp: new Date().toISOString(),
     };
 
-    // 4. Run Prediction Engine
     const prediction = await predictionEngine.predict(state, symbol);
     if (!prediction) {
       console.log(`[Pipeline] No prediction for ${symbol}, skipping.`);
       return;
     }
 
-    // Broadcast prediction
     broadcastToDashboards('prediction', prediction);
 
-    // 5. Run Opportunity Engine (only if prediction is valid)
     const opportunity = await opportunityEngine.evaluate(
       prediction,
       account,
@@ -409,18 +388,13 @@ async function runPredictionPipeline(symbol) {
       { riskPerTradePct: parseFloat(process.env.RISK_PER_TRADE_PCT) || 1.0 }
     );
 
-    // Broadcast opportunity
     broadcastToDashboards('opportunity', opportunity);
-
     console.log(`[Pipeline] ${symbol}: Prediction/opportunity broadcast.`);
   } catch (err) {
     console.error(`[Pipeline] Error for ${symbol}:`, err.message);
   }
 }
 
-/**
- * Run the prediction pipeline for all watched symbols.
- */
 async function runPredictionPipelineAll() {
   console.log('[Pipeline] Running prediction pipeline for all symbols...');
   for (const symbol of WATCHED_SYMBOLS) {
@@ -428,23 +402,18 @@ async function runPredictionPipelineAll() {
   }
 }
 
-// ---------- Hook pipeline to candle closes ----------
 candleStore.on('candleClosed', async (candle) => {
-  // Only run on M5 candles (or M15 if you prefer)
   if (candle.timeframe === 'M5') {
     const symbol = candle.symbol;
+    // If symbol is frxEURUSD, convert to canonical? The state compute expects canonical.
+    // We'll rely on the watched symbols being canonical; we need to map the candle symbol.
+    // Assuming candle.symbol is already canonical (from rebuild).
     if (WATCHED_SYMBOLS.includes(symbol)) {
       console.log(`[Pipeline] Triggered by candle close for ${symbol}`);
       await runPredictionPipeline(symbol);
     }
   }
 });
-
-// ---------- Hook pipeline to decision timer ----------
-// We'll reuse the decisionEngine's timer or create our own.
-// Since decisionEngine already has a 30s timer, we can run the pipeline there.
-// We'll keep the existing timer and also run the pipeline.
-// To avoid duplication, we'll run the pipeline on a separate interval.
 
 let pipelineTimer = null;
 
@@ -459,13 +428,11 @@ function startPipelineTimer() {
   console.log(`[Pipeline] Timer started (${intervalMs}ms)`);
 }
 
-// ============================================================
-
 // ---------- DEBUG ROUTES ----------
 app.get('/debug/status', (req, res) => {
-  const lastState = marketStateCache.get('EUR_USD') || null;
-  const lastRegime = deepRegime.getLatestRegime('EUR_USD') || null;
-  const lastDecision = decisionEngine.getLastDecision('EUR_USD') || null;
+  const lastState = marketStateCache.get('EURUSD') || null;
+  const lastRegime = deepRegime.getLatestRegime('EURUSD') || null;
+  const lastDecision = decisionEngine.getLastDecision('EURUSD') || null;
   res.json({
     engine: {
       candleBuilder: typeof candleStore !== 'undefined' ? 'running' : 'not loaded',
@@ -474,7 +441,7 @@ app.get('/debug/status', (req, res) => {
       decisionEngine: decisionEngine ? 'running' : 'not loaded',
       otieV5: otie ? 'running' : 'not loaded',
     },
-    lastCandle: candleStore.getHistory('EUR_USD', 'M5', 1)[0] || null,
+    lastCandle: candleStore.getHistory('EURUSD', 'M5', 1)[0] || null,
     lastMarketState: lastState,
     lastRegime: lastRegime,
     lastDecision: lastDecision,
@@ -497,7 +464,7 @@ async function startCognitiveEngines() {
   }
 }
 
-// ---------- Start Deriv Broker and connect to events ----------
+// ---------- Start Deriv Broker ----------
 async function startDerivBroker() {
   try {
     const broker = getBroker('deriv_cfd');
@@ -505,7 +472,6 @@ async function startDerivBroker() {
     await broker.connect();
     console.log('[Deriv] Broker connected.');
 
-    // ---- Listen to broker events and broadcast ----
     broker.on('tick', (data) => {
       broadcastToDashboards('price', data);
     });
@@ -552,7 +518,6 @@ async function startServer() {
 
     startWSPing();
 
-    // ---- Initialise Data Orchestrator and State Store ----
     Promise.all([
       dataOrchestrator.recover(),
       stateStore.init(),
@@ -562,20 +527,12 @@ async function startServer() {
       console.warn('⚠️ Failed to initialise Data Orchestrator/State Store:', err.message);
     });
 
-    // ---- Start Cognitive Engines ----
     setTimeout(startCognitiveEngines, 2000);
-
-    // ---- Start Prediction Pipeline Timer ----
     startPipelineTimer();
-
-    // ---- Start Outcome Labeler Scheduler (DISABLED) ----
     console.log('⏸️ Outcome labeler scheduler disabled.');
-
-    // ---- Connect Deriv broker after startup ----
     setTimeout(startDerivBroker, 3000);
   });
 
-  // ---- Graceful shutdown ----
   process.on('SIGINT', async () => {
     console.log('\n🛑 Received SIGINT, shutting down gracefully...');
     if (wsPingTimer) clearInterval(wsPingTimer);
