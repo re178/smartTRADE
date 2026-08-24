@@ -3,6 +3,7 @@
 // Now broadcasts 'prediction' and 'opportunity' events to dashboard.
 // SYMBOL FIX: Watched symbols changed to canonical (EURUSD, etc.)
 // PIPELINE: Timer and candle‑close triggers active.
+// DEBUG: Added extensive logs to trace prediction pipeline execution.
 
 require('dotenv').config();
 
@@ -332,15 +333,17 @@ performanceMonitor.on('thresholdsUpdated', (thresholds) => {
 });
 
 // ============================================================
-//  PREDICTION / OPPORTUNITY PIPELINE
+//  PREDICTION / OPPORTUNITY PIPELINE (with debug logs)
 // ============================================================
 
-// Watched symbols in canonical format (no underscores)
 const WATCHED_SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD'];
 
 async function runPredictionPipeline(symbol) {
+  console.log(`[Pipeline] 🔥 runPredictionPipeline called for ${symbol}`);
   try {
+    console.log(`[Pipeline] Calling deepMarketState.compute for ${symbol}...`);
     const state = await require('./core/intelligence/deep/marketState').compute(symbol, 'M5', 200);
+    console.log(`[Pipeline] deepMarketState.compute returned:`, state ? 'state object' : 'null');
     if (!state) {
       console.log(`[Pipeline] No state for ${symbol}, skipping.`);
       return;
@@ -348,6 +351,7 @@ async function runPredictionPipeline(symbol) {
 
     const product = 'deriv_cfd';
     const broker = getBroker(product);
+    console.log(`[Pipeline] Getting account and positions...`);
     const account = await broker.getAccount();
     const positions = await broker.getOpenTrades();
 
@@ -357,14 +361,18 @@ async function runPredictionPipeline(symbol) {
       timestamp: new Date().toISOString(),
     };
 
+    console.log(`[Pipeline] Calling predictionEngine.predict for ${symbol}...`);
     const prediction = await predictionEngine.predict(state, symbol);
+    console.log(`[Pipeline] predictionEngine.predict returned:`, prediction ? 'prediction object' : 'null');
     if (!prediction) {
       console.log(`[Pipeline] No prediction for ${symbol}, skipping.`);
       return;
     }
 
+    console.log(`[Pipeline] Broadcasting prediction for ${symbol}...`);
     broadcastToDashboards('prediction', prediction);
 
+    console.log(`[Pipeline] Calling opportunityEngine.evaluate...`);
     const opportunity = await opportunityEngine.evaluate(
       prediction,
       account,
@@ -373,15 +381,17 @@ async function runPredictionPipeline(symbol) {
       { riskPerTradePct: parseFloat(process.env.RISK_PER_TRADE_PCT) || 1.0 }
     );
 
+    console.log(`[Pipeline] Broadcasting opportunity for ${symbol}...`);
     broadcastToDashboards('opportunity', opportunity);
-    console.log(`[Pipeline] ${symbol}: Prediction/opportunity broadcast.`);
+    console.log(`[Pipeline] ✅ ${symbol}: Prediction/opportunity broadcast.`);
   } catch (err) {
-    console.error(`[Pipeline] Error for ${symbol}:`, err.message);
+    console.error(`[Pipeline] ❌ Error for ${symbol}:`, err.message);
+    console.error(err.stack);
   }
 }
 
 async function runPredictionPipelineAll() {
-  console.log('[Pipeline] Running prediction pipeline for all symbols...');
+  console.log('[Pipeline] 🚀 runPredictionPipelineAll called');
   for (const symbol of WATCHED_SYMBOLS) {
     await runPredictionPipeline(symbol);
   }
@@ -390,7 +400,7 @@ async function runPredictionPipelineAll() {
 // ---- Trigger on candle close ----
 candleStore.on('candleClosed', async (candle) => {
   if (candle.timeframe === 'M5' && WATCHED_SYMBOLS.includes(candle.symbol)) {
-    console.log(`[Pipeline] Triggered by candle close for ${candle.symbol}`);
+    console.log(`[Pipeline] ⏰ Triggered by candle close for ${candle.symbol}`);
     await runPredictionPipeline(candle.symbol);
   }
 });
@@ -405,7 +415,7 @@ function startPipelineTimer() {
       console.error('[Pipeline] Timer error:', err.message);
     });
   }, intervalMs);
-  console.log(`[Pipeline] Timer started (${intervalMs}ms)`);
+  console.log(`[Pipeline] ⏲️ Timer started (${intervalMs}ms)`);
 }
 
 // ---------- DEBUG ROUTE ----------
