@@ -104,7 +104,7 @@ async function predict(state, symbol, lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = 
       state.timeframe || 'M5',
       lookahead,
       k,
-      regimeCode
+      null
     );
     console.log(`[PredictionEngine]   distribution received:`, distribution ? `sampleSize=${distribution.sampleSize}` : 'null');
 
