@@ -2,6 +2,7 @@
 // INTEGRATED: Prediction Engine, Opportunity Engine, Risk Engine.
 // Now broadcasts 'prediction' and 'opportunity' events to dashboard.
 // SYMBOL FIX: Watched symbols changed to canonical (EURUSD, etc.)
+// PIPELINE: Timer and candle‑close triggers active.
 
 require('dotenv').config();
 
@@ -201,7 +202,7 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'OK', message: 'RTS is running with Deriv broker' });
 });
 
-// ---------- SPA Fallback (no API key injection) ----------
+// ---------- SPA Fallback ----------
 app.get('*', (req, res) => {
   if (!req.path.startsWith('/api')) {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
@@ -215,8 +216,6 @@ const server = http.createServer(app);
 
 // ---------- WebSocket Server ----------
 const wss = new WebSocket.Server({ server });
-
-// Only dashboard clients
 const dashboardClients = new Set();
 
 const WS_PING_INTERVAL = 30000;
@@ -236,19 +235,16 @@ wss.on('connection', (ws, req) => {
   ws.on('pong', () => {});
 });
 
-// ---------- WebSocket keep‑alive ----------
 function startWSPing() {
   if (wsPingTimer) clearInterval(wsPingTimer);
   wsPingTimer = setInterval(() => {
     for (const client of dashboardClients) {
-      if (client.readyState === WebSocket.OPEN) {
-        client.ping();
-      }
+      if (client.readyState === WebSocket.OPEN) client.ping();
     }
   }, WS_PING_INTERVAL);
 }
 
-// ---------- Helper: Enhance account with tradeMode and server ----------
+// ---------- Helper: enhance account ----------
 function enhanceAccount(accountData, broker) {
   if (!accountData) return accountData;
   let tradeMode = 0;
@@ -257,14 +253,10 @@ function enhanceAccount(accountData, broker) {
     tradeMode = broker._account.is_virtual !== undefined ? (broker._account.is_virtual ? 1 : 0) : 0;
     server = broker._account.landing_company_name || 'Unknown';
   }
-  return {
-    ...accountData,
-    tradeMode,
-    server,
-  };
+  return { ...accountData, tradeMode, server };
 }
 
-// ---------- Send initial state to a new dashboard client ----------
+// ---------- Send initial state ----------
 async function sendDashboardInitialState(ws) {
   try {
     const Trade = require('./models/Trade');
@@ -278,9 +270,7 @@ async function sendDashboardInitialState(ws) {
     ]);
 
     let broker;
-    try {
-      broker = getBroker('deriv_cfd');
-    } catch (e) { /* ignore */ }
+    try { broker = getBroker('deriv_cfd'); } catch (e) {}
     const enhancedAccount = enhanceAccount(account, broker);
 
     ws.send(JSON.stringify({ type: 'init', data: { trades, account: enhancedAccount, positions } }));
@@ -309,12 +299,9 @@ function broadcastToDashboards(type, data) {
   });
   console.log(`[Broadcast] Sent "${type}" to ${sent} clients`);
 }
+function broadcast(type, data) { broadcastToDashboards(type, data); }
 
-function broadcast(type, data) {
-  broadcastToDashboards(type, data);
-}
-
-// ---------- Connect CTOS Events to WebSocket ----------
+// ---------- Legacy event bindings ----------
 awarenessEngine.on('marketAwareness', (data) => broadcast('marketAwareness', data));
 deepRegime.on('regime', (regime) => broadcast('regime', regime));
 decisionEngine.on('decision', (decision) => broadcast('decision', decision));
@@ -322,7 +309,6 @@ eventBus.on('account.fetched', (account) => broadcast('account', account));
 eventBus.on('trade.closed', (data) => broadcast('tradeClosed', data));
 eventBus.on('order.placed', (data) => broadcast('trade.placed', data));
 eventBus.on('position.updated', (data) => broadcast('positions', data));
-
 otie.on('otieV5State', (state) => broadcast('otieV5State', state));
 otie.on('otieV5Action', (action) => broadcast('otieV5Action', action));
 
@@ -336,7 +322,6 @@ eventBus.on('trade.closed', async (data) => {
     console.error('[PerformanceMonitor] Failed to record trade:', err.message);
   }
 });
-
 performanceMonitor.on('thresholdsUpdated', (thresholds) => {
   if (otie && typeof otie.updateConfig === 'function') {
     otie.updateConfig(thresholds);
@@ -350,7 +335,7 @@ performanceMonitor.on('thresholdsUpdated', (thresholds) => {
 //  PREDICTION / OPPORTUNITY PIPELINE
 // ============================================================
 
-// ✅ UPDATED: Watched symbols in canonical format (no underscores)
+// Watched symbols in canonical format (no underscores)
 const WATCHED_SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD'];
 
 async function runPredictionPipeline(symbol) {
@@ -402,21 +387,16 @@ async function runPredictionPipelineAll() {
   }
 }
 
+// ---- Trigger on candle close ----
 candleStore.on('candleClosed', async (candle) => {
-  if (candle.timeframe === 'M5') {
-    const symbol = candle.symbol;
-    // If symbol is frxEURUSD, convert to canonical? The state compute expects canonical.
-    // We'll rely on the watched symbols being canonical; we need to map the candle symbol.
-    // Assuming candle.symbol is already canonical (from rebuild).
-    if (WATCHED_SYMBOLS.includes(symbol)) {
-      console.log(`[Pipeline] Triggered by candle close for ${symbol}`);
-      await runPredictionPipeline(symbol);
-    }
+  if (candle.timeframe === 'M5' && WATCHED_SYMBOLS.includes(candle.symbol)) {
+    console.log(`[Pipeline] Triggered by candle close for ${candle.symbol}`);
+    await runPredictionPipeline(candle.symbol);
   }
 });
 
+// ---- Timer trigger ----
 let pipelineTimer = null;
-
 function startPipelineTimer() {
   if (pipelineTimer) clearInterval(pipelineTimer);
   const intervalMs = parseInt(process.env.PREDICTION_INTERVAL_MS) || 30000;
@@ -428,7 +408,7 @@ function startPipelineTimer() {
   console.log(`[Pipeline] Timer started (${intervalMs}ms)`);
 }
 
-// ---------- DEBUG ROUTES ----------
+// ---------- DEBUG ROUTE ----------
 app.get('/debug/status', (req, res) => {
   const lastState = marketStateCache.get('EURUSD') || null;
   const lastRegime = deepRegime.getLatestRegime('EURUSD') || null;
@@ -472,26 +452,14 @@ async function startDerivBroker() {
     await broker.connect();
     console.log('[Deriv] Broker connected.');
 
-    broker.on('tick', (data) => {
-      broadcastToDashboards('price', data);
-    });
-
+    broker.on('tick', (data) => broadcastToDashboards('price', data));
     broker.on('account', async (accountData) => {
       const enhanced = enhanceAccount(accountData, broker);
       broadcastToDashboards('account', enhanced);
     });
-
-    broker.on('positions', (positions) => {
-      broadcastToDashboards('positions', positions);
-    });
-
-    broker.on('orderUpdate', (data) => {
-      broadcastToDashboards('orderUpdate', data);
-    });
-
-    broker.on('_portfolioUpdated', (positions) => {
-      broadcastToDashboards('positions', positions);
-    });
+    broker.on('positions', (positions) => broadcastToDashboards('positions', positions));
+    broker.on('orderUpdate', (data) => broadcastToDashboards('orderUpdate', data));
+    broker.on('_portfolioUpdated', (positions) => broadcastToDashboards('positions', positions));
 
     console.log('[Deriv] Broker event listeners attached.');
   } catch (err) {
@@ -528,7 +496,7 @@ async function startServer() {
     });
 
     setTimeout(startCognitiveEngines, 2000);
-    startPipelineTimer();
+    startPipelineTimer();  // <-- THIS STARTS THE PREDICTION PIPELINE
     console.log('⏸️ Outcome labeler scheduler disabled.');
     setTimeout(startDerivBroker, 3000);
   });
