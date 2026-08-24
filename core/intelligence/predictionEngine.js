@@ -3,7 +3,8 @@
 // Uses enhanced StateStore to retrieve analogues with path data.
 // Outputs a Prediction object for use by Opportunity Engine.
 // SYMBOL FIX: Added normalization to use canonical symbols.
-// DEBUG: Added extensive logging to diagnose prediction pipeline.
+// DEBUG: Extensive logging.
+// REGIME FIX: Passes null to stateStore to bypass regime filter (until regime is properly set in state).
 
 const stateStore = require('./lab/stateStore');
 const deepMarketState = require('./deep/marketState');
@@ -15,7 +16,6 @@ const logger = require('../../infrastructure/logger') || console;
 // ---- Symbol Normalization ----
 function normalizeSymbol(sym) {
   if (!sym) return '';
-  // Remove 'frx' prefix (case-insensitive), remove separators, uppercase
   return sym.replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
 }
 
@@ -45,7 +45,6 @@ function extractFeatures(state) {
     pricePosition: state.structure?.pricePosition || 0.5,
     marketQuality: state.summary?.marketQuality || 50,
   };
-  // Ensure all are numbers
   for (const key of Object.keys(features)) {
     if (typeof features[key] !== 'number' || isNaN(features[key])) {
       features[key] = 0;
@@ -92,19 +91,19 @@ async function predict(state, symbol, lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = 
     const features = extractFeatures(state);
     console.log(`[PredictionEngine]   features:`, JSON.stringify(features).slice(0, 200));
 
-    // 3. Get regime code
+    // 3. Get regime code (for logging only – we will NOT filter by regime)
     const regimeCode = getRegimeCode(state, canonicalSymbol);
-    console.log(`[PredictionEngine]   regime: ${regimeCode}`);
+    console.log(`[PredictionEngine]   regime (current): ${regimeCode} (filter disabled)`);
 
-    // 4. Call enhanced stateStore to get prediction distribution
-    console.log(`[PredictionEngine]   calling stateStore.getPredictionDistribution...`);
+    // 4. Call stateStore WITHOUT regime filter
+    console.log(`[PredictionEngine]   calling stateStore.getPredictionDistribution (regime=null)...`);
     const distribution = await stateStore.getPredictionDistribution(
       features,
       canonicalSymbol,
       state.timeframe || 'M5',
       lookahead,
       k,
-      null
+      null // <-- CRITICAL: bypass regime filter
     );
     console.log(`[PredictionEngine]   distribution received:`, distribution ? `sampleSize=${distribution.sampleSize}` : 'null');
 
@@ -122,7 +121,7 @@ async function predict(state, symbol, lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = 
       symbol: canonicalSymbol,
       timeframe: state.timeframe || 'M5',
       timestamp: new Date().toISOString(),
-      regime: regimeCode,
+      regime: regimeCode, // Store the current regime for reference
 
       probabilities: {
         up: distribution.probUp || 0.33,
@@ -178,7 +177,6 @@ function getNoTradeReason(prediction) {
   return 'NONE';
 }
 
-// ✅ CORRECT EXPORT: Ensure predict is available
 module.exports = {
   predict,
   extractFeatures,
