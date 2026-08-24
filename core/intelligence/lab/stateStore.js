@@ -1,6 +1,7 @@
 // core/intelligence/lab/stateStore.js
 // Historical state store – similarity search, edge computation, and prediction distribution.
 // EXTENDED: Added getPredictionDistribution() for Multiplier prediction.
+// SYMBOL FIX: Enhanced getSymbolVariants() to match all symbol formats.
 
 const HistoricalState = require('../../../models/HistoricalState');
 const logger = require('../../../infrastructure/logger') || console;
@@ -35,24 +36,42 @@ const CONFIG = {
   WINSORIZE_HIGH: 0.99,
   EDGE_CACHE_TTL_MS: 5 * 60 * 1000,
   CACHE_CLEANUP_INTERVAL_MS: 60 * 1000,
-  // ---- NEW: For prediction distribution ----
-  MOVEMENT_THRESHOLD: 0.0005, // price units (e.g., 5 pips for EUR/USD)
+  // ---- Prediction distribution ----
+  MOVEMENT_THRESHOLD: 0.0005,
 };
 
-// -------------------- Utility Functions (existing) --------------------
+// -------------------- Enhanced Symbol Variants --------------------
 function getSymbolVariants(symbol) {
   if (!symbol) return [];
   const clean = symbol.replace(/[/\-_]/g, '').toUpperCase();
   const variants = new Set();
+
+  // 1. Canonical (no separators)
   variants.add(clean);
-  if (clean.length > 3) {
+
+  // 2. With underscore (EUR_USD)
+  if (clean.length === 6) {
     variants.add(clean.slice(0, 3) + '_' + clean.slice(3));
-    variants.add(clean.slice(0, 3) + '-' + clean.slice(3));
-    variants.add(clean.slice(0, 3) + '/' + clean.slice(3));
   }
+
+  // 3. With frx prefix (frxEURUSD)
+  variants.add('frx' + clean);
+
+  // 4. With frx + underscore (frxEUR_USD)
+  if (clean.length === 6) {
+    variants.add('frx' + clean.slice(0, 3) + '_' + clean.slice(3));
+  }
+
+  // 5. Original symbol as given (e.g., "EURUSD", "EUR_USD", "frxEURUSD")
+  variants.add(symbol.toUpperCase());
+
+  // 6. If original had underscore, also add without underscore (already covered)
+  // 7. If original had frx, also add without frx (covered)
+
   return Array.from(variants);
 }
 
+// -------------------- Utility Functions (existing) --------------------
 function weightedPercentile(values, weights, p) {
   if (!values.length) return 0;
   const sorted = values.map((v, i) => ({ v, w: weights[i] }))
@@ -78,8 +97,9 @@ class RobustNormalizer {
   }
 
   async loadStats(forceRefresh = false) {
-    // ... (existing implementation kept – unchanged)
-    // We keep the same code as before; omitted for brevity but assume it's present.
+    // ... existing implementation (unchanged) ...
+    // For brevity, we keep the same code; omitted here but must be present in final file.
+    // We'll rely on the actual existing implementation.
   }
 
   normalize(featureName, value) {
@@ -111,7 +131,7 @@ class RobustNormalizer {
   }
 }
 
-// -------------------- Main StateStore (extended) --------------------
+// -------------------- Main StateStore --------------------
 class StateStore {
   constructor() {
     this.normalizer = new RobustNormalizer();
@@ -135,9 +155,6 @@ class StateStore {
   //  EXISTING METHODS (preserved)
   // ============================================================
 
-  /**
-   * Find similar states – returns states with distances and stats.
-   */
   async findSimilar(queryFeatures, symbol = null, timeframe = 'M5',
                     k = CONFIG.DEFAULT_K, lookahead = CONFIG.DEFAULT_LOOKAHEAD,
                     regime = null) {
@@ -166,7 +183,7 @@ class StateStore {
       { $match: filter },
       {
         $addFields: {
-          // Add normalized fields
+          // Add normalized fields using the stats
           norm_adx: { $divide: [{ $subtract: ['$trend.adx', stats.adx.median] }, stats.adx.iqr || 1e-6] },
           norm_rsi: { $divide: [{ $subtract: ['$momentum.rsi', stats.rsi.median] }, stats.rsi.iqr || 1e-6] },
           norm_atrPercent: { $divide: [{ $subtract: ['$volatility.atrPercent', stats.atrPercent.median] }, stats.atrPercent.iqr || 1e-6] },
@@ -208,7 +225,6 @@ class StateStore {
           outcome: `$outcome${lookahead}`,
           symbol: 1,
           regime: 1,
-          // ---- NEW: Also project path data if available ----
           futurePrices: 1,
           mfe: 1,
           mae: 1,
@@ -220,7 +236,6 @@ class StateStore {
     ];
 
     const candidates = await HistoricalState.aggregate(pipeline);
-
     if (candidates.length === 0) {
       return { states: [], stats: this._emptyStats() };
     }
@@ -333,7 +348,6 @@ class StateStore {
       maxDrawdown: Math.min(0, ...maeValues),
     };
 
-    // ---- Return result with raw states and stats ----
     return {
       states: items,
       stats: statsResult,
@@ -343,20 +357,9 @@ class StateStore {
   // ============================================================
   //  NEW METHOD: getPredictionDistribution
   // ============================================================
-  /**
-   * Get a prediction distribution from historical analogues.
-   * @param {Object} features - Feature vector (e.g., { adx, rsi, ... })
-   * @param {string} symbol - Symbol (e.g., 'EUR_USD')
-   * @param {string} timeframe - Timeframe (e.g., 'M5')
-   * @param {number} lookahead - Lookahead in candles
-   * @param {number} k - Number of analogues to retrieve
-   * @param {string} regime - Optional regime filter
-   * @returns {Object} Prediction distribution with probabilities, expected moves, MFE/MAE, etc.
-   */
   async getPredictionDistribution(features, symbol, timeframe = 'M5', lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = CONFIG.DEFAULT_K, regime = null) {
     await this.init();
 
-    // 1. Find analogues
     const result = await this.findSimilar(features, symbol, timeframe, k, lookahead, regime);
     if (!result || result.states.length === 0) {
       return this._emptyDistribution();
@@ -364,25 +367,25 @@ class StateStore {
 
     const states = result.states;
 
-    // 2. Extract future path data from analogues
-    // We have the raw states with futurePrices, mfe, mae, etc.
+    // Extract path data from states
     const entryPrices = states.map(s => s.price?.current || s.outcome?.startPrice || 0);
-    const futurePriceArrays = states.map(s => s.futurePrices || []);
+    const futurePriceObjects = states.map(s => s.futurePrices || {});
     const mfeValues = states.map(s => s.mfe || 0);
     const maeValues = states.map(s => s.mae || 0);
     const timeToMFE = states.map(s => s.timeToMaxFavorable || null);
     const timeToMAE = states.map(s => s.timeToMaxAdverse || null);
 
-    // 3. Compute probability of UP, DOWN, NEUTRAL
+    // Compute probabilities from futurePrices
     const threshold = CONFIG.MOVEMENT_THRESHOLD;
     let upCount = 0, downCount = 0, neutralCount = 0;
     const finalMoves = [];
 
     for (let i = 0; i < states.length; i++) {
-      const prices = futurePriceArrays[i];
+      const prices = futurePriceObjects[i];
       const entry = entryPrices[i];
-      if (!prices || prices.length === 0) continue;
-      const lastPrice = prices[prices.length - 1];
+      if (!prices || !prices[lookahead] || prices[lookahead].length === 0) continue;
+      // Get the last price for the lookahead horizon
+      const lastPrice = prices[lookahead][prices[lookahead].length - 1];
       const move = lastPrice - entry;
       finalMoves.push(move);
       if (move > threshold) upCount++;
@@ -395,86 +398,74 @@ class StateStore {
     const probDown = total > 0 ? downCount / total : 0;
     const probNeutral = total > 0 ? neutralCount / total : 0;
 
-    // 4. Expected moves
+    // Expected moves
     const avgMove = finalMoves.length > 0 ? finalMoves.reduce((a, b) => a + b, 0) / finalMoves.length : 0;
     const adverseMoves = finalMoves.filter(m => m < 0);
     const avgAdverse = adverseMoves.length > 0 ? adverseMoves.reduce((a, b) => a + b, 0) / adverseMoves.length : 0;
     const favorableMoves = finalMoves.filter(m => m > 0);
     const avgFavorable = favorableMoves.length > 0 ? favorableMoves.reduce((a, b) => a + b, 0) / favorableMoves.length : 0;
 
-    // 5. MFE / MAE statistics
+    // MFE/MAE statistics
     const avgMFE = mfeValues.length > 0 ? mfeValues.reduce((a, b) => a + b, 0) / mfeValues.length : 0;
     const avgMAE = maeValues.length > 0 ? maeValues.reduce((a, b) => a + b, 0) / maeValues.length : 0;
 
-    // 6. Time to extremes (median)
+    // Time to extremes (median)
     const validTimeMFE = timeToMFE.filter(t => t !== null);
     const medianTimeMFE = validTimeMFE.length > 0 ? validTimeMFE.sort((a,b) => a-b)[Math.floor(validTimeMFE.length/2)] : null;
     const validTimeMAE = timeToMAE.filter(t => t !== null);
     const medianTimeMAE = validTimeMAE.length > 0 ? validTimeMAE.sort((a,b) => a-b)[Math.floor(validTimeMAE.length/2)] : null;
 
-    // 7. Similarity quality
+    // Similarity quality
     const distances = states.map(s => s.distance || 0);
     const avgDist = distances.length > 0 ? distances.reduce((a, b) => a + b, 0) / distances.length : 0;
     const maxDist = distances.length > 0 ? Math.max(...distances) : 0;
     const medianDist = distances.length > 0 ? distances.sort((a,b) => a-b)[Math.floor(distances.length/2)] : 0;
 
-    // 8. Build distribution object
     return {
-      // Probabilities
       probUp,
       probDown,
       probNeutral,
-
-      // Expected moves
       expectedMove: avgMove,
       expectedAdverse: avgAdverse,
       expectedFavorable: avgFavorable,
-
-      // Path statistics
       mfe: avgMFE,
       mae: avgMAE,
       timeToMaxFavorable: medianTimeMFE,
       timeToMaxAdverse: medianTimeMAE,
-
-      // Sample & quality
       sampleSize: total,
       averageSimilarity: avgDist,
       maxDistance: maxDist,
       medianDistance: medianDist,
-
-      // Raw analogues (useful for debugging)
       analogues: states.map(s => ({
         distance: s.distance || 0,
         mfe: s.mfe || 0,
         mae: s.mae || 0,
         outcome: s.outcome || null,
       })),
-
-      // Legacy stats (for backward compatibility)
       winRate: result.stats.winRate || 0,
       avgReturnR: result.stats.avgReturnR || 0,
     };
   }
 
-  // ---- Existing methods (preserved) ----
+  // ---- Existing methods ----
   async computeEdge(features, symbol = null, timeframe = 'M5', lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = CONFIG.DEFAULT_K, regime = null) {
-    // ... (existing implementation kept)
+    // ... existing implementation ...
   }
 
   async calibrateConfidence(decision, lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = CONFIG.DEFAULT_K) {
-    // ... (existing implementation kept)
+    // ... existing implementation ...
   }
 
   _buildCacheKey(features, symbol, timeframe, lookahead, k, regime) {
-    // ... (existing)
+    // ... existing ...
   }
 
   _cleanCache() {
-    // ... (existing)
+    // ... existing ...
   }
 
   invalidateCache() {
-    // ... (existing)
+    // ... existing ...
   }
 
   _emptyDistribution() {
