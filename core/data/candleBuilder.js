@@ -1,11 +1,18 @@
 // core/data/candleBuilder.js
 // Aggregates ticks into OHLCV candles for multiple timeframes.
 // Emits 'candleClosed' when a candle completes.
-// Added debug logs to trace flow.
+// SYMBOL FIX: Store candles with canonical symbols (remove 'frx' prefix, separators).
 
 const EventEmitter = require('events');
 const priceBuffer = require('./priceBuffer');
 const logger = require('../../infrastructure/logger') || console;
+
+// ---- Symbol Normalization ----
+function normalizeSymbol(symbol) {
+  if (!symbol) return '';
+  // Remove 'frx' prefix (case-insensitive), remove separators, uppercase
+  return symbol.replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
+}
 
 const TIMEFRAMES = {
   M1: 60 * 1000,
@@ -25,18 +32,17 @@ class CandleBuilder extends EventEmitter {
     // Cache to avoid duplicate emits
     this._closed = new Map();
 
-    // ---- DEBUG: log initialization ----
     console.log('🔧 CandleBuilder: constructor – listening to priceBuffer ticks');
-
     priceBuffer.on('tick', (tick) => this._onTick(tick));
     setInterval(() => this._closeExpired(), 1000);
   }
 
   _onTick(tick) {
-    const { symbol, mid, time } = tick;
+    // Normalize symbol to canonical format (EURUSD, GBPUSD, etc.)
+    const symbol = normalizeSymbol(tick.symbol);
+    const { mid, time } = tick;
 
-    // ---- DEBUG: log every tick received ----
-    console.log(`📥 CandleBuilder: tick received for ${symbol} at ${new Date(time).toISOString()}`);
+    console.log(`📥 CandleBuilder: tick received for ${tick.symbol} -> normalized: ${symbol} at ${new Date(time).toISOString()}`);
 
     for (const [tfName, tfMs] of Object.entries(TIMEFRAMES)) {
       this._updateCandle(symbol, tfName, tfMs, mid, time);
@@ -78,7 +84,6 @@ class CandleBuilder extends EventEmitter {
     if (this._closed.has(key)) return;
     this._closed.set(key, true);
 
-    // ---- DEBUG: log candle close event ----
     console.log(`🔥 CandleBuilder: closing candle ${symbol} ${tfName} startTime=${new Date(candle.startTime).toISOString()}`);
 
     const closedCandle = {
