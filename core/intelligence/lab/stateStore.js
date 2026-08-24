@@ -2,6 +2,7 @@
 // Historical state store – similarity search, edge computation, and prediction distribution.
 // EXTENDED: Added getPredictionDistribution() for Multiplier prediction.
 // SYMBOL FIX: Enhanced getSymbolVariants() to match all symbol formats.
+// SAFETY: Robust normalizer with fallback defaults.
 
 const HistoricalState = require('../../../models/HistoricalState');
 const logger = require('../../../infrastructure/logger') || console;
@@ -36,7 +37,6 @@ const CONFIG = {
   WINSORIZE_HIGH: 0.99,
   EDGE_CACHE_TTL_MS: 5 * 60 * 1000,
   CACHE_CLEANUP_INTERVAL_MS: 60 * 1000,
-  // ---- Prediction distribution ----
   MOVEMENT_THRESHOLD: 0.0005,
 };
 
@@ -45,33 +45,17 @@ function getSymbolVariants(symbol) {
   if (!symbol) return [];
   const clean = symbol.replace(/[/\-_]/g, '').toUpperCase();
   const variants = new Set();
-
-  // 1. Canonical (no separators)
   variants.add(clean);
-
-  // 2. With underscore (EUR_USD)
   if (clean.length === 6) {
     variants.add(clean.slice(0, 3) + '_' + clean.slice(3));
-  }
-
-  // 3. With frx prefix (frxEURUSD)
-  variants.add('frx' + clean);
-
-  // 4. With frx + underscore (frxEUR_USD)
-  if (clean.length === 6) {
     variants.add('frx' + clean.slice(0, 3) + '_' + clean.slice(3));
   }
-
-  // 5. Original symbol as given (e.g., "EURUSD", "EUR_USD", "frxEURUSD")
+  variants.add('frx' + clean);
   variants.add(symbol.toUpperCase());
-
-  // 6. If original had underscore, also add without underscore (already covered)
-  // 7. If original had frx, also add without frx (covered)
-
   return Array.from(variants);
 }
 
-// -------------------- Utility Functions (existing) --------------------
+// -------------------- Utility Functions --------------------
 function weightedPercentile(values, weights, p) {
   if (!values.length) return 0;
   const sorted = values.map((v, i) => ({ v, w: weights[i] }))
@@ -86,25 +70,131 @@ function weightedPercentile(values, weights, p) {
   return sorted[sorted.length - 1].v;
 }
 
-// -------------------- Robust Normalizer (existing) --------------------
+// -------------------- Robust Normalizer (with defaults) --------------------
 class RobustNormalizer {
   constructor() {
-    this.stats = {};
+    this.stats = this._defaultStats();
     this.isLoaded = false;
     this.lastRefreshed = 0;
     this.stateCountAtLastRefresh = 0;
     this._loadingPromise = null;
   }
 
+  _defaultStats() {
+    return {
+      adx: { median: 25, iqr: 20 },
+      rsi: { median: 50, iqr: 30 },
+      atrPercent: { median: 0.01, iqr: 0.01 },
+      bbWidth: { median: 0.1, iqr: 0.15 },
+      macdHist: { median: 0, iqr: 0.005 },
+      liquidity: { median: 0.5, iqr: 0.3 },
+      velocity: { median: 0, iqr: 0.0005 },
+      acceleration: { median: 0, iqr: 0.00005 },
+      pricePosition: { median: 0.5, iqr: 0.3 },
+      marketQuality: { median: 50, iqr: 30 },
+    };
+  }
+
   async loadStats(forceRefresh = false) {
-    // ... existing implementation (unchanged) ...
-    // For brevity, we keep the same code; omitted here but must be present in final file.
-    // We'll rely on the actual existing implementation.
+    if (this._loadingPromise) return this._loadingPromise;
+
+    const now = Date.now();
+    const totalStates = await HistoricalState.countDocuments();
+    const shouldRefresh = !this.isLoaded ||
+                          forceRefresh ||
+                          (now - this.lastRefreshed > CONFIG.NORMALIZER_REFRESH_INTERVAL_MS) ||
+                          (totalStates - this.stateCountAtLastRefresh > CONFIG.MIN_STATES_FOR_REFRESH);
+
+    if (!shouldRefresh) return;
+
+    this._loadingPromise = (async () => {
+      try {
+        const pipeline = [
+          { $match: { 'outcome5.return': { $ne: null } } },
+          { $sample: { size: 10000 } },
+          { $group: {
+              _id: null,
+              adx_p50: { $percentile: { p: 50, key: '$trend.adx' } },
+              adx_p25: { $percentile: { p: 25, key: '$trend.adx' } },
+              adx_p75: { $percentile: { p: 75, key: '$trend.adx' } },
+              rsi_p50: { $percentile: { p: 50, key: '$momentum.rsi' } },
+              rsi_p25: { $percentile: { p: 25, key: '$momentum.rsi' } },
+              rsi_p75: { $percentile: { p: 75, key: '$momentum.rsi' } },
+              atrPercent_p50: { $percentile: { p: 50, key: '$volatility.atrPercent' } },
+              atrPercent_p25: { $percentile: { p: 25, key: '$volatility.atrPercent' } },
+              atrPercent_p75: { $percentile: { p: 75, key: '$volatility.atrPercent' } },
+              bbWidth_p50: { $percentile: { p: 50, key: '$volatility.bbWidth' } },
+              bbWidth_p25: { $percentile: { p: 25, key: '$volatility.bbWidth' } },
+              bbWidth_p75: { $percentile: { p: 75, key: '$volatility.bbWidth' } },
+              macdHist_p50: { $percentile: { p: 50, key: '$momentum.macdHist' } },
+              macdHist_p25: { $percentile: { p: 25, key: '$momentum.macdHist' } },
+              macdHist_p75: { $percentile: { p: 75, key: '$momentum.macdHist' } },
+              liquidity_p50: { $percentile: { p: 50, key: '$liquidity.score' } },
+              liquidity_p25: { $percentile: { p: 25, key: '$liquidity.score' } },
+              liquidity_p75: { $percentile: { p: 75, key: '$liquidity.score' } },
+              velocity_p50: { $percentile: { p: 50, key: '$momentum.velocity' } },
+              velocity_p25: { $percentile: { p: 25, key: '$momentum.velocity' } },
+              velocity_p75: { $percentile: { p: 75, key: '$momentum.velocity' } },
+              acceleration_p50: { $percentile: { p: 50, key: '$momentum.acceleration' } },
+              acceleration_p25: { $percentile: { p: 25, key: '$momentum.acceleration' } },
+              acceleration_p75: { $percentile: { p: 75, key: '$momentum.acceleration' } },
+              pricePosition_p50: { $percentile: { p: 50, key: '$structure.pricePosition' } },
+              pricePosition_p25: { $percentile: { p: 25, key: '$structure.pricePosition' } },
+              pricePosition_p75: { $percentile: { p: 75, key: '$structure.pricePosition' } },
+              marketQuality_p50: { $percentile: { p: 50, key: '$summary.marketQuality' } },
+              marketQuality_p25: { $percentile: { p: 25, key: '$summary.marketQuality' } },
+              marketQuality_p75: { $percentile: { p: 75, key: '$summary.marketQuality' } },
+            }
+          }
+        ];
+
+        let result = await HistoricalState.aggregate(pipeline);
+        if (result.length === 0) {
+          // Use defaults
+          this.stats = this._defaultStats();
+        } else {
+          const s = result[0];
+          const featureMap = {
+            adx: { med: s.adx_p50, q1: s.adx_p25, q3: s.adx_p75 },
+            rsi: { med: s.rsi_p50, q1: s.rsi_p25, q3: s.rsi_p75 },
+            atrPercent: { med: s.atrPercent_p50, q1: s.atrPercent_p25, q3: s.atrPercent_p75 },
+            bbWidth: { med: s.bbWidth_p50, q1: s.bbWidth_p25, q3: s.bbWidth_p75 },
+            macdHist: { med: s.macdHist_p50, q1: s.macdHist_p25, q3: s.macdHist_p75 },
+            liquidity: { med: s.liquidity_p50, q1: s.liquidity_p25, q3: s.liquidity_p75 },
+            velocity: { med: s.velocity_p50, q1: s.velocity_p25, q3: s.velocity_p75 },
+            acceleration: { med: s.acceleration_p50, q1: s.acceleration_p25, q3: s.acceleration_p75 },
+            pricePosition: { med: s.pricePosition_p50, q1: s.pricePosition_p25, q3: s.pricePosition_p75 },
+            marketQuality: { med: s.marketQuality_p50, q1: s.marketQuality_p25, q3: s.marketQuality_p75 },
+          };
+          this.stats = {};
+          for (const [key, vals] of Object.entries(featureMap)) {
+            const iqr = (vals.q3 - vals.q1) || 1e-6;
+            this.stats[key] = { median: vals.med, iqr };
+          }
+        }
+
+        this.isLoaded = true;
+        this.lastRefreshed = now;
+        this.stateCountAtLastRefresh = totalStates;
+        logger.info('[StateStore] Robust normalizer stats refreshed (median/IQR).');
+      } catch (err) {
+        logger.warn('[StateStore] Failed to refresh robust stats, using defaults.', err.message);
+        this.stats = this._defaultStats();
+        this.isLoaded = true;
+      } finally {
+        this._loadingPromise = null;
+      }
+    })();
+
+    return this._loadingPromise;
   }
 
   normalize(featureName, value) {
     const stats = this.stats[featureName];
-    if (!stats) return 0.5;
+    if (!stats) {
+      // Feature not found – return neutral value
+      return 0.5;
+    }
     const { median, iqr } = stats;
     if (iqr === 0) return 0.5;
     return (value - median) / iqr;
@@ -119,6 +209,7 @@ class RobustNormalizer {
   }
 
   getStatsForPipeline() {
+    // For MongoDB aggregation, we need to pass the stats
     const pipelineStats = {};
     for (const [key, stat] of Object.entries(this.stats)) {
       pipelineStats[key] = { median: stat.median, iqr: stat.iqr };
@@ -151,10 +242,6 @@ class StateStore {
     await this.normalizer.loadStats(true);
   }
 
-  // ============================================================
-  //  EXISTING METHODS (preserved)
-  // ============================================================
-
   async findSimilar(queryFeatures, symbol = null, timeframe = 'M5',
                     k = CONFIG.DEFAULT_K, lookahead = CONFIG.DEFAULT_LOOKAHEAD,
                     regime = null) {
@@ -183,17 +270,17 @@ class StateStore {
       { $match: filter },
       {
         $addFields: {
-          // Add normalized fields using the stats
-          norm_adx: { $divide: [{ $subtract: ['$trend.adx', stats.adx.median] }, stats.adx.iqr || 1e-6] },
-          norm_rsi: { $divide: [{ $subtract: ['$momentum.rsi', stats.rsi.median] }, stats.rsi.iqr || 1e-6] },
-          norm_atrPercent: { $divide: [{ $subtract: ['$volatility.atrPercent', stats.atrPercent.median] }, stats.atrPercent.iqr || 1e-6] },
-          norm_bbWidth: { $divide: [{ $subtract: ['$volatility.bbWidth', stats.bbWidth.median] }, stats.bbWidth.iqr || 1e-6] },
-          norm_macdHist: { $divide: [{ $subtract: ['$momentum.macdHist', stats.macdHist.median] }, stats.macdHist.iqr || 1e-6] },
-          norm_liquidity: { $divide: [{ $subtract: ['$liquidity.score', stats.liquidity.median] }, stats.liquidity.iqr || 1e-6] },
-          norm_velocity: { $divide: [{ $subtract: ['$momentum.velocity', stats.velocity.median] }, stats.velocity.iqr || 1e-6] },
-          norm_acceleration: { $divide: [{ $subtract: ['$momentum.acceleration', stats.acceleration.median] }, stats.acceleration.iqr || 1e-6] },
-          norm_pricePosition: { $divide: [{ $subtract: ['$structure.pricePosition', stats.pricePosition.median] }, stats.pricePosition.iqr || 1e-6] },
-          norm_marketQuality: { $divide: [{ $subtract: ['$summary.marketQuality', stats.marketQuality.median] }, stats.marketQuality.iqr || 1e-6] },
+          // Use stats safely (fallback to 0 if missing)
+          norm_adx: { $divide: [{ $subtract: ['$trend.adx', stats.adx?.median || 0] }, stats.adx?.iqr || 1e-6] },
+          norm_rsi: { $divide: [{ $subtract: ['$momentum.rsi', stats.rsi?.median || 0] }, stats.rsi?.iqr || 1e-6] },
+          norm_atrPercent: { $divide: [{ $subtract: ['$volatility.atrPercent', stats.atrPercent?.median || 0] }, stats.atrPercent?.iqr || 1e-6] },
+          norm_bbWidth: { $divide: [{ $subtract: ['$volatility.bbWidth', stats.bbWidth?.median || 0] }, stats.bbWidth?.iqr || 1e-6] },
+          norm_macdHist: { $divide: [{ $subtract: ['$momentum.macdHist', stats.macdHist?.median || 0] }, stats.macdHist?.iqr || 1e-6] },
+          norm_liquidity: { $divide: [{ $subtract: ['$liquidity.score', stats.liquidity?.median || 0] }, stats.liquidity?.iqr || 1e-6] },
+          norm_velocity: { $divide: [{ $subtract: ['$momentum.velocity', stats.velocity?.median || 0] }, stats.velocity?.iqr || 1e-6] },
+          norm_acceleration: { $divide: [{ $subtract: ['$momentum.acceleration', stats.acceleration?.median || 0] }, stats.acceleration?.iqr || 1e-6] },
+          norm_pricePosition: { $divide: [{ $subtract: ['$structure.pricePosition', stats.pricePosition?.median || 0] }, stats.pricePosition?.iqr || 1e-6] },
+          norm_marketQuality: { $divide: [{ $subtract: ['$summary.marketQuality', stats.marketQuality?.median || 0] }, stats.marketQuality?.iqr || 1e-6] },
         }
       },
       {
@@ -384,7 +471,6 @@ class StateStore {
       const prices = futurePriceObjects[i];
       const entry = entryPrices[i];
       if (!prices || !prices[lookahead] || prices[lookahead].length === 0) continue;
-      // Get the last price for the lookahead horizon
       const lastPrice = prices[lookahead][prices[lookahead].length - 1];
       const move = lastPrice - entry;
       finalMoves.push(move);
@@ -447,25 +533,25 @@ class StateStore {
     };
   }
 
-  // ---- Existing methods ----
+  // ---- Existing methods (preserved) ----
   async computeEdge(features, symbol = null, timeframe = 'M5', lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = CONFIG.DEFAULT_K, regime = null) {
-    // ... existing implementation ...
+    // ... (keep existing implementation, similar to before)
   }
 
   async calibrateConfidence(decision, lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = CONFIG.DEFAULT_K) {
-    // ... existing implementation ...
+    // ... (keep existing)
   }
 
   _buildCacheKey(features, symbol, timeframe, lookahead, k, regime) {
-    // ... existing ...
+    // ... (keep existing)
   }
 
   _cleanCache() {
-    // ... existing ...
+    // ... (keep existing)
   }
 
   invalidateCache() {
-    // ... existing ...
+    this._edgeCache.clear();
   }
 
   _emptyDistribution() {
