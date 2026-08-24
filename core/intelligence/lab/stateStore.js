@@ -3,6 +3,7 @@
 // EXTENDED: Added getPredictionDistribution() for Multiplier prediction.
 // SYMBOL FIX: Enhanced getSymbolVariants() to match all symbol formats.
 // SAFETY: Robust normalizer with fallback defaults.
+// LOGGING: Detailed logs to diagnose sampleSize=0.
 
 const HistoricalState = require('../../../models/HistoricalState');
 const logger = require('../../../infrastructure/logger') || console;
@@ -16,7 +17,7 @@ const CONFIG = {
   MAX_DISTANCE: 0.30,
   DISTANCE_STEP: 0.05,
   MAX_DISTANCE_LIMIT: 0.60,
-  TIME_WINDOW_DAYS: 90,
+  TIME_WINDOW_DAYS: 365, // <-- increased to 365 (or set to 0 to disable)
   FEATURE_WEIGHTS: {
     adx: 2.5,
     rsi: 0.8,
@@ -150,7 +151,6 @@ class RobustNormalizer {
 
         let result = await HistoricalState.aggregate(pipeline);
         if (result.length === 0) {
-          // Use defaults
           this.stats = this._defaultStats();
         } else {
           const s = result[0];
@@ -191,10 +191,7 @@ class RobustNormalizer {
 
   normalize(featureName, value) {
     const stats = this.stats[featureName];
-    if (!stats) {
-      // Feature not found – return neutral value
-      return 0.5;
-    }
+    if (!stats) return 0.5;
     const { median, iqr } = stats;
     if (iqr === 0) return 0.5;
     return (value - median) / iqr;
@@ -209,7 +206,6 @@ class RobustNormalizer {
   }
 
   getStatsForPipeline() {
-    // For MongoDB aggregation, we need to pass the stats
     const pipelineStats = {};
     for (const [key, stat] of Object.entries(this.stats)) {
       pipelineStats[key] = { median: stat.median, iqr: stat.iqr };
@@ -247,6 +243,8 @@ class StateStore {
                     regime = null) {
     await this.init();
 
+    console.log(`[StateStore] findSimilar called for ${symbol || 'any'} ${timeframe}, lookahead=${lookahead}, regime=${regime || 'any'}`);
+
     const normalizedQuery = this.normalizer.normalizeVector(queryFeatures);
     const featureFields = Object.keys(normalizedQuery);
     const weights = CONFIG.FEATURE_WEIGHTS;
@@ -255,8 +253,12 @@ class StateStore {
     const filter = {
       timeframe: timeframe,
       [`outcome${lookahead}.return`]: { $ne: null },
-      timestamp: { $gte: new Date(Date.now() - CONFIG.TIME_WINDOW_DAYS * 24 * 60 * 60 * 1000) }
     };
+
+    // Apply time window only if > 0
+    if (CONFIG.TIME_WINDOW_DAYS > 0) {
+      filter.timestamp = { $gte: new Date(Date.now() - CONFIG.TIME_WINDOW_DAYS * 24 * 60 * 60 * 1000) };
+    }
 
     if (symbol) {
       const variants = getSymbolVariants(symbol);
@@ -266,11 +268,12 @@ class StateStore {
 
     if (regime) filter['regime.code'] = regime;
 
+    console.log(`[StateStore] Filter:`, JSON.stringify(filter, null, 2));
+
     const pipeline = [
       { $match: filter },
       {
         $addFields: {
-          // Use stats safely (fallback to 0 if missing)
           norm_adx: { $divide: [{ $subtract: ['$trend.adx', stats.adx?.median || 0] }, stats.adx?.iqr || 1e-6] },
           norm_rsi: { $divide: [{ $subtract: ['$momentum.rsi', stats.rsi?.median || 0] }, stats.rsi?.iqr || 1e-6] },
           norm_atrPercent: { $divide: [{ $subtract: ['$volatility.atrPercent', stats.atrPercent?.median || 0] }, stats.atrPercent?.iqr || 1e-6] },
@@ -323,11 +326,13 @@ class StateStore {
     ];
 
     const candidates = await HistoricalState.aggregate(pipeline);
+    console.log(`[StateStore] Aggregation returned ${candidates.length} candidates.`);
+
     if (candidates.length === 0) {
       return { states: [], stats: this._emptyStats() };
     }
 
-    // ---- Post-processing (existing) ----
+    // ---- Post-processing ----
     const now = Date.now();
     const halfLifeMs = CONFIG.RECENCY_HALF_LIFE_DAYS * 24 * 60 * 60 * 1000;
     const sigma2 = CONFIG.GAUSSIAN_SIGMA ** 2;
@@ -342,6 +347,7 @@ class StateStore {
     }
 
     if (selected.length < CONFIG.MIN_SAMPLES_FOR_EDGE) {
+      console.log(`[StateStore] Selected ${selected.length} after distance expansion (maxDist=${maxDist})`);
       return { states: [], stats: this._emptyStats() };
     }
 
@@ -454,7 +460,6 @@ class StateStore {
 
     const states = result.states;
 
-    // Extract path data from states
     const entryPrices = states.map(s => s.price?.current || s.outcome?.startPrice || 0);
     const futurePriceObjects = states.map(s => s.futurePrices || {});
     const mfeValues = states.map(s => s.mfe || 0);
@@ -462,7 +467,6 @@ class StateStore {
     const timeToMFE = states.map(s => s.timeToMaxFavorable || null);
     const timeToMAE = states.map(s => s.timeToMaxAdverse || null);
 
-    // Compute probabilities from futurePrices
     const threshold = CONFIG.MOVEMENT_THRESHOLD;
     let upCount = 0, downCount = 0, neutralCount = 0;
     const finalMoves = [];
@@ -484,24 +488,20 @@ class StateStore {
     const probDown = total > 0 ? downCount / total : 0;
     const probNeutral = total > 0 ? neutralCount / total : 0;
 
-    // Expected moves
     const avgMove = finalMoves.length > 0 ? finalMoves.reduce((a, b) => a + b, 0) / finalMoves.length : 0;
     const adverseMoves = finalMoves.filter(m => m < 0);
     const avgAdverse = adverseMoves.length > 0 ? adverseMoves.reduce((a, b) => a + b, 0) / adverseMoves.length : 0;
     const favorableMoves = finalMoves.filter(m => m > 0);
     const avgFavorable = favorableMoves.length > 0 ? favorableMoves.reduce((a, b) => a + b, 0) / favorableMoves.length : 0;
 
-    // MFE/MAE statistics
     const avgMFE = mfeValues.length > 0 ? mfeValues.reduce((a, b) => a + b, 0) / mfeValues.length : 0;
     const avgMAE = maeValues.length > 0 ? maeValues.reduce((a, b) => a + b, 0) / maeValues.length : 0;
 
-    // Time to extremes (median)
     const validTimeMFE = timeToMFE.filter(t => t !== null);
     const medianTimeMFE = validTimeMFE.length > 0 ? validTimeMFE.sort((a,b) => a-b)[Math.floor(validTimeMFE.length/2)] : null;
     const validTimeMAE = timeToMAE.filter(t => t !== null);
     const medianTimeMAE = validTimeMAE.length > 0 ? validTimeMAE.sort((a,b) => a-b)[Math.floor(validTimeMAE.length/2)] : null;
 
-    // Similarity quality
     const distances = states.map(s => s.distance || 0);
     const avgDist = distances.length > 0 ? distances.reduce((a, b) => a + b, 0) / distances.length : 0;
     const maxDist = distances.length > 0 ? Math.max(...distances) : 0;
@@ -535,7 +535,7 @@ class StateStore {
 
   // ---- Existing methods (preserved) ----
   async computeEdge(features, symbol = null, timeframe = 'M5', lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = CONFIG.DEFAULT_K, regime = null) {
-    // ... (keep existing implementation, similar to before)
+    // ... (keep existing)
   }
 
   async calibrateConfidence(decision, lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = CONFIG.DEFAULT_K) {
