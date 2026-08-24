@@ -2,7 +2,7 @@
 // Deep Market State – incremental cache, correct mapping for engine indicators.
 // Now publishes to DataOrchestrator for persistence and research.
 // Fully compatible with stateStore.js – all required fields are computed.
-// Handles symbol variants (with/without underscores) via internal normalization.
+// Handles symbol variants (with/without underscores, with/without frx prefix) via internal normalization.
 
 const EventEmitter = require('events');
 const candleStore = require('../../data/candleStore');
@@ -74,10 +74,10 @@ class DeepMarketState extends EventEmitter {
     logger.info('[DeepMarketState] Initialized with DataOrchestrator.');
   }
 
-  // ---- Normalize symbol: remove separators and uppercase ----
+  // ---- Normalize symbol: remove separators and prefix 'frx' ----
   _normalizeSymbol(symbol) {
     if (!symbol) return '';
-    return symbol.replace(/[/\-_]/g, '').toUpperCase();
+    return symbol.replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
   }
 
   _addCandleToBuffer(candle) {
@@ -139,17 +139,25 @@ class DeepMarketState extends EventEmitter {
     return `${normalizedSymbol}:${timeframe}`;
   }
 
-  // Generate symbol variants (similar to stateStore) for fallback loading
+  // ---- Generate symbol variants including frx prefix and underscore variants ----
   _getSymbolVariants(symbol) {
     if (!symbol) return [];
     const clean = symbol.replace(/[/\-_]/g, '').toUpperCase();
     const variants = new Set();
+    // 1. Canonical (no separators)
     variants.add(clean);
-    if (clean.length > 3) {
+    // 2. With underscore
+    if (clean.length === 6) {
       variants.add(clean.slice(0, 3) + '_' + clean.slice(3));
-      variants.add(clean.slice(0, 3) + '-' + clean.slice(3));
-      variants.add(clean.slice(0, 3) + '/' + clean.slice(3));
+      // 3. With underscore and frx prefix
+      variants.add('frx' + clean.slice(0, 3) + '_' + clean.slice(3));
     }
+    // 4. With frx prefix (canonical)
+    variants.add('frx' + clean);
+    // 5. Original symbol as given (may already be frx or with separators)
+    variants.add(symbol.toUpperCase());
+    // 6. If the original had separators, add without them (already covered)
+    // 7. If the original had 'frx', add without (already covered)
     return Array.from(variants);
   }
 
@@ -198,45 +206,11 @@ class DeepMarketState extends EventEmitter {
       // ---- Compute indicators with safe fallbacks ----
       let adxData = null, atrArray = null, rsi = null, macd = null, bb = null, sr = null;
 
-      // ADX
-      try {
-        adxData = ADX(candlesForIndicators, this.indicators.adxPeriod);
-      } catch (err) {
-        logger.error(`[DeepMarketState] ADX error for ${symbol}:${timeframe}`, err);
-        adxData = null;
-      }
-
-      // ATR
-      try {
-        atrArray = ATR(candlesForIndicators, this.indicators.atrPeriod);
-      } catch (err) {
-        logger.error(`[DeepMarketState] ATR error for ${symbol}:${timeframe}`, err);
-        atrArray = null;
-      }
-
-      // RSI
-      try {
-        rsi = RSI(closes, this.indicators.rsiPeriod);
-      } catch (err) {
-        logger.error(`[DeepMarketState] RSI error for ${symbol}:${timeframe}`, err);
-        rsi = null;
-      }
-
-      // MACD
-      try {
-        macd = MACD(closes, this.indicators.macdFast, this.indicators.macdSlow, this.indicators.macdSignal);
-      } catch (err) {
-        logger.error(`[DeepMarketState] MACD error for ${symbol}:${timeframe}`, err);
-        macd = null;
-      }
-
-      // Bollinger Bands
-      try {
-        bb = BollingerBands(closes, this.indicators.bbPeriod, this.indicators.bbStd);
-      } catch (err) {
-        logger.error(`[DeepMarketState] BollingerBands error for ${symbol}:${timeframe}`, err);
-        bb = null;
-      }
+      try { adxData = ADX(candlesForIndicators, this.indicators.adxPeriod); } catch (err) { logger.error(`[DeepMarketState] ADX error for ${symbol}:${timeframe}`, err); adxData = null; }
+      try { atrArray = ATR(candlesForIndicators, this.indicators.atrPeriod); } catch (err) { logger.error(`[DeepMarketState] ATR error for ${symbol}:${timeframe}`, err); atrArray = null; }
+      try { rsi = RSI(closes, this.indicators.rsiPeriod); } catch (err) { logger.error(`[DeepMarketState] RSI error for ${symbol}:${timeframe}`, err); rsi = null; }
+      try { macd = MACD(closes, this.indicators.macdFast, this.indicators.macdSlow, this.indicators.macdSignal); } catch (err) { logger.error(`[DeepMarketState] MACD error for ${symbol}:${timeframe}`, err); macd = null; }
+      try { bb = BollingerBands(closes, this.indicators.bbPeriod, this.indicators.bbStd); } catch (err) { logger.error(`[DeepMarketState] BollingerBands error for ${symbol}:${timeframe}`, err); bb = null; }
 
       // Support/Resistance
       try {
@@ -250,12 +224,8 @@ class DeepMarketState extends EventEmitter {
         console.warn(`⚠️ DeepMarketState: Support/Resistance error for ${symbol}:${timeframe}, using previous values`, srErr.message);
         const previous = this._lastState.get(symbol);
         sr = {
-          support: previous?.structure?.support
-            ? { price: previous.structure.support }
-            : null,
-          resistance: previous?.structure?.resistance
-            ? { price: previous.structure.resistance }
-            : null,
+          support: previous?.structure?.support ? { price: previous.structure.support } : null,
+          resistance: previous?.structure?.resistance ? { price: previous.structure.resistance } : null,
         };
       }
 
@@ -271,10 +241,8 @@ class DeepMarketState extends EventEmitter {
 
       const currentSession = session.getSession();
 
-      // ---- FIX #2: Safe trend lookback ----
       const trendLookback = Math.min(50, closes.length - 1);
 
-      // ---- FIX #1: Correct open price ----
       const state = {
         symbol,
         timeframe,
@@ -288,9 +256,7 @@ class DeepMarketState extends EventEmitter {
         },
         trend: {
           strength: adxData ? adxData.adx : 0,
-          direction: closes[lastIdx] > closes[lastIdx - trendLookback]
-            ? 'bullish'
-            : 'bearish',
+          direction: closes[lastIdx] > closes[lastIdx - trendLookback] ? 'bullish' : 'bearish',
           adx: adxData ? adxData.adx : 0,
           plusDI: adxData ? adxData.plusDI : 0,
           minusDI: adxData ? adxData.minusDI : 0,
@@ -333,7 +299,6 @@ class DeepMarketState extends EventEmitter {
         confidence: 0,
         reason: '',
         status: 'confirmed',
-        // ---- Ensure regime is always valid ----
         regime: {
           code: 'NEUTRAL',
           name: 'Neutral / Mixed',
@@ -360,7 +325,6 @@ class DeepMarketState extends EventEmitter {
         state.momentum.velocity = awareness.velocity || 0;
         state.momentum.acceleration = awareness.acceleration || 0;
         state.summary.liquidityScore = awareness.liquidity || 0.5;
-        // Market quality
         const liq = awareness.liquidity || 0.5;
         const spread = awareness.spread || 0.0002;
         const quality = (liq * 100) - (spread * 1000000);
@@ -368,11 +332,9 @@ class DeepMarketState extends EventEmitter {
         state.summary.noiseLevel = state.summary.marketQuality > 70 ? 'low' : (state.summary.marketQuality > 40 ? 'medium' : 'high');
       }
 
-      // ---- Calculate confidence and reason ----
       state.confidence = this._calculateConfidence(state);
       state.reason = this._buildReason(state);
 
-      // ---- Ensure regime.code is valid before publishing ----
       if (!state.regime || !state.regime.code || !VALID_REGIME_CODES.includes(state.regime.code)) {
         state.regime = {
           code: 'NEUTRAL',
@@ -383,15 +345,12 @@ class DeepMarketState extends EventEmitter {
       }
 
       // ---- PUBLISH TO DATAORCHESTRATOR ----
-      // 1. Recoverable state (marketState) – for current snapshot
       dataOrchestrator.publish('marketState', {
         symbol,
         ...state,
         lastUpdated: new Date(),
       }, { source: 'deepMarketState' });
 
-      // 2. Research state (historicalState) – append‑only
-      // This matches the schema expected by stateStore.js
       dataOrchestrator.publish('historicalState', {
         symbol,
         timeframe,
@@ -407,14 +366,14 @@ class DeepMarketState extends EventEmitter {
         },
         structure: state.structure,
         session: state.session,
-        regime: state.regime,                       // now guaranteed valid
+        regime: state.regime,
         awareness: state.awareness,
         summary: state.summary,
         confidence: state.confidence,
         reason: state.reason,
-        source: 'live',                             // explicitly set (not overridden)
+        source: 'live',
         version: '2.0',
-      }, {}); // empty metadata to avoid overriding source
+      }, {});
 
       this._lastState.set(symbol, state);
 
@@ -428,29 +387,13 @@ class DeepMarketState extends EventEmitter {
   }
 
   // ---- Helper methods (unchanged) ----
-  updateIncremental(tick) {
-    // (keep original implementation if any)
-  }
+  updateIncremental(tick) { /* ... */ }
 
-  _volatilityRegime(atr, candles) {
-    // (keep original implementation)
-  }
-
-  _suggestRegime(adxData, rsi, bbWidth, atr) {
-    // (keep original implementation)
-  }
-
-  _trendConfidence(adxData, rsi, macdHist) {
-    // (keep original implementation)
-  }
-
-  _calculateConfidence(state) {
-    // (keep original implementation)
-  }
-
-  _buildReason(state) {
-    // (keep original implementation)
-  }
+  _volatilityRegime(atr, candles) { /* ... */ }
+  _suggestRegime(adxData, rsi, bbWidth, atr) { /* ... */ }
+  _trendConfidence(adxData, rsi, macdHist) { /* ... */ }
+  _calculateConfidence(state) { /* ... */ }
+  _buildReason(state) { /* ... */ }
 
   getLastState(symbol) {
     return this._lastState.get(symbol) || null;
