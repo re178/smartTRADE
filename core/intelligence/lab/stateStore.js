@@ -3,7 +3,7 @@
 // EXTENDED: Added getPredictionDistribution() for Multiplier prediction.
 // SYMBOL FIX: Enhanced getSymbolVariants() to match all symbol formats.
 // SAFETY: Robust normalizer with fallback defaults.
-// LOGGING: Detailed logs to diagnose sampleSize=0.
+// LOGGING: Detailed logs, increased distance thresholds to find analogues.
 
 const HistoricalState = require('../../../models/HistoricalState');
 const logger = require('../../../infrastructure/logger') || console;
@@ -14,10 +14,10 @@ const CONFIG = {
   DEFAULT_LOOKAHEAD: 5,
   DEFAULT_K: 500,
   MIN_SAMPLES_FOR_EDGE: 20,
-  MAX_DISTANCE: 0.30,
-  DISTANCE_STEP: 0.05,
-  MAX_DISTANCE_LIMIT: 0.60,
-  TIME_WINDOW_DAYS: 365, // <-- increased to 365 (or set to 0 to disable)
+  MAX_DISTANCE: 1.0,          // Increased from 0.30
+  DISTANCE_STEP: 0.1,         // Increased from 0.05
+  MAX_DISTANCE_LIMIT: 2.0,    // Increased from 0.60
+  TIME_WINDOW_DAYS: 365,
   FEATURE_WEIGHTS: {
     adx: 2.5,
     rsi: 0.8,
@@ -71,7 +71,7 @@ function weightedPercentile(values, weights, p) {
   return sorted[sorted.length - 1].v;
 }
 
-// -------------------- Robust Normalizer (with defaults) --------------------
+// -------------------- Robust Normalizer --------------------
 class RobustNormalizer {
   constructor() {
     this.stats = this._defaultStats();
@@ -255,7 +255,6 @@ class StateStore {
       [`outcome${lookahead}.return`]: { $ne: null },
     };
 
-    // Apply time window only if > 0
     if (CONFIG.TIME_WINDOW_DAYS > 0) {
       filter.timestamp = { $gte: new Date(Date.now() - CONFIG.TIME_WINDOW_DAYS * 24 * 60 * 60 * 1000) };
     }
@@ -332,22 +331,30 @@ class StateStore {
       return { states: [], stats: this._emptyStats() };
     }
 
-    // ---- Post-processing ----
+    // ---- Log distance distribution ----
+    const dists = candidates.map(c => c.distance);
+    const minDist = Math.min(...dists);
+    const maxDist = Math.max(...dists);
+    const avgDist = dists.reduce((a, b) => a + b, 0) / dists.length;
+    console.log(`[StateStore] Distance stats: min=${minDist.toFixed(4)}, max=${maxDist.toFixed(4)}, avg=${avgDist.toFixed(4)}`);
+
+    // ---- Post-processing with expanded thresholds ----
     const now = Date.now();
     const halfLifeMs = CONFIG.RECENCY_HALF_LIFE_DAYS * 24 * 60 * 60 * 1000;
     const sigma2 = CONFIG.GAUSSIAN_SIGMA ** 2;
 
-    let maxDist = CONFIG.MAX_DISTANCE;
-    let selected = candidates.filter(item => item.distance <= maxDist);
+    let maxAllowedDist = CONFIG.MAX_DISTANCE;
+    let selected = candidates.filter(item => item.distance <= maxAllowedDist);
     let attempts = 0;
-    while (selected.length < CONFIG.MIN_SAMPLES_FOR_EDGE && maxDist < CONFIG.MAX_DISTANCE_LIMIT && attempts < 10) {
-      maxDist += CONFIG.DISTANCE_STEP;
-      selected = candidates.filter(item => item.distance <= maxDist);
+    while (selected.length < CONFIG.MIN_SAMPLES_FOR_EDGE && maxAllowedDist < CONFIG.MAX_DISTANCE_LIMIT && attempts < 20) {
+      maxAllowedDist += CONFIG.DISTANCE_STEP;
+      selected = candidates.filter(item => item.distance <= maxAllowedDist);
       attempts++;
+      console.log(`[StateStore] Expanding distance threshold to ${maxAllowedDist.toFixed(2)}, selected: ${selected.length}`);
     }
 
     if (selected.length < CONFIG.MIN_SAMPLES_FOR_EDGE) {
-      console.log(`[StateStore] Selected ${selected.length} after distance expansion (maxDist=${maxDist})`);
+      console.log(`[StateStore] Selected ${selected.length} after distance expansion (maxDist=${maxAllowedDist})`);
       return { states: [], stats: this._emptyStats() };
     }
 
@@ -533,7 +540,7 @@ class StateStore {
     };
   }
 
-  // ---- Existing methods (preserved) ----
+  // ---- Existing methods ----
   async computeEdge(features, symbol = null, timeframe = 'M5', lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = CONFIG.DEFAULT_K, regime = null) {
     // ... (keep existing)
   }
