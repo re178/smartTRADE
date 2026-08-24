@@ -1,17 +1,13 @@
 // scripts/rebuildHistoricalStates.js
-// Complete rebuild of HistoricalState from HistoricalCandle.
-// Self-contained – uses only mongoose and internal indicator engine.
-// Run after dropping historicalstates and historicaloutcomes.
+// Complete rebuild of HistoricalState directly from historicalcandles collection.
+// No model file required – uses native MongoDB driver.
+// Self‑contained except for indicator engine (core/strategy/engine).
 
 require('dotenv').config();
 const mongoose = require('mongoose');
 const { performance } = require('perf_hooks');
 
-// ---- Import Models ----
-const HistoricalState = require('../models/HistoricalState');
-const HistoricalCandle = mongoose.model('HistoricalCandle') ;
-
-// ---- Import Indicator Engine (from your codebase) ----
+// ---- Import Indicator Engine (only external dependency) ----
 const {
   ADX,
   ATR,
@@ -24,11 +20,11 @@ const {
 // ---- Configuration ----
 const CONFIG = {
   MONGO_URI: process.env.MONGO_URI || 'mongodb://localhost:27017/rts',
-  BATCH_SIZE: 1000,             // States per batch insert
+  BATCH_SIZE: 1000,
   MIN_CANDLES_FOR_INDICATORS: 50,
   LOOKAHEADS: [5, 10, 20, 40],
   MAX_FUTURE_CANDLES: 40,
-  // All symbols we care about (canonical)
+  // Symbols we care about (canonical)
   SYMBOLS: ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD'],
   TIMEFRAMES: ['M5', 'M15', 'H1'],
 };
@@ -214,7 +210,6 @@ function computeFuturePath(candles, idx, horizons, maxCandles) {
     futurePrices[h] = prices.slice(0, h);
   }
 
-  // MFE/MAE for the full path (up to maxCandles)
   let mfe = 0, mae = 0;
   let timeToMaxFavorable = null, timeToMaxAdverse = null;
   for (let i = 0; i < prices.length; i++) {
@@ -223,9 +218,8 @@ function computeFuturePath(candles, idx, horizons, maxCandles) {
     if (diff < mae) { mae = diff; timeToMaxAdverse = i; }
   }
 
-  // Outcome labels for each horizon (return, returnR, win, maxDrawdown)
   const outcomes = {};
-  const atr = 0.001; // placeholder – we could compute from state but will use fixed for now
+  const atr = 0.001;
   for (const h of horizons) {
     if (prices.length >= h) {
       const endPrice = prices[h - 1];
@@ -271,36 +265,48 @@ class ProgressBar {
 // ---- Main ----
 async function rebuild() {
   console.log('==================================================');
-  console.log('  HISTORICAL STATE REBUILD (from candles)');
+  console.log('  HISTORICAL STATE REBUILD (Native Collection)');
   console.log('==================================================\n');
 
-  // Connect
-  console.log(`Connecting to ${CONFIG.MONGO_URI}...`);
-  await mongoose.connect(CONFIG.MONGO_URI);
+  const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/rts';
+  console.log(`Connecting to ${MONGO_URI}...`);
+  await mongoose.connect(MONGO_URI);
   console.log('✅ Connected.\n');
 
+  const db = mongoose.connection.db;
+  const candlesCollection = db.collection('historicalcandles');
+  const statesCollection = db.collection('historicalstates');
+
   // Verify candles exist
-  const candleCount = await HistoricalCandle.countDocuments();
+  const candleCount = await candlesCollection.countDocuments();
   console.log(`📂 Found ${candleCount} candles.\n`);
   if (candleCount === 0) {
     console.error('❌ No candles found. Please import candles first.');
     process.exit(1);
   }
 
-  // Load all candles (filter by symbols/timeframes we care about)
+  // Drop existing states collection (if any) – we want a clean start
+  console.log('🧹 Dropping existing historicalstates...');
+  await statesCollection.drop().catch(() => {});
+  console.log('✅ historicalstates cleared.\n');
+
+  // Build filter for symbols/timeframes we care about
+  const symbolRegexes = CONFIG.SYMBOLS.map(s => new RegExp(s, 'i'));
   const filter = {
-    symbol: { $in: CONFIG.SYMBOLS.map(s => new RegExp(s, 'i')) },
+    symbol: { $in: symbolRegexes },
     timeframe: { $in: CONFIG.TIMEFRAMES },
   };
-  console.log(`🔍 Fetching candles with filter:`, filter);
-  const allCandles = await HistoricalCandle.find(filter).lean();
+
+  console.log(`🔍 Fetching candles with filter...`);
+  const cursor = candlesCollection.find(filter);
+  const allCandles = await cursor.toArray();
 
   if (allCandles.length === 0) {
-    console.error('❌ No candles match the filter. Check symbol/timeframe names.');
+    console.error('❌ No candles match the filter. Check symbols/timeframes.');
     process.exit(1);
   }
 
-  // Group by (normalized symbol, timeframe)
+  // Group by normalized symbol + timeframe
   const groups = {};
   for (const c of allCandles) {
     const norm = normalizeSymbol(c.symbol);
@@ -313,8 +319,8 @@ async function rebuild() {
   console.log(`   Grouped into ${Object.keys(groups).length} groups.\n`);
 
   // Process each group
-  let totalStates = 0;
-  const allStateDocs = [];
+  let totalInserted = 0;
+  let batch = [];
 
   for (const [key, candles] of Object.entries(groups)) {
     const [symbol, timeframe] = key.split(':');
@@ -323,24 +329,21 @@ async function rebuild() {
     // Sort by time
     candles.sort((a, b) => new Date(a.time) - new Date(b.time));
 
-    // We need at least MIN_CANDLES_FOR_INDICATORS + maxHorizon
     const minNeeded = CONFIG.MIN_CANDLES_FOR_INDICATORS + Math.max(...CONFIG.LOOKAHEADS);
     if (candles.length < minNeeded) {
       console.warn(`   ⏭️  Skipping (need ${minNeeded}, have ${candles.length})`);
       continue;
     }
 
-    const progress = new ProgressBar(candles.length, `${symbol} ${timeframe}`);
+    const progress = new ProgressBar(candles.length - CONFIG.MIN_CANDLES_FOR_INDICATORS + 1, `${symbol} ${timeframe}`);
 
     for (let i = CONFIG.MIN_CANDLES_FOR_INDICATORS - 1; i < candles.length; i++) {
       const stateData = buildState(symbol, timeframe, candles, i);
       if (!stateData) continue;
 
-      // Compute future paths
       const pathData = computeFuturePath(candles, i, CONFIG.LOOKAHEADS, CONFIG.MAX_FUTURE_CANDLES);
-      if (!pathData) continue; // not enough future candles
+      if (!pathData) continue;
 
-      // Populate futurePrices and MFE/MAE
       stateData.futurePrices = pathData.futurePrices;
       stateData.mfe = pathData.mfe;
       stateData.mae = pathData.mae;
@@ -348,42 +351,39 @@ async function rebuild() {
       stateData.timeToMaxAdverse = pathData.timeToMaxAdverse;
       stateData.regimeTransitions = [];
 
-      // Populate outcomes (for compatibility)
       for (const h of CONFIG.LOOKAHEADS) {
-        const out = pathData.outcomes[h];
-        stateData[`outcome${h}`] = out || { return: null, returnR: null, win: null, maxDrawdown: null, volatility: null, filledAt: null };
+        stateData[`outcome${h}`] = pathData.outcomes[h] || { return: null, returnR: null, win: null, maxDrawdown: null, volatility: null, filledAt: null };
       }
 
-      allStateDocs.push(stateData);
-      totalStates++;
+      batch.push(stateData);
+      totalInserted++;
       progress.update(1);
 
-      // Bulk insert when batch size reached
-      if (allStateDocs.length >= CONFIG.BATCH_SIZE) {
+      if (batch.length >= CONFIG.BATCH_SIZE) {
         try {
-          await HistoricalState.insertMany(allStateDocs, { ordered: false });
-          console.log(`   ✅ Inserted batch of ${allStateDocs.length} states`);
-          allStateDocs.length = 0;
+          await statesCollection.insertMany(batch, { ordered: false });
+          console.log(`   ✅ Inserted batch of ${batch.length} states`);
+          batch = [];
         } catch (err) {
           console.error(`   ❌ Batch insert error:`, err.message);
-          // Continue
+          batch = [];
         }
       }
     }
   }
 
   // Insert remaining
-  if (allStateDocs.length > 0) {
+  if (batch.length > 0) {
     try {
-      await HistoricalState.insertMany(allStateDocs, { ordered: false });
-      console.log(`   ✅ Inserted final batch of ${allStateDocs.length} states`);
+      await statesCollection.insertMany(batch, { ordered: false });
+      console.log(`   ✅ Inserted final batch of ${batch.length} states`);
     } catch (err) {
       console.error(`   ❌ Final batch insert error:`, err.message);
     }
   }
 
-  // Verify
-  const finalCount = await HistoricalState.countDocuments();
+  // Final count
+  const finalCount = await statesCollection.countDocuments();
   console.log('\n==================================================');
   console.log('✅ REBUILD COMPLETE');
   console.log(`   Total states inserted: ${finalCount}`);
