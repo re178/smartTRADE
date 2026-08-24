@@ -2,7 +2,7 @@
 // Prediction Engine – Converts market state into a probability distribution of future path.
 // Uses enhanced StateStore to retrieve analogues with path data.
 // Outputs a Prediction object for use by Opportunity Engine.
-// VERIFIED: Integrated with server pipeline.
+// SYMBOL FIX: Added normalization to use canonical symbols.
 
 const stateStore = require('./lab/stateStore');
 const deepMarketState = require('./deep/marketState');
@@ -11,16 +11,18 @@ const marketStateCache = require('../data/marketStateCache');
 const { getFeatureKeys, getDefaultFeatures, normalizeFeatures } = require('../../shared/helpers');
 const logger = require('../../infrastructure/logger') || console;
 
-// Configuration
+// ---- Symbol Normalization ----
+function normalizeSymbol(sym) {
+  if (!sym) return '';
+  // Remove separators and 'frx' prefix, uppercase
+  return sym.replace(/[/\-_]/g, '').replace(/^frx/i, '').toUpperCase();
+}
+
+// ---- Configuration ----
 const CONFIG = {
-  // Default lookahead (candles)
   DEFAULT_LOOKAHEAD: 5,
-  // Minimum analogues required for a prediction
   MIN_SAMPLES: 20,
-  // Maximum distance for analogues (higher = more similar)
   MAX_SIMILARITY_DISTANCE: 0.30,
-  // Threshold for UP/DOWN classification (price movement in price units)
-  // For EUR/USD, 0.0005 ≈ 5 pips
   MOVEMENT_THRESHOLD: 0.0005,
 };
 
@@ -54,7 +56,7 @@ function extractFeatures(state) {
 /**
  * Get the regime code from state, with fallback to deepRegime cache.
  * @param {Object} state - Market state.
- * @param {string} symbol - Symbol.
+ * @param {string} symbol - Symbol (used for fallback).
  * @returns {string} Regime code.
  */
 function getRegimeCode(state, symbol) {
@@ -68,24 +70,31 @@ function getRegimeCode(state, symbol) {
 /**
  * Compute a prediction from a market state.
  * @param {Object} state - Full market state from deepMarketState.compute().
- * @param {string} symbol - Symbol (e.g., 'EUR_USD').
+ * @param {string} symbol - Symbol (e.g., 'EURUSD', 'frxEURUSD', etc.).
  * @param {number} lookahead - Lookahead in candles (default 5).
  * @param {number} k - Number of analogues to retrieve (default 500).
  * @returns {Promise<Object>} Prediction object.
  */
 async function predict(state, symbol, lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = 500) {
   try {
-    // 1. Extract features
+    // 1. Normalize symbol to canonical
+    const canonicalSymbol = normalizeSymbol(symbol);
+    if (!canonicalSymbol) {
+      logger.warn(`[PredictionEngine] Invalid symbol: ${symbol}`);
+      return null;
+    }
+
+    // 2. Extract features
     const features = extractFeatures(state);
-    logger.debug(`[PredictionEngine] Features for ${symbol}:`, features);
+    logger.debug(`[PredictionEngine] Features for ${canonicalSymbol}:`, features);
 
-    // 2. Get regime code
-    const regimeCode = getRegimeCode(state, symbol);
+    // 3. Get regime code
+    const regimeCode = getRegimeCode(state, canonicalSymbol);
 
-    // 3. Call enhanced stateStore to get prediction distribution
+    // 4. Call enhanced stateStore to get prediction distribution
     const distribution = await stateStore.getPredictionDistribution(
       features,
-      symbol,
+      canonicalSymbol,
       state.timeframe || 'M5',
       lookahead,
       k,
@@ -93,18 +102,17 @@ async function predict(state, symbol, lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = 
     );
 
     if (!distribution || distribution.sampleSize < CONFIG.MIN_SAMPLES) {
-      logger.warn(`[PredictionEngine] Insufficient samples (${distribution?.sampleSize || 0}) for ${symbol}`);
+      logger.warn(`[PredictionEngine] Insufficient samples (${distribution?.sampleSize || 0}) for ${canonicalSymbol}`);
       return null;
     }
 
-    // 4. Compute calibrated confidence (if available)
-    // Placeholder: we'll use the raw winRate from the distribution and adjust by sample size
+    // 5. Compute calibrated confidence
     const rawConfidence = distribution.winRate * 100;
     const calibratedConfidence = Math.min(100, rawConfidence * (1 + Math.min(0.1, distribution.sampleSize / 1000)));
 
-    // 5. Build the Prediction object
+    // 6. Build the Prediction object
     const prediction = {
-      symbol,
+      symbol: canonicalSymbol,
       timeframe: state.timeframe || 'M5',
       timestamp: new Date().toISOString(),
       regime: regimeCode,
@@ -141,11 +149,11 @@ async function predict(state, symbol, lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = 
       marketQuality: state.summary?.marketQuality || 50,
       noiseLevel: state.summary?.noiseLevel || 'medium',
 
-      // Raw analogues (optional – for debugging)
+      // Raw analogues (for debugging)
       analogues: distribution.analogues || [],
     };
 
-    logger.info(`[PredictionEngine] Prediction for ${symbol}: UP=${(prediction.probabilities.up*100).toFixed(1)}%, DOWN=${(prediction.probabilities.down*100).toFixed(1)}%, NEUTRAL=${(prediction.probabilities.neutral*100).toFixed(1)}%, Sample=${prediction.sampleSize}`);
+    logger.info(`[PredictionEngine] Prediction for ${canonicalSymbol}: UP=${(prediction.probabilities.up*100).toFixed(1)}%, DOWN=${(prediction.probabilities.down*100).toFixed(1)}%, NEUTRAL=${(prediction.probabilities.neutral*100).toFixed(1)}%, Sample=${prediction.sampleSize}`);
 
     return prediction;
   } catch (err) {
