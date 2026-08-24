@@ -17,7 +17,7 @@ const {
   MACD,
   BollingerBands,
   findSupportResistance,
-} = require('../../strategy/engine');
+} = require('../strategy/engine');
 const logger = require('../../../infrastructure/logger') || console;
 
 // ---- Valid regime codes (for safety) ----
