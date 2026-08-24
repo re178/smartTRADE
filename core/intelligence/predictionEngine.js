@@ -8,7 +8,7 @@ const EventEmitter = require('events');
 const candleStore = require('../data/candleStore');
 const candleHistory = require('../data/candleHistory');
 const marketStateCache = require('../data/marketStateCache');
-const session = require('../session');
+const session = require('./session');
 const { dataOrchestrator, DATA_CLASSES } = require('../../data/dataOrchestrator');
 const {
   ADX,
