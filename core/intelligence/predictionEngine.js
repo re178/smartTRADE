@@ -18,7 +18,7 @@ const {
   BollingerBands,
   findSupportResistance,
 } = require('../strategy/engine');
-const logger = require('../../../infrastructure/logger') || console;
+const logger = require('../../infrastructure/logger') || console;
 
 // ---- Valid regime codes (for safety) ----
 const VALID_REGIME_CODES = [
