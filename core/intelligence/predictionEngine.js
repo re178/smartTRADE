@@ -1,10 +1,9 @@
 // core/intelligence/predictionEngine.js
-// Prediction Engine – Converts market state into a probability distribution of future path.
+// Prediction Engine – Converts historical evidence into a calibrated forecast.
 // Uses enhanced StateStore to retrieve analogues with path data.
 // Outputs a Prediction object for use by Opportunity Engine.
-// SYMBOL FIX: Added normalization to use canonical symbols.
-// DEBUG: Extensive logging.
-// REGIME FIX: Passes null to stateStore to bypass regime filter (until regime is properly set in state).
+// REFACTORED: Removed sample‑size confidence boost, added uncertainty metrics.
+// Confidence is now a placeholder for future calibration.
 
 const stateStore = require('./lab/stateStore');
 const deepMarketState = require('./deep/marketState');
@@ -23,7 +22,6 @@ function normalizeSymbol(sym) {
 const CONFIG = {
   DEFAULT_LOOKAHEAD: 5,
   MIN_SAMPLES: 20,
-  MAX_SIMILARITY_DISTANCE: 0.30,
   MOVEMENT_THRESHOLD: 0.0005,
 };
 
@@ -68,6 +66,17 @@ function getRegimeCode(state, symbol) {
 }
 
 /**
+ * Compute prediction entropy (uncertainty) from probabilities.
+ * Higher entropy = more uncertain.
+ */
+function calculateEntropy(probs) {
+  const values = Object.values(probs).filter(p => p > 0);
+  if (values.length === 0) return 1.0;
+  const sum = values.reduce((a, b) => a + b, 0);
+  return -values.reduce((s, p) => s + (p / sum) * Math.log(p / sum), 0) / Math.log(values.length);
+}
+
+/**
  * Compute a prediction from a market state.
  * @param {Object} state - Full market state from deepMarketState.compute().
  * @param {string} symbol - Symbol (e.g., 'EURUSD', 'frxEURUSD', etc.).
@@ -79,7 +88,7 @@ async function predict(state, symbol, lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = 
   console.log(`[PredictionEngine] >>> predict() called for ${symbol} (lookahead=${lookahead})`);
 
   try {
-    // 1. Normalize symbol to canonical
+    // 1. Normalize symbol
     const canonicalSymbol = normalizeSymbol(symbol);
     console.log(`[PredictionEngine]   normalized symbol: ${canonicalSymbol}`);
     if (!canonicalSymbol) {
@@ -91,7 +100,7 @@ async function predict(state, symbol, lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = 
     const features = extractFeatures(state);
     console.log(`[PredictionEngine]   features:`, JSON.stringify(features).slice(0, 200));
 
-    // 3. Get regime code (for logging only – we will NOT filter by regime)
+    // 3. Get regime code (for logging only – not used in query)
     const regimeCode = getRegimeCode(state, canonicalSymbol);
     console.log(`[PredictionEngine]   regime (current): ${regimeCode} (filter disabled)`);
 
@@ -103,56 +112,97 @@ async function predict(state, symbol, lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = 
       state.timeframe || 'M5',
       lookahead,
       k,
-      null // <-- CRITICAL: bypass regime filter
+      null // <-- bypass regime filter
     );
-    console.log(`[PredictionEngine]   distribution received:`, distribution ? `sampleSize=${distribution.sampleSize}` : 'null');
+    console.log(`[PredictionEngine]   distribution received:`, distribution ? `sampleSize=${distribution.sampleSize}, qualified=${distribution.qualifiedCount}` : 'null');
 
-    if (!distribution || distribution.sampleSize < CONFIG.MIN_SAMPLES) {
-      console.warn(`[PredictionEngine] Insufficient samples (${distribution?.sampleSize || 0}) for ${canonicalSymbol}`);
+    if (!distribution || distribution.qualifiedCount < CONFIG.MIN_SAMPLES) {
+      console.warn(`[PredictionEngine] Insufficient qualified samples (${distribution?.qualifiedCount || 0}) for ${canonicalSymbol}`);
       return null;
     }
 
-    // 5. Compute calibrated confidence
-    const rawConfidence = distribution.winRate * 100;
-    const calibratedConfidence = Math.min(100, rawConfidence * (1 + Math.min(0.1, distribution.sampleSize / 1000)));
+    // 5. Compute probabilities (already normalized by stateStore)
+    const probs = {
+      up: distribution.probUp,
+      down: distribution.probDown,
+      neutral: distribution.probNeutral,
+    };
+    // Ensure they sum to 1
+    const sum = probs.up + probs.down + probs.neutral;
+    if (sum !== 0 && Math.abs(sum - 1) > 0.0001) {
+      probs.up /= sum;
+      probs.down /= sum;
+      probs.neutral /= sum;
+    }
 
-    // 6. Build the Prediction object
+    // 6. Confidence – placeholder for future calibration
+    // For now, we use the raw win rate, but we do NOT apply a sample-size bonus.
+    // We will calibrate this later using historical decision outcomes.
+    const rawConfidence = distribution.winRate * 100;
+    // TEMPORARY: just pass through raw win rate as "confidence", with a note.
+    // In production, we will replace this with a calibrated value.
+    const calibratedConfidence = rawConfidence; // placeholder
+
+    // 7. Uncertainty – entropy of probabilities
+    const entropy = calculateEntropy(probs);
+
+    // 8. Confidence interval – use standard deviation of analogue returns
+    const returns = distribution.analogues.map(a => a.outcome?.returnR).filter(r => r !== null && typeof r === 'number' && !isNaN(r));
+    let confidenceInterval = { lower: 0, upper: 0 };
+    if (returns.length > 1) {
+      const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
+      const std = Math.sqrt(returns.reduce((s, r) => s + (r - mean) ** 2, 0) / returns.length);
+      const half = 1.96 * std / Math.sqrt(returns.length);
+      confidenceInterval = { lower: mean - half, upper: mean + half };
+    }
+
+    // 9. Build the Prediction object
     const prediction = {
       symbol: canonicalSymbol,
       timeframe: state.timeframe || 'M5',
       timestamp: new Date().toISOString(),
-      regime: regimeCode, // Store the current regime for reference
+      regime: regimeCode,
 
-      probabilities: {
-        up: distribution.probUp || 0.33,
-        down: distribution.probDown || 0.33,
-        neutral: distribution.probNeutral || 0.34,
-      },
+      // Probabilities
+      probabilities: probs,
 
+      // Expected moves
       expectedMove: distribution.expectedMove || 0,
       expectedAdverse: distribution.expectedAdverse || 0,
       expectedFavorable: distribution.expectedFavorable || 0,
 
+      // Path extremes
       mfe: distribution.mfe || 0,
       mae: distribution.mae || 0,
       timeToMaxFavorable: distribution.timeToMaxFavorable || null,
       timeToMaxAdverse: distribution.timeToMaxAdverse || null,
 
+      // Sample & quality
       sampleSize: distribution.sampleSize || 0,
-      averageSimilarity: distribution.averageSimilarity || 0,
+      effectiveSampleSize: distribution.effectiveSampleSize || 0,
+      candidateCount: distribution.candidateCount || 0,
+      qualifiedCount: distribution.qualifiedCount || 0,
+      averageDistance: distribution.averageDistance || 0,
+      weightedAverageDistance: distribution.weightedAverageDistance || 0,
       maxDistance: distribution.maxDistance || 0,
       medianDistance: distribution.medianDistance || 0,
+      distanceDistribution: distribution.distanceDistribution || {},
 
-      confidence: Math.round(rawConfidence),
-      calibratedConfidence: Math.round(calibratedConfidence),
+      // Confidence & uncertainty
+      confidence: Math.round(rawConfidence), // raw win rate
+      calibratedConfidence: Math.round(calibratedConfidence), // placeholder
+      predictionUncertainty: entropy, // 0 = certain, 1 = maximally uncertain
+      confidenceInterval: confidenceInterval,
 
+      // Market quality
       marketQuality: state.summary?.marketQuality || 50,
       noiseLevel: state.summary?.noiseLevel || 'medium',
 
+      // Raw analogues (for debugging)
       analogues: distribution.analogues || [],
     };
 
-    console.log(`[PredictionEngine] ✅ Prediction for ${canonicalSymbol}: UP=${(prediction.probabilities.up*100).toFixed(1)}%, DOWN=${(prediction.probabilities.down*100).toFixed(1)}%, NEUTRAL=${(prediction.probabilities.neutral*100).toFixed(1)}%, Sample=${prediction.sampleSize}`);
+    console.log(`[PredictionEngine] ✅ Prediction for ${canonicalSymbol}: UP=${(prediction.probabilities.up*100).toFixed(1)}%, DOWN=${(prediction.probabilities.down*100).toFixed(1)}%, NEUTRAL=${(prediction.probabilities.neutral*100).toFixed(1)}%, Qualified=${prediction.qualifiedCount}, Confidence=${prediction.confidence}%`);
     return prediction;
   } catch (err) {
     console.error(`[PredictionEngine] ❌ Error predicting for ${symbol}:`, err.message);
@@ -163,13 +213,14 @@ async function predict(state, symbol, lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = 
 
 /**
  * Get a NO TRADE reason based on prediction quality.
+ * This is a convenience helper – Opportunity Engine will make the final decision.
  * @param {Object} prediction - Prediction object.
  * @returns {string} NO TRADE reason code.
  */
 function getNoTradeReason(prediction) {
   if (!prediction) return 'LOW_SAMPLE';
-  if (prediction.sampleSize < CONFIG.MIN_SAMPLES) return 'LOW_SAMPLE';
-  if (prediction.averageSimilarity > CONFIG.MAX_SIMILARITY_DISTANCE) return 'POOR_SIMILARITY';
+  if (prediction.qualifiedCount < CONFIG.MIN_SAMPLES) return 'LOW_SAMPLE';
+  if (prediction.averageDistance > 0.30) return 'POOR_SIMILARITY';
   if (prediction.probabilities.up < 0.50 && prediction.probabilities.down < 0.50) return 'LOW_PROBABILITY';
   if (Math.abs(prediction.expectedMove) < 0.0001) return 'LOW_EXPECTED_MOVE';
   if (prediction.mae < -0.001) return 'HIGH_MAE';
