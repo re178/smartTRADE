@@ -1,8 +1,8 @@
-// core/intelligence/lab/stateStore.js
-// Historical state store – similarity search, edge computation, and prediction distribution.
-// REFACTORED: Returns raw evidence, no forced sample-size expansion.
-// Uses weighted analogues for all statistics.
-// Exposes distance distribution and candidate counts.
+// core/intelligence/lab/stateStore.js – Evidence Engine
+// Returns raw historical evidence (candidates, distances, weighted stats).
+// Preserves futurePrices, mfe, mae, timing for downstream use.
+// Uses proper Effective Sample Size (ESS).
+// Regime compatibility weighting.
 
 const HistoricalState = require('../../../models/HistoricalState');
 const logger = require('../../../infrastructure/logger') || console;
@@ -10,10 +10,8 @@ const crypto = require('crypto');
 
 // -------------------- Configuration --------------------
 const CONFIG = {
-  DEFAULT_LOOKAHEAD: 5,
   DEFAULT_K: 500,
-  MAX_DISTANCE: 1.0,          // Maximum distance for a state to be considered "close"
-  MAX_DISTANCE_LIMIT: 2.0,    // Hard limit for accepting any analogue (safety)
+  MAX_DISTANCE_LIMIT: 2.0,
   TIME_WINDOW_DAYS: 365,
   FEATURE_WEIGHTS: {
     adx: 2.5,
@@ -31,14 +29,22 @@ const CONFIG = {
   NORMALIZER_REFRESH_INTERVAL_MS: 60 * 60 * 1000,
   MIN_STATES_FOR_REFRESH: 10000,
   GAUSSIAN_SIGMA: 0.15,
-  WINSORIZE_LOW: 0.01,
-  WINSORIZE_HIGH: 0.99,
-  EDGE_CACHE_TTL_MS: 5 * 60 * 1000,
-  CACHE_CLEANUP_INTERVAL_MS: 60 * 1000,
   MOVEMENT_THRESHOLD: 0.0005,
+  // Regime compatibility mapping (higher = more compatible)
+  REGIME_WEIGHTS: {
+    'STRONG_TREND_BULL':   { 'STRONG_TREND_BULL': 1.0, 'WEAK_TREND': 0.7, 'NEUTRAL': 0.5, 'STRONG_TREND_BEAR': 0.1, 'HIGH_VOLATILITY': 0.4, 'LOW_VOLATILITY': 0.6, 'RANGING': 0.3, 'BREAKOUT': 0.6, 'REVERSAL': 0.3 },
+    'STRONG_TREND_BEAR':   { 'STRONG_TREND_BEAR': 1.0, 'WEAK_TREND': 0.7, 'NEUTRAL': 0.5, 'STRONG_TREND_BULL': 0.1, 'HIGH_VOLATILITY': 0.4, 'LOW_VOLATILITY': 0.6, 'RANGING': 0.3, 'BREAKOUT': 0.6, 'REVERSAL': 0.3 },
+    'NEUTRAL':             { 'NEUTRAL': 1.0, 'WEAK_TREND': 0.7, 'RANGING': 0.8, 'STRONG_TREND_BULL': 0.4, 'STRONG_TREND_BEAR': 0.4, 'HIGH_VOLATILITY': 0.5, 'LOW_VOLATILITY': 0.7, 'BREAKOUT': 0.5, 'REVERSAL': 0.5 },
+    'WEAK_TREND':          { 'WEAK_TREND': 1.0, 'NEUTRAL': 0.7, 'STRONG_TREND_BULL': 0.6, 'STRONG_TREND_BEAR': 0.6, 'RANGING': 0.5, 'HIGH_VOLATILITY': 0.5, 'LOW_VOLATILITY': 0.6, 'BREAKOUT': 0.5, 'REVERSAL': 0.4 },
+    'RANGING':             { 'RANGING': 1.0, 'NEUTRAL': 0.8, 'WEAK_TREND': 0.5, 'LOW_VOLATILITY': 0.7, 'BREAKOUT': 0.4, 'STRONG_TREND_BULL': 0.2, 'STRONG_TREND_BEAR': 0.2, 'HIGH_VOLATILITY': 0.3, 'REVERSAL': 0.3 },
+    'BREAKOUT':            { 'BREAKOUT': 1.0, 'STRONG_TREND_BULL': 0.6, 'STRONG_TREND_BEAR': 0.6, 'WEAK_TREND': 0.5, 'HIGH_VOLATILITY': 0.6, 'NEUTRAL': 0.5, 'LOW_VOLATILITY': 0.3, 'RANGING': 0.4, 'REVERSAL': 0.4 },
+    'REVERSAL':            { 'REVERSAL': 1.0, 'WEAK_TREND': 0.5, 'NEUTRAL': 0.5, 'STRONG_TREND_BULL': 0.3, 'STRONG_TREND_BEAR': 0.3, 'HIGH_VOLATILITY': 0.5, 'LOW_VOLATILITY': 0.4, 'RANGING': 0.4, 'BREAKOUT': 0.4 },
+    'HIGH_VOLATILITY':     { 'HIGH_VOLATILITY': 1.0, 'BREAKOUT': 0.6, 'REVERSAL': 0.5, 'STRONG_TREND_BULL': 0.4, 'STRONG_TREND_BEAR': 0.4, 'WEAK_TREND': 0.5, 'NEUTRAL': 0.5, 'LOW_VOLATILITY': 0.2, 'RANGING': 0.3 },
+    'LOW_VOLATILITY':      { 'LOW_VOLATILITY': 1.0, 'RANGING': 0.7, 'NEUTRAL': 0.7, 'WEAK_TREND': 0.6, 'STRONG_TREND_BULL': 0.4, 'STRONG_TREND_BEAR': 0.4, 'HIGH_VOLATILITY': 0.2, 'BREAKOUT': 0.3, 'REVERSAL': 0.3 },
+  },
 };
 
-// -------------------- Symbol Variants --------------------
+// -------------------- Enhanced Symbol Variants --------------------
 function getSymbolVariants(symbol) {
   if (!symbol) return [];
   const clean = symbol.replace(/[/\-_]/g, '').toUpperCase();
@@ -221,7 +227,7 @@ class StateStore {
     this.normalizer = new RobustNormalizer();
     this._isReady = false;
     this._edgeCache = new Map();
-    this._cacheCleanupInterval = setInterval(() => this._cleanCache(), CONFIG.CACHE_CLEANUP_INTERVAL_MS);
+    this._cacheCleanupInterval = setInterval(() => this._cleanCache(), 60000);
   }
 
   async init() {
@@ -239,11 +245,11 @@ class StateStore {
   //  SIMILARITY SEARCH – Returns raw candidates with distances
   // ============================================================
   async findSimilar(queryFeatures, symbol = null, timeframe = 'M5',
-                    k = CONFIG.DEFAULT_K, lookahead = CONFIG.DEFAULT_LOOKAHEAD,
-                    regime = null) {
+                    k = CONFIG.DEFAULT_K, lookahead = 5,
+                    regimeCode = null) {
     await this.init();
 
-    console.log(`[StateStore] findSimilar called for ${symbol || 'any'} ${timeframe}, lookahead=${lookahead}, regime=${regime || 'any'}`);
+    console.log(`[StateStore] findSimilar called for ${symbol || 'any'} ${timeframe}, lookahead=${lookahead}, regime=${regimeCode || 'any'}`);
 
     const normalizedQuery = this.normalizer.normalizeVector(queryFeatures);
     const weights = CONFIG.FEATURE_WEIGHTS;
@@ -264,7 +270,8 @@ class StateStore {
       else filter.$or = variants.map(sym => ({ symbol: sym }));
     }
 
-    if (regime) filter['regime.code'] = regime;
+    // We do NOT filter by regime here – we will apply regime weighting later.
+    // So we don't add a regime filter to the $match stage.
 
     console.log(`[StateStore] Filter:`, JSON.stringify(filter, null, 2));
 
@@ -320,6 +327,13 @@ class StateStore {
           timeToMaxAdverse: 1,
           regimeTransitions: 1,
           price: 1,
+          trend: 1,
+          momentum: 1,
+          volatility: 1,
+          liquidity: 1,
+          structure: 1,
+          session: 1,
+          summary: 1,
         }
       }
     ];
@@ -328,235 +342,158 @@ class StateStore {
     console.log(`[StateStore] Aggregation returned ${candidates.length} candidates.`);
 
     if (candidates.length === 0) {
-      return { states: [], distanceStats: null, candidateCount: 0, qualifiedCount: 0 };
+      return { states: [], distanceStats: null, candidateCount: 0, qualifiedCount: 0, effectiveSampleSize: 0, totalWeight: 0 };
     }
 
     // ---- Compute distance statistics ----
-    const dists = candidates.map(c => c.distance);
+    const now = Date.now();
+    const halfLifeMs = CONFIG.RECENCY_HALF_LIFE_DAYS * 24 * 60 * 60 * 1000;
+    const sigma2 = CONFIG.GAUSSIAN_SIGMA ** 2;
+
+    // Regime compatibility weight function
+    const getRegimeWeight = (candidateRegime, targetRegime) => {
+      if (!targetRegime || !candidateRegime) return 1.0;
+      const map = CONFIG.REGIME_WEIGHTS[targetRegime];
+      if (!map) return 0.5;
+      return map[candidateRegime] || 0.5;
+    };
+
+    const weightedStates = candidates.map(c => {
+      const ageMs = now - new Date(c.timestamp).getTime();
+      const recencyWeight = Math.exp(-ageMs / halfLifeMs);
+      const simWeight = Math.exp(-(c.distance ** 2) / (2 * sigma2));
+      const regimeWeight = getRegimeWeight(c.regime?.code, regimeCode);
+      const totalWeight = recencyWeight * simWeight * regimeWeight;
+      return { ...c, recencyWeight, simWeight, regimeWeight, totalWeight };
+    });
+
+    // Sort by distance (already sorted)
+    const dists = weightedStates.map(s => s.distance);
     const minDist = Math.min(...dists);
     const maxDist = Math.max(...dists);
     const avgDist = dists.reduce((a, b) => a + b, 0) / dists.length;
     const sortedDists = [...dists].sort((a, b) => a - b);
     const medianDist = sortedDists[Math.floor(sortedDists.length / 2)];
 
-    // Weighted average using recency*similarity
-    const now = Date.now();
-    const halfLifeMs = CONFIG.RECENCY_HALF_LIFE_DAYS * 24 * 60 * 60 * 1000;
-    const sigma2 = CONFIG.GAUSSIAN_SIGMA ** 2;
-    let weightedSum = 0, totalWeight = 0;
-    for (const c of candidates) {
-      const ageMs = now - new Date(c.timestamp).getTime();
-      const recencyWeight = Math.exp(-ageMs / halfLifeMs);
-      const simWeight = Math.exp(-(c.distance ** 2) / (2 * sigma2));
-      const w = recencyWeight * simWeight;
-      weightedSum += c.distance * w;
-      totalWeight += w;
+    // Weighted average distance
+    const totalW = weightedStates.reduce((s, c) => s + c.totalWeight, 0);
+    const weightedAvgDist = totalW > 0 ? weightedStates.reduce((s, c) => s + c.distance * c.totalWeight, 0) / totalW : avgDist;
+
+    // Count qualified (distance <= 1.0)
+    const qualified = weightedStates.filter(c => c.distance <= 1.0);
+
+    // Distance distribution buckets
+    const distBuckets = { '<0.1': 0, '0.1-0.2': 0, '0.2-0.3': 0, '0.3-0.5': 0, '0.5-1.0': 0, '>=1.0': 0 };
+    for (const c of weightedStates) {
+      if (c.distance < 0.1) distBuckets['<0.1']++;
+      else if (c.distance < 0.2) distBuckets['0.1-0.2']++;
+      else if (c.distance < 0.3) distBuckets['0.2-0.3']++;
+      else if (c.distance < 0.5) distBuckets['0.3-0.5']++;
+      else if (c.distance < 1.0) distBuckets['0.5-1.0']++;
+      else distBuckets['>=1.0']++;
     }
-    const weightedAvgDist = totalWeight > 0 ? weightedSum / totalWeight : avgDist;
 
-    // ---- Count close analogues (distance <= MAX_DISTANCE) ----
-    const qualified = candidates.filter(c => c.distance <= CONFIG.MAX_DISTANCE);
+    // Effective Sample Size (ESS) = (Σw)² / Σ(w²)
+    const ess = totalW * totalW / weightedStates.reduce((s, c) => s + c.totalWeight * c.totalWeight, 0);
 
-    console.log(`[StateStore] Distance stats: min=${minDist.toFixed(4)}, max=${maxDist.toFixed(4)}, avg=${avgDist.toFixed(4)}, median=${medianDist.toFixed(4)}, weightedAvg=${weightedAvgDist.toFixed(4)}, qualified=${qualified.length}`);
+    console.log(`[StateStore] Distance stats: min=${minDist.toFixed(4)}, max=${maxDist.toFixed(4)}, avg=${avgDist.toFixed(4)}, median=${medianDist.toFixed(4)}, weightedAvg=${weightedAvgDist.toFixed(4)}, qualified=${qualified.length}, ESS=${ess.toFixed(2)}`);
 
     return {
-      states: candidates, // all candidates
-      distanceStats: {
-        min: minDist,
-        max: maxDist,
-        avg: avgDist,
-        median: medianDist,
-        weightedAvg: weightedAvgDist,
-        distribution: {
-          '< 0.1': candidates.filter(c => c.distance < 0.1).length,
-          '0.1-0.2': candidates.filter(c => c.distance >= 0.1 && c.distance < 0.2).length,
-          '0.2-0.3': candidates.filter(c => c.distance >= 0.2 && c.distance < 0.3).length,
-          '0.3-0.5': candidates.filter(c => c.distance >= 0.3 && c.distance < 0.5).length,
-          '0.5-1.0': candidates.filter(c => c.distance >= 0.5 && c.distance < 1.0).length,
-          '>=1.0': candidates.filter(c => c.distance >= 1.0).length,
-        }
-      },
-      candidateCount: candidates.length,
+      states: weightedStates,  // includes futurePrices, mfe, mae, etc.
+      distanceStats: { min: minDist, max: maxDist, avg: avgDist, median: medianDist, weightedAvg: weightedAvgDist },
+      candidateCount: weightedStates.length,
       qualifiedCount: qualified.length,
+      effectiveSampleSize: ess,
+      distanceDistribution: distBuckets,
+      totalWeight: totalW,
     };
   }
 
   // ============================================================
-  //  PREDICTION DISTRIBUTION – Weighted Evidence
+  //  getPredictionDistribution – returns evidence + basic distribution
   // ============================================================
-  async getPredictionDistribution(features, symbol, timeframe = 'M5', lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = CONFIG.DEFAULT_K, regime = null) {
+  async getPredictionDistribution(features, symbol, timeframe = 'M5', lookahead = 5, k = CONFIG.DEFAULT_K, regimeCode = null) {
     await this.init();
 
-    const similarityResult = await this.findSimilar(features, symbol, timeframe, k, lookahead, regime);
-    const candidates = similarityResult.states;
-    if (candidates.length === 0) {
+    const result = await this.findSimilar(features, symbol, timeframe, k, lookahead, regimeCode);
+    const states = result.states;
+    if (!states || states.length === 0) {
       return this._emptyDistribution();
     }
 
-    // ---- Compute weights ----
-    const now = Date.now();
-    const halfLifeMs = CONFIG.RECENCY_HALF_LIFE_DAYS * 24 * 60 * 60 * 1000;
-    const sigma2 = CONFIG.GAUSSIAN_SIGMA ** 2;
+    // ---- Compute weighted probabilities from valid paths ----
+    let totalValidWeight = 0;
+    let upWeight = 0, downWeight = 0, neutralWeight = 0;
+    let sumMove = 0, sumFavorable = 0, sumAdverse = 0;
+    let sumMFE = 0, sumMAE = 0;
+    let sumTimeMFE = 0, sumTimeMAE = 0;
 
-    const weightedStates = candidates.map(c => {
-      const ageMs = now - new Date(c.timestamp).getTime();
-      const recencyWeight = Math.exp(-ageMs / halfLifeMs);
-      const simWeight = Math.exp(-(c.distance ** 2) / (2 * sigma2));
-      const totalWeight = recencyWeight * simWeight;
-      return { ...c, recencyWeight, simWeight, totalWeight };
-    });
-
-    // ---- Weighted statistics ----
-    let totalWeight = 0;
-    let weightedWin = 0;
-    let weightedReturnR = 0;
-    let weightedReturn = 0;
-    let weightedMFE = 0;
-    let weightedMAE = 0;
-    let weightedTimeMFE = 0;
-    let weightedTimeMAE = 0;
-
-    const upMoves = [], downMoves = [], neutralMoves = [];
-    let total = 0;
-
-    for (const s of weightedStates) {
+    for (const s of states) {
       const w = s.totalWeight;
-      totalWeight += w;
-
-      // Outcome
-      const out = s.outcome;
-      if (out && out.returnR !== null && typeof out.returnR === 'number' && !isNaN(out.returnR)) {
-        weightedReturnR += out.returnR * w;
-        if (out.win) weightedWin += w;
-        // Return in price units
-        if (out.return !== null) weightedReturn += out.return * w;
-      }
-
-      // MFE/MAE
-      if (s.mfe !== null) weightedMFE += s.mfe * w;
-      if (s.mae !== null) weightedMAE += s.mae * w;
-
-      // Timing
-      if (s.timeToMaxFavorable !== null) weightedTimeMFE += s.timeToMaxFavorable * w;
-      if (s.timeToMaxAdverse !== null) weightedTimeMAE += s.timeToMaxAdverse * w;
-
-      // Direction counts (using futurePrices, same as before)
       const entry = s.price?.current || 0;
-      const futurePrices = s.futurePrices || {};
-      if (futurePrices[lookahead] && futurePrices[lookahead].length > 0) {
-        const lastPrice = futurePrices[lookahead][futurePrices[lookahead].length - 1];
-        const move = lastPrice - entry;
-        const threshold = CONFIG.MOVEMENT_THRESHOLD;
-        if (move > threshold) upMoves.push({ move, weight: w });
-        else if (move < -threshold) downMoves.push({ move, weight: w });
-        else neutralMoves.push({ move, weight: w });
-        total++;
-      }
+      const futurePrices = s.futurePrices;
+      if (!futurePrices || !futurePrices[lookahead] || futurePrices[lookahead].length === 0) continue;
+      const lastPrice = futurePrices[lookahead][futurePrices[lookahead].length - 1];
+      const move = lastPrice - entry;
+      totalValidWeight += w;
+      if (move > CONFIG.MOVEMENT_THRESHOLD) upWeight += w;
+      else if (move < -CONFIG.MOVEMENT_THRESHOLD) downWeight += w;
+      else neutralWeight += w;
+
+      sumMove += move * w;
+      if (move > 0) sumFavorable += move * w;
+      else sumAdverse += move * w;
+
+      if (s.mfe !== null) sumMFE += s.mfe * w;
+      if (s.mae !== null) sumMAE += s.mae * w;
+      if (s.timeToMaxFavorable !== null) sumTimeMFE += s.timeToMaxFavorable * w;
+      if (s.timeToMaxAdverse !== null) sumTimeMAE += s.timeToMaxAdverse * w;
     }
 
-    // ---- Probabilities ----
-    const probUp = upMoves.reduce((sum, m) => sum + m.weight, 0) / totalWeight;
-    const probDown = downMoves.reduce((sum, m) => sum + m.weight, 0) / totalWeight;
-    const probNeutral = neutralMoves.reduce((sum, m) => sum + m.weight, 0) / totalWeight;
+    if (totalValidWeight === 0) return this._emptyDistribution();
 
-    // ---- Expected moves (weighted) ----
-    const allMoves = [...upMoves, ...downMoves, ...neutralMoves];
-    let expectedMove = 0, expectedAdverse = 0, expectedFavorable = 0;
-    if (allMoves.length > 0) {
-      const weightedSum = allMoves.reduce((sum, m) => sum + m.move * m.weight, 0);
-      expectedMove = weightedSum / totalWeight;
-      const adverse = allMoves.filter(m => m.move < 0);
-      const favorable = allMoves.filter(m => m.move > 0);
-      if (adverse.length > 0) {
-        const wSum = adverse.reduce((sum, m) => sum + m.weight, 0);
-        expectedAdverse = adverse.reduce((sum, m) => sum + m.move * m.weight, 0) / wSum;
-      }
-      if (favorable.length > 0) {
-        const wSum = favorable.reduce((sum, m) => sum + m.weight, 0);
-        expectedFavorable = favorable.reduce((sum, m) => sum + m.move * m.weight, 0) / wSum;
-      }
+    const probUp = upWeight / totalValidWeight;
+    const probDown = downWeight / totalValidWeight;
+    const probNeutral = neutralWeight / totalValidWeight;
+    const expectedMove = sumMove / totalValidWeight;
+    const expectedFavorable = sumFavorable / totalValidWeight;
+    const expectedAdverse = sumAdverse / totalValidWeight;
+    const mfe = sumMFE / totalValidWeight;
+    const mae = sumMAE / totalValidWeight;
+    const timeToMaxFavorable = sumTimeMFE / totalValidWeight;
+    const timeToMaxAdverse = sumTimeMAE / totalValidWeight;
+
+    // ---- Win rate (from outcome data) ----
+    let winWeight = 0;
+    for (const s of states) {
+      if (s.outcome?.win) winWeight += s.totalWeight;
     }
+    const winRate = totalValidWeight > 0 ? winWeight / totalValidWeight : 0;
 
-    // ---- MFE/MAE (weighted) ----
-    const avgMFE = totalWeight > 0 ? weightedMFE / totalWeight : 0;
-    const avgMAE = totalWeight > 0 ? weightedMAE / totalWeight : 0;
-
-    // ---- Timing (weighted median) ----
-    const timeMFEValues = weightedStates.map(s => s.timeToMaxFavorable).filter(t => t !== null);
-    const timeMAEValues = weightedStates.map(s => s.timeToMaxAdverse).filter(t => t !== null);
-    const medianTimeMFE = timeMFEValues.length > 0 ? timeMFEValues.sort((a,b) => a-b)[Math.floor(timeMFEValues.length/2)] : null;
-    const medianTimeMAE = timeMAEValues.length > 0 ? timeMAEValues.sort((a,b) => a-b)[Math.floor(timeMAEValues.length/2)] : null;
-
-    // ---- Win rate & returnR ----
-    const winRate = totalWeight > 0 ? weightedWin / totalWeight : 0;
-    const avgReturnR = totalWeight > 0 ? weightedReturnR / totalWeight : 0;
-
-    // ---- Build distribution ----
     return {
-      // Probabilities
       probUp,
       probDown,
       probNeutral,
-
-      // Expected moves
       expectedMove,
-      expectedAdverse,
       expectedFavorable,
-
-      // Path extremes
-      mfe: avgMFE,
-      mae: avgMAE,
-
-      // Timing
-      timeToMaxFavorable: medianTimeMFE,
-      timeToMaxAdverse: medianTimeMAE,
-
-      // Sample & quality
-      sampleSize: weightedStates.length,
-      effectiveSampleSize: Math.min(weightedStates.length, Math.round(totalWeight)), // approximate effective sample
-      candidateCount: similarityResult.candidateCount,
-      qualifiedCount: similarityResult.qualifiedCount,
-      averageDistance: similarityResult.distanceStats?.avg || 0,
-      maxDistance: similarityResult.distanceStats?.max || 0,
-      medianDistance: similarityResult.distanceStats?.median || 0,
-      weightedAverageDistance: similarityResult.distanceStats?.weightedAvg || 0,
-      distanceDistribution: similarityResult.distanceStats?.distribution || {},
-
-      // Outcomes
-      winRate,
-      avgReturnR,
-
-      // Raw analogues (for debugging)
-      analogues: weightedStates.map(s => ({
-        distance: s.distance,
-        mfe: s.mfe,
-        mae: s.mae,
-        outcome: s.outcome,
-        timestamp: s.timestamp,
-        weight: s.totalWeight,
-      })),
+      expectedAdverse,
+      mfe,
+      mae,
+      timeToMaxFavorable,
+      timeToMaxAdverse,
+      sampleSize: states.length,
+      effectiveSampleSize: result.effectiveSampleSize,
+      candidateCount: result.candidateCount,
+      qualifiedCount: result.qualifiedCount,
+      averageDistance: result.distanceStats?.avg || 0,
+      weightedAverageDistance: result.distanceStats?.weightedAvg || 0,
+      maxDistance: result.distanceStats?.max || 0,
+      medianDistance: result.distanceStats?.median || 0,
+      distanceDistribution: result.distanceDistribution || {},
+      analogues: states, // full states with futurePrices, mfe, mae, etc.
+      winRate: winRate,
+      avgReturnR: 0, // we don't compute this anymore
     };
-  }
-
-  // ---- Existing methods (placeholder) ----
-  async computeEdge(features, symbol = null, timeframe = 'M5', lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = CONFIG.DEFAULT_K, regime = null) {
-    // ... (keep existing, but could call getPredictionDistribution and extract edge)
-  }
-
-  async calibrateConfidence(decision, lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = CONFIG.DEFAULT_K) {
-    // ... (keep existing)
-  }
-
-  _buildCacheKey(features, symbol, timeframe, lookahead, k, regime) {
-    // ... (keep existing)
-  }
-
-  _cleanCache() {
-    // ... (keep existing)
-  }
-
-  invalidateCache() {
-    this._edgeCache.clear();
   }
 
   _emptyDistribution() {
@@ -565,8 +502,8 @@ class StateStore {
       probDown: 0.33,
       probNeutral: 0.34,
       expectedMove: 0,
-      expectedAdverse: 0,
       expectedFavorable: 0,
+      expectedAdverse: 0,
       mfe: 0,
       mae: 0,
       timeToMaxFavorable: null,
@@ -576,33 +513,19 @@ class StateStore {
       candidateCount: 0,
       qualifiedCount: 0,
       averageDistance: 0,
+      weightedAverageDistance: 0,
       maxDistance: 0,
       medianDistance: 0,
-      weightedAverageDistance: 0,
       distanceDistribution: {},
+      analogues: [],
       winRate: 0,
       avgReturnR: 0,
-      analogues: [],
     };
   }
 
-  _emptyStats() {
-    return {
-      count: 0,
-      winRate: 0,
-      avgReturnR: 0,
-      medianReturnR: 0,
-      p25ReturnR: 0,
-      p75ReturnR: 0,
-      maxWin: 0,
-      maxLoss: 0,
-      avgMAE: 0,
-      avgMFE: 0,
-      confidenceInterval: { lower: 0, upper: 0 },
-      profitFactor: 0,
-      maxDrawdown: 0,
-    };
-  }
+  // ---- Cleanup ----
+  _cleanCache() { /* ... */ }
+  invalidateCache() { this._edgeCache.clear(); }
 }
 
 // ---- Singleton ----
