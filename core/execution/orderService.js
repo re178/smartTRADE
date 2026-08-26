@@ -1,12 +1,6 @@
-// core/execution/orderService.js – Order Management (with Portfolio Risk Integration)
-// FIX: Order model validation (units, clientOrderId) now correctly populated.
-// FIX: Trade side uses lowercase to match schema enum.
-// FIX: Trade is created even if Order fails (order already placed).
-// FIX: P&L is computed correctly on trade close.
-// FIX: Auto‑trade validation now stops execution on failure (no longer swallowed).
-// FIX: closeTrade & modifyTrade no longer update DB or broadcast – delegated to routes.
-// ADDED: partialCloseTrade method.
-// ADDED: Multiplier support via options object.
+// core/execution/orderService.js – Order Management with Multiplier Support
+// Skips CFD validation for Multiplier trades.
+// Uses options object for clarity.
 
 const { getBroker } = require('./brokerFactory');
 const marketProvider = require('../market/provider');
@@ -19,103 +13,69 @@ const Trade = require('../../models/Trade');
 const selfLearner = require('../learning/learner');
 const logger = require('../../infrastructure/logger') || console;
 
-// Singleton Execution Analytics instance
-const executionAnalytics = new ExecutionAnalytics({
-  slippageTolerance: parseFloat(process.env.SLIPPAGE_TOLERANCE) || 1,
-});
-
-// Minimum confidence for auto‑trade
+const executionAnalytics = new ExecutionAnalytics({ slippageTolerance: 1 });
 const MIN_CONFIDENCE = 60;
 const MIN_EDGE = 0.2;
 
-/**
- * Pre‑flight validation for auto‑trade
- */
 function validateAutoTradeSignal(signal) {
-  if (!signal || !signal.side) {
-    return { valid: false, reason: 'No valid signal side' };
-  }
-  if (signal.confidence < MIN_CONFIDENCE) {
-    return { valid: false, reason: `Confidence ${signal.confidence}% below minimum ${MIN_CONFIDENCE}%` };
-  }
-  if (signal.expectedValue < MIN_EDGE) {
-    return { valid: false, reason: `Expected value ${signal.expectedValue} below minimum ${MIN_EDGE}R` };
-  }
-  return { valid: true, reason: 'Signal passes pre‑flight checks' };
+  if (!signal || !signal.side) return { valid: false, reason: 'No valid signal side' };
+  if (signal.confidence < MIN_CONFIDENCE) return { valid: false, reason: `Confidence ${signal.confidence}% below minimum` };
+  if (signal.expectedValue < MIN_EDGE) return { valid: false, reason: `Expected value ${signal.expectedValue} below minimum` };
+  return { valid: true };
 }
 
 /**
- * Place a market order (BUY/SELL) with portfolio risk checks.
- * Supports both CFD (lotSize) and Multiplier (stake) trades.
- * @param {string|Object} instrumentOrOptions - Either instrument string or options object.
- * @param {string} [side] - BUY/SELL (if using legacy signature)
- * @param {number} [lotSize] - CFD lot size
- * @param {number} [stopLoss] - CFD stop loss price
- * @param {number} [takeProfit] - CFD take profit price
- * @param {string} [product] - Trading product
- * @param {string} [decisionId] - Decision ID
- * @param {boolean} [autoTrade] - Whether auto‑trade
+ * Place a market order – supports both CFD and Multiplier.
+ * @param {Object} options
+ * @param {string} options.instrument - Pair (e.g., 'EURUSD')
+ * @param {string} options.side - 'BUY' or 'SELL'
+ * @param {number} [options.lotSize] - CFD lot size
+ * @param {number} [options.stopLoss] - CFD stop loss
+ * @param {number} [options.takeProfit] - CFD take profit
+ * @param {number} [options.stake] - Multiplier stake
+ * @param {number} [options.multiplier] - Multiplier multiplier
+ * @param {number} [options.duration] - Multiplier duration (seconds)
+ * @param {number} [options.knockoutLevel] - Multiplier knockout price
+ * @param {number} [options.takeProfitLevel] - Multiplier take profit price
+ * @param {string} [options.product='deriv_cfd'] - Trading product
+ * @param {string} [options.decisionId=null] - Decision ID
+ * @param {boolean} [options.autoTrade=false] - Auto-trade flag
  * @returns {Promise<Object>} { contractId, price, raw }
  */
-async function placeMarketOrder(instrumentOrOptions, side, lotSize, stopLoss = null, takeProfit = null, product, decisionId = null, autoTrade = false) {
-  // ---- Parse options ----
-  let options;
-  if (typeof instrumentOrOptions === 'object' && instrumentOrOptions !== null) {
-    // Options object mode
-    options = instrumentOrOptions;
-  } else {
-    // Legacy signature
-    options = {
-      instrument: instrumentOrOptions,
-      side,
-      lotSize,
-      stopLoss,
-      takeProfit,
-      product,
-      decisionId,
-      autoTrade,
-    };
-  }
-
+async function placeMarketOrder(options) {
   const {
     instrument,
-    side: optSide,
-    lotSize: optLotSize,
-    stopLoss: optStopLoss,
-    takeProfit: optTakeProfit,
-    product: optProduct,
-    decisionId: optDecisionId,
-    autoTrade: optAutoTrade,
-    // Multiplier fields
+    side,
+    lotSize,
+    stopLoss,
+    takeProfit,
     stake,
     multiplier,
     duration,
     knockoutLevel,
     takeProfitLevel,
+    product = 'deriv_cfd',
+    decisionId = null,
+    autoTrade = false,
   } = options;
 
-  // Determine trade type
   const isMultiplier = stake !== undefined && stake !== null && stake > 0;
-  const isCFD = optLotSize !== undefined && optLotSize !== null && optLotSize > 0;
+  const isCFD = lotSize !== undefined && lotSize !== null && lotSize > 0;
 
   if (!isMultiplier && !isCFD) {
     throw new Error('Either stake (Multiplier) or lotSize (CFD) must be provided.');
   }
 
-  // Use the extracted values
-  const finalSide = optSide;
-  const finalProduct = optProduct || 'deriv_cfd';
+  const currentPrice = await marketProvider.getCurrentPrice(instrument, product);
 
-  // 1. Validate input
-  const currentPrice = await marketProvider.getCurrentPrice(instrument, finalProduct);
-
+  // ---- Validation ----
   if (isCFD) {
     const validation = validateOrderInput({
       pair: instrument,
-      side: finalSide,
-      lotSize: optLotSize,
-      stopLoss: optStopLoss || null,
-      takeProfit: optTakeProfit || null,
+      side,
+      lotSize,
+      stopLoss: stopLoss || null,
+      takeProfit: takeProfit || null,
       currentPrice,
     });
     if (!validation.valid) {
@@ -126,75 +86,72 @@ async function placeMarketOrder(instrumentOrOptions, side, lotSize, stopLoss = n
     if (!multiplier || multiplier < 1) throw new Error('Multiplier must be at least 1');
     if (!duration || duration < 10) throw new Error('Duration must be at least 10 seconds');
     if (stake <= 0) throw new Error('Stake must be positive');
-    // Optional: check knockout and TP levels against current price
-    if (knockoutLevel !== null) {
-      if (finalSide === 'BUY' && knockoutLevel >= currentPrice) {
+    if (knockoutLevel !== null && knockoutLevel !== undefined) {
+      if (side.toUpperCase() === 'BUY' && knockoutLevel >= currentPrice) {
         throw new Error('Knockout must be below current price for BUY');
       }
-      if (finalSide === 'SELL' && knockoutLevel <= currentPrice) {
+      if (side.toUpperCase() === 'SELL' && knockoutLevel <= currentPrice) {
         throw new Error('Knockout must be above current price for SELL');
+      }
+    }
+    if (takeProfitLevel !== null && takeProfitLevel !== undefined) {
+      if (side.toUpperCase() === 'BUY' && takeProfitLevel <= currentPrice) {
+        throw new Error('Take profit must be above current price for BUY');
+      }
+      if (side.toUpperCase() === 'SELL' && takeProfitLevel >= currentPrice) {
+        throw new Error('Take profit must be below current price for SELL');
       }
     }
   }
 
-  // 2. Portfolio risk assessment
-  const broker = getBroker(finalProduct);
+  // ---- Portfolio risk assessment ----
+  const broker = getBroker(product);
   const account = await broker.getAccount();
   const currentPositions = await broker.getOpenTrades();
 
   const signal = {
     symbol: instrument,
-    side: finalSide,
+    side,
     entryPrice: currentPrice,
-    stopLoss: isCFD ? optStopLoss : knockoutLevel,
-    takeProfit: isCFD ? optTakeProfit : takeProfitLevel,
-    recommendedLotSize: isCFD ? optLotSize : stake,
+    stopLoss: isCFD ? stopLoss : knockoutLevel,
+    takeProfit: isCFD ? takeProfit : takeProfitLevel,
+    recommendedLotSize: isCFD ? lotSize : stake,
   };
 
   const portfolioApproval = await portfolioIntelligence.assessNewTrade(signal, parseFloat(account.balance), currentPositions);
   if (!portfolioApproval.approved) {
-    logger.warn(`[orderService] Portfolio risk rejected ${instrument} ${finalSide}: ${portfolioApproval.reason}`);
-    eventBus.emit('order.rejected', { instrument, side: finalSide, reason: portfolioApproval.reason });
+    logger.warn(`[orderService] Portfolio risk rejected ${instrument} ${side}: ${portfolioApproval.reason}`);
+    eventBus.emit('order.rejected', { instrument, side, reason: portfolioApproval.reason });
     throw new Error(`Portfolio risk rejection: ${portfolioApproval.reason}`);
   }
 
-  const finalLotSize = isCFD ? (portfolioApproval.adjustedLotSize || optLotSize) : stake;
-
-  // 3. Auto-trade pre-flight
-  if (optAutoTrade && optDecisionId) {
+  // ---- Auto-trade pre-flight ----
+  if (autoTrade && decisionId) {
     const Decision = require('../../models/HistoricalDecision');
-    const decision = await Decision.findById(optDecisionId);
+    const decision = await Decision.findById(decisionId);
     if (decision) {
       const autoCheck = validateAutoTradeSignal(decision);
       if (!autoCheck.valid) {
         logger.warn(`[orderService] Auto‑trade signal invalid: ${autoCheck.reason}`);
-        eventBus.emit('order.rejected', { instrument, side: finalSide, reason: autoCheck.reason });
+        eventBus.emit('order.rejected', { instrument, side, reason: autoCheck.reason });
         throw new Error(`Auto‑trade rejected: ${autoCheck.reason}`);
       }
     }
   }
 
-  // 4. Execute order
+  // ---- Execute order ----
   const startTime = Date.now();
-  if (!broker.capabilities?.supportsMarketOrders) {
-    throw new Error('Broker does not support market orders');
-  }
-  if (!broker.isConnected()) {
-    await broker.connect();
-  }
+  if (!broker.capabilities?.supportsMarketOrders) throw new Error('Broker does not support market orders');
+  if (!broker.isConnected()) await broker.connect();
 
   let result;
   if (isCFD) {
-    // CFD: use units = lotSize with sign
-    const units = finalSide.toUpperCase() === 'BUY' ? finalLotSize : -finalLotSize;
-    result = await broker.placeMarketOrder(instrument, units, optStopLoss || null, optTakeProfit || null);
+    const units = side.toUpperCase() === 'BUY' ? lotSize : -lotSize;
+    result = await broker.placeMarketOrder(instrument, units, stopLoss || null, takeProfit || null);
   } else {
     // Multiplier: pass stake as units (broker expects amount = Math.abs(units))
-    // We'll also pass the extra parameters as metadata; broker needs to be updated to use them.
-    // For now, we pass knockout as stopLoss and takeProfitLevel as takeProfit.
-    const units = finalSide.toUpperCase() === 'BUY' ? stake : -stake;
+    const units = side.toUpperCase() === 'BUY' ? stake : -stake;
     result = await broker.placeMarketOrder(instrument, units, knockoutLevel || null, takeProfitLevel || null);
-    // Add metadata to result
     result._multiplier = multiplier;
     result._duration = duration;
   }
@@ -202,25 +159,23 @@ async function placeMarketOrder(instrumentOrOptions, side, lotSize, stopLoss = n
   const latency = Date.now() - startTime;
   const contractId = result.tradeID || result.id || result.ticket || null;
   const price = result.price || result.averagePrice || null;
-  if (!contractId) {
-    throw new Error('Broker did not return a trade ID');
-  }
+  if (!contractId) throw new Error('Broker did not return a trade ID');
 
-  // 5. Create Order document
+  // ---- Save Order ----
   const orderData = {
     contractId,
     instrument,
-    side: finalSide.toUpperCase(),
-    lotSize: isCFD ? finalLotSize : stake,
-    units: isCFD ? finalLotSize : stake,
+    side: side.toUpperCase(),
+    lotSize: isCFD ? lotSize : stake,
+    units: isCFD ? lotSize : stake,
     clientOrderId: contractId,
-    stopLoss: isCFD ? optStopLoss : knockoutLevel,
-    takeProfit: isCFD ? optTakeProfit : takeProfitLevel,
+    stopLoss: isCFD ? stopLoss : knockoutLevel,
+    takeProfit: isCFD ? takeProfit : takeProfitLevel,
     status: 'FILLED',
-    product: finalProduct,
+    product,
     filledPrice: price,
     placedAt: new Date(),
-    // Multiplier-specific fields
+    // Multiplier fields
     stake: isMultiplier ? stake : null,
     multiplier: isMultiplier ? multiplier : null,
     duration: isMultiplier ? duration : null,
@@ -230,24 +185,23 @@ async function placeMarketOrder(instrumentOrOptions, side, lotSize, stopLoss = n
   try {
     const order = new Order(orderData);
     await order.save();
-    logger.debug(`[orderService] Order saved for ${contractId}`);
-  } catch (orderErr) {
-    logger.error(`[orderService] Failed to save Order for ${contractId}:`, orderErr.message);
+  } catch (err) {
+    logger.error(`[orderService] Failed to save Order: ${err.message}`);
   }
 
-  // 6. Create Trade record
+  // ---- Save Trade ----
   let trade = null;
   try {
     const tradeData = {
       contractId,
       instrument,
-      side: finalSide.toLowerCase(),
-      lotSize: isCFD ? finalLotSize : stake,
+      side: side.toLowerCase(),
+      lotSize: isCFD ? lotSize : stake,
       openPrice: price,
       status: 'OPEN',
       openTime: new Date(),
-      product: finalProduct,
-      decisionId: optDecisionId || null,
+      product,
+      decisionId: decisionId || null,
       currentPrice: price,
       floatingProfit: 0,
       atrAtEntry: null,
@@ -262,41 +216,38 @@ async function placeMarketOrder(instrumentOrOptions, side, lotSize, stopLoss = n
     };
     trade = new Trade(tradeData);
     await trade.save();
-    logger.info(`[orderService] Trade created (OPEN) for ${contractId} (${instrument} ${finalSide})`);
-  } catch (tradeErr) {
-    logger.error(`[orderService] Failed to create Trade for ${contractId}:`, tradeErr.message);
+    logger.info(`[orderService] Trade created (OPEN) for ${contractId}`);
+  } catch (err) {
+    logger.error(`[orderService] Failed to create Trade: ${err.message}`);
   }
 
-  // 7. Record analytics
-  const spread = await broker.getSpread(instrument).catch(() => 0);
+  // ---- Analytics & Events ----
   executionAnalytics.recordExecution({
     orderId: contractId,
     instrument,
-    side: finalSide,
+    side,
     requestedPrice: price,
     filledPrice: price,
     latency,
-    spread: spread || 0,
+    spread: await broker.getSpread(instrument).catch(() => 0),
     status: 'FILLED',
-    ticket: result.ticket || contractId,
-    server: broker.serverName || 'unknown',
-    broker: finalProduct,
+    ticket: contractId,
+    broker: product,
   });
 
-  // 8. Emit events
   const eventPayload = {
     instrument,
-    side: finalSide,
+    side,
     contractId,
     price,
-    decisionId: optDecisionId || null,
+    decisionId,
     timestamp: new Date().toISOString(),
     isMultiplier,
   };
   if (isCFD) {
-    eventPayload.lotSize = finalLotSize;
-    eventPayload.stopLoss = optStopLoss;
-    eventPayload.takeProfit = optTakeProfit;
+    eventPayload.lotSize = lotSize;
+    eventPayload.stopLoss = stopLoss;
+    eventPayload.takeProfit = takeProfit;
   } else {
     eventPayload.stake = stake;
     eventPayload.multiplier = multiplier;
@@ -305,38 +256,31 @@ async function placeMarketOrder(instrumentOrOptions, side, lotSize, stopLoss = n
     eventPayload.takeProfitLevel = takeProfitLevel;
   }
   eventBus.emit('order.placed', eventPayload);
-  eventBus.emit('trade.placed', { instrument, side: finalSide, contractId, price });
+  eventBus.emit('trade.placed', { instrument, side, contractId, price });
 
-  // 9. Update HistoricalDecision
-  if (optDecisionId) {
+  if (decisionId) {
     try {
       const Decision = require('../../models/HistoricalDecision');
-      const decision = await Decision.findById(optDecisionId);
+      const decision = await Decision.findById(decisionId);
       if (decision) {
         decision.outcome.executed = true;
         decision.outcome.tradeId = trade?._id || contractId;
         await decision.save();
       }
     } catch (err) {
-      logger.warn(`[orderService] Could not update decision ${optDecisionId}:`, err.message);
+      logger.warn(`[orderService] Could not update decision ${decisionId}:`, err.message);
     }
   }
 
   return { contractId, price, raw: result };
 }
 
-/**
- * Cancel a pending order by its contract ID.
- */
+// ---- Other functions (unchanged) ----
 async function cancelOrder(contractId, product) {
   if (!contractId) throw new Error('contractId is required');
   const broker = getBroker(product);
-  if (!broker.capabilities?.supportsCancel) {
-    throw new Error('Broker does not support cancelling pending orders');
-  }
-  if (!broker.isConnected()) {
-    await broker.connect();
-  }
+  if (!broker.capabilities?.supportsCancel) throw new Error('Broker does not support cancelling pending orders');
+  if (!broker.isConnected()) await broker.connect();
   const result = await broker.cancelOrder(contractId);
   await Order.findOneAndUpdate(
     { contractId },
@@ -347,28 +291,17 @@ async function cancelOrder(contractId, product) {
   return result;
 }
 
-/**
- * Close an open trade by its contract ID.
- * DB updates and broadcasts are now handled exclusively by the `/api/mt5/orders/result` route.
- * This method only calls the broker and returns the result.
- */
 async function closeTrade(contractId, product) {
   if (!contractId) throw new Error('contractId is required');
   const broker = getBroker(product);
-  if (!broker.capabilities?.supportsClose) {
-    throw new Error('Broker does not support closing trades');
-  }
-  if (!broker.isConnected()) {
-    await broker.connect();
-  }
+  if (!broker.capabilities?.supportsClose) throw new Error('Broker does not support closing trades');
+  if (!broker.isConnected()) await broker.connect();
   const result = await broker.closeTrade(contractId);
 
-  // ---- Update HistoricalDecision outcome (if any) using the now-closed trade ----
   try {
     const closedTrade = await Trade.findOne({ contractId });
     if (closedTrade && closedTrade.decisionId) {
       await selfLearner.updateDecisionOutcome(closedTrade.decisionId, closedTrade);
-      logger.debug(`[orderService] Decision ${closedTrade.decisionId} outcome updated for trade ${contractId}`);
     }
   } catch (err) {
     logger.warn(`[orderService] Failed to update decision outcome for ${contractId}:`, err.message);
@@ -393,78 +326,44 @@ async function closeTrade(contractId, product) {
   return { ...result, pl: 0 };
 }
 
-/**
- * Modify stop-loss and take-profit for an open trade.
- * DB updates and broadcasts are handled exclusively by the `/api/mt5/orders/result` route.
- * This method only calls the broker and returns the result.
- */
 async function modifyTrade(contractId, stopLoss, takeProfit, product) {
   if (!contractId) throw new Error('contractId is required');
   const broker = getBroker(product);
-  if (!broker.capabilities?.supportsModify) {
-    throw new Error('Broker does not support modifying SL/TP');
-  }
-  if (!broker.isConnected()) {
-    await broker.connect();
-  }
+  if (!broker.capabilities?.supportsModify) throw new Error('Broker does not support modifying SL/TP');
+  if (!broker.isConnected()) await broker.connect();
   const result = await broker.modifySLTP(contractId, stopLoss, takeProfit);
 
   eventBus.emit('order.modified', { contractId, stopLoss, takeProfit, result, timestamp: new Date().toISOString() });
-
   return result;
 }
 
-/**
- * Partially close an open trade by reducing its position size.
- * DB updates and broadcasts are handled by the `/api/mt5/orders/result` route.
- */
 async function partialCloseTrade(contractId, closeUnits, product) {
   if (!contractId) throw new Error('contractId is required');
   if (!closeUnits || closeUnits <= 0) throw new Error('closeUnits must be a positive number');
   const broker = getBroker(product);
-  if (!broker.capabilities?.supportsPartialClose) {
-    throw new Error('Broker does not support partial close');
-  }
-  if (!broker.isConnected()) {
-    await broker.connect();
-  }
+  if (!broker.capabilities?.supportsPartialClose) throw new Error('Broker does not support partial close');
+  if (!broker.isConnected()) await broker.connect();
   const result = await broker.partialClose(contractId, closeUnits);
   eventBus.emit('trade.partialClosed', { contractId, closeUnits, result, timestamp: new Date().toISOString() });
   return result;
 }
 
-/**
- * Get all open trades from the broker.
- */
 async function getOpenTrades(product) {
   const broker = getBroker(product);
-  if (!broker.isConnected()) {
-    await broker.connect();
-  }
+  if (!broker.isConnected()) await broker.connect();
   return broker.getOpenTrades();
 }
 
-/**
- * Get all positions from the broker.
- */
 async function getPositions(product) {
   const broker = getBroker(product);
-  if (!broker.isConnected()) {
-    await broker.connect();
-  }
+  if (!broker.isConnected()) await broker.connect();
   return broker.getPositions();
 }
 
-/**
- * Get execution analytics report.
- */
 function getExecutionAnalytics() {
   return executionAnalytics.getReport();
 }
 
-/**
- * Delete all closed trades from the Trade collection.
- */
 async function deleteClosedTrades() {
   const result = await Trade.deleteMany({ status: 'CLOSED' });
   logger.info(`Deleted ${result.deletedCount} closed trades from history.`);
