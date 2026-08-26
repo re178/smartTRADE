@@ -1,6 +1,7 @@
 // core/execution/broker.js – Stable Dual‑WebSocket Deriv Broker
 // Watchlist: only subscribe to specified symbols.
-// PATCHED: proposal uses `symbol` instead of `underlying_symbol` to match Deriv API.
+// PATCHED: proposal uses `symbol` instead of `underlying_symbol`.
+// PATCHED: duration default increased to 300s; accepts dynamic duration/multiplier.
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -314,7 +315,7 @@ class DerivBroker extends EventEmitter {
 
     this.validateConfig();
 
-    // ---------- Public socket (market data) ----------
+    // ---------- Public socket ----------
     this._publicState = STATE.DISCONNECTED;
     this._publicSocket = null;
     this._publicPendingRequests = new Map();
@@ -325,7 +326,7 @@ class DerivBroker extends EventEmitter {
     this._publicConnectionPromise = null;
     this._publicReconnectTimer = null;
 
-    // ---------- Auth socket (trading) ----------
+    // ---------- Auth socket ----------
     this._authState = STATE.DISCONNECTED;
     this._authSocket = null;
     this._authPendingRequests = new Map();
@@ -407,7 +408,7 @@ class DerivBroker extends EventEmitter {
     return this.symbolManager.getLeverage(symbol) || this.config.leverage || 100;
   }
 
-  // ---------- CONNECTION (overall) ----------
+  // ---------- CONNECTION ----------
   async connect() {
     await Promise.all([
       this._connectPublic(),
@@ -426,7 +427,7 @@ class DerivBroker extends EventEmitter {
     await this._loadPendingOrders();
   }
 
-  // ---- Public socket: persistent reconnect on close/error ----
+  // ---- Public socket ----
   async _connectPublic() {
     if (this._publicState === STATE.READY || this._publicState === STATE.CONNECTED) return;
     if (this._publicConnectionPromise) return this._publicConnectionPromise;
@@ -1388,9 +1389,9 @@ class DerivBroker extends EventEmitter {
   async getPositions() { return this.getOpenTrades(); }
 
   // ============================================================
-  //  PLACE MARKET ORDER – PATCHED (symbol instead of underlying_symbol)
+  //  PLACE MARKET ORDER – PATCHED: dynamic duration & multiplier
   // ============================================================
-  async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null) {
+  async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null, duration = null, multiplier = null) {
     await this._ensureAuthReady();
     const amount = Math.abs(units);
     if (amount <= 0) throw new Error('Order units must be positive.');
@@ -1398,17 +1399,20 @@ class DerivBroker extends EventEmitter {
     const symbol = toDerivSymbol(instrument, this.symbolMap);
     if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
     
+    // Use passed duration or default to 300 seconds (5 minutes)
+    const finalDuration = duration || 300;
+    const finalMultiplier = multiplier || this.getLeverage(symbol) || 100;
+
     const proposalPayload = {
       proposal: 1,
       amount: amount,
       basis: 'stake',
       contract_type: direction,
       currency: this.accountCurrency || 'USD',
-      duration: 60,
+      duration: finalDuration,
       duration_unit: 's',
-      // ✅ FIX: Use 'symbol' instead of 'underlying_symbol'
       symbol: symbol,
-      multiplier: this.getLeverage(symbol) || 100,
+      multiplier: finalMultiplier,
     };
     if (stopLoss) proposalPayload.stop_loss = stopLoss;
     if (takeProfit) proposalPayload.take_profit = takeProfit;
