@@ -1,6 +1,7 @@
 // api/controllers.js – Complete Request Handlers (with Multiplier support)
 // Updated to accept stake, multiplier, duration, knockoutLevel, takeProfitLevel.
 // Falls back to legacy lotSize/stopLoss for backward compatibility.
+// Calls orderService.placeMarketOrder with options object.
 
 const Trade = require('../models/Trade');
 const Order = require('../models/Order');
@@ -292,7 +293,7 @@ exports.getPendingOrders = async (req, res) => {
 };
 
 // ================================================================
-//  PLACE ORDER – Multiplier-aware
+//  PLACE ORDER – Multiplier-aware, uses orderService options
 // ================================================================
 exports.placeOrder = async (req, res) => {
   const {
@@ -314,9 +315,8 @@ exports.placeOrder = async (req, res) => {
   try {
     const product = overrideProduct || getProduct(req);
     const instrument = pair.toUpperCase();
-    const currentPrice = await marketProvider.getCurrentPrice(instrument, product);
 
-    // Determine if this is a Multiplier trade (stake provided) or CFD trade (lotSize provided)
+    // Determine trade type
     const isMultiplier = stake !== undefined && stake !== null && stake > 0;
     const isCFD = lotSize !== undefined && lotSize !== null && lotSize > 0;
 
@@ -328,28 +328,20 @@ exports.placeOrder = async (req, res) => {
 
     if (isMultiplier) {
       // ---- Multiplier trade ----
-      // Validate Multiplier parameters
-      if (!multiplier || multiplier < 1) {
-        return res.status(400).json({ error: 'Multiplier must be at least 1' });
-      }
-      if (!duration || duration < 10) {
-        return res.status(400).json({ error: 'Duration must be at least 10 seconds' });
-      }
-
-      // Call orderService with Multiplier fields
-      orderResult = await orderService.placeMarketOrder(
+      orderResult = await orderService.placeMarketOrder({
         instrument,
         side,
-        stake,                  // stake instead of lotSize
+        stake,
         multiplier,
         duration,
-        knockoutLevel || null,
-        takeProfitLevel || null,
-        product
-      );
+        knockoutLevel: knockoutLevel || null,
+        takeProfitLevel: takeProfitLevel || null,
+        product,
+      });
     } else {
       // ---- CFD trade (legacy) ----
-      // Validate CFD parameters
+      // Validate CFD parameters (this will use the validator)
+      const currentPrice = await marketProvider.getCurrentPrice(instrument, product);
       const validation = validateOrderInput({
         pair: instrument,
         side,
@@ -362,6 +354,7 @@ exports.placeOrder = async (req, res) => {
         return res.status(400).json({ error: validation.message });
       }
 
+      // Portfolio risk check for CFD
       const broker = getBroker(product);
       const account = await broker.getAccount();
       const currentPositions = await broker.getOpenTrades();
@@ -380,9 +373,14 @@ exports.placeOrder = async (req, res) => {
         return res.status(400).json({ error: approval.reason });
       }
 
-      orderResult = await orderService.placeMarketOrder(
-        instrument, side, lotSize, stopLoss || null, takeProfit || null, product
-      );
+      orderResult = await orderService.placeMarketOrder({
+        instrument,
+        side,
+        lotSize,
+        stopLoss: stopLoss || null,
+        takeProfit: takeProfit || null,
+        product,
+      });
     }
 
     // ---- Common post-order steps ----
@@ -409,15 +407,13 @@ exports.closeTrade = async (req, res) => {
   if (!tradeId) return res.status(400).json({ error: 'tradeId required' });
   try {
     const product = getProduct(req);
-    // Use the updated closeTrade which broadcasts events
     const result = await orderService.closeTrade(tradeId, product);
     
-    // Broadcast updated positions and account (redundant but safe)
+    // Broadcast updated positions and account
     try {
       const openTrades = await orderService.getOpenTrades(product);
       broadcastToDashboards('positions', openTrades);
       const account = await accountService.getAccount(product);
-      // Enhance account before broadcasting
       const broker = getBroker(product);
       const enhanced = enhanceAccount(account, broker);
       broadcastToDashboards('account', enhanced);
@@ -503,25 +499,18 @@ exports.autoTrade = async (req, res) => {
     let orderResult;
     if (isMultiplier) {
       // Multiplier auto-trade
-      if (!multiplier || multiplier < 1) {
-        return res.json({ success: false, message: 'Multiplier must be at least 1' });
-      }
-      if (!duration || duration < 10) {
-        return res.json({ success: false, message: 'Duration must be at least 10 seconds' });
-      }
-
-      orderResult = await orderService.placeMarketOrder(
+      orderResult = await orderService.placeMarketOrder({
         instrument,
-        signal.side,
+        side: signal.side,
         stake,
         multiplier,
         duration,
-        knockoutLevel || null,
-        takeProfitLevel || null,
+        knockoutLevel: knockoutLevel || null,
+        takeProfitLevel: takeProfitLevel || null,
         product,
-        null,
-        true
-      );
+        decisionId: null,
+        autoTrade: true,
+      });
     } else {
       // CFD auto-trade (legacy)
       const validation = validateOrderInput({
@@ -548,9 +537,16 @@ exports.autoTrade = async (req, res) => {
         lotSize = await riskManager.calculateLotSize(instrument, signal.entryPrice, signal.stopLoss, riskPercent, 1000, product);
       }
 
-      orderResult = await orderService.placeMarketOrder(
-        instrument, signal.side, lotSize, signal.stopLoss, signal.takeProfit, product, null, true
-      );
+      orderResult = await orderService.placeMarketOrder({
+        instrument,
+        side: signal.side,
+        lotSize,
+        stopLoss: signal.stopLoss || null,
+        takeProfit: signal.takeProfit || null,
+        product,
+        decisionId: null,
+        autoTrade: true,
+      });
     }
 
     const trade = await Trade.findOne({ contractId: orderResult.contractId });
@@ -600,33 +596,23 @@ exports.executeSignal = async (req, res) => {
     const product = getProduct(req);
     const instrument = formattedPair;
 
-    let currentPrice = entryPrice;
-    if (!currentPrice) {
-      currentPrice = await marketProvider.getCurrentPrice(instrument, product);
-    }
+    const currentPrice = entryPrice || await marketProvider.getCurrentPrice(instrument, product);
 
     const isMultiplier = stake !== undefined && stake !== null && stake > 0;
 
     let orderResult;
     if (isMultiplier) {
       // Multiplier signal execution
-      if (!multiplier || multiplier < 1) {
-        return res.status(400).json({ error: 'Multiplier must be at least 1' });
-      }
-      if (!duration || duration < 10) {
-        return res.status(400).json({ error: 'Duration must be at least 10 seconds' });
-      }
-
-      orderResult = await orderService.placeMarketOrder(
+      orderResult = await orderService.placeMarketOrder({
         instrument,
-        cleanSide,
+        side: cleanSide,
         stake,
         multiplier,
         duration,
-        knockoutLevel || null,
-        takeProfitLevel || null,
-        product
-      );
+        knockoutLevel: knockoutLevel || null,
+        takeProfitLevel: takeProfitLevel || null,
+        product,
+      });
     } else {
       // CFD signal execution (legacy)
       if (!lotSize || lotSize <= 0) {
@@ -645,14 +631,14 @@ exports.executeSignal = async (req, res) => {
         return res.status(400).json({ error: validation.message });
       }
 
-      orderResult = await orderService.placeMarketOrder(
+      orderResult = await orderService.placeMarketOrder({
         instrument,
-        cleanSide,
-        parseFloat(lotSize),
-        stopLoss || null,
-        takeProfit || null,
-        product
-      );
+        side: cleanSide,
+        lotSize: parseFloat(lotSize),
+        stopLoss: stopLoss || null,
+        takeProfit: takeProfit || null,
+        product,
+      });
     }
 
     const trade = await Trade.findOne({ contractId: orderResult.contractId });
