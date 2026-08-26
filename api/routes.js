@@ -1,4 +1,5 @@
 // api/routes.js – Complete API Routes (with Developer Key Management & new report endpoint)
+// Added /trade route for Multiplier manual trading.
 
 const express = require('express');
 const router = express.Router();
@@ -27,7 +28,8 @@ router.get('/candles', controllers.getCandles);
 router.get('/positions', controllers.getPositions);
 router.get('/trades', controllers.getTrades);
 router.get('/trade-history', controllers.getTradeHistory);
-router.post('/order', controllers.placeOrder);
+router.post('/order', controllers.placeOrder);        // legacy CFD order
+router.post('/trade', controllers.placeOrder);        // <-- NEW: Multiplier order (same controller)
 router.put('/close/:tradeId', controllers.closeTrade);
 router.get('/signal', controllers.getSignal);
 router.post('/auto-trade', controllers.autoTrade);
