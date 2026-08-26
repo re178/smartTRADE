@@ -1,5 +1,6 @@
 // core/execution/broker.js – Stable Dual‑WebSocket Deriv Broker
 // Watchlist: only subscribe to specified symbols.
+// PATCHED: proposal uses `symbol` instead of `underlying_symbol` to match Deriv API.
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -156,7 +157,6 @@ class StreamingManager {
       }
       return;
     }
-    // Wait for public connection to be ready
     await this.broker._ensurePublicReady();
     const response = await this.broker._sendPublicRequest({ [type]: symbol, subscribe: 1 });
     const subscriptionId = response.subscription?.id;
@@ -479,12 +479,9 @@ class DerivBroker extends EventEmitter {
           this._publicState = STATE.CONNECTED;
           this._startPublicHeartbeat();
           this._flushPublicQueue();
-
-          // ✅ FIX: Restore streaming subscriptions after reconnect
           this.streaming.restoreSubscriptions().catch(err => {
             logger.warn('[DerivBroker] Failed to restore subscriptions:', err.message);
           });
-
           this.emit('publicReady');
           resolve();
         });
@@ -709,7 +706,7 @@ class DerivBroker extends EventEmitter {
     await sleep(200);
   }
 
-  // ---- Auth socket (legacy v3 with authorize) ----
+  // ---- Auth socket ----
   async _connectAuth() {
     if (this._authState === STATE.READY) return;
     if (this._authConnectionPromise) return this._authConnectionPromise;
@@ -1048,7 +1045,7 @@ class DerivBroker extends EventEmitter {
     });
   }
 
-  // ---------- Symbol loading (public) ----------
+  // ---------- Symbol loading ----------
   async _loadSymbolsWithTimeout() {
     return Promise.race([
       this._loadSymbolsInternal(),
@@ -1144,15 +1141,13 @@ class DerivBroker extends EventEmitter {
     return count;
   }
 
-  // ---------- SUBSCRIBE DEFAULT SYMBOLS (only watchlist) ----------
+  // ---------- SUBSCRIBE DEFAULT SYMBOLS ----------
   async _subscribeDefaultSymbols() {
-    // Build a set of valid symbols from the symbolMap (or fallback)
     const validSymbols = new Set(Object.values(this.symbolMap));
     const toSubscribe = WATCHLIST.filter(sym => validSymbols.has(sym));
 
     if (toSubscribe.length === 0) {
       logger.warn('[DerivBroker] None of the watchlist symbols are in the symbol map. Subscribing to fallback symbols...');
-      // As a fallback, subscribe to the first 4 fallback symbols
       const fallbackSymbols = Object.values(FALLBACK_SYMBOLS).slice(0, 4);
       for (const sym of fallbackSymbols) {
         try {
@@ -1209,7 +1204,7 @@ class DerivBroker extends EventEmitter {
     this.emit('orderUpdate', { clientOrderId, status, contractId });
   }
 
-  // ---------- POSITION RECONCILIATION (auth) ----------
+  // ---------- POSITION RECONCILIATION ----------
   async _reconcilePositions() {
     logger.info('[DerivBroker] Reconciling positions from portfolio...');
     try {
@@ -1275,9 +1270,9 @@ class DerivBroker extends EventEmitter {
     };
   }
 
-  // ---------- PUBLIC API ----------
-
-  // ---- Get Account ----
+  // ============================================================
+  // PUBLIC API
+  // ============================================================
   async getAccount() {
     await this._ensureAuthReady();
     if (!this._account) {
@@ -1307,7 +1302,6 @@ class DerivBroker extends EventEmitter {
     };
   }
 
-  // ---- Get Prices (from public) ----
   async getPrices(instruments) {
     await this._ensurePublicReady();
     const results = [];
@@ -1349,7 +1343,6 @@ class DerivBroker extends EventEmitter {
     return results;
   }
 
-  // ---- Get Candles (from public) ----
   async getCandles(instrument, count = 100, granularity = 'M5') {
     await this._ensurePublicReady();
     const symbol = toDerivSymbol(instrument, this.symbolMap);
@@ -1376,7 +1369,6 @@ class DerivBroker extends EventEmitter {
     }));
   }
 
-  // ---- Get Open Trades (auth) ----
   async getOpenTrades() {
     await this._ensureAuthReady();
     try {
@@ -1395,7 +1387,9 @@ class DerivBroker extends EventEmitter {
 
   async getPositions() { return this.getOpenTrades(); }
 
-  // ---- Place Market Order (auth) – CORRECTED CONTRACT TYPES ----
+  // ============================================================
+  //  PLACE MARKET ORDER – PATCHED (symbol instead of underlying_symbol)
+  // ============================================================
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null) {
     await this._ensureAuthReady();
     const amount = Math.abs(units);
@@ -1412,7 +1406,8 @@ class DerivBroker extends EventEmitter {
       currency: this.accountCurrency || 'USD',
       duration: 60,
       duration_unit: 's',
-      underlying_symbol: symbol,
+      // ✅ FIX: Use 'symbol' instead of 'underlying_symbol'
+      symbol: symbol,
       multiplier: this.getLeverage(symbol) || 100,
     };
     if (stopLoss) proposalPayload.stop_loss = stopLoss;
@@ -1465,7 +1460,7 @@ class DerivBroker extends EventEmitter {
     };
   }
 
-  // ---- Close Trade (auth) ----
+  // ---------- Close Trade ----------
   async closeTrade(tradeId) {
     await this._ensureAuthReady();
     if (!tradeId) throw new Error('tradeId is required');
@@ -1489,7 +1484,7 @@ class DerivBroker extends EventEmitter {
     return response;
   }
 
-  // ---- Modify SL/TP (auth) ----
+  // ---------- Modify SL/TP ----------
   async modifySLTP(tradeId, stopLoss, takeProfit) {
     await this._ensureAuthReady();
     if (!tradeId) throw new Error('tradeId is required');
@@ -1509,18 +1504,18 @@ class DerivBroker extends EventEmitter {
     };
   }
 
-  // ---- Partial Close (not supported) ----
+  // ---------- Partial Close (not supported) ----------
   async partialClose(tradeId, units) {
     throw new Error('Partial close is not supported for CFD positions via the public API.');
   }
 
-  // ---- Limit Orders (not implemented) ----
+  // ---------- Limit Orders (not implemented) ----------
   async placeLimitOrder(instrument, units, price, stopLoss = null, takeProfit = null) {
     logger.warn('[DerivBroker] Limit orders are not supported; falling back to market order.');
     return this.placeMarketOrder(instrument, units, stopLoss, takeProfit);
   }
 
-  // ---- Health ----
+  // ---------- Health ----------
   isMarketDataConnected() {
     return this._publicState === STATE.CONNECTED || this._publicState === STATE.READY;
   }
