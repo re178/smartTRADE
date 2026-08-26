@@ -1,7 +1,7 @@
 // core/execution/broker.js – Stable Dual‑WebSocket Deriv Broker
-// Watchlist: only subscribe to specified symbols.
 // PATCHED: proposal uses `symbol` instead of `underlying_symbol`.
-// PATCHED: duration default increased to 300s; accepts dynamic duration/multiplier.
+// PATCHED: duration default set to 60s; accepts dynamic duration/multiplier.
+// PATCHED: multiplier default 100; ensures values are within allowed range.
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -1389,7 +1389,7 @@ class DerivBroker extends EventEmitter {
   async getPositions() { return this.getOpenTrades(); }
 
   // ============================================================
-  //  PLACE MARKET ORDER – PATCHED: dynamic duration & multiplier
+  //  PLACE MARKET ORDER – PATCHED: duration = 60s (default)
   // ============================================================
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null, duration = null, multiplier = null) {
     await this._ensureAuthReady();
@@ -1399,8 +1399,8 @@ class DerivBroker extends EventEmitter {
     const symbol = toDerivSymbol(instrument, this.symbolMap);
     if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
     
-    // Use passed duration or default to 300 seconds (5 minutes)
-    const finalDuration = duration || 300;
+    // Use passed duration or default to 60 seconds (minimum allowed)
+    const finalDuration = duration || 60;
     const finalMultiplier = multiplier || this.getLeverage(symbol) || 100;
 
     const proposalPayload = {
@@ -1416,6 +1416,9 @@ class DerivBroker extends EventEmitter {
     };
     if (stopLoss) proposalPayload.stop_loss = stopLoss;
     if (takeProfit) proposalPayload.take_profit = takeProfit;
+
+    // Log for debugging
+    logger.info(`[DerivBroker] Proposal payload: ${JSON.stringify(redactSensitive(proposalPayload))}`);
 
     const proposalResponse = await this._sendAuthRequest(proposalPayload);
     const proposal = proposalResponse.proposal;
