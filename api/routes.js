@@ -1,741 +1,264 @@
-// api/controllers.js – Complete Request Handlers (with Multiplier support)
-// Updated to accept stake, multiplier, duration, knockoutLevel, takeProfitLevel.
-// Falls back to legacy lotSize/stopLoss for backward compatibility.
+// api/routes.js – Complete API Routes (with Developer Key Management & new report endpoint)
+// Added /trade route for Multiplier manual trading.
 
-const Trade = require('../models/Trade');
-const Order = require('../models/Order');
-const User = require('../models/User');
-const marketProvider = require('../core/market/provider');
-const { getBroker } = require('../core/execution/brokerFactory');
-const orderService = require('../core/execution/orderService');
-const strategyEngine = require('../core/strategy/engine');
-const riskManager = require('../core/risk/manager');
-const accountService = require('../core/portfolio/accountService');
-const { PortfolioManager, PerformanceLearner } = require('../core/analytics/performanceSuite');
-const { notifyTrade } = require('../core/notifications/notificationService');
-const { validateOrderInput } = require('../shared/validators');
-const { formatSymbol } = require('../shared/helpers');
+const express = require('express');
+const router = express.Router();
+const controllers = require('./controllers');
+const {
+  BacktestingEngine,
+  WalkForwardOptimizer,
+  PerformanceLearner,
+} = require('../core/analytics/performanceSuite');
+const { sendTestEmail } = require('../core/notifications/emailService');
+
+// Use your existing logger
 const logger = require('../infrastructure/logger') || console;
 
-// ---- Report Generator ----
-const { generateReport } = require('../core/reporting/reportGenerator');
+// ---------- Developer Key Management (Models + Services) ----------
+const ApiKey = require('../models/ApiKey');
+const { generateApiKey, generateApiSecret, hashSecret } = require('../services/apiKeyGenerator');
 
-// ---- Import broadcast function from server ----
-const { broadcastToDashboards } = require('../server');
+// ================================================================
+// ================ EXISTING ENDPOINTS =============================
+// ================================================================
 
-// ---------- Portfolio Manager Instance ----------
-const portfolioManager = new PortfolioManager({
-  maxOpenTrades: parseInt(process.env.MAX_OPEN_TRADES) || 5,
-  maxDailyLoss: parseFloat(process.env.MAX_DAILY_LOSS) || 0,
-  maxExposure: parseFloat(process.env.MAX_EXPOSURE) || Infinity,
-  maxPositionSize: parseFloat(process.env.MAX_POSITION_SIZE) || 1000,
-  correlatedPairs: process.env.CORRELATED_PAIRS ? JSON.parse(process.env.CORRELATED_PAIRS) : [],
+router.get('/account', controllers.getAccount);
+router.get('/prices', controllers.getPrices);
+router.get('/candles', controllers.getCandles);
+router.get('/positions', controllers.getPositions);
+router.get('/trades', controllers.getTrades);
+router.get('/trade-history', controllers.getTradeHistory);
+router.post('/order', controllers.placeOrder);        // legacy CFD order
+router.post('/trade', controllers.placeOrder);        // <-- NEW: Multiplier order (same controller)
+router.put('/close/:tradeId', controllers.closeTrade);
+router.get('/signal', controllers.getSignal);
+router.post('/auto-trade', controllers.autoTrade);
+router.get('/health', (req, res) => res.json({ status: 'OK' }));
+router.post('/broker/reset-circuit-breaker', (req, res) => {
+  const broker = controllers.getBrokerForRequest(req);
+  if (broker._resetCircuitBreaker) {
+    broker._resetCircuitBreaker();
+    res.json({ status: 'Circuit breaker reset successfully' });
+  } else {
+    res.status(500).json({ error: 'Method not available' });
+  }
 });
 
-// ---------- Performance Learner (lazy init) ----------
-let performanceLearner = null;
-async function getPerformanceLearner() {
-  if (!performanceLearner) {
-    performanceLearner = new PerformanceLearner({
-      learningRate: parseFloat(process.env.LEARNING_RATE) || 0.1,
-      minSamples: parseInt(process.env.MIN_SAMPLES) || 20,
-    });
-    await performanceLearner.loadHistory();
-  }
-  return performanceLearner;
-}
-
-// ---------- Helper to get product from request ----------
-function getProduct(req) {
-  // If user has a preference, use it; otherwise default to deriv_cfd
-  if (req.user && req.user.tradingProduct) {
-    return req.user.tradingProduct;
-  }
-  return process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd';
-}
-
-// ---------- Helper: Enhance account with tradeMode and server ----------
-function enhanceAccount(accountData, broker) {
-  if (!accountData) return accountData;
-  let tradeMode = 0;
-  let server = 'Unknown';
-  if (broker && broker._account) {
-    tradeMode = broker._account.is_virtual !== undefined ? (broker._account.is_virtual ? 1 : 0) : 0;
-    server = broker._account.landing_company_name || 'Unknown';
-  }
-  return {
-    ...accountData,
-    tradeMode,
-    server,
-  };
-}
+// ---------- Execute live signal directly (for auto‑execute toggle) ----------
+router.post('/execute-signal', controllers.executeSignal);
 
 // ---------- User Preferences ----------
-exports.getPreferences = async (req, res) => {
+router.get('/user/preferences', controllers.getPreferences);
+router.post('/user/preferences', controllers.updatePreferences);
+
+// ---------- Notification Endpoints ----------
+router.get('/notifications/status', (req, res) => {
+  const emailEnabled = process.env.ENABLE_EMAIL_NOTIFICATIONS === 'true';
+  const instagramEnabled = process.env.ENABLE_INSTAGRAM_NOTIFICATIONS === 'true';
+  const email = process.env.NOTIFICATION_EMAIL || '';
+  res.json({
+    emailEnabled,
+    instagramEnabled,
+    email,
+  });
+});
+
+router.post('/test-email', async (req, res) => {
   try {
-    const userId = req.user?.id || 'admin';
-    let user = await User.findOne({ userId });
-    if (!user) {
-      // Default to deriv_cfd
-      user = new User({ userId, tradingProduct: 'deriv_cfd' });
-      await user.save();
+    const email = process.env.NOTIFICATION_EMAIL;
+    if (!email) {
+      return res.status(400).json({ error: 'NOTIFICATION_EMAIL not set' });
     }
-    res.json({ tradingProduct: user.tradingProduct });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-};
-
-exports.updatePreferences = async (req, res) => {
-  const { tradingProduct } = req.body;
-  const validProducts = ['mt5', 'deriv_cfd', 'deriv_multiplier', 'deriv_basic'];
-  if (!validProducts.includes(tradingProduct)) {
-    return res.status(400).json({ error: 'Invalid product' });
-  }
-  try {
-    const userId = req.user?.id || 'admin';
-    let user = await User.findOne({ userId });
-    if (!user) {
-      user = new User({ userId, tradingProduct });
-    } else {
-      user.tradingProduct = tradingProduct;
-    }
-    await user.save();
-    if (req.user) req.user.tradingProduct = tradingProduct;
-    res.json({ success: true, tradingProduct });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-};
-
-// ================================================================
-//  ACCOUNT – ENHANCED with tradeMode and server
-// ================================================================
-exports.getAccount = async (req, res) => {
-  try {
-    const product = getProduct(req);
-    const account = await accountService.getAccount(product);
-
-    // Enhance with tradeMode and server from broker's internal state
-    let enhanced = account;
-    try {
-      const broker = getBroker(product);
-      enhanced = enhanceAccount(account, broker);
-    } catch (err) {
-      logger.warn('[getAccount] Could not fetch broker internal state:', err.message);
-    }
-
-    res.json(enhanced);
-  } catch (error) {
-    logger.error('[getAccount] Error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-};
-
-// ---------- Market Data ----------
-exports.getPrices = async (req, res) => {
-  const { instruments } = req.query;
-  if (!instruments) return res.status(400).json({ error: 'instruments query param required' });
-  try {
-    const product = getProduct(req);
-    const pairs = instruments.split(',');
-    const prices = await marketProvider.getPrices(pairs, product);
-    res.json(prices);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-};
-
-exports.getCandles = async (req, res) => {
-  const { pair, count = 100, granularity = 'M5' } = req.query;
-  if (!pair) return res.status(400).json({ error: 'pair query param required' });
-  try {
-    const product = getProduct(req);
-    const candles = await marketProvider.getCandles(pair, parseInt(count), granularity, product);
-    res.json(candles);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-};
-
-// ---------- Symbol Metadata ----------
-exports.getSymbols = async (req, res) => {
-  try {
-    const product = getProduct(req);
-    const broker = getBroker(product);
-    if (!broker.isConnected()) {
-      await broker.connect();
-    }
-    let symbols = [];
-    if (broker.symbolManager && typeof broker.symbolManager._symbols === 'object') {
-      symbols = Array.from(broker.symbolManager._symbols.values());
-    } else if (broker.symbols) {
-      symbols = typeof broker.symbols === 'function' ? await broker.symbols() : broker.symbols;
-    } else {
-      try {
-        const allSymbols = await marketProvider.getSymbols(product);
-        if (allSymbols) symbols = allSymbols;
-      } catch (e) {
-        // ignore
-      }
-    }
-    res.json(symbols);
-  } catch (error) {
-    logger.error('[getSymbols] Error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-};
-
-// ---------- Broker Capabilities ----------
-exports.getCapabilities = async (req, res) => {
-  try {
-    const product = getProduct(req);
-    const broker = getBroker(product);
-    const caps = broker.capabilities || {};
-    const info = {
-      product,
-      name: broker.serverName || product,
-      connected: broker.isConnected(),
-      state: broker._state || 'unknown',
-      capabilities: caps,
-    };
-    res.json(info);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-};
-
-// ================================================================
-//  POSITIONS & TRADES – Normalised for frontend
-// ================================================================
-exports.getPositions = async (req, res) => {
-  try {
-    const product = getProduct(req);
-    const broker = getBroker(product);
-    const positions = await broker.getPositions();
-    res.json(positions);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-};
-
-exports.getTrades = async (req, res) => {
-  try {
-    const product = getProduct(req);
-    const broker = getBroker(product);
-    const rawTrades = await broker.getOpenTrades();
-    // Normalise to frontend format
-    const trades = rawTrades.map(t => ({
-      id: t.id,
-      instrument: t.instrument,
-      side: t.side,
-      price: t.price,
-      currentPrice: t.currentPrice,
-      units: t.units,
-      unrealizedPL: t.unrealizedPL,
-      stopLoss: t.stopLoss,
-      takeProfit: t.takeProfit,
-      openTime: t.openTime,
-    }));
-    res.json(trades);
-  } catch (error) {
-    logger.error('[getTrades] Error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-};
-
-// ================================================================
-//  TRADE HISTORY – Fixed field mapping
-// ================================================================
-exports.getTradeHistory = async (req, res) => {
-  try {
-    const trades = await Trade.find({ status: 'CLOSED' }).sort({ closeTime: -1 }).lean();
-    const mapped = trades.map(t => ({
-      pair: t.instrument || t.pair || 'N/A',
-      side: t.side || 'N/A',
-      entryPrice: t.openPrice || t.entryPrice || null,
-      exitPrice: t.closePrice || t.exitPrice || null,
-      lotSize: t.lotSize || 0,
-      pnl: t.realizedProfit !== undefined ? t.realizedProfit : (t.pnl || 0),
-      status: t.status || 'CLOSED',
-      date: t.closeTime || t.updatedAt || t.createdAt,
-    }));
-    res.json(mapped);
-  } catch (error) {
-    logger.error('[getTradeHistory] Error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-};
-
-// ================================================================
-//  PENDING ORDERS – Normalised for frontend
-// ================================================================
-exports.getPendingOrders = async (req, res) => {
-  try {
-    const pending = await Order.find({
-      status: { $in: ['PENDING', 'ACCEPTED', 'EXECUTING'] }
-    }).sort({ createdAt: -1 }).lean();
-    const mapped = pending.map(o => ({
-      contractId: o.contractId || o.clientOrderId,
-      instrument: o.instrument,
-      side: o.side,
-      entryPrice: o.entryPrice || o.placedPrice,
-      units: o.units || o.lotSize,
-      status: o.status,
-      clientOrderId: o.clientOrderId,
-    }));
-    res.json(mapped);
-  } catch (error) {
-    logger.error('[getPendingOrders] Error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-};
-
-// ================================================================
-//  PLACE ORDER – Multiplier-aware
-// ================================================================
-exports.placeOrder = async (req, res) => {
-  const {
-    pair,
-    side,
-    // Legacy CFD fields
-    lotSize,
-    stopLoss,
-    takeProfit,
-    // New Multiplier fields
-    stake,
-    multiplier,
-    duration,
-    knockoutLevel,
-    takeProfitLevel,
-    product: overrideProduct,
-  } = req.body;
-
-  try {
-    const product = overrideProduct || getProduct(req);
-    const instrument = pair.toUpperCase();
-    const currentPrice = await marketProvider.getCurrentPrice(instrument, product);
-
-    // Determine if this is a Multiplier trade (stake provided) or CFD trade (lotSize provided)
-    const isMultiplier = stake !== undefined && stake !== null && stake > 0;
-    const isCFD = lotSize !== undefined && lotSize !== null && lotSize > 0;
-
-    if (!isMultiplier && !isCFD) {
-      return res.status(400).json({ error: 'Either stake (Multiplier) or lotSize (CFD) must be provided.' });
-    }
-
-    let orderResult;
-
-    if (isMultiplier) {
-      // ---- Multiplier trade ----
-      // Validate Multiplier parameters
-      if (!multiplier || multiplier < 1) {
-        return res.status(400).json({ error: 'Multiplier must be at least 1' });
-      }
-      if (!duration || duration < 10) {
-        return res.status(400).json({ error: 'Duration must be at least 10 seconds' });
-      }
-
-      // Call orderService with Multiplier fields
-      orderResult = await orderService.placeMarketOrder(
-        instrument,
-        side,
-        stake,                  // stake instead of lotSize
-        multiplier,
-        duration,
-        knockoutLevel || null,
-        takeProfitLevel || null,
-        product
-      );
-    } else {
-      // ---- CFD trade (legacy) ----
-      // Validate CFD parameters
-      const validation = validateOrderInput({
-        pair: instrument,
-        side,
-        lotSize,
-        stopLoss: stopLoss || null,
-        takeProfit: takeProfit || null,
-        currentPrice,
-      });
-      if (!validation.valid) {
-        return res.status(400).json({ error: validation.message });
-      }
-
-      const broker = getBroker(product);
-      const account = await broker.getAccount();
-      const currentPositions = await broker.getOpenTrades();
-
-      const signal = {
-        pair: instrument,
-        side,
-        entryPrice: currentPrice,
-        stopLoss: stopLoss || null,
-        takeProfit: takeProfit || null,
-        recommendedLotSize: lotSize,
-      };
-
-      const approval = await portfolioManager.canOpenTrade(signal, parseFloat(account.balance), currentPositions);
-      if (!approval.allowed) {
-        return res.status(400).json({ error: approval.reason });
-      }
-
-      orderResult = await orderService.placeMarketOrder(
-        instrument, side, lotSize, stopLoss || null, takeProfit || null, product
-      );
-    }
-
-    // ---- Common post-order steps ----
-    const trade = await Trade.findOne({ contractId: orderResult.contractId });
-    if (!trade) {
-      logger.warn(`[placeOrder] Trade not found by contractId ${orderResult.contractId}`);
-      return res.json({ success: true, raw: orderResult, trade: null });
-    }
-
-    const broker = getBroker(product);
-    const account = await broker.getAccount();
-    notifyTrade('OPENED', trade, account).catch(err => logger.error('[Notification] Error:', err.message));
-
-    res.json({ success: true, trade, raw: orderResult });
-  } catch (error) {
-    logger.error('[placeOrder] Error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-};
-
-// ---------- Close Trade ----------
-exports.closeTrade = async (req, res) => {
-  const { tradeId } = req.params;
-  if (!tradeId) return res.status(400).json({ error: 'tradeId required' });
-  try {
-    const product = getProduct(req);
-    // Use the updated closeTrade which broadcasts events
-    const result = await orderService.closeTrade(tradeId, product);
-    
-    // Broadcast updated positions and account (redundant but safe)
-    try {
-      const openTrades = await orderService.getOpenTrades(product);
-      broadcastToDashboards('positions', openTrades);
-      const account = await accountService.getAccount(product);
-      // Enhance account before broadcasting
-      const broker = getBroker(product);
-      const enhanced = enhanceAccount(account, broker);
-      broadcastToDashboards('account', enhanced);
-    } catch (broadcastErr) {
-      logger.warn('[controllers] Failed to broadcast after close:', broadcastErr.message);
-    }
-
-    portfolioManager.updateDailyPnL(result.pl || 0);
-    const updated = await Trade.findOne({ contractId: tradeId });
-    if (updated) {
-      const broker = getBroker(product);
-      const account = await broker.getAccount();
-      notifyTrade('CLOSED', updated, account).catch(err => logger.error('[Notification] Error:', err.message));
-      try {
-        const learner = await getPerformanceLearner();
-        learner.recordTrade(updated);
-      } catch (err) {
-        logger.warn('[PerformanceLearner] Failed to record trade:', err.message);
-      }
-    }
+    const result = await sendTestEmail(email);
     res.json({ success: true, result });
-  } catch (error) {
-    logger.error('[closeTrade] Error:', error.message);
-    res.status(500).json({ error: error.message });
+  } catch (err) {
+    logger.error('[test-email] Error:', err.message);
+    res.status(500).json({ error: err.message });
   }
-};
+});
 
-// ---------- Cancel Order ----------
-exports.cancelOrder = async (req, res) => {
-  const { orderId } = req.params;
-  if (!orderId) return res.status(400).json({ error: 'orderId required' });
-  try {
-    const product = getProduct(req);
-    const result = await orderService.cancelOrder(orderId, product);
-    res.json({ success: true, result });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-};
+// ---------- Pending Orders ----------
+router.get('/pending-orders', controllers.getPendingOrders);
+router.delete('/order/:orderId', controllers.cancelOrder);
 
 // ---------- Delete History ----------
-exports.deleteHistory = async (req, res) => {
+router.delete('/history', controllers.deleteHistory);
+
+// ---------- Performance Suite ----------
+router.post('/backtest', async (req, res) => {
   try {
-    const count = await orderService.deleteClosedTrades();
-    res.json({ success: true, deletedCount: count });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+    const engine = new BacktestingEngine(req.body);
+    const result = await engine.run();
+    res.json(result);
+  } catch (err) {
+    logger.error('[Backtest] Error:', err);
+    res.status(500).json({ error: err.message });
   }
-};
+});
 
-// ---------- Strategy & Signal ----------
-exports.getSignal = async (req, res) => {
-  const { pair, strategy = 'sma', ...params } = req.query;
-  if (!pair) return res.status(400).json({ error: 'pair query param required' });
+router.get('/portfolio/status', async (req, res) => {
   try {
-    const product = getProduct(req);
-    const instrument = pair.toUpperCase();
-    const signal = await strategyEngine.generateSignal(instrument, strategy, { ...params, product });
-    if (!signal) return res.json({ signal: null, message: 'No signal generated' });
-    res.json(signal);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-};
-
-// ---------- Auto Trade (Multiplier-aware) ----------
-exports.autoTrade = async (req, res) => {
-  const { pair, riskPercent = 1, strategy = 'sma', ...params } = req.body;
-  if (!pair) return res.status(400).json({ error: 'pair required' });
-  try {
-    const product = getProduct(req);
-    const instrument = pair.toUpperCase();
-
-    const signal = await strategyEngine.generateSignal(instrument, strategy, { ...params, product });
-    if (!signal) return res.json({ success: false, message: 'No trading signal' });
-
-    const currentPrice = signal.entryPrice;
-
-    // Determine if we should use Multiplier mode (if stake, multiplier, duration provided)
-    const { stake, multiplier, duration, knockoutLevel, takeProfitLevel } = req.body;
-    const isMultiplier = stake !== undefined && stake !== null && stake > 0;
-
-    let orderResult;
-    if (isMultiplier) {
-      // Multiplier auto-trade
-      if (!multiplier || multiplier < 1) {
-        return res.json({ success: false, message: 'Multiplier must be at least 1' });
-      }
-      if (!duration || duration < 10) {
-        return res.json({ success: false, message: 'Duration must be at least 10 seconds' });
-      }
-
-      orderResult = await orderService.placeMarketOrder(
-        instrument,
-        signal.side,
-        stake,
-        multiplier,
-        duration,
-        knockoutLevel || null,
-        takeProfitLevel || null,
-        product,
-        null,
-        true
-      );
-    } else {
-      // CFD auto-trade (legacy)
-      const validation = validateOrderInput({
-        pair: instrument,
-        side: signal.side,
-        lotSize: signal.recommendedLotSize || 0.01,
-        stopLoss: signal.stopLoss || null,
-        takeProfit: signal.takeProfit || null,
-        currentPrice,
-      });
-      if (!validation.valid) {
-        return res.json({ success: false, message: validation.message });
-      }
-
-      const broker = getBroker(product);
-      const account = await broker.getAccount();
-      const currentPositions = await broker.getOpenTrades();
-
-      const approval = await portfolioManager.canOpenTrade(signal, parseFloat(account.balance), currentPositions);
-      if (!approval.allowed) return res.json({ success: false, message: approval.reason });
-
-      let lotSize = signal.recommendedLotSize;
-      if (!lotSize) {
-        lotSize = await riskManager.calculateLotSize(instrument, signal.entryPrice, signal.stopLoss, riskPercent, 1000, product);
-      }
-
-      orderResult = await orderService.placeMarketOrder(
-        instrument, signal.side, lotSize, signal.stopLoss, signal.takeProfit, product, null, true
-      );
-    }
-
-    const trade = await Trade.findOne({ contractId: orderResult.contractId });
-    if (!trade) {
-      logger.warn(`[autoTrade] Trade not found by contractId ${orderResult.contractId}`);
-      return res.json({ success: true, raw: orderResult, trade: null });
-    }
-
-    const broker = getBroker(product);
+    const product = controllers.getProduct(req);
+    const broker = require('../core/execution/brokerFactory').getBroker(product);
     const account = await broker.getAccount();
-    notifyTrade('OPENED', trade, account).catch(err => logger.error('[Notification] Error:', err.message));
-
-    res.json({ success: true, signal, trade, raw: orderResult });
-  } catch (error) {
-    logger.error('[autoTrade] Error:', error.message);
-    res.status(500).json({ error: error.message });
+    const trades = await broker.getOpenTrades();
+    const totalExposure = trades.reduce((sum, t) => sum + Math.abs(t.units * t.price), 0);
+    res.json({ account, openTrades: trades, totalExposure });
+  } catch (err) {
+    logger.error('[portfolio/status] Error:', err.message);
+    res.status(500).json({ error: err.message });
   }
-};
+});
 
-// ---------- Execute Live Signal (Multiplier-aware) ----------
-exports.executeSignal = async (req, res) => {
-  const {
-    pair,
-    side,
-    entryPrice,
-    stopLoss,
-    takeProfit,
-    lotSize,
-    stake,
-    multiplier,
-    duration,
-    knockoutLevel,
-    takeProfitLevel,
-  } = req.body;
+router.get('/execution/analytics', (req, res) => {
+  res.json({ message: 'Execution analytics – integrate with orderService.getExecutionAnalytics()' });
+});
 
-  if (!pair || !side) {
-    return res.status(400).json({ error: 'pair and side are required' });
-  }
-
-  const formattedPair = formatSymbol(pair);
-  const cleanSide = side.toUpperCase().trim();
-  if (!['BUY', 'SELL'].includes(cleanSide)) {
-    return res.status(400).json({ error: 'Side must be BUY or SELL' });
-  }
-
+router.post('/walkforward', async (req, res) => {
   try {
-    const product = getProduct(req);
-    const instrument = formattedPair;
-
-    let currentPrice = entryPrice;
-    if (!currentPrice) {
-      currentPrice = await marketProvider.getCurrentPrice(instrument, product);
-    }
-
-    const isMultiplier = stake !== undefined && stake !== null && stake > 0;
-
-    let orderResult;
-    if (isMultiplier) {
-      // Multiplier signal execution
-      if (!multiplier || multiplier < 1) {
-        return res.status(400).json({ error: 'Multiplier must be at least 1' });
-      }
-      if (!duration || duration < 10) {
-        return res.status(400).json({ error: 'Duration must be at least 10 seconds' });
-      }
-
-      orderResult = await orderService.placeMarketOrder(
-        instrument,
-        cleanSide,
-        stake,
-        multiplier,
-        duration,
-        knockoutLevel || null,
-        takeProfitLevel || null,
-        product
-      );
-    } else {
-      // CFD signal execution (legacy)
-      if (!lotSize || lotSize <= 0) {
-        return res.status(400).json({ error: 'lotSize is required for CFD trade' });
-      }
-
-      const validation = validateOrderInput({
-        pair: instrument,
-        side: cleanSide,
-        lotSize,
-        stopLoss: stopLoss || null,
-        takeProfit: takeProfit || null,
-        currentPrice,
-      });
-      if (!validation.valid) {
-        return res.status(400).json({ error: validation.message });
-      }
-
-      orderResult = await orderService.placeMarketOrder(
-        instrument,
-        cleanSide,
-        parseFloat(lotSize),
-        stopLoss || null,
-        takeProfit || null,
-        product
-      );
-    }
-
-    const trade = await Trade.findOne({ contractId: orderResult.contractId });
-    if (!trade) {
-      logger.warn(`[executeSignal] Trade not found for contractId: ${orderResult.contractId}`);
-      return res.json({ success: true, raw: orderResult, trade: null });
-    }
-
-    const broker = getBroker(product);
-    const account = await broker.getAccount();
-    notifyTrade('OPENED', trade, account).catch(err => logger.error('[Notification] Error:', err.message));
-
-    res.json({ success: true, trade, raw: orderResult });
-  } catch (error) {
-    logger.error('[executeSignal] Error:', error.message);
-    res.status(500).json({ error: error.message });
+    const optimizer = new WalkForwardOptimizer(req.body);
+    const results = await optimizer.run();
+    res.json(results);
+  } catch (err) {
+    logger.error('[WalkForward] Error:', err);
+    res.status(500).json({ error: err.message });
   }
-};
+});
 
-// ============================================================
-//  REPORT GENERATION – Fully Implemented
-// ============================================================
-
-exports.generateReport = async (req, res) => {
+router.post('/performance/learn', async (req, res) => {
   try {
-    const { from, to, includeTrades = true } = req.body;
+    const learner = new PerformanceLearner(req.body);
+    await learner.loadHistory();
+    res.json({ message: 'Performance learner initialised successfully' });
+  } catch (err) {
+    logger.error('[PerformanceLearn] Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
-    const fromDate = from ? new Date(from) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-    const toDate = to ? new Date(to) : new Date();
+// ================================================================
+// ================ NEW ENDPOINTS ==================================
+// ================================================================
 
-    if (fromDate > toDate) {
-      return res.status(400).json({ error: 'From date must be before To date' });
+router.get('/symbols', controllers.getSymbols);           // symbol metadata
+router.get('/capabilities', controllers.getCapabilities); // broker capabilities
+
+// ---- NEW: Report Generation ----
+router.post('/report', controllers.generateReport);
+
+// ================================================================
+// ================ DEVELOPER API KEY MANAGEMENT ===================
+// ================================================================
+
+router.get('/dashboard/developer-keys', async (req, res) => {
+  try {
+    const keys = await ApiKey.find().sort({ createdAt: -1 }).select('-hashedSecret');
+    res.json(keys);
+  } catch (err) {
+    logger.error('Error fetching API keys:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.post('/dashboard/developer-keys/generate', async (req, res) => {
+  try {
+    const { applicationName, description, permissions } = req.body;
+    if (!applicationName) {
+      return res.status(400).json({ error: 'Application name is required' });
     }
+    const apiKey = generateApiKey();
+    const apiSecret = generateApiSecret();
+    const hashedSecret = await hashSecret(apiSecret);
 
-    let trades = [];
-    if (includeTrades) {
-      const rawTrades = await Trade.find({
-        status: 'CLOSED',
-        closeTime: { $gte: fromDate, $lte: toDate }
-      }).sort({ closeTime: -1 }).lean();
-
-      trades = rawTrades.map(t => ({
-        pair: t.instrument || t.pair || 'N/A',
-        side: t.side || 'N/A',
-        entryPrice: t.openPrice || t.entryPrice || null,
-        exitPrice: t.closePrice || t.exitPrice || null,
-        lotSize: t.lotSize || 0,
-        pnl: t.realizedProfit !== undefined ? t.realizedProfit : (t.pnl || 0),
-        status: t.status || 'CLOSED',
-        date: t.closeTime || t.updatedAt || t.createdAt,
-      }));
-    }
-
-    const product = getProduct(req);
-    const account = await accountService.getAccount(product);
-
-    const { calculateMetrics } = require('../core/analytics/performanceSuite');
-    const metrics = calculateMetrics(trades, account.balance || 10000);
-
-    const crypto = require('crypto');
-    const reportHash = crypto.createHash('sha256')
-      .update(JSON.stringify({ trades, metrics, account, fromDate, toDate }))
-      .digest('hex')
-      .slice(0, 16);
-
-    const pdfBuffer = await generateReport({
-      fromDate,
-      toDate,
-      trades,
-      metrics,
-      account,
-      verificationCode: reportHash,
-      systemName: 'RTS/CTOS v3.0 (Multiplier)',
+    const newKey = new ApiKey({
+      applicationName,
+      description: description || '',
+      apiKey,
+      hashedSecret,
+      permissions: permissions || [],
+      status: 'active',
+      owner: req.user?.userId || 'admin'
     });
 
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename=RTS_Report_${new Date().toISOString().slice(0,10)}.pdf`);
-    res.send(pdfBuffer);
-  } catch (error) {
-    logger.error('[generateReport] Error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-};
+    await newKey.save();
+    logger.info(`API Key created for ${applicationName}`);
 
-// ---------- Export helper ----------
-exports.getProduct = getProduct;
+    res.status(201).json({
+      apiKey: newKey.apiKey,
+      apiSecret,
+      applicationName: newKey.applicationName,
+      permissions: newKey.permissions,
+      createdAt: newKey.createdAt
+    });
+  } catch (err) {
+    logger.error('Error generating API key:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.put('/dashboard/developer-keys/:id/disable', async (req, res) => {
+  try {
+    const key = await ApiKey.findByIdAndUpdate(req.params.id, { status: 'disabled' }, { new: true }).select('-hashedSecret');
+    if (!key) return res.status(404).json({ error: 'Key not found' });
+    logger.info(`API Key disabled: ${key.apiKey}`);
+    res.json(key);
+  } catch (err) {
+    logger.error('Error disabling key:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.put('/dashboard/developer-keys/:id/enable', async (req, res) => {
+  try {
+    const key = await ApiKey.findByIdAndUpdate(req.params.id, { status: 'active' }, { new: true }).select('-hashedSecret');
+    if (!key) return res.status(404).json({ error: 'Key not found' });
+    logger.info(`API Key enabled: ${key.apiKey}`);
+    res.json(key);
+  } catch (err) {
+    logger.error('Error enabling key:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.delete('/dashboard/developer-keys/:id', async (req, res) => {
+  try {
+    const key = await ApiKey.findByIdAndDelete(req.params.id);
+    if (!key) return res.status(404).json({ error: 'Key not found' });
+    logger.info(`API Key deleted: ${key.apiKey}`);
+    res.json({ message: 'Key deleted' });
+  } catch (err) {
+    logger.error('Error deleting key:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.put('/dashboard/developer-keys/:id/regenerate-secret', async (req, res) => {
+  try {
+    const apiSecret = generateApiSecret();
+    const hashedSecret = await hashSecret(apiSecret);
+    const key = await ApiKey.findByIdAndUpdate(
+      req.params.id,
+      { hashedSecret, updatedAt: new Date() },
+      { new: true }
+    ).select('-hashedSecret');
+    if (!key) return res.status(404).json({ error: 'Key not found' });
+    logger.info(`API Secret regenerated for: ${key.apiKey}`);
+    res.json({
+      message: 'Secret regenerated',
+      apiKey: key.apiKey,
+      apiSecret
+    });
+  } catch (err) {
+    logger.error('Error regenerating secret:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ================================================================
+// ================ SERVE THE DEVELOPER PORTAL PAGE ================
+// ================================================================
+router.get('/developer-api', (req, res) => {
+  res.render('developerApi');
+});
+
+module.exports = router;
