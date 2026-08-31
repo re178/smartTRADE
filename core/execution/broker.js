@@ -1,6 +1,6 @@
 // core/execution/broker.js – Stable Dual‑WebSocket Deriv Broker
 // Watchlist: only subscribe to specified symbols.
-// CORRECTED: proposal uses `underlying_symbol` (Deriv API v3).
+// CORRECTED: proposal uses `symbol` (v3 WebSocket endpoint)
 // Normalizes duration and multiplier; logs proposal for debugging.
 
 const WebSocket = require('ws');
@@ -1389,7 +1389,7 @@ class DerivBroker extends EventEmitter {
   async getPositions() { return this.getOpenTrades(); }
 
   // ============================================================
-  //  PLACE MARKET ORDER – FULLY CORRECTED
+  //  PLACE MARKET ORDER – FULLY CORRECTED (v3 WebSocket uses `symbol`)
   // ============================================================
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null, duration = null, multiplier = null) {
     await this._ensureAuthReady();
@@ -1417,7 +1417,7 @@ class DerivBroker extends EventEmitter {
 
     // ------------------------------------------------------------
     // NORMALIZE DURATION
-    // Derive API expects a valid duration in seconds.
+    // Deriv v3 WebSocket expects a valid duration in seconds.
     // Default to 60 seconds if not provided or invalid.
     // ------------------------------------------------------------
     let finalDuration = Number(duration);
@@ -1432,7 +1432,7 @@ class DerivBroker extends EventEmitter {
 
     // ------------------------------------------------------------
     // BUILD PROPOSAL PAYLOAD
-    // IMPORTANT: Use `underlying_symbol` (current API)
+    // IMPORTANT: v3 WebSocket uses `symbol` (not `underlying_symbol`)
     // Do NOT send `date_expiry` together with `duration`
     // ------------------------------------------------------------
     const proposalPayload = {
@@ -1445,7 +1445,7 @@ class DerivBroker extends EventEmitter {
       duration: finalDuration,
       duration_unit: 's',
 
-      underlying_symbol: symbol,
+      symbol: symbol,          // <-- v3 WebSocket uses `symbol`
 
       multiplier: finalMultiplier,
     };
