@@ -1,7 +1,7 @@
 // core/execution/broker.js – Stable Dual‑WebSocket Deriv Broker
-// PATCHED: proposal uses `symbol` instead of `underlying_symbol`.
-// PATCHED: duration default set to 60s; accepts dynamic duration/multiplier.
-// PATCHED: multiplier default 100; ensures values are within allowed range.
+// Watchlist: only subscribe to specified symbols.
+// CORRECTED: proposal uses `underlying_symbol` (Deriv API v3).
+// Normalizes duration and multiplier; logs proposal for debugging.
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -1211,13 +1211,13 @@ class DerivBroker extends EventEmitter {
     try {
       const positions = await this.getOpenTrades();
       logger.info('[Reconcile] Positions from API:', JSON.stringify(positions, null, 2));
-      
+
       const dbOrders = await Order.find({ status: ORDER_STATUS.FILLED });
       const dbMap = new Map();
       for (const ord of dbOrders) {
         if (ord.contractId) dbMap.set(ord.contractId, ord);
       }
-      
+
       for (const pos of positions) {
         const contractId = pos.id;
         if (!dbMap.has(contractId)) {
@@ -1237,7 +1237,7 @@ class DerivBroker extends EventEmitter {
           logger.info(`[Reconcile] Created order for position ${contractId}`);
         }
       }
-      
+
       const openIds = new Set(positions.map(p => p.id));
       for (const [contractId, clientOrderId] of this._orderMap) {
         if (!openIds.has(contractId)) {
@@ -1245,7 +1245,7 @@ class DerivBroker extends EventEmitter {
           this._orderMap.delete(contractId);
         }
       }
-      
+
       this.emit('positions', positions);
       logger.info('[Reconcile] Position reconciliation complete.');
     } catch (err) {
@@ -1376,7 +1376,7 @@ class DerivBroker extends EventEmitter {
       const response = await this._sendAuthRequest({ portfolio: 1 });
       const portfolio = response.portfolio || {};
       const contracts = portfolio.contracts || [];
-      const openContracts = contracts.filter(c => 
+      const openContracts = contracts.filter(c =>
         c.status && (c.status.toLowerCase() === 'open' || c.status.toLowerCase() === 'active')
       );
       return openContracts.map(c => this._normalizeContract(c));
@@ -1389,45 +1389,96 @@ class DerivBroker extends EventEmitter {
   async getPositions() { return this.getOpenTrades(); }
 
   // ============================================================
-  //  PLACE MARKET ORDER – PATCHED: duration = 60s (default)
+  //  PLACE MARKET ORDER – FULLY CORRECTED
   // ============================================================
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null, duration = null, multiplier = null) {
     await this._ensureAuthReady();
-    const amount = Math.abs(units);
-    if (amount <= 0) throw new Error('Order units must be positive.');
-    const direction = units > 0 ? 'MULTUP' : 'MULTDOWN';
-    const symbol = toDerivSymbol(instrument, this.symbolMap);
-    if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
-    
-    // Use passed duration or default to 60 seconds (minimum allowed)
-    const finalDuration = duration || 60;
-    const finalMultiplier = multiplier || this.getLeverage(symbol) || 100;
 
+    const amount = Math.abs(Number(units));
+    if (!Number.isFinite(amount) || amount <= 0) {
+      throw new Error('Order units must be a positive number.');
+    }
+
+    const direction = units > 0 ? 'MULTUP' : 'MULTDOWN';
+
+    const symbol = toDerivSymbol(instrument, this.symbolMap);
+    if (!symbol) {
+      throw new Error(`Unknown instrument: ${instrument}`);
+    }
+
+    // ------------------------------------------------------------
+    // NORMALIZE MULTIPLIER
+    // ------------------------------------------------------------
+    let finalMultiplier = Number(multiplier);
+    if (!Number.isFinite(finalMultiplier) || finalMultiplier <= 0) {
+      finalMultiplier = Number(this.getLeverage(symbol)) || 100;
+    }
+    finalMultiplier = Math.floor(finalMultiplier);
+
+    // ------------------------------------------------------------
+    // NORMALIZE DURATION
+    // Derive API expects a valid duration in seconds.
+    // Default to 60 seconds if not provided or invalid.
+    // ------------------------------------------------------------
+    let finalDuration = Number(duration);
+    if (!Number.isFinite(finalDuration) || finalDuration <= 0) {
+      finalDuration = 60;
+    }
+    finalDuration = Math.floor(finalDuration);
+    // Safety minimum: ensure at least 60 seconds (Deriv requires >= 60)
+    if (finalDuration < 60) {
+      finalDuration = 60;
+    }
+
+    // ------------------------------------------------------------
+    // BUILD PROPOSAL PAYLOAD
+    // IMPORTANT: Use `underlying_symbol` (current API)
+    // Do NOT send `date_expiry` together with `duration`
+    // ------------------------------------------------------------
     const proposalPayload = {
       proposal: 1,
       amount: amount,
       basis: 'stake',
       contract_type: direction,
       currency: this.accountCurrency || 'USD',
+
       duration: finalDuration,
       duration_unit: 's',
-      symbol: symbol,
+
+      underlying_symbol: symbol,
+
       multiplier: finalMultiplier,
     };
-    if (stopLoss) proposalPayload.stop_loss = stopLoss;
-    if (takeProfit) proposalPayload.take_profit = takeProfit;
 
-    // Log for debugging
-    logger.info(`[DerivBroker] Proposal payload: ${JSON.stringify(redactSensitive(proposalPayload))}`);
+    // Add stop_loss / take_profit only if provided
+    if (stopLoss !== null && stopLoss !== undefined) {
+      proposalPayload.stop_loss = Number(stopLoss);
+    }
+    if (takeProfit !== null && takeProfit !== undefined) {
+      proposalPayload.take_profit = Number(takeProfit);
+    }
 
+    // Log the proposal (redacted) for debugging
+    logger.info(`[DerivBroker] MULT proposal payload: ${JSON.stringify(redactSensitive(proposalPayload))}`);
+
+    // ---- Request proposal ----
     const proposalResponse = await this._sendAuthRequest(proposalPayload);
     const proposal = proposalResponse.proposal;
     if (!proposal) {
-      throw new Error('Failed to get proposal: ' + JSON.stringify(proposalResponse));
+      throw new Error(`Failed to get proposal: ${JSON.stringify(proposalResponse)}`);
     }
-    const proposalId = proposal.id;
-    const askPrice = proposal.ask_price;
 
+    const proposalId = proposal.id;
+    if (!proposalId) {
+      throw new Error(`Deriv returned a proposal without an ID: ${JSON.stringify(proposalResponse)}`);
+    }
+
+    const askPrice = Number(proposal.ask_price);
+    if (!Number.isFinite(askPrice) || askPrice <= 0) {
+      throw new Error(`Invalid proposal ask price: ${proposal.ask_price}`);
+    }
+
+    // ---- Buy the contract ----
     const buyPayload = {
       buy: proposalId,
       price: askPrice,
@@ -1435,12 +1486,13 @@ class DerivBroker extends EventEmitter {
     const buyResponse = await this._sendAuthRequest(buyPayload);
     const buy = buyResponse.buy;
     if (!buy || !buy.contract_id) {
-      throw new Error('Buy failed: ' + JSON.stringify(buyResponse));
+      throw new Error(`Buy failed: ${JSON.stringify(buyResponse)}`);
     }
 
     const contractId = buy.contract_id;
-    const price = buy.price || 0;
+    const price = Number(buy.price) || 0;
 
+    // ---- Save Order ----
     const newOrder = new Order({
       clientOrderId: generateClientOrderId(),
       instrument,
@@ -1448,13 +1500,14 @@ class DerivBroker extends EventEmitter {
       units: amount,
       entryPrice: price,
       status: ORDER_STATUS.FILLED,
-      contractId: contractId,
+      contractId,
       filledAt: new Date(),
     });
     await newOrder.save();
     this._orders.set(newOrder.clientOrderId, newOrder);
     this._orderMap.set(contractId, newOrder.clientOrderId);
 
+    // ---- Emit positions update ----
     this.getOpenTrades()
       .then(positions => this.emit('positions', positions))
       .catch(err => logger.error('[DerivBroker] Failed to emit positions after market order:', err.message));
@@ -1462,7 +1515,7 @@ class DerivBroker extends EventEmitter {
     return {
       tradeID: String(contractId),
       ticket: String(contractId),
-      price: price,
+      price,
       raw: buyResponse,
     };
   }
