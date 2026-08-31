@@ -1,6 +1,6 @@
 // core/execution/broker.js – Stable Dual‑WebSocket Deriv Broker
 // Watchlist: only subscribe to specified symbols.
-// CORRECTED: proposal uses `symbol` (v3 WebSocket endpoint)
+// FINAL: proposal uses `symbol` (v3 WebSocket endpoint), duration default 300s.
 // Normalizes duration and multiplier; logs proposal for debugging.
 
 const WebSocket = require('ws');
@@ -1389,7 +1389,7 @@ class DerivBroker extends EventEmitter {
   async getPositions() { return this.getOpenTrades(); }
 
   // ============================================================
-  //  PLACE MARKET ORDER – FULLY CORRECTED (v3 WebSocket uses `symbol`)
+  //  PLACE MARKET ORDER – FINAL (Duration default 300s)
   // ============================================================
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null, duration = null, multiplier = null) {
     await this._ensureAuthReady();
@@ -1417,23 +1417,20 @@ class DerivBroker extends EventEmitter {
 
     // ------------------------------------------------------------
     // NORMALIZE DURATION
-    // Deriv v3 WebSocket expects a valid duration in seconds.
-    // Default to 60 seconds if not provided or invalid.
+    // Default to 300 seconds (5 minutes) – safe for many multipliers.
+    // Must be between 60 and 3600 seconds for forex pairs.
     // ------------------------------------------------------------
     let finalDuration = Number(duration);
     if (!Number.isFinite(finalDuration) || finalDuration <= 0) {
-      finalDuration = 60;
+      finalDuration = 300; // 5 minutes
     }
     finalDuration = Math.floor(finalDuration);
-    // Safety minimum: ensure at least 60 seconds (Deriv requires >= 60)
-    if (finalDuration < 60) {
-      finalDuration = 60;
-    }
+    if (finalDuration < 60) finalDuration = 60;
+    if (finalDuration > 3600) finalDuration = 3600;
 
     // ------------------------------------------------------------
     // BUILD PROPOSAL PAYLOAD
-    // IMPORTANT: v3 WebSocket uses `symbol` (not `underlying_symbol`)
-    // Do NOT send `date_expiry` together with `duration`
+    // v3 WebSocket uses `symbol` (not `underlying_symbol`)
     // ------------------------------------------------------------
     const proposalPayload = {
       proposal: 1,
@@ -1445,12 +1442,11 @@ class DerivBroker extends EventEmitter {
       duration: finalDuration,
       duration_unit: 's',
 
-      symbol: symbol,          // <-- v3 WebSocket uses `symbol`
+      symbol: symbol,
 
       multiplier: finalMultiplier,
     };
 
-    // Add stop_loss / take_profit only if provided
     if (stopLoss !== null && stopLoss !== undefined) {
       proposalPayload.stop_loss = Number(stopLoss);
     }
