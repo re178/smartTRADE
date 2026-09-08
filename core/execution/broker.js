@@ -1,10 +1,6 @@
 // core/execution/broker.js – Stable Dual‑WebSocket Deriv Broker
-// CORRECTED:
-// - contracts_for no longer uses `currency` (removed from API)
-// - MultiplierOfferingManager only checks availability of MULTUP/MULTDOWN
-// - proposal uses `underlying_symbol` (current API)
-// - duration is NOT forced – left as optional, default omitted
-// - multiplier defaults to 10 if not provided
+// CORRECTED: v3 WebSocket uses `symbol` (not `underlying_symbol`).
+// Added Multiplier Offering Manager to validate available multipliers.
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -19,7 +15,7 @@ const Account = require('../../models/Account');
 EventEmitter.defaultMaxListeners = 20;
 
 // ============================================================
-// WATCHLIST – only these symbols will be subscribed for ticks
+// WATCHLIST
 // ============================================================
 const WATCHLIST = [
   'frxEURUSD',
@@ -90,7 +86,6 @@ function fromDerivSymbol(symbol, reverseMap) {
   return symbol;
 }
 
-// Hardcoded fallback symbols – used only if public discovery fails
 const FALLBACK_SYMBOLS = {
   'EUR_USD': 'frxEURUSD',
   'GBP_USD': 'frxGBPUSD',
@@ -123,7 +118,6 @@ class RateLimiter {
     this.tokens = capacity;
     this.lastRefill = Date.now();
   }
-
   async acquire() {
     while (true) {
       const now = Date.now();
@@ -141,7 +135,7 @@ class RateLimiter {
 }
 
 // ============================================================
-// STREAMING MANAGER (public ticks)
+// STREAMING MANAGER
 // ============================================================
 class StreamingManager {
   constructor(broker) {
@@ -150,7 +144,6 @@ class StreamingManager {
     this._subscriptionIdMap = new Map();
     this._priceCache = new Map();
   }
-
   async subscribe(type, symbol, callback) {
     const key = `${type}:${symbol}`;
     if (this._subscriptions.has(key)) {
@@ -172,7 +165,6 @@ class StreamingManager {
     this._subscriptionIdMap.set(subscriptionId, key);
     logger.info(`[Streaming] Subscribed to ${key} (ID: ${subscriptionId})`);
   }
-
   async unsubscribe(type, symbol, callback = null) {
     const key = `${type}:${symbol}`;
     const sub = this._subscriptions.get(key);
@@ -187,7 +179,6 @@ class StreamingManager {
     this._priceCache.delete(symbol);
     logger.info(`[Streaming] Unsubscribed from ${key}`);
   }
-
   async restoreSubscriptions() {
     if (this._subscriptions.size === 0) return;
     logger.info('[Streaming] Restoring subscriptions...');
@@ -212,7 +203,6 @@ class StreamingManager {
       }
     }
   }
-
   handleTick(tick) {
     const symbol = tick.symbol;
     const bid = tick.bid ? parseFloat(tick.bid) : null;
@@ -231,105 +221,101 @@ class StreamingManager {
       }
     }
   }
-
   getPrice(symbol) { return this._priceCache.get(symbol) || null; }
   getAllPrices() { return Object.fromEntries(this._priceCache); }
 }
 
 // ============================================================
-// SYMBOL MANAGER (only for symbol info, not leverage)
+// SYMBOL MANAGER (only for symbol info)
 // ============================================================
 class SymbolManager {
   constructor() {
     this._symbols = new Map();
   }
-
   setSymbols(symbols) {
     for (const sym of symbols) {
       const key = sym.underlying_symbol ?? sym.symbol;
       if (key) this._symbols.set(key, sym);
     }
   }
-
   getSymbolInfo(derivSymbol) { return this._symbols.get(derivSymbol) || null; }
 }
 
 // ============================================================
-// MULTIPLIER OFFERING MANAGER – CORRECTED
+// MULTIPLIER OFFERING MANAGER
 // ============================================================
 class MultiplierOfferingManager {
   constructor(broker) {
     this.broker = broker;
     this._cache = new Map();
-    this._ttl = 60000; // 1 minute
+    this._ttl = 300000; // 5 min
   }
-
   async fetchOfferings(symbol) {
     try {
-      // contracts_for does NOT accept 'currency' in current API
       const response = await this.broker._sendPublicRequest({
-        contracts_for: symbol
+        contracts_for: symbol,
+        currency: this.broker.accountCurrency || 'USD',
       });
-
-      const contracts = response?.contracts_for?.available || [];
-      const multiplierTypes = contracts
-        .filter(c =>
-          c.contract_type === 'MULTUP' ||
-          c.contract_type === 'MULTDOWN'
-        )
-        .map(c => ({
-          type: c.contract_type,
-          underlying_symbol: c.underlying_symbol || symbol
-        }));
-
-      logger.info(
-        `[MultiplierOffering] ${symbol} contract types: ${
-          multiplierTypes.map(x => x.type).join(', ') || 'NONE'
-        }`
-      );
-
-      return multiplierTypes;
-
+      const contracts = response.contracts_for?.available || [];
+      const multiplierOffers = contracts
+        .filter(c => c.contract_type === 'MULTUP' || c.contract_type === 'MULTDOWN')
+        .map(c => ({ type: c.contract_type, multiplier: c.multiplier }));
+      const unique = [];
+      const seen = new Set();
+      for (const offer of multiplierOffers) {
+        const key = `${offer.type}:${offer.multiplier}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          unique.push(offer);
+        }
+      }
+      return unique;
     } catch (err) {
-      logger.error(
-        `[MultiplierOffering] contracts_for failed for ${symbol}:`,
-        err.message
-      );
+      logger.error(`[MultiplierOffering] Failed to fetch offerings for ${symbol}:`, err.message);
       return [];
     }
   }
-
-  async getAvailableTypes(symbol) {
+  async getAvailableMultipliers(symbol) {
     const now = Date.now();
     const cached = this._cache.get(symbol);
-
     if (cached && cached.expiry > now) {
-      return cached.types;
+      return cached.multipliers;
     }
-
-    const offerings = await this.fetchOfferings(symbol);
-    const types = [...new Set(offerings.map(o => o.type))];
-
+    const offers = await this.fetchOfferings(symbol);
+    const multipliers = offers
+      .map(o => o.multiplier)
+      .filter(m => typeof m === 'number' && m > 0);
+    const unique = [...new Set(multipliers)].sort((a, b) => a - b);
     this._cache.set(symbol, {
-      types,
-      expiry: now + this._ttl
+      multipliers: unique,
+      expiry: now + this._ttl,
     });
-
-    return types;
+    logger.info(`[MultiplierOffering] ${symbol} available multipliers: ${unique.join(', ')}`);
+    return unique;
   }
-
-  async isDirectionAvailable(symbol, contractType) {
-    const available = await this.getAvailableTypes(symbol);
-    return available.includes(contractType);
+  async isMultiplierAvailable(symbol, multiplier) {
+    const available = await this.getAvailableMultipliers(symbol);
+    return available.includes(multiplier);
   }
-
+  async selectMultiplier(symbol, requested = null) {
+    const available = await this.getAvailableMultipliers(symbol);
+    if (!available.length) {
+      throw new Error(`No multiplier offerings available for ${symbol}`);
+    }
+    if (requested !== null && requested !== undefined && available.includes(requested)) {
+      return requested;
+    }
+    const selected = available[available.length - 1]; // highest
+    logger.info(`[MultiplierOffering] Selected multiplier ${selected} for ${symbol}`);
+    return selected;
+  }
   invalidate(symbol) {
     this._cache.delete(symbol);
   }
 }
 
 // ============================================================
-// MAIN BROKER CLASS (Stable Dual WebSocket)
+// MAIN BROKER CLASS
 // ============================================================
 const BROKER_CAPABILITIES = {
   supportsTrailingStop: false,
@@ -369,7 +355,7 @@ class DerivBroker extends EventEmitter {
       minStopDistance: parseFloat(config.minStopDistance || 0.0001),
       rateLimit: parseFloat(config.rateLimit || 5),
       rateCapacity: parseFloat(config.rateCapacity || 10),
-      leverage: parseFloat(config.leverage || 100), // kept for legacy but not used
+      leverage: parseFloat(config.leverage || 100),
       riskValidator: config.riskValidator || null,
       fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || 3),
       readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 30000),
@@ -407,7 +393,7 @@ class DerivBroker extends EventEmitter {
     this.streaming = new StreamingManager(this);
     this.symbolManager = new SymbolManager();
 
-    // ---------- Multiplier Offering Manager (NEW) ----------
+    // Multiplier Offering Manager
     this.multiplierManager = new MultiplierOfferingManager(this);
 
     // ---------- Circuit breaker ----------
@@ -473,6 +459,11 @@ class DerivBroker extends EventEmitter {
     logger.info('[DerivBroker] Configuration validated.');
   }
 
+  getLeverage(symbol) {
+    // Kept for legacy, but not used as multiplier
+    return 100;
+  }
+
   // ---------- CONNECTION ----------
   async connect() {
     await Promise.all([
@@ -492,7 +483,7 @@ class DerivBroker extends EventEmitter {
     await this._loadPendingOrders();
   }
 
-  // ---- Public socket (unchanged) ----
+  // ---- Public socket ----
   async _connectPublic() {
     if (this._publicState === STATE.READY || this._publicState === STATE.CONNECTED) return;
     if (this._publicConnectionPromise) return this._publicConnectionPromise;
@@ -1453,7 +1444,7 @@ class DerivBroker extends EventEmitter {
   async getPositions() { return this.getOpenTrades(); }
 
   // ============================================================
-  //  PLACE MARKET ORDER – FULLY CORRECTED
+  //  PLACE MARKET ORDER – CORRECTED
   // ============================================================
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null, duration = null, multiplier = null) {
     await this._ensureAuthReady();
@@ -1470,51 +1461,45 @@ class DerivBroker extends EventEmitter {
       throw new Error(`Unknown instrument: ${instrument}`);
     }
 
-    // ------------------------------------------------------------
-    // 1. VERIFY THAT THE DIRECTION IS OFFERED
-    // ------------------------------------------------------------
-    const availableTypes = await this.multiplierManager.getAvailableTypes(symbol);
-    logger.info(`[DerivBroker] ${symbol} multiplier types: ${availableTypes.join(', ') || 'NONE'}`);
-
-    if (!availableTypes.includes(direction)) {
-      throw new Error(
-        `No ${direction} offering available for ${symbol}. ` +
-        `Available: ${availableTypes.join(', ') || 'NONE'}`
-      );
-    }
-
-    // ------------------------------------------------------------
-    // 2. SELECT MULTIPLIER
-    // ------------------------------------------------------------
+    // ---- Select multiplier via offering manager ----
     let finalMultiplier = Number(multiplier);
     if (!Number.isFinite(finalMultiplier) || finalMultiplier <= 0) {
-      finalMultiplier = 10; // safe default
+      finalMultiplier = await this.multiplierManager.selectMultiplier(symbol);
+    } else {
+      const available = await this.multiplierManager.getAvailableMultipliers(symbol);
+      if (!available.includes(finalMultiplier)) {
+        logger.warn(`[DerivBroker] Requested multiplier ${finalMultiplier} not available. Available: ${available.join(', ')}`);
+        finalMultiplier = available[available.length - 1] || 10;
+      }
     }
-    finalMultiplier = Math.floor(finalMultiplier);
+    if (!Number.isFinite(finalMultiplier) || finalMultiplier <= 0) {
+      finalMultiplier = 10;
+    }
 
-    // ------------------------------------------------------------
-    // 3. BUILD CURRENT DERIV PROPOSAL
-    // Use `underlying_symbol` (current API)
-    // Duration is optional – if not provided, omit it.
-    // ------------------------------------------------------------
+    // ---- Duration ----
+    let finalDuration = Number(duration);
+    if (!Number.isFinite(finalDuration) || finalDuration <= 0) {
+      finalDuration = 300; // 5 min default
+    }
+    finalDuration = Math.floor(finalDuration);
+    if (finalDuration < 60) finalDuration = 60;
+    if (finalDuration > 3600) finalDuration = 3600;
+
+    // ---- Build proposal (v3 WebSocket uses `symbol`) ----
     const proposalPayload = {
       proposal: 1,
       amount: amount,
       basis: 'stake',
       contract_type: direction,
       currency: this.accountCurrency || 'USD',
-      multiplier: finalMultiplier,
-      underlying_symbol: symbol,
-    };
 
-    // Add duration ONLY if provided
-    if (duration !== null && duration !== undefined) {
-      const dur = Number(duration);
-      if (Number.isFinite(dur) && dur > 0) {
-        proposalPayload.duration = Math.floor(dur);
-        proposalPayload.duration_unit = 's';
-      }
-    }
+      duration: finalDuration,
+      duration_unit: 's',
+
+      symbol: symbol,   // <-- CORRECT: use `symbol`, not `underlying_symbol`
+
+      multiplier: finalMultiplier,
+    };
 
     if (stopLoss !== null && stopLoss !== undefined) {
       proposalPayload.stop_loss = Number(stopLoss);
@@ -1523,18 +1508,18 @@ class DerivBroker extends EventEmitter {
       proposalPayload.take_profit = Number(takeProfit);
     }
 
-    logger.info(`[DerivBroker] MULT proposal payload: ${JSON.stringify(redactSensitive(proposalPayload))}`);
+    logger.info(`[DerivBroker] Proposal payload: ${JSON.stringify(redactSensitive(proposalPayload))}`);
 
     // ---- Request proposal ----
     const proposalResponse = await this._sendAuthRequest(proposalPayload);
-    const proposal = proposalResponse?.proposal;
+    const proposal = proposalResponse.proposal;
     if (!proposal) {
       throw new Error(`Failed to get proposal: ${JSON.stringify(proposalResponse)}`);
     }
 
     const proposalId = proposal.id;
     if (!proposalId) {
-      throw new Error(`Deriv returned proposal without ID: ${JSON.stringify(proposalResponse)}`);
+      throw new Error(`Proposal missing ID: ${JSON.stringify(proposalResponse)}`);
     }
 
     const askPrice = Number(proposal.ask_price);
@@ -1542,12 +1527,13 @@ class DerivBroker extends EventEmitter {
       throw new Error(`Invalid proposal ask price: ${proposal.ask_price}`);
     }
 
-    // ---- Buy the contract ----
-    const buyResponse = await this._sendAuthRequest({
+    // ---- Buy ----
+    const buyPayload = {
       buy: proposalId,
       price: askPrice,
-    });
-    const buy = buyResponse?.buy;
+    };
+    const buyResponse = await this._sendAuthRequest(buyPayload);
+    const buy = buyResponse.buy;
     if (!buy || !buy.contract_id) {
       throw new Error(`Buy failed: ${JSON.stringify(buyResponse)}`);
     }
@@ -1570,10 +1556,10 @@ class DerivBroker extends EventEmitter {
     this._orders.set(newOrder.clientOrderId, newOrder);
     this._orderMap.set(contractId, newOrder.clientOrderId);
 
-    // ---- Emit positions update ----
+    // ---- Emit positions ----
     this.getOpenTrades()
       .then(positions => this.emit('positions', positions))
-      .catch(err => logger.error('[DerivBroker] Failed to emit positions after market order:', err.message));
+      .catch(err => logger.error('[DerivBroker] Failed to emit positions:', err.message));
 
     return {
       tradeID: String(contractId),
