@@ -1,7 +1,7 @@
 // core/execution/broker.js – Stable Dual‑WebSocket Deriv Broker
-// Watchlist: only subscribe to specified symbols.
-// FIX: No forced duration for MULTUP/MULTDOWN. Duration is optional.
-// Uses `symbol` for v3 WebSocket (auth) endpoint.
+// ADDED: Multiplier Offering Manager (contracts_for) to validate available multipliers.
+// Uses v3 WebSocket endpoint (`symbol` field).
+// Duration default is 300s (5 minutes) but can be overridden.
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -234,32 +234,132 @@ class StreamingManager {
 }
 
 // ============================================================
-// SYMBOL MANAGER
+// SYMBOL MANAGER (kept for symbol mapping only)
 // ============================================================
 class SymbolManager {
   constructor() {
     this._symbols = new Map();
-    this._leverageMap = {
-      'frxEURUSD': 100, 'frxGBPUSD': 100, 'frxUSDJPY': 100,
-      'frxAUDUSD': 100, 'frxUSDCAD': 100, 'frxUSDCHF': 100,
-      'frxNZDUSD': 100, 'frxEURGBP': 100, 'frxEURJPY': 100,
-      'frxGBPJPY': 100,
-    };
   }
 
   setSymbols(symbols) {
     for (const sym of symbols) {
       const key = sym.underlying_symbol ?? sym.symbol;
-      if (key) {
-        this._symbols.set(key, sym);
-        if (sym.leverage) this._leverageMap[key] = sym.leverage;
-      }
+      if (key) this._symbols.set(key, sym);
     }
   }
 
-  getLeverage(derivSymbol) { return this._leverageMap[derivSymbol] || 100; }
-  getPip(derivSymbol) { return this._symbols.get(derivSymbol)?.pip || 0.0001; }
   getSymbolInfo(derivSymbol) { return this._symbols.get(derivSymbol) || null; }
+}
+
+// ============================================================
+// MULTIPLIER OFFERING MANAGER (NEW)
+// ============================================================
+class MultiplierOfferingManager {
+  constructor(broker) {
+    this.broker = broker;
+    this._cache = new Map(); // symbol -> { offerings, expiry }
+    this._ttl = 300000; // 5 minutes
+  }
+
+  /**
+   * Fetch available multiplier contracts for a symbol from Deriv.
+   * Uses the `contracts_for` public endpoint.
+   */
+  async fetchOfferings(symbol) {
+    try {
+      const response = await this.broker._sendPublicRequest({
+        contracts_for: symbol,
+        currency: this.broker.accountCurrency || 'USD',
+      });
+      const contracts = response.contracts_for?.available || [];
+      // Filter only multiplier contracts (MULTUP and MULTDOWN)
+      const multiplierOffers = contracts
+        .filter(c => c.contract_type === 'MULTUP' || c.contract_type === 'MULTDOWN')
+        .map(c => ({
+          type: c.contract_type,
+          multiplier: c.multiplier,
+          // you can also store min/max stakes if needed
+        }));
+      // Deduplicate by multiplier value
+      const unique = [];
+      const seen = new Set();
+      for (const offer of multiplierOffers) {
+        const key = `${offer.type}:${offer.multiplier}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          unique.push(offer);
+        }
+      }
+      return unique;
+    } catch (err) {
+      logger.error(`[MultiplierOffering] Failed to fetch offerings for ${symbol}:`, err.message);
+      return [];
+    }
+  }
+
+  /**
+   * Get available multipliers for a symbol, using cache if fresh.
+   * @param {string} symbol - Deriv symbol (e.g., 'frxEURUSD')
+   * @returns {Promise<number[]>} Array of multiplier values (e.g., [2, 5, 10, 20, 50])
+   */
+  async getAvailableMultipliers(symbol) {
+    const now = Date.now();
+    const cached = this._cache.get(symbol);
+    if (cached && cached.expiry > now) {
+      return cached.multipliers;
+    }
+
+    const offers = await this.fetchOfferings(symbol);
+    // Extract unique multiplier values (ignore direction)
+    const multipliers = offers
+      .map(o => o.multiplier)
+      .filter(m => typeof m === 'number' && m > 0);
+    const unique = [...new Set(multipliers)].sort((a, b) => a - b);
+
+    this._cache.set(symbol, {
+      multipliers: unique,
+      expiry: now + this._ttl,
+    });
+
+    logger.info(`[MultiplierOffering] ${symbol} available multipliers: ${unique.join(', ')}`);
+    return unique;
+  }
+
+  /**
+   * Check if a specific multiplier is available for a symbol.
+   */
+  async isMultiplierAvailable(symbol, multiplier) {
+    const available = await this.getAvailableMultipliers(symbol);
+    return available.includes(multiplier);
+  }
+
+  /**
+   * Select the best multiplier: if requested is available, use it;
+   * otherwise pick the highest available, or the lowest if none.
+   * @param {string} symbol
+   * @param {number} [requested] - Desired multiplier, or null/undefined for default.
+   * @returns {Promise<number>} The selected multiplier.
+   */
+  async selectMultiplier(symbol, requested = null) {
+    const available = await this.getAvailableMultipliers(symbol);
+    if (!available.length) {
+      throw new Error(`No multiplier offerings available for ${symbol}`);
+    }
+
+    if (requested !== null && requested !== undefined && available.includes(requested)) {
+      return requested;
+    }
+
+    // If requested is not available or not specified, pick the highest available
+    // (or you could pick the lowest; we pick highest for max potential)
+    const selected = available[available.length - 1];
+    logger.info(`[MultiplierOffering] Selected multiplier ${selected} for ${symbol} (available: ${available.join(', ')})`);
+    return selected;
+  }
+
+  invalidate(symbol) {
+    this._cache.delete(symbol);
+  }
 }
 
 // ============================================================
@@ -303,7 +403,7 @@ class DerivBroker extends EventEmitter {
       minStopDistance: parseFloat(config.minStopDistance || 0.0001),
       rateLimit: parseFloat(config.rateLimit || 5),
       rateCapacity: parseFloat(config.rateCapacity || 10),
-      leverage: parseFloat(config.leverage || 100),
+      leverage: parseFloat(config.leverage || 100), // kept for legacy, but not used as multiplier
       riskValidator: config.riskValidator || null,
       fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || 3),
       readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 30000),
@@ -340,6 +440,9 @@ class DerivBroker extends EventEmitter {
 
     this.streaming = new StreamingManager(this);
     this.symbolManager = new SymbolManager();
+
+    // ---------- Multiplier Offering Manager (NEW) ----------
+    this.multiplierManager = new MultiplierOfferingManager(this);
 
     // ---------- Circuit breaker ----------
     this._cbState = CB_STATE.CLOSED;
@@ -404,10 +507,6 @@ class DerivBroker extends EventEmitter {
     logger.info('[DerivBroker] Configuration validated.');
   }
 
-  getLeverage(symbol) {
-    return this.symbolManager.getLeverage(symbol) || this.config.leverage || 100;
-  }
-
   // ---------- CONNECTION ----------
   async connect() {
     await Promise.all([
@@ -427,7 +526,7 @@ class DerivBroker extends EventEmitter {
     await this._loadPendingOrders();
   }
 
-  // ---- Public socket ----
+  // ---- Public socket (unchanged) ----
   async _connectPublic() {
     if (this._publicState === STATE.READY || this._publicState === STATE.CONNECTED) return;
     if (this._publicConnectionPromise) return this._publicConnectionPromise;
@@ -561,7 +660,7 @@ class DerivBroker extends EventEmitter {
       return;
     }
     try {
-      const isImportant = payload.active_symbols || payload.ticks || payload.ohlc;
+      const isImportant = payload.active_symbols || payload.ticks || payload.ohlc || payload.contracts_for;
       if (isImportant) {
         logger.info(`[Out Public] ${payload.req_id || 'no-req-id'} →`, JSON.stringify(redactSensitive(payload), null, 2));
       } else {
@@ -688,8 +787,7 @@ class DerivBroker extends EventEmitter {
         handled = true;
       }
 
-      if (msg.active_symbols !== undefined) {
-        logger.debug('[In Public] active_symbols response received.');
+      if (msg.active_symbols !== undefined || msg.contracts_for !== undefined) {
         handled = true;
       }
 
@@ -1389,7 +1487,7 @@ class DerivBroker extends EventEmitter {
   async getPositions() { return this.getOpenTrades(); }
 
   // ============================================================
-  //  PLACE MARKET ORDER – FIXED: NO FORCED DURATION
+  //  PLACE MARKET ORDER – WITH MULTIPLIER OFFERING VALIDATION
   // ============================================================
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null, duration = null, multiplier = null) {
     await this._ensureAuthReady();
@@ -1407,30 +1505,40 @@ class DerivBroker extends EventEmitter {
     }
 
     // ------------------------------------------------------------
-    // NORMALIZE MULTIPLIER
+    // VALIDATE AND SELECT MULTIPLIER USING OFFERING MANAGER
     // ------------------------------------------------------------
     let finalMultiplier = Number(multiplier);
     if (!Number.isFinite(finalMultiplier) || finalMultiplier <= 0) {
-      finalMultiplier = Number(this.getLeverage(symbol)) || 100;
-    }
-    finalMultiplier = Math.floor(finalMultiplier);
-
-    // ------------------------------------------------------------
-    // DURATION – ONLY ADD IF EXPLICITLY PROVIDED
-    // Do not force a default; MULTUP/MULTDOWN may not require it.
-    // ------------------------------------------------------------
-    let finalDuration = null;
-    if (duration !== null && duration !== undefined) {
-      const parsed = Number(duration);
-      if (!Number.isFinite(parsed) || parsed <= 0) {
-        throw new Error(`Invalid duration provided: ${duration}`);
+      // No multiplier provided – pick the highest available
+      finalMultiplier = await this.multiplierManager.selectMultiplier(symbol);
+    } else {
+      // Check if requested multiplier is available
+      const available = await this.multiplierManager.getAvailableMultipliers(symbol);
+      if (!available.includes(finalMultiplier)) {
+        logger.warn(`[DerivBroker] Requested multiplier ${finalMultiplier} not available for ${symbol}. Available: ${available.join(', ')}`);
+        // Pick the highest available
+        finalMultiplier = available[available.length - 1] || 10;
       }
-      finalDuration = Math.floor(parsed);
-      // Optionally clamp if needed, but we'll just pass it as given.
+    }
+    // Safety – if still not set, default to 10
+    if (!Number.isFinite(finalMultiplier) || finalMultiplier <= 0) {
+      finalMultiplier = 10;
     }
 
     // ------------------------------------------------------------
-    // BUILD PROPOSAL PAYLOAD – v3 WebSocket uses `symbol`
+    // DURATION – optional, default 300s if not provided
+    // ------------------------------------------------------------
+    let finalDuration = Number(duration);
+    if (!Number.isFinite(finalDuration) || finalDuration <= 0) {
+      finalDuration = 300; // 5 minutes
+    }
+    finalDuration = Math.floor(finalDuration);
+    if (finalDuration < 60) finalDuration = 60;
+    if (finalDuration > 3600) finalDuration = 3600;
+
+    // ------------------------------------------------------------
+    // BUILD PROPOSAL PAYLOAD
+    // v3 WebSocket uses `symbol` (not `underlying_symbol`)
     // ------------------------------------------------------------
     const proposalPayload = {
       proposal: 1,
@@ -1438,17 +1546,15 @@ class DerivBroker extends EventEmitter {
       basis: 'stake',
       contract_type: direction,
       currency: this.accountCurrency || 'USD',
+
+      duration: finalDuration,
+      duration_unit: 's',
+
       symbol: symbol,
+
       multiplier: finalMultiplier,
     };
 
-    // Add duration only if provided and valid
-    if (finalDuration !== null) {
-      proposalPayload.duration = finalDuration;
-      proposalPayload.duration_unit = 's';
-    }
-
-    // Add stop_loss / take_profit only if provided
     if (stopLoss !== null && stopLoss !== undefined) {
       proposalPayload.stop_loss = Number(stopLoss);
     }
