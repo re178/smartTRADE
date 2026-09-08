@@ -1,7 +1,7 @@
 // core/execution/broker.js – Stable Dual‑WebSocket Deriv Broker
 // Watchlist: only subscribe to specified symbols.
-// FINAL: proposal uses `symbol` (v3 WebSocket endpoint), duration default 300s.
-// Normalizes duration and multiplier; logs proposal for debugging.
+// FIX: No forced duration for MULTUP/MULTDOWN. Duration is optional.
+// Uses `symbol` for v3 WebSocket (auth) endpoint.
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -1389,7 +1389,7 @@ class DerivBroker extends EventEmitter {
   async getPositions() { return this.getOpenTrades(); }
 
   // ============================================================
-  //  PLACE MARKET ORDER – FINAL (Duration default 300s)
+  //  PLACE MARKET ORDER – FIXED: NO FORCED DURATION
   // ============================================================
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null, duration = null, multiplier = null) {
     await this._ensureAuthReady();
@@ -1416,21 +1416,21 @@ class DerivBroker extends EventEmitter {
     finalMultiplier = Math.floor(finalMultiplier);
 
     // ------------------------------------------------------------
-    // NORMALIZE DURATION
-    // Default to 300 seconds (5 minutes) – safe for many multipliers.
-    // Must be between 60 and 3600 seconds for forex pairs.
+    // DURATION – ONLY ADD IF EXPLICITLY PROVIDED
+    // Do not force a default; MULTUP/MULTDOWN may not require it.
     // ------------------------------------------------------------
-    let finalDuration = Number(duration);
-    if (!Number.isFinite(finalDuration) || finalDuration <= 0) {
-      finalDuration = 300; // 5 minutes
+    let finalDuration = null;
+    if (duration !== null && duration !== undefined) {
+      const parsed = Number(duration);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        throw new Error(`Invalid duration provided: ${duration}`);
+      }
+      finalDuration = Math.floor(parsed);
+      // Optionally clamp if needed, but we'll just pass it as given.
     }
-    finalDuration = Math.floor(finalDuration);
-    if (finalDuration < 60) finalDuration = 60;
-    if (finalDuration > 3600) finalDuration = 3600;
 
     // ------------------------------------------------------------
-    // BUILD PROPOSAL PAYLOAD
-    // v3 WebSocket uses `symbol` (not `underlying_symbol`)
+    // BUILD PROPOSAL PAYLOAD – v3 WebSocket uses `symbol`
     // ------------------------------------------------------------
     const proposalPayload = {
       proposal: 1,
@@ -1438,15 +1438,17 @@ class DerivBroker extends EventEmitter {
       basis: 'stake',
       contract_type: direction,
       currency: this.accountCurrency || 'USD',
-
-      duration: finalDuration,
-      duration_unit: 's',
-
       symbol: symbol,
-
       multiplier: finalMultiplier,
     };
 
+    // Add duration only if provided and valid
+    if (finalDuration !== null) {
+      proposalPayload.duration = finalDuration;
+      proposalPayload.duration_unit = 's';
+    }
+
+    // Add stop_loss / take_profit only if provided
     if (stopLoss !== null && stopLoss !== undefined) {
       proposalPayload.stop_loss = Number(stopLoss);
     }
