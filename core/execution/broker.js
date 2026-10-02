@@ -1,6 +1,7 @@
 // core/execution/broker.js – Stable Dual‑WebSocket Deriv Broker
-// CORRECTED: v3 WebSocket uses `symbol` (not `underlying_symbol`).
-// Added Multiplier Offering Manager to validate available multipliers.
+// Watchlist: only subscribe to specified symbols.
+// v3 Auth WebSocket uses `symbol` in proposal.
+// Simple, reliable multiplier/duration handling.
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
@@ -118,6 +119,7 @@ class RateLimiter {
     this.tokens = capacity;
     this.lastRefill = Date.now();
   }
+
   async acquire() {
     while (true) {
       const now = Date.now();
@@ -144,6 +146,7 @@ class StreamingManager {
     this._subscriptionIdMap = new Map();
     this._priceCache = new Map();
   }
+
   async subscribe(type, symbol, callback) {
     const key = `${type}:${symbol}`;
     if (this._subscriptions.has(key)) {
@@ -165,6 +168,7 @@ class StreamingManager {
     this._subscriptionIdMap.set(subscriptionId, key);
     logger.info(`[Streaming] Subscribed to ${key} (ID: ${subscriptionId})`);
   }
+
   async unsubscribe(type, symbol, callback = null) {
     const key = `${type}:${symbol}`;
     const sub = this._subscriptions.get(key);
@@ -179,6 +183,7 @@ class StreamingManager {
     this._priceCache.delete(symbol);
     logger.info(`[Streaming] Unsubscribed from ${key}`);
   }
+
   async restoreSubscriptions() {
     if (this._subscriptions.size === 0) return;
     logger.info('[Streaming] Restoring subscriptions...');
@@ -203,6 +208,7 @@ class StreamingManager {
       }
     }
   }
+
   handleTick(tick) {
     const symbol = tick.symbol;
     const bid = tick.bid ? parseFloat(tick.bid) : null;
@@ -221,97 +227,27 @@ class StreamingManager {
       }
     }
   }
+
   getPrice(symbol) { return this._priceCache.get(symbol) || null; }
   getAllPrices() { return Object.fromEntries(this._priceCache); }
 }
 
 // ============================================================
-// SYMBOL MANAGER (only for symbol info)
+// SYMBOL MANAGER
 // ============================================================
 class SymbolManager {
   constructor() {
     this._symbols = new Map();
   }
+
   setSymbols(symbols) {
     for (const sym of symbols) {
       const key = sym.underlying_symbol ?? sym.symbol;
       if (key) this._symbols.set(key, sym);
     }
   }
-  getSymbolInfo(derivSymbol) { return this._symbols.get(derivSymbol) || null; }
-}
 
-// ============================================================
-// MULTIPLIER OFFERING MANAGER
-// ============================================================
-class MultiplierOfferingManager {
-  constructor(broker) {
-    this.broker = broker;
-    this._cache = new Map();
-    this._ttl = 300000; // 5 min
-  }
-  async fetchOfferings(symbol) {
-    try {
-      const response = await this.broker._sendPublicRequest({
-        contracts_for: symbol,
-        currency: this.broker.accountCurrency || 'USD',
-      });
-      const contracts = response.contracts_for?.available || [];
-      const multiplierOffers = contracts
-        .filter(c => c.contract_type === 'MULTUP' || c.contract_type === 'MULTDOWN')
-        .map(c => ({ type: c.contract_type, multiplier: c.multiplier }));
-      const unique = [];
-      const seen = new Set();
-      for (const offer of multiplierOffers) {
-        const key = `${offer.type}:${offer.multiplier}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          unique.push(offer);
-        }
-      }
-      return unique;
-    } catch (err) {
-      logger.error(`[MultiplierOffering] Failed to fetch offerings for ${symbol}:`, err.message);
-      return [];
-    }
-  }
-  async getAvailableMultipliers(symbol) {
-    const now = Date.now();
-    const cached = this._cache.get(symbol);
-    if (cached && cached.expiry > now) {
-      return cached.multipliers;
-    }
-    const offers = await this.fetchOfferings(symbol);
-    const multipliers = offers
-      .map(o => o.multiplier)
-      .filter(m => typeof m === 'number' && m > 0);
-    const unique = [...new Set(multipliers)].sort((a, b) => a - b);
-    this._cache.set(symbol, {
-      multipliers: unique,
-      expiry: now + this._ttl,
-    });
-    logger.info(`[MultiplierOffering] ${symbol} available multipliers: ${unique.join(', ')}`);
-    return unique;
-  }
-  async isMultiplierAvailable(symbol, multiplier) {
-    const available = await this.getAvailableMultipliers(symbol);
-    return available.includes(multiplier);
-  }
-  async selectMultiplier(symbol, requested = null) {
-    const available = await this.getAvailableMultipliers(symbol);
-    if (!available.length) {
-      throw new Error(`No multiplier offerings available for ${symbol}`);
-    }
-    if (requested !== null && requested !== undefined && available.includes(requested)) {
-      return requested;
-    }
-    const selected = available[available.length - 1]; // highest
-    logger.info(`[MultiplierOffering] Selected multiplier ${selected} for ${symbol}`);
-    return selected;
-  }
-  invalidate(symbol) {
-    this._cache.delete(symbol);
-  }
+  getSymbolInfo(derivSymbol) { return this._symbols.get(derivSymbol) || null; }
 }
 
 // ============================================================
@@ -393,9 +329,6 @@ class DerivBroker extends EventEmitter {
     this.streaming = new StreamingManager(this);
     this.symbolManager = new SymbolManager();
 
-    // Multiplier Offering Manager
-    this.multiplierManager = new MultiplierOfferingManager(this);
-
     // ---------- Circuit breaker ----------
     this._cbState = CB_STATE.CLOSED;
     this._cbFailureCount = 0;
@@ -460,7 +393,6 @@ class DerivBroker extends EventEmitter {
   }
 
   getLeverage(symbol) {
-    // Kept for legacy, but not used as multiplier
     return 100;
   }
 
@@ -617,7 +549,7 @@ class DerivBroker extends EventEmitter {
       return;
     }
     try {
-      const isImportant = payload.active_symbols || payload.ticks || payload.ohlc || payload.contracts_for;
+      const isImportant = payload.active_symbols || payload.ticks || payload.ohlc;
       if (isImportant) {
         logger.info(`[Out Public] ${payload.req_id || 'no-req-id'} →`, JSON.stringify(redactSensitive(payload), null, 2));
       } else {
@@ -744,7 +676,8 @@ class DerivBroker extends EventEmitter {
         handled = true;
       }
 
-      if (msg.active_symbols !== undefined || msg.contracts_for !== undefined) {
+      if (msg.active_symbols !== undefined) {
+        logger.debug('[In Public] active_symbols response received.');
         handled = true;
       }
 
@@ -1444,7 +1377,7 @@ class DerivBroker extends EventEmitter {
   async getPositions() { return this.getOpenTrades(); }
 
   // ============================================================
-  //  PLACE MARKET ORDER – CORRECTED
+  //  PLACE MARKET ORDER
   // ============================================================
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null, duration = null, multiplier = null) {
     await this._ensureAuthReady();
@@ -1461,43 +1394,31 @@ class DerivBroker extends EventEmitter {
       throw new Error(`Unknown instrument: ${instrument}`);
     }
 
-    // ---- Select multiplier via offering manager ----
+    // Multiplier
     let finalMultiplier = Number(multiplier);
-    if (!Number.isFinite(finalMultiplier) || finalMultiplier <= 0) {
-      finalMultiplier = await this.multiplierManager.selectMultiplier(symbol);
-    } else {
-      const available = await this.multiplierManager.getAvailableMultipliers(symbol);
-      if (!available.includes(finalMultiplier)) {
-        logger.warn(`[DerivBroker] Requested multiplier ${finalMultiplier} not available. Available: ${available.join(', ')}`);
-        finalMultiplier = available[available.length - 1] || 10;
-      }
-    }
     if (!Number.isFinite(finalMultiplier) || finalMultiplier <= 0) {
       finalMultiplier = 10;
     }
+    finalMultiplier = Math.floor(finalMultiplier);
 
-    // ---- Duration ----
+    // Duration
     let finalDuration = Number(duration);
     if (!Number.isFinite(finalDuration) || finalDuration <= 0) {
-      finalDuration = 300; // 5 min default
+      finalDuration = 300;
     }
     finalDuration = Math.floor(finalDuration);
     if (finalDuration < 60) finalDuration = 60;
     if (finalDuration > 3600) finalDuration = 3600;
 
-    // ---- Build proposal (v3 WebSocket uses `symbol`) ----
     const proposalPayload = {
       proposal: 1,
       amount: amount,
       basis: 'stake',
       contract_type: direction,
       currency: this.accountCurrency || 'USD',
-
       duration: finalDuration,
       duration_unit: 's',
-
-      symbol: symbol,   // <-- CORRECT: use `symbol`, not `underlying_symbol`
-
+      symbol: symbol,
       multiplier: finalMultiplier,
     };
 
@@ -1510,7 +1431,6 @@ class DerivBroker extends EventEmitter {
 
     logger.info(`[DerivBroker] Proposal payload: ${JSON.stringify(redactSensitive(proposalPayload))}`);
 
-    // ---- Request proposal ----
     const proposalResponse = await this._sendAuthRequest(proposalPayload);
     const proposal = proposalResponse.proposal;
     if (!proposal) {
@@ -1527,7 +1447,6 @@ class DerivBroker extends EventEmitter {
       throw new Error(`Invalid proposal ask price: ${proposal.ask_price}`);
     }
 
-    // ---- Buy ----
     const buyPayload = {
       buy: proposalId,
       price: askPrice,
@@ -1541,7 +1460,6 @@ class DerivBroker extends EventEmitter {
     const contractId = buy.contract_id;
     const price = Number(buy.price) || 0;
 
-    // ---- Save Order ----
     const newOrder = new Order({
       clientOrderId: generateClientOrderId(),
       instrument,
@@ -1556,7 +1474,6 @@ class DerivBroker extends EventEmitter {
     this._orders.set(newOrder.clientOrderId, newOrder);
     this._orderMap.set(contractId, newOrder.clientOrderId);
 
-    // ---- Emit positions ----
     this.getOpenTrades()
       .then(positions => this.emit('positions', positions))
       .catch(err => logger.error('[DerivBroker] Failed to emit positions:', err.message));
