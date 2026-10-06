@@ -8,15 +8,12 @@
 // CORRECTED: Auto-discovers the real Options account ID; never trusts a
 //            hardcoded account ID blindly. Uses `underlying_symbol`.
 //
-// [FIX 1] Single-flight guard on connect() — prevents duplicate
-//         active_symbols fetch and duplicate default subscriptions.
-// [FIX 2] StreamingManager.subscribe() is now concurrency-safe via a
-//         pending-subscriptions map — prevents AlreadySubscribed errors.
-// [FIX 3] Explicit account-type selection (DERIV_ACCOUNT_TYPE=demo|real)
-//         replaces blind "accounts[0]" fallback. Fails loud, never
-//         silently lands on the wrong environment.
-// [FIX 4] Balance is now actually requested, stored, streamed, and
-//         surfaced through getAccount(). No more hardcoded '0'.
+// [FIX 1] Single-flight guard on connect().
+// [FIX 2] Concurrency-safe StreamingManager.subscribe().
+// [FIX 3] Explicit account-type selection (DERIV_ACCOUNT_TYPE=demo|real).
+// [FIX 4] Balance actually requested, stored, streamed, surfaced via getAccount().
+// [FIX 5] MULTUP/MULTDOWN use date_expiry (1 year out) — the previous
+//         300s duration was rejected with InvalidExpiry.
 
 const WebSocket = require('ws');
 const axios = require('axios');
@@ -65,6 +62,11 @@ const ORDER_STATUS = {
 
 const CB_STATE = { CLOSED: 'CLOSED', OPEN: 'OPEN', HALF_OPEN: 'HALF_OPEN' };
 let _requestCounter = 0;
+
+// [FIX 5] How far in the future the multiplier contract's date_expiry sits.
+// Deriv treats this as the "maximum lifetime" — the position is still
+// closed manually via sell, not automatically at this date.
+const MULTIPLIER_EXPIRY_SECONDS = 365 * 24 * 60 * 60; // 1 year
 
 // ============================================================
 // HELPERS
@@ -145,8 +147,8 @@ class StreamingManager {
     this._subscriptions = new Map();
     this._subscriptionIdMap = new Map();
     this._priceCache = new Map();
-    // [FIX 2] Track in-flight subscribe() calls to prevent duplicate
-    // `subscribe:1` frames being sent for the same (type, symbol).
+    // [FIX 2] In-flight subscribe() calls, to prevent duplicate
+    // `subscribe:1` frames for the same (type, symbol).
     this._pendingSubscriptions = new Map();
   }
 
@@ -438,7 +440,6 @@ class DerivBroker extends EventEmitter {
     const normType = (a) => String(a.account_type || a.type || '').toLowerCase();
     const normId   = (a) => a.account_id || a.id || a.accountId;
 
-    // Cache the resolved account for later enrichment of balance frames.
     const remember = (acc) => {
       this._account = {
         loginid: normId(acc),
@@ -546,8 +547,7 @@ class DerivBroker extends EventEmitter {
     this.emit('ready');
     this.emit('connected');
 
-    // [FIX 4] Fetch the balance before declaring "fully ready" so any
-    // downstream getAccount() call returns a real number, not '0'.
+    // [FIX 4] Fetch the balance before declaring "fully ready".
     await this._ensureBalanceLoaded();
 
     await this._subscribeDefaultSymbols();
@@ -1128,7 +1128,6 @@ class DerivBroker extends EventEmitter {
   // ============================================================
   async getAccount() {
     await this._ensureAuthReady();
-    // [FIX 4] If we somehow got here before the balance landed, wait for it.
     if (!this._account || this._account.balance == null) {
       try { await this._ensureBalanceLoaded(); } catch (_) {}
     }
@@ -1150,8 +1149,6 @@ class DerivBroker extends EventEmitter {
     };
   }
   _getDefaultAccount() {
-    // [FIX 4] Mark as stale so the dashboard can distinguish "not loaded"
-    // from "genuinely $0".
     return {
       id: 'UNKNOWN',
       balance: '0',
@@ -1215,7 +1212,6 @@ class DerivBroker extends EventEmitter {
   // ============================================================
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null, duration = null, multiplier = null) {
     await this._ensureAuthReady();
-    // [FIX 4] Make sure the real currency is loaded before submitting a proposal.
     if (!this._account || this._account.balance == null) {
       try { await this._ensureBalanceLoaded(); } catch (_) {}
     }
@@ -1229,19 +1225,38 @@ class DerivBroker extends EventEmitter {
     if (!Number.isFinite(finalMultiplier) || finalMultiplier <= 0) finalMultiplier = 10;
     finalMultiplier = Math.floor(finalMultiplier);
 
-    let finalDuration = Number(duration);
-    if (!Number.isFinite(finalDuration) || finalDuration <= 0) finalDuration = 300;
-    finalDuration = Math.floor(finalDuration);
-    if (finalDuration < 60) finalDuration = 60;
-    if (finalDuration > 3600) finalDuration = 3600;
+    // [FIX 5] Multiplier contracts (MULTUP/MULTDOWN) do NOT accept short
+    // durations. Deriv rejects anything below ~1 day with `InvalidExpiry`.
+    // The cleanest fix is to use `date_expiry` instead of `duration` —
+    // a timestamp far enough in the future that the contract is effectively
+    // open-ended. Position closure is still done manually via `sell`.
+    const isMultiplier = direction === 'MULTUP' || direction === 'MULTDOWN';
 
     const proposalPayload = {
-      proposal: 1, amount, basis: 'stake', contract_type: direction,
+      proposal: 1,
+      amount,
+      basis: 'stake',
+      contract_type: direction,
       currency: this.accountCurrency || 'USD',
-      duration: finalDuration, duration_unit: 's',
       underlying_symbol: symbol,
       multiplier: finalMultiplier,
     };
+
+    if (isMultiplier) {
+      // [FIX 5] date_expiry path — required for multiplier contracts.
+      proposalPayload.date_expiry =
+        Math.floor(Date.now() / 1000) + MULTIPLIER_EXPIRY_SECONDS;
+    } else {
+      // Non-multiplier contracts (e.g. CALL/PUT) still use duration.
+      let finalDuration = Number(duration);
+      if (!Number.isFinite(finalDuration) || finalDuration <= 0) finalDuration = 300;
+      finalDuration = Math.floor(finalDuration);
+      if (finalDuration < 60) finalDuration = 60;
+      if (finalDuration > 3600) finalDuration = 3600;
+      proposalPayload.duration = finalDuration;
+      proposalPayload.duration_unit = 's';
+    }
+
     if (stopLoss != null) proposalPayload.stop_loss = Number(stopLoss);
     if (takeProfit != null) proposalPayload.take_profit = Number(takeProfit);
 
@@ -1357,7 +1372,6 @@ const brokerInstance = new DerivBroker({
   restBaseUrl: process.env.DERIV_REST_BASE_URL || 'https://api.derivws.com',
   publicWsUrl: process.env.DERIV_PUBLIC_WS_URL || 'wss://api.derivws.com/trading/v1/options/ws/public',
   accountId: process.env.DERIV_ACCOUNT_ID || null,
-  // [FIX 3] Explicit account type — defaults to demo.
   accountType: process.env.DERIV_ACCOUNT_TYPE || 'demo',
   connectionTimeout: parseInt(process.env.DERIV_CONNECTION_TIMEOUT) || 30000,
   reconnectBaseDelay: parseInt(process.env.DERIV_RECONNECT_DELAY) || 2000,
