@@ -15,6 +15,8 @@
 // [FIX 3] Explicit account-type selection (DERIV_ACCOUNT_TYPE=demo|real)
 //         replaces blind "accounts[0]" fallback. Fails loud, never
 //         silently lands on the wrong environment.
+// [FIX 4] Balance is now actually requested, stored, streamed, and
+//         surfaced through getAccount(). No more hardcoded '0'.
 
 const WebSocket = require('ws');
 const axios = require('axios');
@@ -148,26 +150,22 @@ class StreamingManager {
     this._pendingSubscriptions = new Map();
   }
 
-  // [FIX 2] Concurrency-safe subscribe. If a subscribe for the same key is
-  // already in flight, attach the callback to it and share the promise.
+  // [FIX 2] Concurrency-safe subscribe.
   async subscribe(type, symbol, callback) {
     const key = `${type}:${symbol}`;
 
-    // Fully subscribed — just attach the callback.
     if (this._subscriptions.has(key)) {
       const sub = this._subscriptions.get(key);
       if (!sub.callbacks.includes(callback)) sub.callbacks.push(callback);
       return;
     }
 
-    // Subscribe in flight — piggyback on the existing request.
     if (this._pendingSubscriptions.has(key)) {
       const pending = this._pendingSubscriptions.get(key);
       if (!pending.callbacks.includes(callback)) pending.callbacks.push(callback);
       return pending.promise;
     }
 
-    // First caller — own the network round-trip.
     const pending = { callbacks: [callback] };
     pending.promise = (async () => {
       try {
@@ -280,7 +278,6 @@ class DerivBroker extends EventEmitter {
       appId: appId,
       restBaseUrl: config.restBaseUrl || process.env.DERIV_REST_BASE_URL || 'https://api.derivws.com',
       publicWsUrl: config.publicWsUrl || process.env.DERIV_PUBLIC_WS_URL || 'wss://api.derivws.com/trading/v1/options/ws/public',
-      // Optional override — but we now VALIDATE it against discovery
       accountId: config.accountId || process.env.DERIV_ACCOUNT_ID || null,
       // [FIX 3] Explicit account type — 'demo' | 'real'. Default: demo.
       accountType: (config.accountType || process.env.DERIV_ACCOUNT_TYPE || 'demo').toLowerCase(),
@@ -300,6 +297,8 @@ class DerivBroker extends EventEmitter {
       readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 30000),
       symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 30000),
       heartbeatTimeout: parseInt(config.heartbeatTimeout || process.env.DERIV_HEARTBEAT_TIMEOUT || 60000),
+      // [FIX 4] How long to wait for the first balance frame at startup.
+      balanceTimeout: parseInt(config.balanceTimeout || process.env.DERIV_BALANCE_TIMEOUT || 10000),
     };
 
     this.validateConfig();
@@ -360,6 +359,10 @@ class DerivBroker extends EventEmitter {
     // [FIX 1] Single-flight guard for connect().
     this._connectPromise = null;
 
+    // [FIX 4] Deferred resolved once the first balance frame arrives.
+    this._accountReady = null;
+    this._accountReadyResolve = null;
+
     logger.info('[DerivBroker] Initialized with Current Options API (OTP-URL auth).');
     logger.info(`[DerivBroker] REST base: ${this.config.restBaseUrl}`);
     logger.info(`[DerivBroker] Public WS: ${this.config.publicWsUrl}`);
@@ -373,7 +376,6 @@ class DerivBroker extends EventEmitter {
     if (!this.config.publicWsUrl?.startsWith('ws')) throw new Error('Invalid public WebSocket URL');
     if (!this.config.restBaseUrl?.startsWith('http')) throw new Error('Invalid REST base URL');
     if (this.config.maxQueueSize < 1) throw new Error('maxQueueSize must be at least 1');
-    // [FIX 3] Validate account type upfront so misconfiguration fails fast.
     if (!['demo', 'real'].includes(this.config.accountType)) {
       throw new Error(
         `DERIV_ACCOUNT_TYPE must be "demo" or "real" (got "${this.config.accountType}")`
@@ -400,7 +402,7 @@ class DerivBroker extends EventEmitter {
   }
 
   // ============================================================
-  // REST: ACCOUNT DISCOVERY (always called)
+  // REST: ACCOUNT DISCOVERY
   // ============================================================
   async _fetchAccounts() {
     const url = `${this.config.restBaseUrl}/trading/v1/options/accounts`;
@@ -410,7 +412,6 @@ class DerivBroker extends EventEmitter {
       timeout: this.config.connectionTimeout,
     });
 
-    // Deriv can return either { data: [...] } or a bare array.
     const raw = resp.data?.data ?? resp.data;
     let list = [];
     if (Array.isArray(raw)) list = raw;
@@ -427,10 +428,7 @@ class DerivBroker extends EventEmitter {
     return list;
   }
 
-  // [FIX 3] Deterministic, explicit account selection.
-  //   1. If DERIV_ACCOUNT_ID is set AND present in the discovered list → use it.
-  //   2. Otherwise select the first account matching DERIV_ACCOUNT_TYPE.
-  //   3. If no match → throw (never silently pick the wrong environment).
+  // [FIX 3] Deterministic account selection.
   async _resolveAccountId() {
     const accounts = await this._fetchAccounts();
     if (!accounts || accounts.length === 0) {
@@ -440,7 +438,18 @@ class DerivBroker extends EventEmitter {
     const normType = (a) => String(a.account_type || a.type || '').toLowerCase();
     const normId   = (a) => a.account_id || a.id || a.accountId;
 
-    // 1. Explicit ID wins, but only if it validates.
+    // Cache the resolved account for later enrichment of balance frames.
+    const remember = (acc) => {
+      this._account = {
+        loginid: normId(acc),
+        account_id: normId(acc),
+        currency: acc.currency || 'USD',
+        account_type: normType(acc),
+        balance: this._account?.balance ?? null,
+      };
+      if (acc.currency) this.accountCurrency = acc.currency;
+    };
+
     if (this.config.accountId) {
       const match = accounts.find(a => normId(a) === this.config.accountId);
       if (match) {
@@ -449,6 +458,7 @@ class DerivBroker extends EventEmitter {
           `[DerivBroker] Using configured accountId (validated): ${id} ` +
           `[type=${normType(match)} currency=${match.currency || 'N/A'}]`
         );
+        remember(match);
         return id;
       }
       logger.warn(
@@ -457,7 +467,6 @@ class DerivBroker extends EventEmitter {
       );
     }
 
-    // 2. Type-based selection.
     const wanted = this.config.accountType;
     const byType = accounts.filter(a => normType(a) === wanted);
 
@@ -485,6 +494,7 @@ class DerivBroker extends EventEmitter {
       `[DerivBroker] Auto-selected accountId: ${id} ` +
       `[type=${normType(chosen)} currency=${chosen.currency || 'N/A'}]`
     );
+    remember(chosen);
     return id;
   }
 
@@ -511,9 +521,7 @@ class DerivBroker extends EventEmitter {
   // ============================================================
   // CONNECTION
   // ============================================================
-  // [FIX 1] Single-flight connect(): concurrent/repeat calls share one
-  // initialization. Prevents duplicate active_symbols fetch and duplicate
-  // default subscriptions.
+  // [FIX 1] Single-flight connect().
   async connect() {
     if (this._connectPromise) {
       logger.info('[DerivBroker] connect() already in flight — joining existing promise.');
@@ -537,9 +545,40 @@ class DerivBroker extends EventEmitter {
     this._ready = true;
     this.emit('ready');
     this.emit('connected');
+
+    // [FIX 4] Fetch the balance before declaring "fully ready" so any
+    // downstream getAccount() call returns a real number, not '0'.
+    await this._ensureBalanceLoaded();
+
     await this._subscribeDefaultSymbols();
     await this._reconcilePositions();
     await this._loadPendingOrders();
+  }
+
+  // [FIX 4] Subscribe to balance and resolve once the first frame lands.
+  async _ensureBalanceLoaded(timeoutMs = this.config.balanceTimeout) {
+    if (this._account && this._account.balance != null) return this._account;
+
+    if (!this._accountReady) {
+      this._accountReady = new Promise((resolve) => {
+        this._accountReadyResolve = resolve;
+      });
+    }
+
+    try {
+      await this._sendAuthRequest({ balance: 1, subscribe: 1 });
+    } catch (err) {
+      logger.warn('[DerivBroker] Balance subscribe failed:', err.message);
+    }
+
+    await Promise.race([
+      this._accountReady,
+      sleep(timeoutMs).then(() => {
+        logger.warn('[DerivBroker] Balance load timeout — proceeding without account.');
+      }),
+    ]);
+
+    return this._account;
   }
 
   // ---- PUBLIC SOCKET ----
@@ -908,7 +947,30 @@ class DerivBroker extends EventEmitter {
         this.emit('_portfolioUpdated', this._openPositions);
         handled = true;
       }
-      if (msg.balance) handled = true;
+
+      // [FIX 4] Balance — store, remember currency, resolve the deferred.
+      if (msg.balance) {
+        const b = msg.balance;
+        this._account = {
+          loginid: b.loginid || this._account?.loginid,
+          account_id: this._account?.account_id,
+          balance: b.balance,
+          currency: b.currency || this._account?.currency || this.accountCurrency || 'USD',
+          account_type: this._account?.account_type || this.config.accountType,
+        };
+        if (b.currency) this.accountCurrency = b.currency;
+        logger.info(
+          `[DerivBroker] Balance update: ${b.balance} ${b.currency}` +
+          (b.loginid ? ` (${b.loginid})` : '')
+        );
+        if (this._accountReadyResolve) {
+          this._accountReadyResolve(this._account);
+          this._accountReadyResolve = null;
+        }
+        this.emit('accountUpdate', this._account);
+        handled = true;
+      }
+
       if (msg.buy || msg.sell || msg.proposal) handled = true;
       if (!handled) logger.debug('[In Auth] Unhandled:', JSON.stringify(redactSensitive(msg)));
     } catch (e) { logger.error('[In Auth] Parse error:', e.message); }
@@ -987,9 +1049,6 @@ class DerivBroker extends EventEmitter {
     const valid = new Set(Object.values(this.symbolMap));
     const toSub = WATCHLIST.filter(s => valid.has(s));
     const list = toSub.length > 0 ? toSub : Object.values(FALLBACK_SYMBOLS).slice(0, 4);
-    // [FIX 2] Serialized loop — combined with the pending-map in
-    // StreamingManager, this guarantees one subscribe per symbol even if
-    // _subscribeDefaultSymbols is (accidentally) invoked twice.
     for (const sym of list) {
       try { await this.streaming.subscribe('ticks', sym, () => {}); } catch (_) {}
     }
@@ -1069,20 +1128,41 @@ class DerivBroker extends EventEmitter {
   // ============================================================
   async getAccount() {
     await this._ensureAuthReady();
-    if (!this._account) return this._getDefaultAccount();
+    // [FIX 4] If we somehow got here before the balance landed, wait for it.
+    if (!this._account || this._account.balance == null) {
+      try { await this._ensureBalanceLoaded(); } catch (_) {}
+    }
+    if (!this._account || this._account.balance == null) {
+      return this._getDefaultAccount();
+    }
+
     const acc = this._account;
+    const bal = Number(acc.balance) || 0;
     return {
       id: acc.loginid || acc.account_id || 'N/A',
-      balance: acc.balance || '0',
+      balance: String(bal),
       currency: acc.currency || 'USD',
-      equity: acc.balance || '0',
-      marginUsed: '0', marginAvailable: acc.balance || '0',
+      equity: String(bal),
+      marginUsed: '0',
+      marginAvailable: String(bal),
+      accountType: acc.account_type || this.config.accountType,
       createdTime: new Date().toISOString(),
     };
   }
   _getDefaultAccount() {
-    return { id: 'DEMO_ACCOUNT', balance: '0', currency: 'USD', equity: '0',
-      marginUsed: '0', marginAvailable: '0', createdTime: new Date().toISOString() };
+    // [FIX 4] Mark as stale so the dashboard can distinguish "not loaded"
+    // from "genuinely $0".
+    return {
+      id: 'UNKNOWN',
+      balance: '0',
+      currency: 'USD',
+      equity: '0',
+      marginUsed: '0',
+      marginAvailable: '0',
+      accountType: this.config.accountType,
+      createdTime: new Date().toISOString(),
+      stale: true,
+    };
   }
   async getPrices(instruments) {
     await this._ensurePublicReady();
@@ -1135,6 +1215,10 @@ class DerivBroker extends EventEmitter {
   // ============================================================
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null, duration = null, multiplier = null) {
     await this._ensureAuthReady();
+    // [FIX 4] Make sure the real currency is loaded before submitting a proposal.
+    if (!this._account || this._account.balance == null) {
+      try { await this._ensureBalanceLoaded(); } catch (_) {}
+    }
     const amount = Math.abs(Number(units));
     if (!Number.isFinite(amount) || amount <= 0) throw new Error('Order units must be positive.');
     const direction = units > 0 ? 'MULTUP' : 'MULTDOWN';
@@ -1240,6 +1324,7 @@ class DerivBroker extends EventEmitter {
       pendingSubscriptions: this.streaming._pendingSubscriptions.size,
       openPositions: this._openPositions.length,
       accountType: this.config.accountType,
+      accountLoaded: !!(this._account && this._account.balance != null),
     };
   }
   async killSwitch() {
@@ -1272,8 +1357,7 @@ const brokerInstance = new DerivBroker({
   restBaseUrl: process.env.DERIV_REST_BASE_URL || 'https://api.derivws.com',
   publicWsUrl: process.env.DERIV_PUBLIC_WS_URL || 'wss://api.derivws.com/trading/v1/options/ws/public',
   accountId: process.env.DERIV_ACCOUNT_ID || null,
-  // [FIX 3] Explicit account type — defaults to demo. Set to 'real' only
-  // after you have explicitly tested the full trading loop.
+  // [FIX 3] Explicit account type — defaults to demo.
   accountType: process.env.DERIV_ACCOUNT_TYPE || 'demo',
   connectionTimeout: parseInt(process.env.DERIV_CONNECTION_TIMEOUT) || 30000,
   reconnectBaseDelay: parseInt(process.env.DERIV_RECONNECT_DELAY) || 2000,
@@ -1285,6 +1369,7 @@ const brokerInstance = new DerivBroker({
   readinessTimeout: parseInt(process.env.DERIV_READINESS_TIMEOUT) || 30000,
   symbolTimeout: parseInt(process.env.DERIV_SYMBOL_TIMEOUT) || 30000,
   heartbeatTimeout: parseInt(process.env.DERIV_HEARTBEAT_TIMEOUT) || 60000,
+  balanceTimeout: parseInt(process.env.DERIV_BALANCE_TIMEOUT) || 10000,
 });
 
 module.exports = brokerInstance;
