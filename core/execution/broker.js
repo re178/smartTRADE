@@ -1,9 +1,11 @@
-// core/execution/broker.js – Stable Dual‑WebSocket Deriv Broker
-// Watchlist: only subscribe to specified symbols.
-// FIX: No forced duration for MULTUP/MULTDOWN. Duration is optional.
-// Uses `symbol` for v3 WebSocket (auth) endpoint.
+// core/execution/broker.js – Stable Dual‑WebSocket Deriv Broker (Current Options API)
+// PUBLIC WS: wss://api.derivws.com/trading/v1/options/ws/public
+// AUTH: REST -> OTP URL -> WebSocket (no `authorize` message needed)
+// Proposal uses `underlying_symbol` (current API field).
+// OTP URLs are valid 120s, so they are re-requested on every reconnect.
 
 const WebSocket = require('ws');
+const axios = require('axios');
 const { EventEmitter } = require('events');
 const { sleep } = require('../../shared/helpers');
 const logger = require('../../infrastructure/logger') || console;
@@ -16,7 +18,7 @@ const Account = require('../../models/Account');
 EventEmitter.defaultMaxListeners = 20;
 
 // ============================================================
-// WATCHLIST – only these symbols will be subscribed for ticks
+// WATCHLIST
 // ============================================================
 const WATCHLIST = [
   'frxEURUSD',
@@ -87,7 +89,6 @@ function fromDerivSymbol(symbol, reverseMap) {
   return symbol;
 }
 
-// Hardcoded fallback symbols – used only if public discovery fails
 const FALLBACK_SYMBOLS = {
   'EUR_USD': 'frxEURUSD',
   'GBP_USD': 'frxGBPUSD',
@@ -107,7 +108,12 @@ function redactSensitive(obj) {
   if (copy.authorize) copy.authorize = '***REDACTED***';
   if (copy.api_token) copy.api_token = '***REDACTED***';
   if (copy.token) copy.token = '***REDACTED***';
+  if (copy.otp) copy.otp = '***REDACTED***';
   return copy;
+}
+
+function isPatToken(token) {
+  return typeof token === 'string' && token.startsWith('pat_');
 }
 
 // ============================================================
@@ -239,31 +245,20 @@ class StreamingManager {
 class SymbolManager {
   constructor() {
     this._symbols = new Map();
-    this._leverageMap = {
-      'frxEURUSD': 100, 'frxGBPUSD': 100, 'frxUSDJPY': 100,
-      'frxAUDUSD': 100, 'frxUSDCAD': 100, 'frxUSDCHF': 100,
-      'frxNZDUSD': 100, 'frxEURGBP': 100, 'frxEURJPY': 100,
-      'frxGBPJPY': 100,
-    };
   }
 
   setSymbols(symbols) {
     for (const sym of symbols) {
       const key = sym.underlying_symbol ?? sym.symbol;
-      if (key) {
-        this._symbols.set(key, sym);
-        if (sym.leverage) this._leverageMap[key] = sym.leverage;
-      }
+      if (key) this._symbols.set(key, sym);
     }
   }
 
-  getLeverage(derivSymbol) { return this._leverageMap[derivSymbol] || 100; }
-  getPip(derivSymbol) { return this._symbols.get(derivSymbol)?.pip || 0.0001; }
   getSymbolInfo(derivSymbol) { return this._symbols.get(derivSymbol) || null; }
 }
 
 // ============================================================
-// MAIN BROKER CLASS (Stable Dual WebSocket)
+// MAIN BROKER CLASS
 // ============================================================
 const BROKER_CAPABILITIES = {
   supportsTrailingStop: false,
@@ -289,15 +284,17 @@ class DerivBroker extends EventEmitter {
     this.config = {
       apiToken: config.apiToken || process.env.DERIV_API_TOKEN,
       appId: appId,
-      publicWsUrl: config.publicWsUrl || process.env.DERIV_PUBLIC_WS_URL || `wss://api.derivws.com/trading/v1/options/ws/public`,
-      authWsUrl: config.authWsUrl || process.env.DERIV_AUTH_WS_URL || `wss://ws.derivws.com/websockets/v3?app_id=${appId}`,
+      // -------- Current Options API endpoints --------
+      restBaseUrl: config.restBaseUrl || process.env.DERIV_REST_BASE_URL || 'https://api.derivws.com',
+      publicWsUrl: config.publicWsUrl || process.env.DERIV_PUBLIC_WS_URL || 'wss://api.derivws.com/trading/v1/options/ws/public',
+      // Optional: pin a specific account ID. If not set, the broker will discover it.
+      accountId: config.accountId || process.env.DERIV_ACCOUNT_ID || null,
+      // -------- Reconnect / timeouts --------
       connectionTimeout: parseInt(config.connectionTimeout || process.env.DERIV_CONNECTION_TIMEOUT || 30000),
       reconnectBaseDelay: parseInt(config.reconnectBaseDelay || process.env.DERIV_RECONNECT_DELAY || 2000),
       maxReconnectDelay: parseInt(config.maxReconnectDelay || process.env.DERIV_MAX_RECONNECT_DELAY || 30000),
       maxRetries: parseInt(config.maxRetries || process.env.DERIV_MAX_RETRIES || 3),
       maxQueueSize: parseInt(config.maxQueueSize || process.env.DERIV_MAX_QUEUE_SIZE || 100),
-      circuitBreakerThreshold: parseInt(config.circuitBreakerThreshold || process.env.DERIV_CIRCUIT_BREAKER_THRESHOLD || 20),
-      circuitBreakerTimeout: parseInt(config.circuitBreakerTimeout || process.env.DERIV_CIRCUIT_BREAKER_TIMEOUT || 60000),
       minOrderSize: parseFloat(config.minOrderSize || 0.01),
       maxOrderSize: parseFloat(config.maxOrderSize || 100),
       minStopDistance: parseFloat(config.minStopDistance || 0.0001),
@@ -310,8 +307,6 @@ class DerivBroker extends EventEmitter {
       symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 30000),
       heartbeatTimeout: parseInt(config.heartbeatTimeout || process.env.DERIV_HEARTBEAT_TIMEOUT || 60000),
     };
-
-    this.productType = 'cfd';
 
     this.validateConfig();
 
@@ -329,12 +324,14 @@ class DerivBroker extends EventEmitter {
     // ---------- Auth socket ----------
     this._authState = STATE.DISCONNECTED;
     this._authSocket = null;
+    this._authWsUrl = null;                 // current OTP WS URL
     this._authPendingRequests = new Map();
     this._authMessageQueue = [];
     this._authHeartbeatInterval = null;
     this._authHeartbeatTimeout = null;
     this._authLastPong = Date.now();
     this._authConnectionPromise = null;
+    this._authReconnectTimer = null;
 
     this._rateLimiter = new RateLimiter(this.config.rateLimit, this.config.rateCapacity);
 
@@ -388,27 +385,101 @@ class DerivBroker extends EventEmitter {
 
     this._ready = false;
 
-    logger.info('[DerivBroker] Created with stable dual WebSocket architecture.');
+    logger.info('[DerivBroker] Created with Current Options API (OTP‑URL auth).');
+    logger.info(`[DerivBroker] REST base: ${this.config.restBaseUrl}`);
     logger.info(`[DerivBroker] Public WS: ${this.config.publicWsUrl}`);
-    logger.info(`[DerivBroker] Auth WS: ${this.config.authWsUrl}`);
     logger.info(`[DerivBroker] Watchlist: ${WATCHLIST.join(', ')}`);
   }
 
   validateConfig() {
     if (!this.config.apiToken) throw new Error('DERIV_API_TOKEN is required');
     if (!this.config.appId) throw new Error('DERIV_APP_ID is required');
-    if (!this.config.publicWsUrl || !this.config.publicWsUrl.startsWith('ws')) throw new Error('Invalid public WebSocket URL');
-    if (!this.config.authWsUrl || !this.config.authWsUrl.startsWith('ws')) throw new Error('Invalid auth WebSocket URL');
+    if (!this.config.publicWsUrl || !this.config.publicWsUrl.startsWith('ws')) {
+      throw new Error('Invalid public WebSocket URL');
+    }
+    if (!this.config.restBaseUrl || !this.config.restBaseUrl.startsWith('http')) {
+      throw new Error('Invalid REST base URL');
+    }
     if (this.config.maxQueueSize < 1) throw new Error('maxQueueSize must be at least 1');
     if (isNaN(this.config.leverage) || this.config.leverage <= 0) throw new Error('leverage must be positive');
     logger.info('[DerivBroker] Configuration validated.');
   }
 
   getLeverage(symbol) {
-    return this.symbolManager.getLeverage(symbol) || this.config.leverage || 100;
+    return 100;
   }
 
-  // ---------- CONNECTION ----------
+  // ============================================================
+  //  REST HEADERS
+  // ============================================================
+  _restHeaders() {
+    const headers = {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'Authorization': `Bearer ${this.config.apiToken}`,
+    };
+    // PAT authentication requires Deriv-App-ID; OAuth tokens don't.
+    if (isPatToken(this.config.apiToken)) {
+      headers['Deriv-App-ID'] = String(this.config.appId);
+    }
+    return headers;
+  }
+
+  // ============================================================
+  //  REST: ACCOUNT DISCOVERY
+  // ============================================================
+  async _fetchAccounts() {
+    const url = `${this.config.restBaseUrl}/trading/v1/options/accounts`;
+    logger.info(`[DerivBroker] GET ${url}`);
+    const resp = await axios.get(url, {
+      headers: this._restHeaders(),
+      timeout: this.config.connectionTimeout,
+    });
+    // Response shape: { data: [ { account_id / id, ... } ], ... }
+    const raw = resp.data?.data ?? resp.data;
+    const list = Array.isArray(raw) ? raw : (raw?.accounts || []);
+    return list;
+  }
+
+  async _resolveAccountId() {
+    if (this.config.accountId) return this.config.accountId;
+    const accounts = await this._fetchAccounts();
+    if (!accounts || accounts.length === 0) {
+      throw new Error('No Options trading accounts found for this token');
+    }
+    // Prefer real accounts; fall back to the first one
+    const chosen = accounts[0];
+    const id = chosen.account_id || chosen.id || chosen.accountId;
+    if (!id) {
+      throw new Error('Account object missing account_id: ' + JSON.stringify(chosen));
+    }
+    logger.info(`[DerivBroker] Discovered accountId: ${id}`);
+    return id;
+  }
+
+  // ============================================================
+  //  REST: OTP -> Auth WebSocket URL
+  // ============================================================
+  async _requestOtpUrl() {
+    const accountId = await this._resolveAccountId();
+    const url = `${this.config.restBaseUrl}/trading/v1/options/accounts/${encodeURIComponent(accountId)}/otp`;
+    logger.info(`[DerivBroker] POST ${url}`);
+    const resp = await axios.post(url, {}, {
+      headers: this._restHeaders(),
+      timeout: this.config.connectionTimeout,
+    });
+    const data = resp.data?.data ?? resp.data;
+    const wsUrl = data?.url;
+    if (!wsUrl || !wsUrl.startsWith('ws')) {
+      throw new Error('OTP response did not contain a WebSocket URL: ' + JSON.stringify(resp.data));
+    }
+    logger.info(`[DerivBroker] Received OTP WebSocket URL (${wsUrl.split('?')[0]})`);
+    return wsUrl;
+  }
+
+  // ============================================================
+  //  CONNECTION
+  // ============================================================
   async connect() {
     await Promise.all([
       this._connectPublic(),
@@ -427,7 +498,7 @@ class DerivBroker extends EventEmitter {
     await this._loadPendingOrders();
   }
 
-  // ---- Public socket ----
+  // ---------- PUBLIC SOCKET ----------
   async _connectPublic() {
     if (this._publicState === STATE.READY || this._publicState === STATE.CONNECTED) return;
     if (this._publicConnectionPromise) return this._publicConnectionPromise;
@@ -488,10 +559,7 @@ class DerivBroker extends EventEmitter {
         });
 
         socket.on('message', (data) => this._handlePublicMessage(data));
-
-        socket.on('error', (err) => {
-          logger.error('[DerivBroker] Public WS error:', err.message);
-        });
+        socket.on('error', (err) => logger.error('[DerivBroker] Public WS error:', err.message));
 
         socket.on('close', (code, reason) => {
           clearTimeout(connectionTimer);
@@ -707,7 +775,7 @@ class DerivBroker extends EventEmitter {
     await sleep(200);
   }
 
-  // ---- Auth socket ----
+  // ---------- AUTH SOCKET (OTP URL) ----------
   async _connectAuth() {
     if (this._authState === STATE.READY) return;
     if (this._authConnectionPromise) return this._authConnectionPromise;
@@ -719,8 +787,26 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  _doConnectAuth() {
+  async _doConnectAuth() {
+    // Step 1: REST OTP
+    let wsUrl;
+    try {
+      wsUrl = await this._requestOtpUrl();
+      this._authWsUrl = wsUrl;
+    } catch (err) {
+      logger.error('[DerivBroker] Failed to obtain OTP URL:', err.message);
+      this._authState = STATE.FAILED;
+      this._scheduleAuthReconnect();
+      throw err;
+    }
+
+    // Step 2: Connect to the returned URL
     return new Promise((resolve, reject) => {
+      if (this._authReconnectTimer) {
+        clearTimeout(this._authReconnectTimer);
+        this._authReconnectTimer = null;
+      }
+
       if (this._authState === STATE.FATAL) {
         reject(new Error('Auth WS in FATAL state.'));
         return;
@@ -733,11 +819,12 @@ class DerivBroker extends EventEmitter {
 
       this._authState = STATE.CONNECTING;
       this._closeAuthSocket();
+      this._authState = STATE.CONNECTING;
 
-      logger.info(`[DerivBroker] Connecting auth WS: ${this.config.authWsUrl}`);
+      logger.info(`[DerivBroker] Connecting auth WS (OTP URL)`);
 
       try {
-        this._authSocket = new WebSocket(this.config.authWsUrl);
+        this._authSocket = new WebSocket(wsUrl);
         const socket = this._authSocket;
 
         const connectionTimer = setTimeout(() => {
@@ -751,100 +838,39 @@ class DerivBroker extends EventEmitter {
 
         socket.on('open', () => {
           clearTimeout(connectionTimer);
-          logger.info('[DerivBroker] Auth WS connected.');
-          this._authState = STATE.CONNECTED;
+          logger.info('[DerivBroker] Auth WS connected (OTP‑authenticated).');
+          this._authState = STATE.READY;
           this._startAuthHeartbeat();
           this._flushAuthQueue();
-          this._authorize()
-            .then(async (authResponse) => {
-              if (authResponse && authResponse.authorize) {
-                this._account = authResponse.authorize;
-                this.accountCurrency = this._account.currency || 'USD';
-                logger.info('[DerivBroker] Account stored from authorize.');
-                try {
-                  await Account.upsertAccount({
-                    accountId: 'default',
-                    balance: parseFloat(this._account.balance) || 0,
-                    equity: parseFloat(this._account.balance) || 0,
-                    currency: this.accountCurrency,
-                    broker: 'deriv',
-                    loginId: this._account.loginid || '',
-                    leverage: parseFloat(this._account.leverage) || 100,
-                    status: 'online',
-                  });
-                  this.emit('account', await Account.getLatest('default'));
-                } catch (err) {
-                  logger.error('[DerivBroker] Failed to save account:', err.message);
-                }
-              }
-              logger.info('[DerivBroker] Auth authorized.');
-              this._authState = STATE.READY;
-              this.emit('authReady');
-              resolve();
-            })
-            .catch((err) => {
-              logger.error('[DerivBroker] Authorization failed:', err.message);
-              this._authFailCount++;
-              if (this._authFailCount >= this.config.fatalAfterAuthFailures) {
-                this._authState = STATE.FATAL;
-                this._closeAuthSocket();
-                reject(new Error(`Authorization failed ${this._authFailCount} times.`));
-                return;
-              }
-              this._authState = STATE.FAILED;
-              this._closeAuthSocket();
-              setTimeout(() => {
-                this._connectAuth().catch(err => logger.error('Auth reconnect failed:', err));
-              }, this._getReconnectDelay(0));
-            });
+          this.emit('authReady');
+          resolve();
         });
 
         socket.on('message', (data) => this._handleAuthMessage(data));
         socket.on('error', (err) => logger.error('[DerivBroker] Auth WS error:', err.message));
+
         socket.on('close', (code, reason) => {
           clearTimeout(connectionTimer);
           logger.info(`[DerivBroker] Auth WS closed. Code: ${code}`);
           this._authState = STATE.DISCONNECTED;
           this._stopAuthHeartbeat();
-          setTimeout(() => {
-            this._connectAuth().catch(err => logger.error('Auth reconnect failed:', err));
-          }, this._getReconnectDelay(0));
+          this._scheduleAuthReconnect();
         });
 
       } catch (err) {
         this._authState = STATE.FAILED;
+        this._scheduleAuthReconnect();
         reject(err);
       }
     });
   }
 
-  _authorize() {
-    return new Promise((resolve, reject) => {
-      const reqId = generateRequestId();
-      const payload = { authorize: this.config.apiToken, req_id: reqId };
-      const timeout = setTimeout(() => {
-        if (this._authPendingRequests.has(reqId)) {
-          this._authPendingRequests.delete(reqId);
-          reject(new Error('Authorize timeout'));
-        }
-      }, 10000);
-
-      this._authPendingRequests.set(reqId, {
-        resolve: (msg) => {
-          clearTimeout(timeout);
-          const safeMsg = redactSensitive(msg);
-          logger.info('[Auth] Authorization response:', JSON.stringify(safeMsg, null, 2));
-          resolve(msg);
-        },
-        reject: (err) => { clearTimeout(timeout); reject(err); },
-        timeout,
-        sentAt: Date.now(),
-        cancel: () => {},
-        signal: null,
-      });
-
-      this._sendAuthRaw(payload);
-    });
+  _scheduleAuthReconnect() {
+    if (this._authReconnectTimer) clearTimeout(this._authReconnectTimer);
+    this._authReconnectTimer = setTimeout(() => {
+      // Request fresh OTP and reconnect
+      this._connectAuth().catch(err => logger.error('Auth reconnect failed:', err));
+    }, this._getReconnectDelay(0));
   }
 
   _startAuthHeartbeat() {
@@ -859,7 +885,7 @@ class DerivBroker extends EventEmitter {
       if (Date.now() - this._authLastPong > this.config.heartbeatTimeout) {
         logger.warn('[DerivBroker] Auth WS heartbeat timeout, reconnecting.');
         this._closeAuthSocket();
-        this._connectAuth().catch(err => logger.error('Auth reconnect failed:', err));
+        this._scheduleAuthReconnect();
       }
     }, 10000);
   }
@@ -896,7 +922,7 @@ class DerivBroker extends EventEmitter {
       return;
     }
     try {
-      const isImportant = payload.proposal || payload.buy || payload.sell || payload.portfolio || payload.authorize;
+      const isImportant = payload.proposal || payload.buy || payload.sell || payload.portfolio || payload.balance;
       if (isImportant) {
         logger.info(`[Out Auth] ${payload.req_id || 'no-req-id'} →`, JSON.stringify(redactSensitive(payload), null, 2));
       } else {
@@ -1013,6 +1039,11 @@ class DerivBroker extends EventEmitter {
           .filter(c => c.status && (c.status.toLowerCase() === 'open' || c.status.toLowerCase() === 'active'))
           .map(c => this._normalizeContract(c));
         this.emit('_portfolioUpdated', this._openPositions);
+        handled = true;
+      }
+
+      if (msg.balance) {
+        logger.debug('[In Auth] Balance update:', JSON.stringify(redactSensitive(msg.balance)));
         handled = true;
       }
 
@@ -1281,7 +1312,7 @@ class DerivBroker extends EventEmitter {
     }
     const acc = this._account;
     return {
-      id: acc.loginid || 'N/A',
+      id: acc.loginid || acc.account_id || 'N/A',
       balance: acc.balance || '0',
       currency: acc.currency || 'USD',
       equity: acc.balance || '0',
@@ -1389,7 +1420,7 @@ class DerivBroker extends EventEmitter {
   async getPositions() { return this.getOpenTrades(); }
 
   // ============================================================
-  //  PLACE MARKET ORDER – FIXED: NO FORCED DURATION
+  //  PLACE MARKET ORDER (MULTUP/MULTDOWN)
   // ============================================================
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null, duration = null, multiplier = null) {
     await this._ensureAuthReady();
@@ -1400,55 +1431,40 @@ class DerivBroker extends EventEmitter {
     }
 
     const direction = units > 0 ? 'MULTUP' : 'MULTDOWN';
-
     const symbol = toDerivSymbol(instrument, this.symbolMap);
     if (!symbol) {
       throw new Error(`Unknown instrument: ${instrument}`);
     }
 
-    // ------------------------------------------------------------
-    // NORMALIZE MULTIPLIER
-    // ------------------------------------------------------------
+    // Multiplier: default 10
     let finalMultiplier = Number(multiplier);
     if (!Number.isFinite(finalMultiplier) || finalMultiplier <= 0) {
-      finalMultiplier = Number(this.getLeverage(symbol)) || 100;
+      finalMultiplier = 10;
     }
     finalMultiplier = Math.floor(finalMultiplier);
 
-    // ------------------------------------------------------------
-    // DURATION – ONLY ADD IF EXPLICITLY PROVIDED
-    // Do not force a default; MULTUP/MULTDOWN may not require it.
-    // ------------------------------------------------------------
-    let finalDuration = null;
-    if (duration !== null && duration !== undefined) {
-      const parsed = Number(duration);
-      if (!Number.isFinite(parsed) || parsed <= 0) {
-        throw new Error(`Invalid duration provided: ${duration}`);
-      }
-      finalDuration = Math.floor(parsed);
-      // Optionally clamp if needed, but we'll just pass it as given.
+    // Duration: default 300s
+    let finalDuration = Number(duration);
+    if (!Number.isFinite(finalDuration) || finalDuration <= 0) {
+      finalDuration = 300;
     }
+    finalDuration = Math.floor(finalDuration);
+    if (finalDuration < 60) finalDuration = 60;
+    if (finalDuration > 3600) finalDuration = 3600;
 
-    // ------------------------------------------------------------
-    // BUILD PROPOSAL PAYLOAD – v3 WebSocket uses `symbol`
-    // ------------------------------------------------------------
+    // -------- Current Options API uses `underlying_symbol` --------
     const proposalPayload = {
       proposal: 1,
       amount: amount,
       basis: 'stake',
       contract_type: direction,
       currency: this.accountCurrency || 'USD',
-      symbol: symbol,
+      duration: finalDuration,
+      duration_unit: 's',
+      underlying_symbol: symbol,
       multiplier: finalMultiplier,
     };
 
-    // Add duration only if provided and valid
-    if (finalDuration !== null) {
-      proposalPayload.duration = finalDuration;
-      proposalPayload.duration_unit = 's';
-    }
-
-    // Add stop_loss / take_profit only if provided
     if (stopLoss !== null && stopLoss !== undefined) {
       proposalPayload.stop_loss = Number(stopLoss);
     }
@@ -1456,10 +1472,9 @@ class DerivBroker extends EventEmitter {
       proposalPayload.take_profit = Number(takeProfit);
     }
 
-    // Log the proposal (redacted) for debugging
-    logger.info(`[DerivBroker] MULT proposal payload: ${JSON.stringify(redactSensitive(proposalPayload))}`);
+    logger.info(`[DerivBroker] Proposal payload: ${JSON.stringify(redactSensitive(proposalPayload))}`);
 
-    // ---- Request proposal ----
+    // -------- Request proposal --------
     const proposalResponse = await this._sendAuthRequest(proposalPayload);
     const proposal = proposalResponse.proposal;
     if (!proposal) {
@@ -1468,7 +1483,7 @@ class DerivBroker extends EventEmitter {
 
     const proposalId = proposal.id;
     if (!proposalId) {
-      throw new Error(`Deriv returned a proposal without an ID: ${JSON.stringify(proposalResponse)}`);
+      throw new Error(`Proposal missing ID: ${JSON.stringify(proposalResponse)}`);
     }
 
     const askPrice = Number(proposal.ask_price);
@@ -1476,11 +1491,8 @@ class DerivBroker extends EventEmitter {
       throw new Error(`Invalid proposal ask price: ${proposal.ask_price}`);
     }
 
-    // ---- Buy the contract ----
-    const buyPayload = {
-      buy: proposalId,
-      price: askPrice,
-    };
+    // -------- Buy --------
+    const buyPayload = { buy: proposalId, price: askPrice };
     const buyResponse = await this._sendAuthRequest(buyPayload);
     const buy = buyResponse.buy;
     if (!buy || !buy.contract_id) {
@@ -1490,7 +1502,7 @@ class DerivBroker extends EventEmitter {
     const contractId = buy.contract_id;
     const price = Number(buy.price) || 0;
 
-    // ---- Save Order ----
+    // -------- Save Order --------
     const newOrder = new Order({
       clientOrderId: generateClientOrderId(),
       instrument,
@@ -1505,10 +1517,10 @@ class DerivBroker extends EventEmitter {
     this._orders.set(newOrder.clientOrderId, newOrder);
     this._orderMap.set(contractId, newOrder.clientOrderId);
 
-    // ---- Emit positions update ----
+    // -------- Emit positions --------
     this.getOpenTrades()
       .then(positions => this.emit('positions', positions))
-      .catch(err => logger.error('[DerivBroker] Failed to emit positions after market order:', err.message));
+      .catch(err => logger.error('[DerivBroker] Failed to emit positions:', err.message));
 
     return {
       tradeID: String(contractId),
@@ -1522,10 +1534,7 @@ class DerivBroker extends EventEmitter {
   async closeTrade(tradeId) {
     await this._ensureAuthReady();
     if (!tradeId) throw new Error('tradeId is required');
-    const sellPayload = {
-      sell: tradeId,
-      price: 0,
-    };
+    const sellPayload = { sell: tradeId, price: 0 };
     const response = await this._sendAuthRequest(sellPayload);
     const sell = response.sell;
     if (!sell) {
@@ -1682,15 +1691,14 @@ class DerivBroker extends EventEmitter {
 const brokerInstance = new DerivBroker({
   apiToken: process.env.DERIV_API_TOKEN,
   appId: process.env.DERIV_APP_ID,
-  publicWsUrl: process.env.DERIV_PUBLIC_WS_URL || `wss://api.derivws.com/trading/v1/options/ws/public`,
-  authWsUrl: process.env.DERIV_AUTH_WS_URL || `wss://ws.derivws.com/websockets/v3?app_id=${process.env.DERIV_APP_ID || '1089'}`,
+  restBaseUrl: process.env.DERIV_REST_BASE_URL || 'https://api.derivws.com',
+  publicWsUrl: process.env.DERIV_PUBLIC_WS_URL || 'wss://api.derivws.com/trading/v1/options/ws/public',
+  accountId: process.env.DERIV_ACCOUNT_ID || null,
   connectionTimeout: parseInt(process.env.DERIV_CONNECTION_TIMEOUT) || 30000,
   reconnectBaseDelay: parseInt(process.env.DERIV_RECONNECT_DELAY) || 2000,
   maxReconnectDelay: parseInt(process.env.DERIV_MAX_RECONNECT_DELAY) || 30000,
   maxRetries: parseInt(process.env.DERIV_MAX_RETRIES) || 3,
   maxQueueSize: parseInt(process.env.DERIV_MAX_QUEUE_SIZE) || 100,
-  circuitBreakerThreshold: parseInt(process.env.DERIV_CIRCUIT_BREAKER_THRESHOLD) || 20,
-  circuitBreakerTimeout: parseInt(process.env.DERIV_CIRCUIT_BREAKER_TIMEOUT) || 60000,
   minOrderSize: parseFloat(process.env.DERIV_MIN_ORDER_SIZE) || 0.01,
   maxOrderSize: parseFloat(process.env.DERIV_MAX_ORDER_SIZE) || 100,
   minStopDistance: parseFloat(process.env.DERIV_MIN_STOP_DISTANCE) || 0.0001,
