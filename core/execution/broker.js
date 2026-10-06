@@ -7,6 +7,14 @@
 //
 // CORRECTED: Auto-discovers the real Options account ID; never trusts a
 //            hardcoded account ID blindly. Uses `underlying_symbol`.
+//
+// [FIX 1] Single-flight guard on connect() — prevents duplicate
+//         active_symbols fetch and duplicate default subscriptions.
+// [FIX 2] StreamingManager.subscribe() is now concurrency-safe via a
+//         pending-subscriptions map — prevents AlreadySubscribed errors.
+// [FIX 3] Explicit account-type selection (DERIV_ACCOUNT_TYPE=demo|real)
+//         replaces blind "accounts[0]" fallback. Fails loud, never
+//         silently lands on the wrong environment.
 
 const WebSocket = require('ws');
 const axios = require('axios');
@@ -135,22 +143,57 @@ class StreamingManager {
     this._subscriptions = new Map();
     this._subscriptionIdMap = new Map();
     this._priceCache = new Map();
+    // [FIX 2] Track in-flight subscribe() calls to prevent duplicate
+    // `subscribe:1` frames being sent for the same (type, symbol).
+    this._pendingSubscriptions = new Map();
   }
+
+  // [FIX 2] Concurrency-safe subscribe. If a subscribe for the same key is
+  // already in flight, attach the callback to it and share the promise.
   async subscribe(type, symbol, callback) {
     const key = `${type}:${symbol}`;
+
+    // Fully subscribed — just attach the callback.
     if (this._subscriptions.has(key)) {
       const sub = this._subscriptions.get(key);
       if (!sub.callbacks.includes(callback)) sub.callbacks.push(callback);
       return;
     }
-    await this.broker._ensurePublicReady();
-    const response = await this.broker._sendPublicRequest({ [type]: symbol, subscribe: 1 });
-    const subscriptionId = response.subscription?.id;
-    if (!subscriptionId) { logger.error(`[Streaming] No subscription ID for ${key}`); return; }
-    this._subscriptions.set(key, { type, symbol, subscriptionId, callbacks: [callback] });
-    this._subscriptionIdMap.set(subscriptionId, key);
-    logger.info(`[Streaming] Subscribed to ${key} (ID: ${subscriptionId})`);
+
+    // Subscribe in flight — piggyback on the existing request.
+    if (this._pendingSubscriptions.has(key)) {
+      const pending = this._pendingSubscriptions.get(key);
+      if (!pending.callbacks.includes(callback)) pending.callbacks.push(callback);
+      return pending.promise;
+    }
+
+    // First caller — own the network round-trip.
+    const pending = { callbacks: [callback] };
+    pending.promise = (async () => {
+      try {
+        await this.broker._ensurePublicReady();
+        const response = await this.broker._sendPublicRequest({ [type]: symbol, subscribe: 1 });
+        const subscriptionId = response.subscription?.id;
+        if (!subscriptionId) {
+          logger.error(`[Streaming] No subscription ID for ${key}`);
+          return;
+        }
+        this._subscriptions.set(key, {
+          type, symbol, subscriptionId, callbacks: pending.callbacks,
+        });
+        this._subscriptionIdMap.set(subscriptionId, key);
+        logger.info(`[Streaming] Subscribed to ${key} (ID: ${subscriptionId})`);
+      } catch (err) {
+        logger.error(`[Streaming] Subscribe failed for ${key}:`, err.message);
+      } finally {
+        this._pendingSubscriptions.delete(key);
+      }
+    })();
+
+    this._pendingSubscriptions.set(key, pending);
+    return pending.promise;
   }
+
   async unsubscribe(type, symbol, callback = null) {
     const key = `${type}:${symbol}`;
     const sub = this._subscriptions.get(key);
@@ -164,6 +207,7 @@ class StreamingManager {
     this._subscriptionIdMap.delete(sub.subscriptionId);
     this._priceCache.delete(symbol);
   }
+
   async restoreSubscriptions() {
     if (this._subscriptions.size === 0) return;
     logger.info('[Streaming] Restoring subscriptions...');
@@ -181,6 +225,7 @@ class StreamingManager {
       } catch (err) { logger.error(`[Streaming] Restore failed ${key}:`, err.message); }
     }
   }
+
   handleTick(tick) {
     const symbol = tick.symbol;
     const bid = tick.bid ? parseFloat(tick.bid) : null;
@@ -195,6 +240,7 @@ class StreamingManager {
       }
     }
   }
+
   getPrice(symbol) { return this._priceCache.get(symbol) || null; }
   getAllPrices() { return Object.fromEntries(this._priceCache); }
 }
@@ -236,6 +282,8 @@ class DerivBroker extends EventEmitter {
       publicWsUrl: config.publicWsUrl || process.env.DERIV_PUBLIC_WS_URL || 'wss://api.derivws.com/trading/v1/options/ws/public',
       // Optional override — but we now VALIDATE it against discovery
       accountId: config.accountId || process.env.DERIV_ACCOUNT_ID || null,
+      // [FIX 3] Explicit account type — 'demo' | 'real'. Default: demo.
+      accountType: (config.accountType || process.env.DERIV_ACCOUNT_TYPE || 'demo').toLowerCase(),
       connectionTimeout: parseInt(config.connectionTimeout || process.env.DERIV_CONNECTION_TIMEOUT || 30000),
       reconnectBaseDelay: parseInt(config.reconnectBaseDelay || process.env.DERIV_RECONNECT_DELAY || 2000),
       maxReconnectDelay: parseInt(config.maxReconnectDelay || process.env.DERIV_MAX_RECONNECT_DELAY || 30000),
@@ -309,9 +357,13 @@ class DerivBroker extends EventEmitter {
     this._openPositions = [];
     this._ready = false;
 
+    // [FIX 1] Single-flight guard for connect().
+    this._connectPromise = null;
+
     logger.info('[DerivBroker] Initialized with Current Options API (OTP-URL auth).');
     logger.info(`[DerivBroker] REST base: ${this.config.restBaseUrl}`);
     logger.info(`[DerivBroker] Public WS: ${this.config.publicWsUrl}`);
+    logger.info(`[DerivBroker] Account type preference: ${this.config.accountType}`);
     logger.info(`[DerivBroker] Watchlist: ${WATCHLIST.join(', ')}`);
   }
 
@@ -321,6 +373,12 @@ class DerivBroker extends EventEmitter {
     if (!this.config.publicWsUrl?.startsWith('ws')) throw new Error('Invalid public WebSocket URL');
     if (!this.config.restBaseUrl?.startsWith('http')) throw new Error('Invalid REST base URL');
     if (this.config.maxQueueSize < 1) throw new Error('maxQueueSize must be at least 1');
+    // [FIX 3] Validate account type upfront so misconfiguration fails fast.
+    if (!['demo', 'real'].includes(this.config.accountType)) {
+      throw new Error(
+        `DERIV_ACCOUNT_TYPE must be "demo" or "real" (got "${this.config.accountType}")`
+      );
+    }
     logger.info('[DerivBroker] Configuration validated.');
   }
 
@@ -359,7 +417,6 @@ class DerivBroker extends EventEmitter {
     else if (Array.isArray(raw?.accounts)) list = raw.accounts;
     else if (raw && typeof raw === 'object') list = [raw];
 
-    // Log what we got (safely)
     logger.info(`[DerivBroker] Discovered ${list.length} Options account(s).`);
     for (const acc of list) {
       const id = acc.account_id || acc.id || acc.accountId;
@@ -370,30 +427,64 @@ class DerivBroker extends EventEmitter {
     return list;
   }
 
+  // [FIX 3] Deterministic, explicit account selection.
+  //   1. If DERIV_ACCOUNT_ID is set AND present in the discovered list → use it.
+  //   2. Otherwise select the first account matching DERIV_ACCOUNT_TYPE.
+  //   3. If no match → throw (never silently pick the wrong environment).
   async _resolveAccountId() {
     const accounts = await this._fetchAccounts();
     if (!accounts || accounts.length === 0) {
       throw new Error('No Options trading accounts found for this PAT');
     }
 
-    // If config.accountId was set, only use it if it's in the discovered list
+    const normType = (a) => String(a.account_type || a.type || '').toLowerCase();
+    const normId   = (a) => a.account_id || a.id || a.accountId;
+
+    // 1. Explicit ID wins, but only if it validates.
     if (this.config.accountId) {
-      const match = accounts.find(a => (a.account_id || a.id || a.accountId) === this.config.accountId);
+      const match = accounts.find(a => normId(a) === this.config.accountId);
       if (match) {
-        const id = match.account_id || match.id || match.accountId;
-        logger.info(`[DerivBroker] Using configured accountId (validated): ${id}`);
+        const id = normId(match);
+        logger.info(
+          `[DerivBroker] Using configured accountId (validated): ${id} ` +
+          `[type=${normType(match)} currency=${match.currency || 'N/A'}]`
+        );
         return id;
       }
       logger.warn(
         `[DerivBroker] Configured accountId "${this.config.accountId}" not in discovered list. ` +
-        `Falling back to first available account.`
+        `Falling back to type-based selection.`
       );
     }
 
-    const first = accounts[0];
-    const id = first.account_id || first.id || first.accountId;
-    if (!id) throw new Error('Account object missing account_id: ' + JSON.stringify(first));
-    logger.info(`[DerivBroker] Auto-selected accountId: ${id}`);
+    // 2. Type-based selection.
+    const wanted = this.config.accountType;
+    const byType = accounts.filter(a => normType(a) === wanted);
+
+    if (byType.length === 0) {
+      const available = accounts.map(a => `${normType(a)}(${normId(a)})`).join(', ');
+      throw new Error(
+        `No Options account of type "${wanted}" found. ` +
+        `Available: [${available}]. ` +
+        `Set DERIV_ACCOUNT_TYPE to one of those, or set DERIV_ACCOUNT_ID explicitly.`
+      );
+    }
+
+    if (byType.length > 1) {
+      logger.warn(
+        `[DerivBroker] ${byType.length} "${wanted}" accounts found; selecting first. ` +
+        `Set DERIV_ACCOUNT_ID to pin a specific one.`
+      );
+    }
+
+    const chosen = byType[0];
+    const id = normId(chosen);
+    if (!id) throw new Error('Account object missing account_id: ' + JSON.stringify(chosen));
+
+    logger.info(
+      `[DerivBroker] Auto-selected accountId: ${id} ` +
+      `[type=${normType(chosen)} currency=${chosen.currency || 'N/A'}]`
+    );
     return id;
   }
 
@@ -420,7 +511,23 @@ class DerivBroker extends EventEmitter {
   // ============================================================
   // CONNECTION
   // ============================================================
+  // [FIX 1] Single-flight connect(): concurrent/repeat calls share one
+  // initialization. Prevents duplicate active_symbols fetch and duplicate
+  // default subscriptions.
   async connect() {
+    if (this._connectPromise) {
+      logger.info('[DerivBroker] connect() already in flight — joining existing promise.');
+      return this._connectPromise;
+    }
+    this._connectPromise = this._doConnect();
+    try {
+      return await this._connectPromise;
+    } finally {
+      this._connectPromise = null;
+    }
+  }
+
+  async _doConnect() {
     await Promise.all([this._connectPublic(), this._connectAuth()]);
     await this._loadSymbolsWithTimeout();
     if (!this._symbolsDiscovered) {
@@ -880,6 +987,9 @@ class DerivBroker extends EventEmitter {
     const valid = new Set(Object.values(this.symbolMap));
     const toSub = WATCHLIST.filter(s => valid.has(s));
     const list = toSub.length > 0 ? toSub : Object.values(FALLBACK_SYMBOLS).slice(0, 4);
+    // [FIX 2] Serialized loop — combined with the pending-map in
+    // StreamingManager, this guarantees one subscribe per symbol even if
+    // _subscribeDefaultSymbols is (accidentally) invoked twice.
     for (const sym of list) {
       try { await this.streaming.subscribe('ticks', sym, () => {}); } catch (_) {}
     }
@@ -1127,7 +1237,9 @@ class DerivBroker extends EventEmitter {
         placed: this.metrics.ordersPlaced, filled: this.metrics.ordersFilled, rejected: this.metrics.ordersRejected,
       },
       subscriptions: this.streaming._subscriptions.size,
+      pendingSubscriptions: this.streaming._pendingSubscriptions.size,
       openPositions: this._openPositions.length,
+      accountType: this.config.accountType,
     };
   }
   async killSwitch() {
@@ -1141,6 +1253,7 @@ class DerivBroker extends EventEmitter {
     this._publicState = STATE.DISCONNECTED;
     this._authState = STATE.DISCONNECTED;
     this._ready = false;
+    this._connectPromise = null;
   }
   _getReconnectDelay(attempt) {
     const base = this.config.reconnectBaseDelay;
@@ -1159,6 +1272,9 @@ const brokerInstance = new DerivBroker({
   restBaseUrl: process.env.DERIV_REST_BASE_URL || 'https://api.derivws.com',
   publicWsUrl: process.env.DERIV_PUBLIC_WS_URL || 'wss://api.derivws.com/trading/v1/options/ws/public',
   accountId: process.env.DERIV_ACCOUNT_ID || null,
+  // [FIX 3] Explicit account type — defaults to demo. Set to 'real' only
+  // after you have explicitly tested the full trading loop.
+  accountType: process.env.DERIV_ACCOUNT_TYPE || 'demo',
   connectionTimeout: parseInt(process.env.DERIV_CONNECTION_TIMEOUT) || 30000,
   reconnectBaseDelay: parseInt(process.env.DERIV_RECONNECT_DELAY) || 2000,
   maxReconnectDelay: parseInt(process.env.DERIV_MAX_RECONNECT_DELAY) || 30000,
