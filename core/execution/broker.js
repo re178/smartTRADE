@@ -12,9 +12,10 @@
 // [FIX 2] Concurrency-safe StreamingManager.subscribe().
 // [FIX 3] Explicit account-type selection (DERIV_ACCOUNT_TYPE=demo|real).
 // [FIX 4] Balance actually requested, stored, streamed, surfaced via getAccount().
-// [FIX 5] MULTUP/MULTDOWN proposal matches current Deriv multiplier shape:
-//         duration_unit:'s' only, subscribe:1, no duration, no date_expiry.
+// [FIX 5] MULTUP/MULTDOWN proposal uses duration=300 / duration_unit='s'.
 //         SL/TP nested under `limit_order`.
+// [FIX 6] Multiplier clamped to Deriv's accepted set: 100, 200, 300, 500, 800.
+//         Default = 100 (the smallest accepted).
 
 const WebSocket = require('ws');
 const axios = require('axios');
@@ -64,6 +65,12 @@ const ORDER_STATUS = {
 const CB_STATE = { CLOSED: 'CLOSED', OPEN: 'OPEN', HALF_OPEN: 'HALF_OPEN' };
 let _requestCounter = 0;
 
+// [FIX 6] Deriv accepts only these multiplier values for MULTUP/MULTDOWN.
+// Anything outside this set is rejected with:
+//   "Multiplier is not in acceptable range. Accepts 100,200,300,500,800."
+const ACCEPTED_MULTIPLIERS = [100, 200, 300, 500, 800];
+const DEFAULT_MULTIPLIER = 100;
+
 // ============================================================
 // HELPERS
 // ============================================================
@@ -110,6 +117,17 @@ function redactSensitive(obj) {
 
 function isPatToken(token) {
   return typeof token === 'string' && token.startsWith('pat_');
+}
+
+// [FIX 6] Normalise any incoming multiplier to the nearest accepted value.
+// Anything invalid or below 100 → DEFAULT_MULTIPLIER (100).
+function normaliseMultiplier(raw) {
+  const n = Math.floor(Number(raw));
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_MULTIPLIER;
+  if (ACCEPTED_MULTIPLIERS.includes(n)) return n;
+  // Round down to the largest accepted value ≤ n. If n < 100 → default.
+  const candidates = ACCEPTED_MULTIPLIERS.filter(v => v <= n);
+  return candidates.length > 0 ? candidates[candidates.length - 1] : DEFAULT_MULTIPLIER;
 }
 
 // ============================================================
@@ -1214,18 +1232,21 @@ class DerivBroker extends EventEmitter {
     const symbol = toDerivSymbol(instrument, this.symbolMap);
     if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
 
-    let finalMultiplier = Number(multiplier);
-    if (!Number.isFinite(finalMultiplier) || finalMultiplier <= 0) {
-      finalMultiplier = 10;
+    // [FIX 6] Clamp to Deriv's accepted multiplier set.
+    const finalMultiplier = normaliseMultiplier(multiplier);
+    if (finalMultiplier !== Math.floor(Number(multiplier))) {
+      logger.info(
+        `[DerivBroker] Multiplier adjusted: requested=${multiplier ?? 'null'} → using ${finalMultiplier} ` +
+        `(accepted: ${ACCEPTED_MULTIPLIERS.join(',')})`
+      );
     }
-    finalMultiplier = Math.floor(finalMultiplier);
 
-    const isMultiplier = direction === 'MULTUP' || direction === 'MULTDOWN';
+    // [FIX 5] Match current Deriv multiplier examples.
+    const finalDuration =
+      Number.isFinite(Number(duration)) && Number(duration) > 0
+        ? Math.floor(Number(duration))
+        : 300;
 
-    // [FIX 5] Base payload — no duration, no date_expiry by default.
-    // The multiplier branch adds duration_unit only (matches current
-    // Deriv multiplier proposal shape). The non-multiplier branch adds
-    // a bounded duration.
     const proposalPayload = {
       proposal: 1,
       amount,
@@ -1234,31 +1255,11 @@ class DerivBroker extends EventEmitter {
       currency: this.accountCurrency || 'USD',
       underlying_symbol: symbol,
       multiplier: finalMultiplier,
+      duration: finalDuration,
+      duration_unit: 's',
     };
 
-    if (isMultiplier) {
-      // Deriv multiplier proposal:
-      //   - do NOT send date_expiry
-      //   - do NOT send a fixed duration
-      //   - current documented multiplier shape uses duration_unit only
-      proposalPayload.duration_unit = 's';
-      proposalPayload.subscribe = 1;
-
-      logger.info('[MULTIPLIER] Proposal parameters: ' + JSON.stringify({
-        contract_type: direction,
-        underlying_symbol: symbol,
-        multiplier: finalMultiplier,
-        amount,
-        currency: this.accountCurrency || 'USD',
-        duration_unit: 's',
-      }));
-    } else {
-      const safeDuration = Math.max(60, Math.min(3600, Number(duration) || 300));
-      proposalPayload.duration = safeDuration;
-      proposalPayload.duration_unit = 's';
-    }
-
-    // SL/TP nested under `limit_order`, per current Options API.
+    // [FIX 5] SL/TP nested under `limit_order`.
     if (stopLoss != null || takeProfit != null) {
       proposalPayload.limit_order = {};
       if (stopLoss != null) {
@@ -1349,6 +1350,7 @@ class DerivBroker extends EventEmitter {
       openPositions: this._openPositions.length,
       accountType: this.config.accountType,
       accountLoaded: !!(this._account && this._account.balance != null),
+      acceptedMultipliers: ACCEPTED_MULTIPLIERS,
     };
   }
   async killSwitch() {
