@@ -3,7 +3,7 @@
 // Now broadcasts 'prediction' and 'opportunity' events to dashboard.
 // SYMBOL FIX: Watched symbols changed to canonical (EURUSD, etc.)
 // PIPELINE: Timer and candle‑close triggers active.
-// DEBUG: Added extensive logs to trace prediction pipeline execution.
+// LOGGING: Verbose logging removed. Summary-only output.
 
 require('dotenv').config();
 
@@ -67,17 +67,12 @@ async function ensureAdmin() {
     if (!admin) {
       admin = new User({ userId: adminId, tradingProduct: 'deriv_cfd' });
       await admin.save();
-      console.log('✅ Admin user created with product: deriv_cfd');
-    } else {
-      if (admin.tradingProduct === 'mt5') {
-        admin.tradingProduct = 'deriv_cfd';
-        await admin.save();
-        console.log('✅ Admin product updated to deriv_cfd');
-      }
-      console.log('✅ Admin user already exists.');
+    } else if (admin.tradingProduct === 'mt5') {
+      admin.tradingProduct = 'deriv_cfd';
+      await admin.save();
     }
   } catch (err) {
-    console.error('❌ Admin creation failed:', err.message);
+    console.error('[Admin] Creation failed:', err.message);
   }
 }
 
@@ -134,9 +129,8 @@ app.use((req, res, next) => {
             parsed = JSON.parse(repaired);
             req.body = parsed;
             req.repairedRawBody = repaired;
-            console.log('✅ JSON repaired successfully.');
           } catch (err2) {
-            console.error('❌ JSON repair also failed:', err2.message);
+            console.error('[BodyParser] JSON repair failed:', err2.message);
             req.body = {};
             req.parseError = err2;
           }
@@ -150,27 +144,9 @@ app.use((req, res, next) => {
     next();
   });
   req.on('error', (err) => {
-    console.error('Request body error:', err);
+    console.error('[BodyParser] Request body error:', err.message);
     next(err);
   });
-});
-
-// ---------- Request Logger ----------
-app.use((req, res, next) => {
-  if (req.path.startsWith('/api')) {
-    console.log('\n==============================');
-    console.log(new Date().toISOString());
-    console.log(req.method, req.originalUrl);
-    console.log('Body length:', req.rawBody?.length || 0);
-    if (req.rawBody && req.rawBody.length > 0 && req.rawBody.length < 500) {
-      console.log('Raw Body (stringified):', JSON.stringify(req.rawBody));
-    }
-    if (req.repairedRawBody) {
-      console.log('Repaired:', req.repairedRawBody);
-    }
-    console.log('==============================');
-  }
-  next();
 });
 
 app.use(express.static('public'));
@@ -183,12 +159,11 @@ app.use(async (req, res, next) => {
       const defaultProduct = process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd';
       admin = new User({ userId: 'admin', tradingProduct: defaultProduct });
       await admin.save();
-      console.log('✅ Admin user auto-created.');
     }
     req.user = { id: 'admin', tradingProduct: admin.tradingProduct };
     next();
   } catch (err) {
-    console.error('❌ Admin middleware error:', err.message);
+    console.error('[AdminMiddleware] Error:', err.message);
     req.user = { id: 'admin', tradingProduct: process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd' };
     next();
   }
@@ -223,16 +198,16 @@ const WS_PING_INTERVAL = 30000;
 let wsPingTimer = null;
 
 wss.on('connection', (ws, req) => {
-  console.log('[WebSocket] Dashboard client connected.');
   dashboardClients.add(ws);
   sendDashboardInitialState(ws);
+  console.log(`[WS] Dashboard client connected (total: ${dashboardClients.size})`);
 
   ws.on('close', () => {
     dashboardClients.delete(ws);
-    console.log('[WebSocket] Dashboard client disconnected.');
+    console.log(`[WS] Dashboard client disconnected (total: ${dashboardClients.size})`);
   });
 
-  ws.on('error', (err) => console.error('[WebSocket] Error:', err.message));
+  ws.on('error', (err) => console.error('[WS] Error:', err.message));
   ws.on('pong', () => {});
 });
 
@@ -275,30 +250,20 @@ async function sendDashboardInitialState(ws) {
     const enhancedAccount = enhanceAccount(account, broker);
 
     ws.send(JSON.stringify({ type: 'init', data: { trades, account: enhancedAccount, positions } }));
-    console.log('[WebSocket] Initial state sent to new dashboard client.');
   } catch (err) {
-    console.error('[WebSocket] Failed to send initial state:', err.message);
+    console.error('[WS] Failed to send initial state:', err.message);
   }
 }
 
 // ---- Broadcast functions ----
 function broadcastToDashboards(type, data) {
-  console.log(`[Broadcast] Attempting to broadcast "${type}" to ${dashboardClients.size} clients`);
-  if (dashboardClients.size === 0) {
-    console.warn(`[Broadcast] No dashboard clients connected.`);
-    return;
-  }
+  if (dashboardClients.size === 0) return;
   const message = JSON.stringify({ type, data });
-  let sent = 0;
   dashboardClients.forEach((client) => {
     if (client.readyState === WebSocket.OPEN) {
       client.send(message);
-      sent++;
-    } else {
-      console.warn(`[Broadcast] Client not open, state: ${client.readyState}`);
     }
   });
-  console.log(`[Broadcast] Sent "${type}" to ${sent} clients`);
 }
 function broadcast(type, data) { broadcastToDashboards(type, data); }
 
@@ -326,32 +291,24 @@ eventBus.on('trade.closed', async (data) => {
 performanceMonitor.on('thresholdsUpdated', (thresholds) => {
   if (otie && typeof otie.updateConfig === 'function') {
     otie.updateConfig(thresholds);
-    console.log('[PerformanceMonitor] OTIE config updated.');
   } else {
     console.warn('[PerformanceMonitor] OTIE updateConfig method not available.');
   }
 });
 
 // ============================================================
-//  PREDICTION / OPPORTUNITY PIPELINE (with debug logs)
+//  PREDICTION / OPPORTUNITY PIPELINE
 // ============================================================
 
 const WATCHED_SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD'];
 
 async function runPredictionPipeline(symbol) {
-  console.log(`[Pipeline] 🔥 runPredictionPipeline called for ${symbol}`);
   try {
-    console.log(`[Pipeline] Calling deepMarketState.compute for ${symbol}...`);
     const state = await require('./core/intelligence/deep/marketState').compute(symbol, 'M5', 200);
-    console.log(`[Pipeline] deepMarketState.compute returned:`, state ? 'state object' : 'null');
-    if (!state) {
-      console.log(`[Pipeline] No state for ${symbol}, skipping.`);
-      return;
-    }
+    if (!state) return false;
 
     const product = 'deriv_cfd';
     const broker = getBroker(product);
-    console.log(`[Pipeline] Getting account and positions...`);
     const account = await broker.getAccount();
     const positions = await broker.getOpenTrades();
 
@@ -361,18 +318,11 @@ async function runPredictionPipeline(symbol) {
       timestamp: new Date().toISOString(),
     };
 
-    console.log(`[Pipeline] Calling predictionEngine.predict for ${symbol}...`);
     const prediction = await predictionEngine.predict(state, symbol);
-    console.log(`[Pipeline] predictionEngine.predict returned:`, prediction ? 'prediction object' : 'null');
-    if (!prediction) {
-      console.log(`[Pipeline] No prediction for ${symbol}, skipping.`);
-      return;
-    }
+    if (!prediction) return false;
 
-    console.log(`[Pipeline] Broadcasting prediction for ${symbol}...`);
     broadcastToDashboards('prediction', prediction);
 
-    console.log(`[Pipeline] Calling opportunityEngine.evaluate...`);
     const opportunity = await opportunityEngine.evaluate(
       prediction,
       account,
@@ -381,26 +331,26 @@ async function runPredictionPipeline(symbol) {
       { riskPerTradePct: parseFloat(process.env.RISK_PER_TRADE_PCT) || 1.0 }
     );
 
-    console.log(`[Pipeline] Broadcasting opportunity for ${symbol}...`);
     broadcastToDashboards('opportunity', opportunity);
-    console.log(`[Pipeline] ✅ ${symbol}: Prediction/opportunity broadcast.`);
+    return true;
   } catch (err) {
-    console.error(`[Pipeline] ❌ Error for ${symbol}:`, err.message);
-    console.error(err.stack);
+    console.error(`[Pipeline] Error for ${symbol}:`, err.message);
+    return false;
   }
 }
 
 async function runPredictionPipelineAll() {
-  console.log('[Pipeline] 🚀 runPredictionPipelineAll called');
+  let ok = 0;
   for (const symbol of WATCHED_SYMBOLS) {
-    await runPredictionPipeline(symbol);
+    const result = await runPredictionPipeline(symbol);
+    if (result) ok++;
   }
+  console.log(`[Pipeline] Cycle complete: ${ok}/${WATCHED_SYMBOLS.length} symbols processed.`);
 }
 
 // ---- Trigger on candle close ----
 candleStore.on('candleClosed', async (candle) => {
   if (candle.timeframe === 'M5' && WATCHED_SYMBOLS.includes(candle.symbol)) {
-    console.log(`[Pipeline] ⏰ Triggered by candle close for ${candle.symbol}`);
     await runPredictionPipeline(candle.symbol);
   }
 });
@@ -415,7 +365,7 @@ function startPipelineTimer() {
       console.error('[Pipeline] Timer error:', err.message);
     });
   }, intervalMs);
-  console.log(`[Pipeline] ⏲️ Timer started (${intervalMs}ms)`);
+  console.log(`[Pipeline] Timer started (${intervalMs}ms).`);
 }
 
 // ---------- DEBUG ROUTE ----------
@@ -442,13 +392,7 @@ app.get('/debug/status', (req, res) => {
 // ---------- Start Cognitive Engines ----------
 async function startCognitiveEngines() {
   try {
-    console.log('[CTOS] Starting cognitive engines...');
-    console.log('[CTOS] Market Awareness Engine: active');
-    console.log('[CTOS] Deep Regime Detector: active');
-    console.log('[CTOS] Decision Engine: active');
-    console.log('[CTOS] OTIE V5: active');
-    console.log('[CTOS] Performance Monitor: active');
-    console.log('[CTOS] All cognitive modules initialized successfully.');
+    console.log('[CTOS] Cognitive engines active: Awareness, Regime, Decision, OTIE V5, PerformanceMonitor.');
   } catch (err) {
     console.error('[CTOS] Initialization error:', err.message);
   }
@@ -458,7 +402,6 @@ async function startCognitiveEngines() {
 async function startDerivBroker() {
   try {
     const broker = getBroker('deriv_cfd');
-    console.log('[Deriv] Connecting Deriv broker...');
     await broker.connect();
     console.log('[Deriv] Broker connected.');
 
@@ -470,8 +413,6 @@ async function startDerivBroker() {
     broker.on('positions', (positions) => broadcastToDashboards('positions', positions));
     broker.on('orderUpdate', (data) => broadcastToDashboards('orderUpdate', data));
     broker.on('_portfolioUpdated', (positions) => broadcastToDashboards('positions', positions));
-
-    console.log('[Deriv] Broker event listeners attached.');
   } catch (err) {
     console.error('[Deriv] Failed to start Deriv broker:', err.message);
   }
@@ -482,17 +423,16 @@ async function startServer() {
   await ensureAdmin();
 
   server.listen(PORT, () => {
+    console.log('==============================================');
     console.log(`✅ RTS server running on http://localhost:${PORT}`);
-    console.log(`📊 Dashboard: http://localhost:${PORT}`);
-    console.log(`🔌 API base: http://localhost:${PORT}/api`);
-    console.log(`🔬 Research endpoints: http://localhost:${PORT}/api/research`);
-    console.log(`📡 Deriv REST endpoints: http://localhost:${PORT}/api/deriv`);
-    console.log('🧠 CTOS Cognitive Engine: enabled.');
-    console.log('📡 Request logging enabled.');
-    console.log('🛠️  JSON repair enabled as fallback.');
-    console.log('🧹  Null bytes (\\0) stripped from all incoming JSON.');
-    console.log('📦 Deriv broker: active, connected to WebSocket.');
-    console.log('🧪 Prediction/Opportunity Pipeline: enabled.');
+    console.log(`📊 Dashboard:      http://localhost:${PORT}`);
+    console.log(`🔌 API base:       http://localhost:${PORT}/api`);
+    console.log(`🔬 Research:       http://localhost:${PORT}/api/research`);
+    console.log(`📡 Deriv REST:     http://localhost:${PORT}/api/deriv`);
+    console.log('🧠 CTOS Cognitive Engine: enabled');
+    console.log('📦 Deriv broker: active');
+    console.log('🧪 Prediction/Opportunity Pipeline: enabled');
+    console.log('==============================================');
 
     startWSPing();
 
@@ -506,7 +446,7 @@ async function startServer() {
     });
 
     setTimeout(startCognitiveEngines, 2000);
-    startPipelineTimer();  // <-- THIS STARTS THE PREDICTION PIPELINE
+    startPipelineTimer();
     console.log('⏸️ Outcome labeler scheduler disabled.');
     setTimeout(startDerivBroker, 3000);
   });
@@ -518,7 +458,6 @@ async function startServer() {
     try {
       await dataOrchestrator.shutdown();
       if (otie && typeof otie.stop === 'function') otie.stop();
-      console.log('✅ Data Orchestrator flushed.');
     } catch (err) {
       console.error('Error during shutdown:', err.message);
     }
@@ -532,7 +471,6 @@ async function startServer() {
     try {
       await dataOrchestrator.shutdown();
       if (otie && typeof otie.stop === 'function') otie.stop();
-      console.log('✅ Data Orchestrator flushed.');
     } catch (err) {
       console.error('Error during shutdown:', err.message);
     }
