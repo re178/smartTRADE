@@ -2,7 +2,12 @@
 // Market Awareness Engine – runs on every tick.
 // Observes: spread, velocity, acceleration, liquidity, micro‑structure.
 // Updates MarketStateCache (RAM) every tick, persists to MongoDB periodically.
-// DEBUG: Added detailed logging to verify tick processing and event emission.
+//
+// Logging policy:
+//   • Silent per tick — no console.log inside _processTick().
+//   • One compact summary line per minute so the pipeline can still be
+//     verified as alive without flooding stdout.
+//   • Constructor emits a single init log.
 
 const priceBuffer = require('../data/priceBuffer');
 const marketStateCache = require('../data/marketStateCache');
@@ -16,20 +21,28 @@ const CONFIG = {
   SPREAD_SMA_ALPHA: 0.3,
 };
 
+// How often to emit the summary line.
+const SUMMARY_INTERVAL_MS = 60_000;
+
 class MarketAwarenessEngine {
   constructor() {
     this._state = new Map(); // symbol -> internal state
     this._tickCount = 0;
+    this._tickCountBySymbol = new Map();
+    this._lastUpdateBySymbol = new Map(); // symbol -> last computed stateUpdate
+    this._lastSummaryAt = Date.now();
 
     // Listen to every tick from the price buffer
     priceBuffer.on('tick', (tick) => {
       this._tickCount++;
-      console.log(`[MarketAwareness] Tick #${this._tickCount} received for ${tick.symbol} at ${new Date(tick.time).toISOString()}`);
+      this._tickCountBySymbol.set(
+        tick.symbol,
+        (this._tickCountBySymbol.get(tick.symbol) || 0) + 1
+      );
       this._processTick(tick);
     });
 
     logger.info('[MarketAwarenessEngine] Initialized, listening to ticks.');
-    console.log('[MarketAwarenessEngine] ✅ Listener attached to priceBuffer.');
   }
 
   _processTick(tick) {
@@ -124,18 +137,20 @@ class MarketAwarenessEngine {
       lastUpdated: new Date(time),
     };
 
-    // Log computed metrics for debugging
-    console.log(`[MarketAwareness] ${symbol}: spread=${spread.toFixed(5)}, velocity=${velocity.toFixed(6)}, acceleration=${acceleration.toFixed(6)}, liquidity=${liquidity.toFixed(3)}, unusual=${unusual ? unusual.join(',') : 'none'}`);
-
     marketStateCache.update(symbol, stateUpdate);
 
     // 10. Emit marketAwareness event
     const awarenessEvent = { symbol, ...stateUpdate };
     this.emit('marketAwareness', awarenessEvent);
-    console.log(`[MarketAwareness] ✅ Emitted marketAwareness for ${symbol}`);
+
+    // Retain the latest computed state for summary logging
+    this._lastUpdateBySymbol.set(symbol, stateUpdate);
 
     // Update last tick time
     state.lastTickTime = time;
+
+    // Periodic compact summary (once per SUMMARY_INTERVAL_MS)
+    this._maybeLogSummary();
   }
 
   _detectUnusual(update, state) {
@@ -162,6 +177,31 @@ class MarketAwarenessEngine {
     }
 
     return events.length > 0 ? events : null;
+  }
+
+  // Compact periodic summary — one line per symbol, once per minute.
+  _maybeLogSummary() {
+    const now = Date.now();
+    if (now - this._lastSummaryAt < SUMMARY_INTERVAL_MS) return;
+    this._lastSummaryAt = now;
+
+    const parts = [];
+    for (const [symbol, u] of this._lastUpdateBySymbol) {
+      const ticks = this._tickCountBySymbol.get(symbol) || 0;
+      parts.push(
+        `${symbol}: ticks=${ticks} ` +
+        `spread=${u.spread.toFixed(5)} ` +
+        `vel=${u.velocity.toFixed(6)} ` +
+        `acc=${u.acceleration.toFixed(6)} ` +
+        `liq=${u.liquidity.toFixed(3)} ` +
+        `unusual=${u.unusual ? u.unusual.join(',') : 'none'}`
+      );
+    }
+
+    logger.info(
+      `[MarketAwareness] Summary — total ticks=${this._tickCount}, ` +
+      `symbols=${this._lastUpdateBySymbol.size}\n  ${parts.join('\n  ')}`
+    );
   }
 }
 
