@@ -12,9 +12,9 @@
 // [FIX 2] Concurrency-safe StreamingManager.subscribe().
 // [FIX 3] Explicit account-type selection (DERIV_ACCOUNT_TYPE=demo|real).
 // [FIX 4] Balance actually requested, stored, streamed, surfaced via getAccount().
-// [FIX 5] MULTUP/MULTDOWN proposal uses duration=300 / duration_unit='s'
-//         (matches current Deriv examples). SL/TP now nested under
-//         `limit_order`, per current Options API schema.
+// [FIX 5] MULTUP/MULTDOWN proposal matches current Deriv multiplier shape:
+//         duration_unit:'s' only, subscribe:1, no duration, no date_expiry.
+//         SL/TP nested under `limit_order`.
 
 const WebSocket = require('ws');
 const axios = require('axios');
@@ -1220,15 +1220,12 @@ class DerivBroker extends EventEmitter {
     }
     finalMultiplier = Math.floor(finalMultiplier);
 
-    // [FIX 5] Match current Deriv multiplier examples:
-    //   duration: 300, duration_unit: 's'. If Deriv responds with
-    //   InvalidExpiry again, that response will tell us the actual
-    //   allowed range for frxEURUSD and we'll adapt.
-    const finalDuration =
-      Number.isFinite(Number(duration)) && Number(duration) > 0
-        ? Math.floor(Number(duration))
-        : 300;
+    const isMultiplier = direction === 'MULTUP' || direction === 'MULTDOWN';
 
+    // [FIX 5] Base payload — no duration, no date_expiry by default.
+    // The multiplier branch adds duration_unit only (matches current
+    // Deriv multiplier proposal shape). The non-multiplier branch adds
+    // a bounded duration.
     const proposalPayload = {
       proposal: 1,
       amount,
@@ -1237,11 +1234,31 @@ class DerivBroker extends EventEmitter {
       currency: this.accountCurrency || 'USD',
       underlying_symbol: symbol,
       multiplier: finalMultiplier,
-      duration: finalDuration,
-      duration_unit: 's',
     };
 
-    // [FIX 5] SL/TP now nested under `limit_order`, per current Options API.
+    if (isMultiplier) {
+      // Deriv multiplier proposal:
+      //   - do NOT send date_expiry
+      //   - do NOT send a fixed duration
+      //   - current documented multiplier shape uses duration_unit only
+      proposalPayload.duration_unit = 's';
+      proposalPayload.subscribe = 1;
+
+      logger.info('[MULTIPLIER] Proposal parameters: ' + JSON.stringify({
+        contract_type: direction,
+        underlying_symbol: symbol,
+        multiplier: finalMultiplier,
+        amount,
+        currency: this.accountCurrency || 'USD',
+        duration_unit: 's',
+      }));
+    } else {
+      const safeDuration = Math.max(60, Math.min(3600, Number(duration) || 300));
+      proposalPayload.duration = safeDuration;
+      proposalPayload.duration_unit = 's';
+    }
+
+    // SL/TP nested under `limit_order`, per current Options API.
     if (stopLoss != null || takeProfit != null) {
       proposalPayload.limit_order = {};
       if (stopLoss != null) {
