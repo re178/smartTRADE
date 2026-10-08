@@ -32,7 +32,8 @@ class CandleBuilder extends EventEmitter {
     // Cache to avoid duplicate emits
     this._closed = new Map();
 
-    console.log('🔧 CandleBuilder: constructor – listening to priceBuffer ticks');
+    // Minimal confirmation log
+    logger.info?.('CandleBuilder: initialized');
     priceBuffer.on('tick', (tick) => this._onTick(tick));
     setInterval(() => this._closeExpired(), 1000);
   }
@@ -41,8 +42,6 @@ class CandleBuilder extends EventEmitter {
     // Normalize symbol to canonical format (EURUSD, GBPUSD, etc.)
     const symbol = normalizeSymbol(tick.symbol);
     const { mid, time } = tick;
-
-    console.log(`📥 CandleBuilder: tick received for ${tick.symbol} -> normalized: ${symbol} at ${new Date(time).toISOString()}`);
 
     for (const [tfName, tfMs] of Object.entries(TIMEFRAMES)) {
       this._updateCandle(symbol, tfName, tfMs, mid, time);
@@ -83,8 +82,6 @@ class CandleBuilder extends EventEmitter {
     const key = `${symbol}:${tfName}:${candle.startTime}`;
     if (this._closed.has(key)) return;
     this._closed.set(key, true);
-
-    console.log(`🔥 CandleBuilder: closing candle ${symbol} ${tfName} startTime=${new Date(candle.startTime).toISOString()}`);
 
     const closedCandle = {
       symbol,
