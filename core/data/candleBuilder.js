@@ -5,7 +5,6 @@
 
 const EventEmitter = require('events');
 const priceBuffer = require('./priceBuffer');
-const logger = require('../../infrastructure/logger') || console;
 
 // ---- Symbol Normalization ----
 function normalizeSymbol(symbol) {
@@ -32,8 +31,6 @@ class CandleBuilder extends EventEmitter {
     // Cache to avoid duplicate emits
     this._closed = new Map();
 
-    // Minimal confirmation log
-    logger.info?.('CandleBuilder: initialized');
     priceBuffer.on('tick', (tick) => this._onTick(tick));
     setInterval(() => this._closeExpired(), 1000);
   }
