@@ -16,6 +16,9 @@
 //         SL/TP nested under `limit_order`.
 // [FIX 6] Multiplier clamped to Deriv's accepted set: 100, 200, 300, 500, 800.
 //         Default = 100 (the smallest accepted).
+// [FIX 7] InvalidExpiry workaround: remove `duration` from MULTUP/MULTDOWN
+//         proposal. Keep `duration_unit: 's'` and add `subscribe: 1`
+//         per Deriv's current multiplier workflow example. Targeted test.
 
 const WebSocket = require('ws');
 const axios = require('axios');
@@ -1241,12 +1244,10 @@ class DerivBroker extends EventEmitter {
       );
     }
 
-    // [FIX 5] Match current Deriv multiplier examples.
-    const finalDuration =
-      Number.isFinite(Number(duration)) && Number(duration) > 0
-        ? Math.floor(Number(duration))
-        : 300;
-
+    // [FIX 5 / FIX 7] Deriv's current multiplier workflow example sends
+    //   NO `duration` on the proposal. `duration_unit` is kept, and
+    //   `subscribe: 1` is added per the example. This is targeted at the
+    //   InvalidExpiry error observed on MULTUP/MULTDOWN proposals.
     const proposalPayload = {
       proposal: 1,
       amount,
@@ -1255,8 +1256,8 @@ class DerivBroker extends EventEmitter {
       currency: this.accountCurrency || 'USD',
       underlying_symbol: symbol,
       multiplier: finalMultiplier,
-      duration: finalDuration,
       duration_unit: 's',
+      subscribe: 1,
     };
 
     // [FIX 5] SL/TP nested under `limit_order`.
