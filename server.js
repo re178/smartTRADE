@@ -200,11 +200,9 @@ let wsPingTimer = null;
 wss.on('connection', (ws, req) => {
   dashboardClients.add(ws);
   sendDashboardInitialState(ws);
-  console.log(`[WS] Dashboard client connected (total: ${dashboardClients.size})`);
 
   ws.on('close', () => {
     dashboardClients.delete(ws);
-    console.log(`[WS] Dashboard client disconnected (total: ${dashboardClients.size})`);
   });
 
   ws.on('error', (err) => console.error('[WS] Error:', err.message));
@@ -345,7 +343,7 @@ async function runPredictionPipelineAll() {
     const result = await runPredictionPipeline(symbol);
     if (result) ok++;
   }
-  console.log(`[Pipeline] Cycle complete: ${ok}/${WATCHED_SYMBOLS.length} symbols processed.`);
+  // (cycle summary log removed — fires every PREDICTION_INTERVAL_MS)
 }
 
 // ---- Trigger on candle close ----
