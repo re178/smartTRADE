@@ -18,7 +18,6 @@ const {
   BollingerBands,
   findSupportResistance,
 } = require('../../strategy/engine');
-const logger = require('../../../infrastructure/logger') || console;
 
 // ---- Valid regime codes (for safety) ----
 const VALID_REGIME_CODES = [
@@ -70,8 +69,6 @@ class DeepMarketState extends EventEmitter {
     dataOrchestrator.register('regimeChange', DATA_CLASSES.RESEARCH, {
       collection: 'historicalstates',
     });
-
-    logger.info('[DeepMarketState] Initialized with DataOrchestrator.');
   }
 
   // ---- Normalize symbol: remove separators and prefix 'frx' ----
@@ -115,7 +112,6 @@ class DeepMarketState extends EventEmitter {
     }
 
     if (!candles || candles.length < 50) {
-      logger.warn(`[DeepMarketState] Insufficient candles for ${symbol}:${timeframe} (got ${candles ? candles.length : 0})`);
       return null;
     }
 
@@ -127,7 +123,6 @@ class DeepMarketState extends EventEmitter {
       typeof c.close === 'number' && !isNaN(c.close)
     );
     if (valid.length < 50) {
-      logger.warn(`[DeepMarketState] Not enough valid candles for ${symbol}:${timeframe} (${valid.length})`);
       return null;
     }
 
@@ -166,12 +161,9 @@ class DeepMarketState extends EventEmitter {
    * Uses the in‑memory buffer; loads from DB only once per symbol+timeframe.
    */
   async compute(symbol, timeframe = 'M5', candleCount = 200) {
-    console.log(`🧮 DeepMarketState.compute() called for ${symbol} ${timeframe} (count=${candleCount})`);
-
     try {
       const candles = await this._ensureBuffer(symbol, timeframe, candleCount);
       if (!candles) {
-        console.log(`⚠️ DeepMarketState: no candle data for ${symbol}:${timeframe}`);
         return null;
       }
 
@@ -183,7 +175,6 @@ class DeepMarketState extends EventEmitter {
         typeof c.close === 'number' && !isNaN(c.close)
       );
       if (validCandles.length < 50) {
-        console.log(`⚠️ DeepMarketState: not enough valid candles after filtering for ${symbol}:${timeframe}`);
         return null;
       }
 
@@ -199,29 +190,26 @@ class DeepMarketState extends EventEmitter {
         .filter(item => item && item.mid && typeof item.mid.h === 'number');
 
       if (candlesForIndicators.length < 50) {
-        console.log(`⚠️ DeepMarketState: not enough valid indicator candles for ${symbol}:${timeframe} (${candlesForIndicators.length})`);
         return null;
       }
 
       // ---- Compute indicators with safe fallbacks ----
       let adxData = null, atrArray = null, rsi = null, macd = null, bb = null, sr = null;
 
-      try { adxData = ADX(candlesForIndicators, this.indicators.adxPeriod); } catch (err) { logger.error(`[DeepMarketState] ADX error for ${symbol}:${timeframe}`, err); adxData = null; }
-      try { atrArray = ATR(candlesForIndicators, this.indicators.atrPeriod); } catch (err) { logger.error(`[DeepMarketState] ATR error for ${symbol}:${timeframe}`, err); atrArray = null; }
-      try { rsi = RSI(closes, this.indicators.rsiPeriod); } catch (err) { logger.error(`[DeepMarketState] RSI error for ${symbol}:${timeframe}`, err); rsi = null; }
-      try { macd = MACD(closes, this.indicators.macdFast, this.indicators.macdSlow, this.indicators.macdSignal); } catch (err) { logger.error(`[DeepMarketState] MACD error for ${symbol}:${timeframe}`, err); macd = null; }
-      try { bb = BollingerBands(closes, this.indicators.bbPeriod, this.indicators.bbStd); } catch (err) { logger.error(`[DeepMarketState] BollingerBands error for ${symbol}:${timeframe}`, err); bb = null; }
+      try { adxData = ADX(candlesForIndicators, this.indicators.adxPeriod); } catch (err) { adxData = null; }
+      try { atrArray = ATR(candlesForIndicators, this.indicators.atrPeriod); } catch (err) { atrArray = null; }
+      try { rsi = RSI(closes, this.indicators.rsiPeriod); } catch (err) { rsi = null; }
+      try { macd = MACD(closes, this.indicators.macdFast, this.indicators.macdSlow, this.indicators.macdSignal); } catch (err) { macd = null; }
+      try { bb = BollingerBands(closes, this.indicators.bbPeriod, this.indicators.bbStd); } catch (err) { bb = null; }
 
       // Support/Resistance
       try {
         if (candlesForIndicators.length >= 30) {
           sr = findSupportResistance(candlesForIndicators, this.indicators.supportResistanceLookback, 0.001);
         } else {
-          console.log(`⚠️ DeepMarketState: not enough candles for SR (${candlesForIndicators.length})`);
           sr = null;
         }
       } catch (srErr) {
-        console.warn(`⚠️ DeepMarketState: Support/Resistance error for ${symbol}:${timeframe}, using previous values`, srErr.message);
         const previous = this._lastState.get(symbol);
         sr = {
           support: previous?.structure?.support ? { price: previous.structure.support } : null,
@@ -377,11 +365,8 @@ class DeepMarketState extends EventEmitter {
 
       this._lastState.set(symbol, state);
 
-      console.log(`✅ DeepMarketState.compute() succeeded for ${symbol} ${timeframe}, confidence ${state.confidence}`);
       return state;
     } catch (err) {
-      console.error(`❌ DeepMarketState.compute() error for ${symbol} ${timeframe}:`, err.message);
-      logger.error('[DeepMarketState] Compute error:', err.message);
       return null;
     }
   }
