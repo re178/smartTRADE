@@ -19,6 +19,8 @@
 // [FIX 7] InvalidExpiry workaround: remove `duration` from MULTUP/MULTDOWN
 //         proposal. Keep `duration_unit: 's'` and add `subscribe: 1`
 //         per Deriv's current multiplier workflow example. Targeted test.
+// [FIX 8] Added getSpread(instrument) — required by risk validation and
+//         trade placement. Returns spread in PRICE units (not pips).
 
 const WebSocket = require('ws');
 const axios = require('axios');
@@ -401,6 +403,42 @@ class DerivBroker extends EventEmitter {
   }
 
   getLeverage(_symbol) { return 100; }
+
+  // [FIX 8] Spread lookup — required by risk validation and trade placement.
+  // Accepts canonical 'EUR_USD', compact 'EURUSD', or Deriv 'frxEURUSD'.
+  // Returns spread in PRICE UNITS (not pips). Priority:
+  //   1. Live bid/ask from the streaming tick cache (most accurate)
+  //   2. Static spread map populated at symbol discovery (pip_size * 0.5)
+  //   3. Hard fallback: 0.0001
+  getSpread(instrument) {
+    if (!instrument) return 0;
+
+    // Resolve to Deriv symbol (e.g. 'frxEURUSD').
+    let symbol = toDerivSymbol(instrument, this.symbolMap);
+
+    // Handle compact 'EURUSD' → 'EUR_USD' → 'frxEURUSD'.
+    if (symbol && !symbol.startsWith('frx')) {
+      const upper = symbol.toUpperCase();
+      if (upper.length === 6 && !upper.includes('_')) {
+        const sep = upper.slice(0, 3) + '_' + upper.slice(3);
+        if (this.symbolMap[sep]) symbol = this.symbolMap[sep];
+      }
+    }
+
+    // 1. Live bid/ask from streaming cache.
+    const cached = this.streaming.getPrice(symbol);
+    if (cached && cached.bid != null && cached.ask != null) {
+      const live = Math.abs(cached.ask - cached.bid);
+      if (Number.isFinite(live) && live > 0) return live;
+    }
+
+    // 2. Static spread map (populated from pip_size * 0.5).
+    const mapped = this.spreadMap[symbol];
+    if (Number.isFinite(mapped) && mapped > 0) return mapped;
+
+    // 3. Fallback.
+    return 0.0001;
+  }
 
   // ============================================================
   // REST HEADERS
