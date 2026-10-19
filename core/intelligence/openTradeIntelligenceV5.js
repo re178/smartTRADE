@@ -15,7 +15,6 @@ const deepRegime = require('./deep/regime');
 const marketStateCache = require('../data/marketStateCache');
 const awarenessEngine = require('../awareness/engine');
 const eventBus = require('../../infrastructure/eventBus');
-const logger = require('../../infrastructure/logger') || console;
 
 // ---- BROKER FACTORY (Deriv only) ----
 const { getBroker } = require('../execution/brokerFactory');
@@ -255,7 +254,7 @@ class SymbolProfileManager {
           sampleSize: states.length,
         }, { upsert: true });
       } catch (err) {
-        logger.warn(`[Profiles] Failed to update ${symbol}:`, err.message);
+        // ignore
       }
     }
   }
@@ -320,7 +319,6 @@ class HistoricalMemoryEngine {
         trajectoryMatch: 0.8,
       };
     } catch (err) {
-      logger.warn('[Memory] Analogues failed:', err.message);
       return null;
     }
   }
@@ -844,7 +842,6 @@ class LearningEngine {
       const avgExpected = data.evSum / data.count;
       adjustments[type] = avgActual - avgExpected;
     }
-    logger.info('[LearningEngine] Action performance adjustments:', adjustments);
     return adjustments;
   }
 
@@ -895,18 +892,14 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
 
     // Ensure broker is connected (it will be auto-connected by factory)
     // but we can call connect() to be safe.
-    this.broker.connect().catch(err => {
-      logger.error('[OTIE V5] Broker connection failed:', err.message);
-    });
+    this.broker.connect().catch(() => {});
 
     // ---- Event listeners for real‑time updates ----
     eventBus.on('trade.placed', (data) => {
-      logger.info(`[OTIE V5] trade.placed event received for ${data.contractId} (${data.instrument})`);
       this._triggerEvaluation(data.instrument);
     });
 
     eventBus.on('trade.closed', (data) => {
-      logger.info(`[OTIE V5] trade.closed event received for ${data.contractId}`);
       // Remove from local caches
       if (data.contractId) {
         delete this._tradeHistory[data.contractId];
@@ -916,7 +909,6 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     });
 
     eventBus.on('position.updated', (data) => {
-      logger.info(`[OTIE V5] position.updated event received for ${data.symbol} (${data.ticket})`);
       this._triggerEvaluation(data.symbol);
     });
 
@@ -936,34 +928,29 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     // ---- Timer fallback ----
     this._startTimer();
     this._scheduleBackgroundJobs();
-    this.profileManager.updateAllProfiles().catch(err => logger.warn('[Profiles] Initial update failed:', err.message));
-
-    logger.info('[OTIE V5] Initialized with Deriv broker and event‑driven evaluation.');
+    this.profileManager.updateAllProfiles().catch(() => {});
   }
 
   _startTimer() {
     if (this._timer) clearInterval(this._timer);
     this._timer = setInterval(() => {
-      this._evaluateAll().catch(err => {
-        logger.error('[OTIE V5] Timer evaluation error:', err.message);
-      });
+      this._evaluateAll().catch(() => {});
     }, CONFIG.EVALUATION_INTERVAL_MS);
-    logger.info(`[OTIE V5] Timer started (${CONFIG.EVALUATION_INTERVAL_MS}ms)`);
   }
 
   _scheduleBackgroundJobs() {
     setInterval(() => {
-      this.profileManager.updateAllProfiles().catch(err => logger.warn('[Profiles] Update failed:', err.message));
+      this.profileManager.updateAllProfiles().catch(() => {});
     }, CONFIG.PROFILE_UPDATE_INTERVAL_MS);
 
     setInterval(() => {
-      this.learningEngine.updateEVWeights().catch(err => logger.warn('[Learning] Update failed:', err.message));
+      this.learningEngine.updateEVWeights().catch(() => {});
     }, 7 * 24 * 60 * 60 * 1000);
 
     setInterval(() => {
       this.learningEngine.calibrateConfidence().then(cal => {
-        if (cal) logger.info('[Calibration] Confidence calibration updated:', cal);
-      }).catch(err => logger.warn('[Calibration] Failed:', err.message));
+        // calibration updated
+      }).catch(() => {});
     }, 7 * 24 * 60 * 60 * 1000);
   }
 
@@ -974,9 +961,7 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     this._pendingEvaluations.add(symbol);
     setTimeout(async () => {
       this._pendingEvaluations.delete(symbol);
-      await this._evaluateSymbol(symbol).catch(err => {
-        logger.error(`[OTIE V5] Evaluation error for ${symbol}:`, err.message);
-      });
+      await this._evaluateSymbol(symbol).catch(() => {});
     }, 500);
   }
 
@@ -996,15 +981,13 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
         return;
       }
 
-      logger.info(`[OTIE V5] Timer: Found ${openTrades.length} open trade(s).`);
-
       for (const trade of openTrades) {
         if (trade.instrument) {
           await this._evaluateTrade(trade);
         }
       }
     } catch (err) {
-      logger.error('[OTIE V5] _evaluateAll error:', err.message);
+      // ignore
     } finally {
       this._isRunning = false;
     }
@@ -1028,7 +1011,7 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
         await this._evaluateTrade(trade);
       }
     } catch (err) {
-      logger.error(`[OTIE V5] _evaluateSymbol error for ${symbol}:`, err.message);
+      // ignore
     } finally {
       this._isRunning = false;
     }
@@ -1039,7 +1022,6 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     // Double-check the trade is still open
     const freshTrade = await Trade.findOne({ contractId: trade.contractId, status: 'OPEN' });
     if (!freshTrade) {
-      logger.debug(`[OTIE V5] Trade ${trade.contractId} no longer open, skipping.`);
       return;
     }
 
@@ -1053,7 +1035,6 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
       awareness = marketStateCache.get(symbol) || {};
       regime = deepRegime.getLatestRegime(symbol) || {};
     } catch (err) {
-      logger.warn(`[OTIE V5] Could not get state for ${symbol}:`, err.message);
       return;
     }
 
@@ -1094,11 +1075,8 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     const simulated = await this.forwardSim.simulate(trade, state, filteredActions, analogues);
     const bestAction = simulated[0] || { type: 'HOLD', ev: 0, confidence: 50 };
 
-    logger.info(`[OTIE V5] Trade ${tradeId} (${symbol}) profitR=${currentProfitR.toFixed(2)} peak=${peakProfitR.toFixed(2)} bestAction=${bestAction.type} (ev=${bestAction.ev.toFixed(3)}, conf=${bestAction.confidence.toFixed(0)}%)`);
-
     const validation = await this.validator.validate(trade, bestAction);
     if (!validation.valid) {
-      logger.debug(`[OTIE V5] Action rejected: ${validation.reason}`);
       bestAction.type = 'HOLD';
       bestAction.reason = 'Validation failed: ' + validation.reason;
     }
@@ -1106,8 +1084,6 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     if (bestAction.type !== 'HOLD' && bestAction.confidence >= CONFIG.MIN_ACTION_CONFIDENCE) {
       await this._executeAction(trade, bestAction);
       this.actionCompetition.updateTradeStage(tradeId, bestAction);
-    } else {
-      logger.debug(`[OTIE V5] Trade ${tradeId}: no action taken (${bestAction.type}, conf=${bestAction.confidence})`);
     }
 
     const decision = new TradeManagementDecision({
@@ -1171,11 +1147,8 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
   // ---- Execute action via broker ----
   async _executeAction(trade, action) {
     try {
-      logger.info(`[OTIE V5] Executing action: ${action.type} on trade ${trade.contractId} (reason: ${action.reason})`);
-
       const freshTrade = await Trade.findOne({ contractId: trade.contractId, status: 'OPEN' });
       if (!freshTrade) {
-        logger.warn(`[OTIE V5] Trade ${trade.contractId} no longer open – skipping action.`);
         return;
       }
 
@@ -1192,7 +1165,6 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
           if (this.broker.capabilities.supportsPartialClose) {
             result = await this.broker.partialClose(trade.contractId, action.volume);
           } else {
-            logger.warn('[OTIE V5] Broker does not support partial close – closing full position.');
             result = await this.broker.closeTrade(trade.contractId);
             action.type = 'CLOSE';
           }
@@ -1201,12 +1173,10 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
           result = await this.broker.closeTrade(trade.contractId);
           break;
         default:
-          logger.warn(`[OTIE V5] Unknown action type: ${action.type}`);
           return;
       }
 
       if (result && (result.success || result.contract_id || result.position_id)) {
-        logger.info(`[OTIE V5] ✅ Action ${action.type} executed successfully for trade ${trade.contractId}`);
         this.emit('otieV5Action', {
           tradeId: trade.contractId,
           action: action.type,
@@ -1218,11 +1188,8 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
         if (action.type === 'CLOSE') {
           await Trade.updateOne({ contractId: trade.contractId }, { $set: { pendingClose: false } });
         }
-        const errorMsg = result?.error || 'Unknown error';
-        logger.error(`[OTIE V5] ❌ Action ${action.type} failed: ${errorMsg}`);
       }
     } catch (err) {
-      logger.error(`[OTIE V5] ❌ Failed to execute action:`, err.message);
       if (action.type === 'CLOSE') {
         await Trade.updateOne({ contractId: trade.contractId }, { $set: { pendingClose: false } });
       }
@@ -1237,7 +1204,6 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
     CONFIG.PARTIAL_FRACTION_MIN = newThresholds.partialFractionMin ?? CONFIG.PARTIAL_FRACTION_MIN;
     CONFIG.PARTIAL_FRACTION_MAX = newThresholds.partialFractionMax ?? CONFIG.PARTIAL_FRACTION_MAX;
     CONFIG.EXPECTED_REMAINING_THRESHOLD = newThresholds.expectedRemainingThreshold ?? CONFIG.EXPECTED_REMAINING_THRESHOLD;
-    logger.info('[OTIE V5] Configuration updated by Performance Monitor.');
   }
 
   stop() {
@@ -1245,7 +1211,6 @@ class OpenTradeIntelligenceV5 extends EventEmitter {
       clearInterval(this._timer);
       this._timer = null;
     }
-    logger.info('[OTIE V5] Stopped.');
   }
 }
 
