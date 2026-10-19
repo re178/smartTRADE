@@ -7,7 +7,6 @@ const candleStore = require('../../data/candleStore');
 const deepMarketState = require('./marketState');
 const session = require('../session');
 const { dataOrchestrator, DATA_CLASSES } = require('../../data/dataOrchestrator');
-const logger = require('../../../infrastructure/logger') || console;
 
 // Regime definitions (matching the master prompt)
 const REGIME_TYPES = {
@@ -36,9 +35,6 @@ const IDEAL_STRATEGIES = {
 
 class DeepRegimeDetector {
   constructor() {
-    // ---- DEBUG: log initialization ----
-    console.log('🔧 DeepRegimeDetector: constructor – listening to candleStore');
-
     // Listen to candle closes from the candle builder/store
     candleStore.on('candleClosed', (candle) => {
       this._onCandleClose(candle);
@@ -59,34 +55,21 @@ class DeepRegimeDetector {
       collection: 'historicalstates',
       batchSize: 50,
     });
-
-    logger.info('[DeepRegimeDetector] Initialized, listening to candle closes.');
   }
 
   async _onCandleClose(candle) {
     const { symbol, timeframe } = candle;
-
-    // ---- DEBUG: log when a candle is received ----
-    console.log(`🔔 DeepRegimeDetector: received candle ${symbol} ${timeframe}`);
 
     // Only process primary timeframes (M5, M15, H1)
     const supportedTimeframes = ['M5', 'M15', 'H1'];
     if (!supportedTimeframes.includes(timeframe)) return;
 
     try {
-      // ---- DEBUG: log before compute ----
-      console.log(`🧠 DeepRegimeDetector: calling deepMarketState.compute() for ${symbol} ${timeframe}`);
-
       // Get the deep market state (full, confirmed)
       const state = await deepMarketState.compute(symbol, timeframe, 200);
       if (!state) {
-        console.log(`⚠️ DeepRegimeDetector: deepMarketState.compute() returned null for ${symbol} ${timeframe}`);
-        logger.warn(`[DeepRegimeDetector] No deep state for ${symbol}:${timeframe}`);
         return;
       }
-
-      // ---- DEBUG: log compute success ----
-      console.log(`✅ DeepRegimeDetector: deepMarketState.compute() succeeded for ${symbol} ${timeframe}, confidence ${state.confidence}`);
 
       // Classify the regime
       const regime = this._classifyRegime(state);
@@ -112,9 +95,6 @@ class DeepRegimeDetector {
 
       // Store latest
       this._latestRegime[symbol] = regime;
-
-      // ---- DEBUG: log regime emission ----
-      console.log(`📢 DeepRegimeDetector: emitting regime ${regime.code} for ${symbol} with confidence ${regime.confidence}%`);
 
       // Emit regime event
       this.emit('regime', {
@@ -153,14 +133,9 @@ class DeepRegimeDetector {
           reason: regime.reason,
           source: 'deepRegimeDetector',
         }, { source: 'regimeChange' });
-
-        logger.debug(`[DeepRegimeDetector] ${symbol} regime change: ${prevCode || 'None'} → ${regime.code}`);
       }
-
-      logger.debug(`[DeepRegimeDetector] ${symbol}:${timeframe} → ${regime.code} (${Math.round(regime.confidence)}%)`);
     } catch (err) {
-      console.error(`❌ DeepRegimeDetector: error for ${symbol}:${timeframe}`, err.message);
-      logger.error(`[DeepRegimeDetector] Error for ${symbol}:${timeframe}`, err.message);
+      return;
     }
   }
 
