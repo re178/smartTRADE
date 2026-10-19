@@ -10,7 +10,6 @@ const awarenessEngine = require('../awareness/engine');
 const selfLearner = require('../learning/learner');
 const stateStore = require('../intelligence/lab/stateStore');
 const { dataOrchestrator } = require('../data/dataOrchestrator');
-const logger = require('../../infrastructure/logger') || console;
 
 const CONFIG = {
   DECISION_INTERVAL_MS: 30000,
@@ -41,15 +40,11 @@ class DecisionEngine extends EventEmitter {
     this._timer = null;
     this._isReady = false;
 
-    console.log('🔧 DecisionEngine: constructor – listening to regime events');
-
     deepRegime.on('regime', (regime) => {
-      console.log(`⚖️ DecisionEngine: received regime event for ${regime.symbol} (${regime.code})`);
       this._onRegime(regime);
     });
 
     this._timer = setInterval(() => {
-      console.log('⏰ DecisionEngine: timer tick – evaluating all symbols');
       this._evaluate();
     }, CONFIG.DECISION_INTERVAL_MS);
 
@@ -57,22 +52,16 @@ class DecisionEngine extends EventEmitter {
       stateStore.init()
         .then(() => {
           this._isReady = true;
-          console.log('✅ DecisionEngine: StateStore ready for edge computation.');
         })
         .catch(err => {
-          console.warn('⚠️ DecisionEngine: StateStore init failed, using fallback.', err.message);
           this._isReady = false;
         });
     } else {
-      console.warn('⚠️ DecisionEngine: StateStore not available, using fallback.');
       this._isReady = false;
     }
-
-    logger.info('[DecisionEngine] Initialized with probability/EV framework.');
   }
 
   async _onRegime(regime) {
-    console.log(`⚖️ DecisionEngine: processing regime for ${regime.symbol} (${regime.code}, conf: ${regime.confidence})`);
     const decision = await this._evaluateSymbol(regime.symbol);
     if (decision && decision.decision !== 'NO_TRADE') {
       const prev = this._lastDecision[regime.symbol];
@@ -85,15 +74,10 @@ class DecisionEngine extends EventEmitter {
             decision.decisionId = decisionId;
           }
         } catch (err) {
-          console.error(`❌ DecisionEngine: Failed to log decision:`, err.message);
+          // ignore
         }
-        console.log(`📢 DecisionEngine: emitting decision for ${regime.symbol}: ${decision.decision} (${decision.confidence}%)`);
         this.emit('decision', decision);
-      } else {
-        console.log(`⏸️ DecisionEngine: decision for ${regime.symbol} unchanged, not re-emitting`);
       }
-    } else {
-      console.log(`⏭️ DecisionEngine: NO_TRADE decision for ${regime.symbol}, not emitting`);
     }
   }
 
@@ -101,10 +85,8 @@ class DecisionEngine extends EventEmitter {
     try {
       const symbols = awarenessEngine._state ? Array.from(awarenessEngine._state.keys()) : [];
       if (symbols.length === 0) {
-        console.log('⏳ DecisionEngine: no symbols in awareness engine');
         return;
       }
-      console.log(`🔄 DecisionEngine: evaluating ${symbols.length} symbols`);
       for (const symbol of symbols) {
         const decision = await this._evaluateSymbol(symbol);
         if (decision && decision.decision !== 'NO_TRADE') {
@@ -117,16 +99,14 @@ class DecisionEngine extends EventEmitter {
                 decision.decisionId = decisionId;
               }
             } catch (err) {
-              console.error(`❌ DecisionEngine: Failed to log decision:`, err.message);
+              // ignore
             }
-            console.log(`📢 DecisionEngine: emitting decision for ${symbol}: ${decision.decision} (${decision.confidence}%)`);
             this.emit('decision', decision);
           }
         }
       }
     } catch (err) {
-      console.error(`❌ DecisionEngine: evaluation error:`, err.message);
-      logger.error('[DecisionEngine] Evaluation error:', err.message);
+      // ignore
     }
   }
 
@@ -134,14 +114,12 @@ class DecisionEngine extends EventEmitter {
     // 1. Get current awareness state (flat, for immediate metrics)
     const state = marketStateCache.get(symbol);
     if (!state) {
-      console.log(`❌ DecisionEngine: no market state for ${symbol}`);
       return null;
     }
 
     // 2. Get deep state (full nested) for logging
     let deepState = deepMarketState.getLastState(symbol);
     if (!deepState) {
-      console.warn(`⚠️ DecisionEngine: no deep state for ${symbol}, using awareness state fallback`);
       deepState = {
         ...state,
         trend: { direction: state.trend || 'neutral', strength: 0, adx: 0, plusDI: 0, minusDI: 0 },
@@ -183,7 +161,6 @@ class DecisionEngine extends EventEmitter {
           CONFIG.EDGE_LOOKAHEAD
         );
       } catch (err) {
-        console.warn(`⚠️ DecisionEngine: StateStore error for ${symbol}:`, err.message);
         edge = null;
       }
     }
@@ -217,12 +194,8 @@ class DecisionEngine extends EventEmitter {
         expectedValue = ev;
         probability = winProb;
       }
-
-      console.log(`📊 DecisionEngine: ${symbol} edge: EV=${ev.toFixed(3)}, winProb=${(winProb*100).toFixed(1)}%, sample=${edge.sampleSize}`);
-
     } else {
       // ---- Fallback: Rule-Based Scoring with Learning Weights ----
-      console.log(`⚠️ DecisionEngine: ${symbol} using fallback rule-based scoring (sample size ${edge?.sampleSize || 0})`);
       const result = this._weightedFallbackRuleBased(symbol, state, regime);
       decision = result.decision;
       confidence = result.confidence;
@@ -243,10 +216,9 @@ class DecisionEngine extends EventEmitter {
           // Adjust confidence towards calibrated value
           confidence = confidence * 0.6 + calibration.calibratedConfidence * 0.4;
           confidence = Math.round(Math.min(100, Math.max(0, confidence)));
-          console.log(`📊 DecisionEngine: ${symbol} calibrated confidence from ${confidence} to ${calibration.calibratedConfidence} (sample ${calibration.sampleSize})`);
         }
       } catch (err) {
-        console.warn(`⚠️ DecisionEngine: Confidence calibration failed for ${symbol}:`, err.message);
+        // ignore
       }
     }
 
