@@ -2,7 +2,6 @@
 // Centralised persistence with class‑based data lifecycle policies.
 
 const mongoose = require('mongoose');
-const logger = require('../../infrastructure/logger') || console;
 
 // ---- Data Class Constants ----
 const DATA_CLASSES = {
@@ -41,7 +40,6 @@ class DataOrchestrator {
     this._flushAppends = this._flushAppends.bind(this);
 
     // No need for _startFlushTimers – we use per‑batch timers.
-    logger.info('[DataOrchestrator] Initialized.');
   }
 
   // ============================================================
@@ -63,7 +61,6 @@ class DataOrchestrator {
     };
 
     this._policies.set(key, policy);
-    logger.debug(`[DataOrchestrator] Registered key: ${key} (${dataClass})`);
   }
 
   _defaultTTL(dataClass) {
@@ -95,7 +92,6 @@ class DataOrchestrator {
   publish(key, data, metadata = {}) {
     const policy = this._policies.get(key);
     if (!policy) {
-      logger.warn(`[DataOrchestrator] No policy registered for key: ${key}`);
       return;
     }
 
@@ -119,7 +115,8 @@ class DataOrchestrator {
         this._handleKnowledge(key, entry, policy);
         break;
       default:
-        logger.warn(`[DataOrchestrator] Unknown class for key ${key}`);
+        // Unknown class – no-op
+        break;
     }
   }
 
@@ -171,7 +168,6 @@ class DataOrchestrator {
 
         const collection = this._getCollectionForKey(key);
         if (!collection) {
-          logger.warn(`[DataOrchestrator] No collection for recoverable key: ${key}`);
           continue;
         }
 
@@ -180,10 +176,8 @@ class DataOrchestrator {
         const doc = { ...latest.metadata, ...latest.data };
         const query = { symbol: doc.symbol || 'global' };
         await collection.findOneAndUpdate(query, { $set: doc }, { upsert: true });
-
-        logger.debug(`[DataOrchestrator] Snapshot flushed for ${key}`);
       } catch (err) {
-        logger.error(`[DataOrchestrator] Error flushing snapshot for ${key}:`, err.message);
+        // ignore
       }
     }
   }
@@ -202,7 +196,6 @@ class DataOrchestrator {
 
         const collection = this._getCollectionForKey(key);
         if (!collection) {
-          logger.warn(`[DataOrchestrator] No collection for research key: ${key}`);
           continue;
         }
 
@@ -222,10 +215,9 @@ class DataOrchestrator {
 
         if (docs.length > 0) {
           await collection.insertMany(docs);
-          logger.debug(`[DataOrchestrator] Appended ${docs.length} items for ${key}`);
         }
       } catch (err) {
-        logger.error(`[DataOrchestrator] Error flushing append for ${key}:`, err.message);
+        // ignore
       }
     }
   }
@@ -279,7 +271,6 @@ class DataOrchestrator {
     try {
       const collection = this._getCollectionForKey(key);
       if (!collection) {
-        logger.warn(`[DataOrchestrator] No collection for business/key: ${key}`);
         return;
       }
 
@@ -291,9 +282,8 @@ class DataOrchestrator {
       } else {
         await collection.create(doc);
       }
-      logger.debug(`[DataOrchestrator] Persisted immediately for ${key}`);
     } catch (err) {
-      logger.error(`[DataOrchestrator] Error persisting ${key}:`, err.message);
+      // ignore
     }
   }
 
@@ -331,23 +321,19 @@ class DataOrchestrator {
   async recover() {
     if (this._recovered) return;
 
-    logger.info('[DataOrchestrator] Starting recovery...');
-
     try {
       await this._loadRecoverableState();
       await this._loadBusinessState();
       await this._loadKnowledgeState();
 
       this._recovered = true;
-      logger.info('[DataOrchestrator] Recovery complete.');
     } catch (err) {
-      logger.error('[DataOrchestrator] Recovery error:', err.message);
+      // ignore
     }
   }
 
   async _loadRecoverableState() {
     // No DB loading for marketState – rebuilt from candles/awareness
-    logger.debug('[DataOrchestrator] No recoverable state to load from DB.');
   }
 
   async _loadBusinessState() {
@@ -365,7 +351,6 @@ class DataOrchestrator {
           timestamp: Date.now(),
           policy: this._policies.get('learningState'),
         });
-        logger.info(`[DataOrchestrator] Loaded ${weights.length} learning weights.`);
       }
     } catch (err) {
       // ignore
@@ -406,7 +391,6 @@ class DataOrchestrator {
   // ============================================================
 
   async shutdown() {
-    logger.info('[DataOrchestrator] Shutting down...');
     if (this._snapshotTimer) {
       clearTimeout(this._snapshotTimer);
       await this._flushSnapshots();
@@ -415,7 +399,6 @@ class DataOrchestrator {
       clearTimeout(this._appendTimer);
       await this._flushAppends();
     }
-    logger.info('[DataOrchestrator] Shutdown complete.');
   }
 }
 
