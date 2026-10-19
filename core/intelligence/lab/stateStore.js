@@ -5,7 +5,6 @@
 // Regime compatibility weighting.
 
 const HistoricalState = require('../../../models/HistoricalState');
-const logger = require('../../../infrastructure/logger') || console;
 const crypto = require('crypto');
 
 // -------------------- Configuration --------------------
@@ -179,9 +178,7 @@ class RobustNormalizer {
         this.isLoaded = true;
         this.lastRefreshed = now;
         this.stateCountAtLastRefresh = totalStates;
-        logger.info('[StateStore] Robust normalizer stats refreshed (median/IQR).');
       } catch (err) {
-        logger.warn('[StateStore] Failed to refresh robust stats, using defaults.', err.message);
         this.stats = this._defaultStats();
         this.isLoaded = true;
       } finally {
@@ -234,7 +231,6 @@ class StateStore {
     if (this._isReady) return;
     await this.normalizer.ensureLoaded();
     this._isReady = true;
-    logger.info('[StateStore] Initialized with robust normalizer.');
   }
 
   async refreshNormalizer() {
@@ -248,8 +244,6 @@ class StateStore {
                     k = CONFIG.DEFAULT_K, lookahead = 5,
                     regimeCode = null) {
     await this.init();
-
-    console.log(`[StateStore] findSimilar called for ${symbol || 'any'} ${timeframe}, lookahead=${lookahead}, regime=${regimeCode || 'any'}`);
 
     const normalizedQuery = this.normalizer.normalizeVector(queryFeatures);
     const weights = CONFIG.FEATURE_WEIGHTS;
@@ -272,8 +266,6 @@ class StateStore {
 
     // We do NOT filter by regime here – we will apply regime weighting later.
     // So we don't add a regime filter to the $match stage.
-
-    console.log(`[StateStore] Filter:`, JSON.stringify(filter, null, 2));
 
     const pipeline = [
       { $match: filter },
@@ -339,7 +331,6 @@ class StateStore {
     ];
 
     const candidates = await HistoricalState.aggregate(pipeline);
-    console.log(`[StateStore] Aggregation returned ${candidates.length} candidates.`);
 
     if (candidates.length === 0) {
       return { states: [], distanceStats: null, candidateCount: 0, qualifiedCount: 0, effectiveSampleSize: 0, totalWeight: 0 };
@@ -395,8 +386,6 @@ class StateStore {
 
     // Effective Sample Size (ESS) = (Σw)² / Σ(w²)
     const ess = totalW * totalW / weightedStates.reduce((s, c) => s + c.totalWeight * c.totalWeight, 0);
-
-    console.log(`[StateStore] Distance stats: min=${minDist.toFixed(4)}, max=${maxDist.toFixed(4)}, avg=${avgDist.toFixed(4)}, median=${medianDist.toFixed(4)}, weightedAvg=${weightedAvgDist.toFixed(4)}, qualified=${qualified.length}, ESS=${ess.toFixed(2)}`);
 
     return {
       states: weightedStates,  // includes futurePrices, mfe, mae, etc.
