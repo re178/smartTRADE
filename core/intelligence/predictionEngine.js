@@ -4,7 +4,6 @@
 // Preserves analogues for OpportunityEngine.
 
 const stateStore = require('./lab/stateStore');
-const logger = require('../../infrastructure/logger') || console;
 
 // ---- Symbol Normalization ----
 function normalizeSymbol(sym) {
@@ -82,27 +81,20 @@ function getRegimeCode(state, symbol) {
  * @returns {Promise<Object>} Prediction object.
  */
 async function predict(state, symbol, lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = 500) {
-  console.log(`[PredictionEngine] >>> predict() called for ${symbol} (lookahead=${lookahead})`);
-
   try {
     // 1. Normalize symbol
     const canonicalSymbol = normalizeSymbol(symbol);
-    console.log(`[PredictionEngine]   normalized symbol: ${canonicalSymbol}`);
     if (!canonicalSymbol) {
-      console.warn(`[PredictionEngine] Invalid symbol: ${symbol}`);
       return null;
     }
 
     // 2. Extract features
     const features = extractFeatures(state);
-    console.log(`[PredictionEngine]   features:`, JSON.stringify(features).slice(0, 200));
 
     // 3. Get regime code (for logging and regime weighting)
     const regimeCode = getRegimeCode(state, canonicalSymbol);
-    console.log(`[PredictionEngine]   regime (current): ${regimeCode}`);
 
     // 4. Call StateStore (regime is passed for compatibility weighting)
-    console.log(`[PredictionEngine]   calling stateStore.getPredictionDistribution...`);
     const distribution = await stateStore.getPredictionDistribution(
       features,
       canonicalSymbol,
@@ -111,10 +103,8 @@ async function predict(state, symbol, lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = 
       k,
       regimeCode  // passed for regime weighting
     );
-    console.log(`[PredictionEngine]   distribution received:`, distribution ? `sampleSize=${distribution.sampleSize}, qualified=${distribution.qualifiedCount}, ESS=${distribution.effectiveSampleSize}` : 'null');
 
     if (!distribution || distribution.qualifiedCount < CONFIG.MIN_QUALIFIED || distribution.effectiveSampleSize < CONFIG.MIN_EFFECTIVE_SAMPLE) {
-      console.warn(`[PredictionEngine] Insufficient qualified samples (${distribution?.qualifiedCount || 0}) for ${canonicalSymbol}`);
       return null;
     }
 
@@ -220,11 +210,8 @@ async function predict(state, symbol, lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = 
       analogues: distribution.analogues || [], // contains futurePrices, mfe, mae, etc.
     };
 
-    console.log(`[PredictionEngine] ✅ Prediction for ${canonicalSymbol}: Direction=${direction}, UP=${(prediction.probabilities.up*100).toFixed(1)}%, DOWN=${(prediction.probabilities.down*100).toFixed(1)}%, NEUTRAL=${(prediction.probabilities.neutral*100).toFixed(1)}%, Qualified=${prediction.qualifiedCount}, Confidence=${prediction.confidence}%`);
     return prediction;
   } catch (err) {
-    console.error(`[PredictionEngine] ❌ Error predicting for ${symbol}:`, err.message);
-    console.error(err.stack);
     return null;
   }
 }
