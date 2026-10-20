@@ -4,6 +4,24 @@
 // SYMBOL FIX: Watched symbols changed to canonical (EURUSD, etc.)
 // PIPELINE: Timer and candle‑close triggers active.
 // LOGGING: Verbose logging removed. Summary-only output.
+//
+// [WIRE-1] broadcastToDashboards / broadcast are defined AND exported
+//   BEFORE ./api/routes is required. Fixes the circular-require bug where
+//   controllers.js destructured `broadcastToDashboards` from a still-empty
+//   exports object and then threw "broadcastToDashboards is not a function"
+//   every time it tried to push to the dashboard.
+// [WIRE-2] dashboardClients Set moved above the route require — same reason.
+// [WIRE-3] broker.on(...) handlers attached BEFORE await broker.connect()
+//   so the initial accountUpdate, positions and contractUpdate events fired
+//   during _doConnect / _reconcilePositions / _resumeContractSubscriptions
+//   are not dropped on the floor.
+// [WIRE-4] broker.on('account', ...) renamed to broker.on('accountUpdate', ...)
+//   to match the event the broker actually emits.
+// [WIRE-5] NEW handler: broker.on('contractUpdate', ...). This is the event
+//   that carries live profit / currentSpot / status / isSold per tick.
+//   Without this the dashboard has no live P/L source.
+// [WIRE-6] SIGINT / SIGTERM now also call broker.disconnect() so the auth
+//   and public WS do not keep reconnecting during shutdown.
 
 require('dotenv').config();
 
@@ -14,6 +32,31 @@ const mongoose = require('mongoose');
 const WebSocket = require('ws');
 const http = require('http');
 
+// ============================================================
+// [WIRE-1 / WIRE-2] Broadcast helpers MUST be defined and exported
+// before anything that requires them is loaded. controllers.js does
+//   const { broadcastToDashboards } = require('../server');
+// at the top of the file. Because server -> routes -> controllers -> server
+// is a circular require, the destructure on the controllers side runs
+// against a partial exports object. If broadcastToDashboards is not yet
+// assigned, it is `undefined` and any later call throws.
+// ============================================================
+const dashboardClients = new Set();
+
+function broadcastToDashboards(type, data) {
+  if (dashboardClients.size === 0) return;
+  const message = JSON.stringify({ type, data });
+  for (const client of dashboardClients) {
+    if (client.readyState === WebSocket.OPEN) client.send(message);
+  }
+}
+function broadcast(type, data) { broadcastToDashboards(type, data); }
+
+module.exports.broadcastToDashboards = broadcastToDashboards;
+module.exports.broadcast = broadcast;
+// ============================================================
+
+// ---- NOW it is safe to require the route tree ----
 const connectDB = require('./config/db');
 const apiRoutes = require('./api/routes');
 const researchRoutes = require('./api/routes/research');
@@ -191,8 +234,8 @@ app.get('*', (req, res) => {
 const server = http.createServer(app);
 
 // ---------- WebSocket Server ----------
+// [WIRE-2] dashboardClients Set is defined at the top of the file.
 const wss = new WebSocket.Server({ server });
-const dashboardClients = new Set();
 
 const WS_PING_INTERVAL = 30000;
 let wsPingTimer = null;
@@ -253,18 +296,6 @@ async function sendDashboardInitialState(ws) {
   }
 }
 
-// ---- Broadcast functions ----
-function broadcastToDashboards(type, data) {
-  if (dashboardClients.size === 0) return;
-  const message = JSON.stringify({ type, data });
-  dashboardClients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(message);
-    }
-  });
-}
-function broadcast(type, data) { broadcastToDashboards(type, data); }
-
 // ---------- Legacy event bindings ----------
 awarenessEngine.on('marketAwareness', (data) => broadcast('marketAwareness', data));
 deepRegime.on('regime', (regime) => broadcast('regime', regime));
@@ -280,7 +311,7 @@ otie.on('otieV5Action', (action) => broadcast('otieV5Action', action));
 eventBus.on('trade.closed', async (data) => {
   try {
     const Trade = require('./models/Trade');
-    const trade = await Trade.findOne({ contractId: data.contractId });
+    const trade = await Trade.findOne({ contractId: String(data.contractId) });
     if (trade) performanceMonitor.recordTrade(trade);
   } catch (err) {
     console.error('[PerformanceMonitor] Failed to record trade:', err.message);
@@ -343,7 +374,6 @@ async function runPredictionPipelineAll() {
     const result = await runPredictionPipeline(symbol);
     if (result) ok++;
   }
-  // (cycle summary log removed — fires every PREDICTION_INTERVAL_MS)
 }
 
 // ---- Trigger on candle close ----
@@ -400,17 +430,30 @@ async function startCognitiveEngines() {
 async function startDerivBroker() {
   try {
     const broker = getBroker('deriv_cfd');
-    await broker.connect();
-    console.log('[Deriv] Broker connected.');
 
+    // [WIRE-3] Attach ALL listeners BEFORE connect() so we do not miss the
+    // events emitted during _doConnect / _ensureBalanceLoaded /
+    // _reconcilePositions / _resumeContractSubscriptions.
     broker.on('tick', (data) => broadcastToDashboards('price', data));
-    broker.on('account', async (accountData) => {
+
+    // [WIRE-4] Renamed from 'account' — the broker emits 'accountUpdate'.
+    broker.on('accountUpdate', async (accountData) => {
       const enhanced = enhanceAccount(accountData, broker);
       broadcastToDashboards('account', enhanced);
     });
+
+    // [WIRE-5] NEW — live per-contract P/L, status, isValidToSell.
+    // This is the channel the frontend needs to render running trades.
+    broker.on('contractUpdate', (state) => {
+      broadcastToDashboards('contractUpdate', state);
+    });
+
     broker.on('positions', (positions) => broadcastToDashboards('positions', positions));
     broker.on('orderUpdate', (data) => broadcastToDashboards('orderUpdate', data));
     broker.on('_portfolioUpdated', (positions) => broadcastToDashboards('positions', positions));
+
+    await broker.connect();
+    console.log('[Deriv] Broker connected.');
   } catch (err) {
     console.error('[Deriv] Failed to start Deriv broker:', err.message);
   }
@@ -449,8 +492,8 @@ async function startServer() {
     setTimeout(startDerivBroker, 3000);
   });
 
-  process.on('SIGINT', async () => {
-    console.log('\n🛑 Received SIGINT, shutting down gracefully...');
+  async function shutdown(signal) {
+    console.log(`\n🛑 Received ${signal}, shutting down gracefully...`);
     if (wsPingTimer) clearInterval(wsPingTimer);
     if (pipelineTimer) clearInterval(pipelineTimer);
     try {
@@ -459,21 +502,16 @@ async function startServer() {
     } catch (err) {
       console.error('Error during shutdown:', err.message);
     }
+    // [WIRE-6] Disconnect broker so auth/public WS don't keep reconnecting.
+    try {
+      const broker = getBroker('deriv_cfd');
+      if (broker && typeof broker.disconnect === 'function') await broker.disconnect();
+    } catch (_) { /* best effort */ }
     process.exit(0);
-  });
+  }
 
-  process.on('SIGTERM', async () => {
-    console.log('\n🛑 Received SIGTERM, shutting down gracefully...');
-    if (wsPingTimer) clearInterval(wsPingTimer);
-    if (pipelineTimer) clearInterval(pipelineTimer);
-    try {
-      await dataOrchestrator.shutdown();
-      if (otie && typeof otie.stop === 'function') otie.stop();
-    } catch (err) {
-      console.error('Error during shutdown:', err.message);
-    }
-    process.exit(0);
-  });
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
 startServer().catch(err => {
