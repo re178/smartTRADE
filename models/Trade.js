@@ -1,18 +1,28 @@
 // models/Trade.js
 // Trade schema for tracking open and closed trades.
 // EXTENDED: Added Multiplier-specific fields.
+//
+// [CHANGE-3A] contractId is now a String. Deriv contract IDs are opaque
+//   identifiers, not numeric quantities. Existing documents were written
+//   under the old Number type; a one-off migration (see note in
+//   migration notes) is required. Any code that queries by contractId
+//   should pass String(contractId) for compatibility during the transition.
+// [CHANGE-3B] Added purchasePrice (amount paid for the Deriv contract).
+//   Distinct from openPrice (underlying market entry spot). Multiplier
+//   trades populate it; CFD trades leave it null.
 
 const mongoose = require('mongoose');
 
 const TradeSchema = new mongoose.Schema(
   {
-    // ---- MT5 core fields ----
+    // ---- Contract identity ----
+    // [CHANGE-3A] String, not Number. Treat as an opaque identifier.
     contractId: {
-      type: Number,
+      type: String,
       required: true,
       unique: true,
       index: true,
-      description: 'MT5 ticket number (unique per trade)',
+      description: 'Deriv contract ID (unique per trade; opaque identifier)',
     },
     instrument: {
       type: String,
@@ -217,6 +227,18 @@ const TradeSchema = new mongoose.Schema(
       type: Number,
       default: null,
       description: 'Take-profit price level (for Multiplier trades)',
+    },
+
+    // ---- [CHANGE-3B] Contract purchase cost ----
+    // Amount paid to Deriv for the contract. Distinct from openPrice,
+    // which is the underlying market entry spot. Populated for
+    // Multiplier trades; null for CFD trades (which have no purchase
+    // cost in this sense).
+    purchasePrice: {
+      type: Number,
+      default: null,
+      min: 0,
+      description: 'Amount paid to purchase the Deriv contract',
     },
 
     // ---- Entry Thesis (prediction snapshot) ----
