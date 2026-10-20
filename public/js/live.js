@@ -1,768 +1,403 @@
-// public/js/live.js – WebSocket client with stable connection and heartbeat
-// Real‑time events: marketAwareness, regime, decision, fusion, otieV5State, otieV5Action,
-// init, account, positions, price, prediction, opportunity, etc.
-// Updated for Multiplier prediction events.
+// public/js/live.js – WebSocket dispatcher
+// All state updates go through window.updateDashboardState (app.js renders).
+// Only contractUpdate, price, positions, and account bypass full-rerender
+// for performance — they call targeted render functions from app.js.
+//
+// [FIX-1] case 'contractUpdate' — the missing handler that was keeping
+//   the dashboard frozen. Merges live tick into dashboardState.positions,
+//   stores state in dashboardState.contractStates, then repaints only the
+//   positions widget and the monitor line (not all 16 widgets).
+// [FIX-2] Removed local updatePositions() / updateAccount() renderers.
+//   app.js is the single renderer.
+// [FIX-3] Removed displayAwareness / displayRegime / displayMetrics /
+//   displayFusion — app.js renders those panels via its widget functions.
+// [FIX-4] Removed executeSignalFromCard — app.js owns it.
+// [FIX-5] init case no longer writes msg.data.trades into history (that
+//   field is OPEN trades on the server; history comes from /api/trade-history).
+// [FIX-6] Auto-execute block honours the new controller response shape and
+//   never retries on BROKER_ERROR.
 
-(function() {
+(function () {
   'use strict';
 
   const WS_RECONNECT_DELAY = 2000;
   const WS_MAX_RECONNECT_DELAY = 30000;
-  const HEARTBEAT_INTERVAL = 25000; // send ping every 25s
+  const HEARTBEAT_INTERVAL = 25000;
 
   let reconnectAttempts = 0;
   let ws = null;
   let reconnectTimer = null;
   let heartbeatTimer = null;
+  let _autoExecuting = false;
 
-  // DOM elements
-  const awarenessPanel = document.getElementById('awarenessPanel');
-  const hypothesisPanel = document.getElementById('hypothesisPanel');
-  const knowledgePanel = document.getElementById('knowledgePanel');
-  const liveSignalPanel = document.getElementById('liveSignalPanel');
-  const regimePanel = document.getElementById('regimePanel');
-  const metricsPanel = document.getElementById('metricsPanel');
-  const fusionPanel = document.getElementById('fusionPanel');
-  const wsStatus = document.getElementById('wsStatus');
-  const otieContent = document.getElementById('otieContent');
-  const predictionPanel = document.getElementById('predictionPanel');
-  const opportunityPanel = document.getElementById('opportunityPanel');
+  function updateWsStatus(connected) {
+    const el = document.getElementById('wsStatus');
+    if (el) {
+      el.textContent = connected ? '🟢 Live' : '🔴 Disconnected';
+      el.className = connected ? 'badge bg-success' : 'badge bg-danger';
+    }
+    if (window.updateApiStatus) window.updateApiStatus(connected);
+  }
 
-  // ---- SoundManager (global from app.js) ----
   function playSound(type) {
     if (window.SoundManager && typeof window.SoundManager[type] === 'function') {
       window.SoundManager[type]();
-    } else {
-      try {
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.frequency.value = type === 'tradeOpen' ? 600 : (type === 'reject' ? 300 : 800);
-        gain.gain.value = 0.3;
-        osc.start();
-        osc.stop(ctx.currentTime + 0.3);
-      } catch (e) {}
     }
   }
 
-  // ---- Helper: formatSymbol ----
-  function formatSymbol(symbol) {
-    if (!symbol || typeof symbol !== 'string') return symbol;
-    const upper = symbol.toUpperCase().trim();
-    if (upper.length === 6 && /^[A-Z]{6}$/.test(upper)) {
-      return upper.slice(0, 3) + '_' + upper.slice(3);
-    }
-    return upper;
+  function formatSymbol(s) {
+    if (!s || typeof s !== 'string') return s;
+    const u = s.toUpperCase().trim();
+    return (u.length === 6 && /^[A-Z]{6}$/.test(u)) ? u.slice(0, 3) + '_' + u.slice(3) : u;
   }
-
   function formatPrice(p) {
     if (p === undefined || p === null) return 'N/A';
     return parseFloat(p).toFixed(5);
   }
 
-  function updateWsStatus(connected) {
-    if (wsStatus) {
-      wsStatus.textContent = connected ? '🟢 Live' : '🔴 Disconnected';
-      wsStatus.className = connected ? 'badge bg-success' : 'badge bg-danger';
-    }
-    if (window.updateApiStatus) {
-      window.updateApiStatus(connected);
-    }
-  }
+  function state() { return window.dashboardState || null; }
 
   function connectWebSocket() {
-    // If there's an existing connection, close it first
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      return;
-    }
-
-    // Use the WebSocket URL from config (auto-detected)
+    if (ws && ws.readyState === WebSocket.OPEN) return;
     const wsUrl = CONFIG.WS_URL;
-    console.log('[Live] Connecting to WebSocket:', wsUrl);
+    console.log('[Live] Connecting:', wsUrl);
+    try { ws = new WebSocket(wsUrl); }
+    catch (e) { console.error('[Live] Creation failed:', e); scheduleReconnect(); return; }
 
-    try {
-      ws = new WebSocket(wsUrl);
-    } catch (e) {
-      console.error('[Live] WebSocket creation failed:', e);
-      scheduleReconnect();
-      return;
-    }
-
-    ws.onopen = function() {
-      console.log('[Live] WebSocket connected.');
+    ws.onopen = function () {
+      console.log('[Live] Connected.');
       reconnectAttempts = 0;
       updateWsStatus(true);
-      // Start heartbeat
       if (heartbeatTimer) clearInterval(heartbeatTimer);
-      heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_INTERVAL);
+      heartbeatTimer = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' }));
+      }, HEARTBEAT_INTERVAL);
     };
 
-    ws.onmessage = function(event) {
+    ws.onmessage = function (event) {
       try {
         const msg = JSON.parse(event.data);
-        // Respond to server ping with pong (if needed)
-        if (msg.type === 'ping') {
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'pong' }));
-          }
-          return;
-        }
+        if (msg.type === 'ping') { ws.send(JSON.stringify({ type: 'pong' })); return; }
         handleMessage(msg);
-      } catch (e) {
-        console.error('[Live] Message parse error:', e);
-      }
+      } catch (e) { console.error('[Live] Parse error:', e); }
     };
 
-    ws.onclose = function(event) {
-      console.warn('[Live] WebSocket closed.', event.code, event.reason);
+    ws.onclose = function (event) {
+      console.warn('[Live] Closed.', event.code);
       updateWsStatus(false);
-      if (heartbeatTimer) {
-        clearInterval(heartbeatTimer);
-        heartbeatTimer = null;
-      }
-      // Only reconnect if the close was not intentional (no reconnect if code 1000)
-      if (event.code !== 1000) {
-        scheduleReconnect();
-      }
+      if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+      if (event.code !== 1000) scheduleReconnect();
     };
 
-    ws.onerror = function(err) {
-      console.error('[Live] WebSocket error:', err);
-      // ws will close after error, so onclose will handle reconnect
-    };
-  }
-
-  function sendHeartbeat() {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'ping' }));
-    }
+    ws.onerror = function (err) { console.error('[Live] Error:', err); };
   }
 
   function scheduleReconnect() {
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     const delay = Math.min(WS_RECONNECT_DELAY * Math.pow(1.5, reconnectAttempts), WS_MAX_RECONNECT_DELAY);
     reconnectAttempts++;
-    console.log(`[Live] Reconnecting in ${delay}ms (attempt ${reconnectAttempts})`);
-    reconnectTimer = setTimeout(function() {
-      connectWebSocket();
-    }, delay);
+    reconnectTimer = setTimeout(connectWebSocket, delay);
   }
 
   // ============================================================
-  //  MAIN MESSAGE HANDLER – WITH NEW PREDICTION & OPPORTUNITY
+  //  [FIX-1] Per-contract live tick
+  // ============================================================
+  function handleContractUpdate(cu) {
+    const s = state();
+    if (!s || !cu) return;
+    const contractId = String(cu.contractId || '');
+    if (!contractId) return;
+
+    // Store latest state
+    if (!s.contractStates) s.contractStates = {};
+    s.contractStates[contractId] = cu;
+    s.lastContractUpdateAt = cu.receivedAt || Date.now();
+
+    const positions = s.positions || [];
+    const idx = positions.findIndex(p => String(p.id ?? p.contractId) === contractId);
+    const isClosed = !!(cu.isSold || cu.isExpired);
+
+    if (idx >= 0) {
+      if (isClosed) {
+        // Settlement arrived — drop from positions
+        positions.splice(idx, 1);
+      } else {
+        // Merge latest values in place
+        positions[idx] = {
+          ...positions[idx],
+          currentPrice: cu.currentSpot != null ? cu.currentSpot : positions[idx].currentPrice,
+          unrealizedPL: cu.currentProfit != null ? cu.currentProfit : positions[idx].unrealizedPL,
+          isValidToSell: cu.isValidToSell,
+          contractStatus: cu.status,
+          lastUpdate: cu.receivedAt,
+        };
+      }
+    } else if (!isClosed) {
+      // First tick before a positions snapshot — synthesize an entry
+      const ct = String(cu.contractType || '').toUpperCase();
+      positions.push({
+        id: contractId,
+        contractId,
+        instrument: cu.symbol || 'UNKNOWN',
+        side: ct.includes('UP') ? 'BUY' : (ct.includes('DOWN') ? 'SELL' : 'UNKNOWN'),
+        price: cu.entrySpot ?? 0,
+        entryPrice: cu.entrySpot ?? null,
+        purchasePrice: cu.buyPrice ?? null,
+        currentPrice: cu.currentSpot ?? 0,
+        unrealizedPL: cu.currentProfit ?? 0,
+        units: cu.buyPrice ?? 0,
+        status: 'OPEN',
+        isValidToSell: cu.isValidToSell,
+        lastUpdate: cu.receivedAt,
+      });
+    } else {
+      // Closed contract we never saw open — nothing to do
+      return;
+    }
+
+    s.positions = positions;
+
+    // [FIX-1] Targeted repaint — do NOT call updateDashboardState (would
+    // rerender all 16 widgets every tick). app.js exposes these on window.
+    if (typeof window.renderPositionsWidget === 'function') window.renderPositionsWidget();
+    if (typeof window.renderLiveMonitorStatus === 'function') window.renderLiveMonitorStatus();
+  }
+
+  // ============================================================
+  //  Main dispatch
   // ============================================================
   function handleMessage(msg) {
-    // Log received message type for debugging
-    console.log('[Live] Received message type:', msg.type);
-
-    // Update state store and render all widgets
     switch (msg.type) {
+
       // ============================================================
-      //  NEW: Prediction and Opportunity events
+      // [FIX-1] Live per-contract tick — the missing handler
+      // ============================================================
+      case 'contractUpdate':
+        handleContractUpdate(msg.data || {});
+        break;
+
+      // ============================================================
+      // Prediction / Opportunity
       // ============================================================
       case 'prediction':
-        console.log('[Live] ✅ Prediction received:', msg.data);
-        // The prediction panel will be updated via app.js renderPredictionWidget
-        if (window.updateDashboardState) {
-          window.updateDashboardState({ prediction: msg.data });
-        }
+        if (window.updateDashboardState) window.updateDashboardState({ prediction: msg.data });
         break;
 
       case 'opportunity':
-        console.log('[Live] ✅ Opportunity received:', msg.data);
-        if (window.updateDashboardState) {
-          window.updateDashboardState({ opportunity: msg.data });
-        }
-        // If opportunity is tradable and auto-execute is on, we could auto-trade here
-        if (msg.data.tradable && document.getElementById('autoExecuteToggle')?.checked) {
-          console.log('[Live] Auto‑executing opportunity:', msg.data);
-          // Auto-execution logic – calls the same API as manual trade
-          // We'll use the same /api/trade endpoint but with the Multiplier fields
-          fetch('/api/trade', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              pair: msg.data.prediction?.symbol || 'EUR_USD',
-              side: msg.data.direction,
-              stake: msg.data.stake,
-              multiplier: msg.data.multiplier,
-              duration: msg.data.duration,
-              knockoutLevel: msg.data.knockoutLevel,
-              takeProfitLevel: msg.data.takeProfitLevel,
-              product: 'deriv_cfd',
-            })
-          })
-          .then(res => res.json())
-          .then(data => {
-            if (data.success) {
-              console.log('[Live] Auto‑executed Multiplier trade:', data);
-              playSound('tradeOpen');
-            } else {
-              console.error('[Live] Auto‑execute failed:', data.error);
-              playSound('reject');
-            }
-          })
-          .catch(err => {
-            console.error('[Live] Auto‑execute error:', err);
-            playSound('reject');
-          });
-        }
+        if (window.updateDashboardState) window.updateDashboardState({ opportunity: msg.data });
+        maybeAutoExecute(msg.data);
         break;
 
       // ============================================================
-      //  EXISTING EVENTS (preserved)
+      // Intelligence feeds — dispatched to updateDashboardState;
+      // app.js render*Widget functions paint them.
       // ============================================================
       case 'marketAwareness':
-        displayAwareness(msg.data);
-        if (window.updateDashboardState) {
-          window.updateDashboardState({ awareness: msg.data });
-        }
+        if (window.updateDashboardState) window.updateDashboardState({ awareness: msg.data });
         break;
-
       case 'regime':
-        displayRegime(msg.data);
-        if (window.updateDashboardState) {
-          window.updateDashboardState({ regime: msg.data });
-        }
+        if (window.updateDashboardState) window.updateDashboardState({ regime: msg.data });
         break;
-
-      case 'hypothesisCreated':
-        addHypothesis(msg.data);
+      case 'fusion':
+        if (window.updateDashboardState) window.updateDashboardState({ fusion: msg.data });
         break;
-
-      case 'hypothesisResolved':
-        updateHypothesis(msg.data);
+      case 'metrics':
+        if (window.updateDashboardState) window.updateDashboardState({ metrics: msg.data });
         break;
-
-      case 'knowledge':
-        displayKnowledge(msg.data);
-        break;
-
       case 'decision':
         displayDecision(msg.data);
-        if (window.updateDashboardState) {
-          window.updateDashboardState({ liveSignal: msg.data });
-        }
+        if (window.updateDashboardState) window.updateDashboardState({ liveSignal: msg.data });
         break;
 
-      case 'fusion':
-        displayFusion(msg.data);
-        if (window.updateDashboardState) {
-          window.updateDashboardState({ fusion: msg.data });
-        }
-        break;
-
-      case 'marketClosed':
-        displayMarketClosed(msg.data);
-        break;
-
-      case 'metrics':
-        displayMetrics(msg.data);
-        if (window.updateDashboardState) {
-          window.updateDashboardState({ metrics: msg.data });
-        }
-        break;
-
+      // ============================================================
+      // OTIE — app.js has no render widget for #otieContent, so
+      // live.js owns these two.
+      // ============================================================
       case 'otieV5State':
         displayOTIEState(msg.data);
-        if (window.updateDashboardState) {
-          const currentOTIE = (window.dashboardState?.otieDecisions) || [];
-          currentOTIE.unshift(msg.data);
-          if (currentOTIE.length > 20) currentOTIE.pop();
-          window.updateDashboardState({ otieDecisions: currentOTIE });
-        }
         break;
-
       case 'otieV5Action':
         displayOTIEAction(msg.data);
-        if (window.updateDashboardState) {
-          const currentActions = (window.dashboardState?.otieActions) || [];
-          currentActions.unshift(msg.data);
-          if (currentActions.length > 20) currentActions.pop();
-          window.updateDashboardState({ otieActions: currentActions });
-        }
         break;
 
+      // ============================================================
+      // Order / trade events
+      // ============================================================
       case 'tradeClosed': {
-        if (window.updateDashboardState) {
-          const closedId = msg.data.contractId;
-          const currentPositions = (window.dashboardState?.positions) || [];
-          const updatedPositions = currentPositions.filter(p => p.id !== closedId);
-          window.updateDashboardState({ positions: updatedPositions });
+        const s = state();
+        if (s && s.positions) {
+          const cid = String(msg.data.contractId);
+          s.positions = s.positions.filter(p => String(p.id ?? p.contractId) !== cid);
+          if (typeof window.renderPositionsWidget === 'function') window.renderPositionsWidget();
         }
-        if (typeof addNotification === 'function') addNotification('Trade closed', 'info');
         playSound('tradeClose');
         break;
       }
-
-      case 'trade.placed': {
+      case 'trade.placed':
         playSound('tradeOpen');
-        if (typeof addNotification === 'function') addNotification('Trade opened', 'success');
-        break;
-      }
-
-      case 'order.rejected':
-        playSound('reject');
-        if (typeof addNotification === 'function') addNotification('Order rejected: ' + (msg.data.reason || ''), 'danger');
         break;
 
+      // ============================================================
+      // [FIX-5] init — do NOT touch history
+      // ============================================================
       case 'init': {
-        if (window.updateDashboardState) {
-          window.updateDashboardState({
-            account: msg.data.account,
-            positions: msg.data.positions,
-            history: msg.data.trades || [],
-          });
-        }
-        if (msg.data.account) updateAccount(msg.data.account);
-        if (msg.data.positions) updatePositions(msg.data.positions);
-        if (msg.data.trades && typeof renderHistoryTable === 'function') renderHistoryTable();
+        const s = state();
+        if (!s) break;
+        s.account = msg.data.account || s.account;
+        if (Array.isArray(msg.data.positions)) s.positions = msg.data.positions;
+        // history intentionally untouched — /api/trade-history owns it
+        if (typeof window.renderAccountWidget === 'function') window.renderAccountWidget();
+        if (typeof window.renderPositionsWidget === 'function') window.renderPositionsWidget();
         break;
       }
 
       case 'positions': {
-        updatePositions(msg.data);
-        if (window.updateDashboardState) {
-          window.updateDashboardState({ positions: msg.data });
-        }
+        const s = state();
+        if (!s) break;
+        s.positions = Array.isArray(msg.data) ? msg.data : [];
+        if (typeof window.renderPositionsWidget === 'function') window.renderPositionsWidget();
         break;
       }
 
       case 'account': {
-        updateAccount(msg.data);
-        if (window.updateDashboardState) {
-          window.updateDashboardState({ account: msg.data });
-        }
+        const s = state();
+        if (!s) break;
+        s.account = msg.data;
+        if (typeof window.renderAccountWidget === 'function') window.renderAccountWidget();
         break;
       }
 
       case 'price': {
-        if (window.updateDashboardState) {
-          const symbol = msg.data.symbol;
-          const currentPrices = (window.dashboardState?.prices) || {};
-          currentPrices[symbol] = msg.data;
-          window.updateDashboardState({ prices: currentPrices });
-        }
+        const s = state();
+        if (!s || !msg.data) break;
+        if (!s.prices) s.prices = {};
+        s.prices[msg.data.symbol] = msg.data;
+        if (typeof window.renderPriceWidgets === 'function') window.renderPriceWidgets();
         break;
       }
 
       case 'positionUpdated':
-        // Could update positions if needed – currently handled by 'positions'
+        // No-op — 'positions' and 'contractUpdate' handle position state
         break;
 
       default:
-        console.debug('[Live] Unknown message type:', msg.type);
+        console.debug('[Live] Unhandled:', msg.type);
     }
   }
 
   // ============================================================
-  //  DISPLAY FUNCTIONS (existing – unchanged)
+  // [FIX-6] Auto-execute — status-aware, never retries on error
   // ============================================================
-  function displayAwareness(data) {
-    if (!awarenessPanel) return;
-    const { symbol, spread, velocity, acceleration, liquidity, unusualEvents, lastUpdated } = data;
-    const events = unusualEvents ? unusualEvents.join(', ') : 'None';
-    awarenessPanel.innerHTML = `
-      <div class="card">
-        <div class="card-body">
-          <h6 class="card-title">Market Awareness (${symbol})</h6>
-          <p>Spread: ${spread.toFixed(5)} | Velocity: ${velocity.toFixed(6)}</p>
-          <p>Acceleration: ${acceleration.toFixed(6)} | Liquidity: ${(liquidity * 100).toFixed(0)}%</p>
-          <p>Unusual: ${events}</p>
-          <p class="small text-muted">${new Date(lastUpdated).toLocaleString()}</p>
-        </div>
-      </div>
-    `;
+  function maybeAutoExecute(opp) {
+    if (!opp || !opp.tradable) return;
+    const toggle = document.getElementById('autoExecuteToggle');
+    if (!toggle || !toggle.checked) return;
+    if (_autoExecuting) return;
+
+    _autoExecuting = true;
+    console.log('[Live] Auto-executing opportunity:', opp.direction, opp.prediction?.symbol);
+
+    fetch((CONFIG.API_BASE || '') + '/api/trade', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        pair: opp.prediction?.symbol || 'EUR_USD',
+        side: opp.direction,
+        stake: opp.stake,
+        multiplier: opp.multiplier,
+        duration: opp.duration,
+        knockoutLevel: opp.knockoutLevel,
+        takeProfitLevel: opp.takeProfitLevel,
+        product: 'deriv_cfd',
+      }),
+    })
+      .then(r => r.json().then(b => ({ status: r.status, body: b })).catch(() => ({ status: r.status, body: {} })))
+      .then(({ status, body }) => {
+        if (body.status === 'FILLED') {
+          playSound('tradeOpen');
+          console.log('[Live] Auto-trade placed:', body.contractId);
+        } else if (body.status === 'CONFIRMED_RECORD_FAILED') {
+          console.warn('[Live] Auto-trade confirmed but not recorded:', body.contractId, '— DO NOT retry');
+        } else if (body.status === 'REJECTED') {
+          playSound('reject');
+          console.log('[Live] Auto-trade rejected:', body.error);
+        } else {
+          // BROKER_ERROR or network — do NOT retry
+          console.error('[Live] Auto-trade broker error — do not retry:', body.error || status);
+        }
+      })
+      .catch(err => {
+        console.error('[Live] Auto-trade network error — do not retry:', err);
+        playSound('reject');
+      })
+      .finally(() => { _autoExecuting = false; });
   }
 
-  function displayRegime(regime) {
-    if (!regimePanel) return;
-    const { name, confidence, description, symbol, timestamp } = regime;
-    regimePanel.innerHTML = `
-      <div class="card">
-        <div class="card-body">
-          <h6 class="card-title">Current Regime</h6>
-          <p class="card-text"><strong>${name}</strong> (${confidence}%)</p>
-          <p class="small">${description || ''}</p>
-          <p class="small text-muted">${symbol} | ${new Date(timestamp).toLocaleString()}</p>
-        </div>
-      </div>
-    `;
-  }
-
-  function addHypothesis(hypothesis) {
-    if (!hypothesisPanel) return;
-    const { id, symbol, type, status, createdAt } = hypothesis;
-    const el = document.createElement('div');
-    el.className = 'alert alert-info hypothesis-item';
-    el.dataset.id = id;
-    el.innerHTML = `
-      <strong>Hypothesis #${id}</strong> (${symbol})<br>
-      Type: ${type}<br>
-      Status: ${status}<br>
-      Created: ${new Date(createdAt).toLocaleString()}
-    `;
-    hypothesisPanel.prepend(el);
-    while (hypothesisPanel.children.length > 10) {
-      hypothesisPanel.removeChild(hypothesisPanel.lastChild);
-    }
-  }
-
-  function updateHypothesis(hypothesis) {
-    if (!hypothesisPanel) return;
-    const { id, status, outcome, resolvedAt } = hypothesis;
-    const items = hypothesisPanel.querySelectorAll(`.hypothesis-item[data-id="${id}"]`);
-    if (items.length > 0) {
-      const el = items[0];
-      const statusClass = status === 'confirmed' ? 'success' : (status === 'rejected' ? 'danger' : 'secondary');
-      el.className = `alert alert-${statusClass} hypothesis-item`;
-      el.innerHTML = `
-        <strong>Hypothesis #${id}</strong> (${hypothesis.symbol})<br>
-        Type: ${hypothesis.type}<br>
-        Status: <strong>${status}</strong> (conf: ${outcome?.confidence || 0}%)<br>
-        Resolved: ${new Date(resolvedAt).toLocaleString()}
-      `;
-    }
-  }
-
-  function displayKnowledge(knowledge) {
-    if (!knowledgePanel) return;
-    const { symbol, indicator, valueRange, outcome, confidence, lastUpdated } = knowledge;
-    knowledgePanel.innerHTML = `
-      <div class="card">
-        <div class="card-body">
-          <h6 class="card-title">Knowledge (${symbol})</h6>
-          <p>${indicator} ${valueRange} → ${outcome}</p>
-          <p>Confidence: ${(confidence * 100).toFixed(0)}%</p>
-          <p class="small text-muted">${new Date(lastUpdated).toLocaleString()}</p>
-        </div>
-      </div>
-    `;
-  }
-
-  function displayDecision(decision) {
-    if (!liveSignalPanel) return;
-    const decisionId = decision.decisionId || decision._id || decision.id;
-    const { symbol, decision: side, confidence, entryPrice, stopLoss, takeProfit, recommendedLotSize, reason, timestamp } = decision;
-
+  // ============================================================
+  // Display functions owned by live.js (panels app.js doesn't render)
+  // ============================================================
+  function displayDecision(d) {
+    const panel = document.getElementById('liveSignalPanel');
+    if (!panel) return;
+    const decisionId = d.decisionId || d._id || d.id;
     playSound('signal');
 
-    if (!side || side === 'NO_TRADE') {
-      liveSignalPanel.innerHTML = `
-        <div class="alert alert-secondary">
-          <h5>No Trade</h5>
-          <p>${reason || 'No trading opportunity at this time.'}</p>
-          <p class="text-muted small">${new Date(timestamp).toLocaleString()}</p>
-        </div>
-      `;
+    if (!d.decision || d.decision === 'NO_TRADE') {
+      panel.innerHTML = `<div class="alert alert-secondary">
+        <h5>No Trade</h5>
+        <p>${d.reason || 'No opportunity.'}</p>
+        <p class="text-muted small">${d.timestamp ? new Date(d.timestamp).toLocaleString() : ''}</p>
+      </div>`;
       return;
     }
 
-    const alertClass = side === 'BUY' ? 'success' : 'danger';
-    const sideLabel = side || 'NO TRADE';
-    const formattedSymbol = formatSymbol(symbol);
-
-    let html = `<div class="live-signal-card ${side.toLowerCase()}" data-symbol="${formattedSymbol}" data-side="${side}" data-entry="${entryPrice}" data-sl="${stopLoss}" data-tp="${takeProfit}" data-lot="${recommendedLotSize || 0.01}" data-decision-id="${decisionId}">`;
-    html += `<h5><strong>${sideLabel}</strong> ${formattedSymbol} (${confidence}% confidence)</h5>`;
-    if (side && side !== 'NO_TRADE') {
-      html += `<p>Entry: ${formatPrice(entryPrice)} | SL: ${formatPrice(stopLoss)} | TP: ${formatPrice(takeProfit)}</p>`;
-      html += `<p>Lot: ${recommendedLotSize || 'N/A'}</p>`;
-      html += `<p><small>${reason || ''}</small></p>`;
-      html += `<button class="btn btn-sm btn-primary execute-signal-btn" onclick="window.executeSignalFromCard(this)">`;
-      html += `<i class="fas fa-rocket"></i> Execute Trade</button>`;
-      if (decisionId) {
-        html += `<button class="btn btn-sm btn-outline-info ms-2 explain-signal-btn" onclick="window.openDecisionInspector('${decisionId}')">`;
-        html += `<i class="fas fa-info-circle"></i> Explain</button>`;
-      }
-    }
-    html += `<p class="text-muted small mt-2">${new Date(timestamp).toLocaleString()}</p>`;
-    html += `</div>`;
-    liveSignalPanel.innerHTML = html;
-  }
-
-  function displayFusion(fusion) {
-    if (!fusionPanel) return;
-    const { symbol, verdict, confidence, agreement, timeframeBreakdown, reasons, session } = fusion;
-
-    const verdictClass = verdict === 'bullish' ? 'success' : (verdict === 'bearish' ? 'danger' : 'secondary');
-    const verdictIcon = verdict === 'bullish' ? '📈' : (verdict === 'bearish' ? '📉' : '➖');
-
-    let html = `
-      <div class="row">
-        <div class="col-md-6">
-          <h5>${verdictIcon} ${symbol} – <span class="text-${verdictClass}">${verdict.toUpperCase()}</span> (${confidence}% confidence)</h5>
-          <p>Agreement: ${agreement}% across ${fusion.timeframeCount} timeframes</p>
-          <ul class="list-inline">
-            <li class="list-inline-item"><span class="badge bg-success">Bullish ${timeframeBreakdown.bullish}</span></li>
-            <li class="list-inline-item"><span class="badge bg-danger">Bearish ${timeframeBreakdown.bearish}</span></li>
-            <li class="list-inline-item"><span class="badge bg-secondary">Neutral ${timeframeBreakdown.neutral}</span></li>
-          </ul>
-          <p><small>Session: ${session.name} (multiplier ${session.liquidityMultiplier})</small></p>
-        </div>
-        <div class="col-md-6">
-          <p><strong>Reasons</strong></p>
-          <ul class="small">
-            ${reasons.map(r => `<li>${r}</li>`).join('') || '<li>No detailed reasons</li>'}
-          </ul>
-        </div>
-      </div>
-    `;
-    fusionPanel.innerHTML = html;
-  }
-
-  window.showTimeframeDetails = function(symbol) {
-    console.log('Fetch details for', symbol);
-    alert('Timeframe details will be displayed here (to be implemented).');
-  };
-
-  function displayMarketClosed(data) {
-    if (!liveSignalPanel) return;
-    liveSignalPanel.innerHTML = `
-      <div class="alert alert-warning">
-        <h5><i class="fas fa-hourglass-end"></i> Market Closed</h5>
-        <p>${data.reason}</p>
-        <p><strong>Next open:</strong> ${data.nextOpen ? new Date(data.nextOpen).toLocaleString() : 'Unknown'}</p>
-      </div>
-    `;
-  }
-
-  function displayMetrics(metrics) {
-    if (!metricsPanel) return;
-    const { winRate, profitFactor, sharpe, maxDrawdown, expectancy, totalTrades, dailyPnL, currentDrawdown, timestamp } = metrics;
-    metricsPanel.innerHTML = `
-      <div class="card">
-        <div class="card-body">
-          <h6 class="card-title">Live Performance</h6>
-          <div class="row">
-            <div class="col-6">Win Rate: ${(winRate * 100).toFixed(1)}%</div>
-            <div class="col-6">Profit Factor: ${profitFactor.toFixed(2)}</div>
-          </div>
-          <div class="row">
-            <div class="col-6">Sharpe: ${sharpe.toFixed(2)}</div>
-            <div class="col-6">Max DD: ${(maxDrawdown * 100).toFixed(1)}%</div>
-          </div>
-          <div class="row">
-            <div class="col-6">Expectancy: ${expectancy.toFixed(2)}</div>
-            <div class="col-6">Trades: ${totalTrades}</div>
-          </div>
-          <div class="row">
-            <div class="col-6">Daily P&L: ${dailyPnL.toFixed(2)}</div>
-            <div class="col-6">Current DD: ${(currentDrawdown * 100).toFixed(1)}%</div>
-          </div>
-          <p class="small text-muted mt-2">${new Date(timestamp).toLocaleString()}</p>
-        </div>
-      </div>
-    `;
+    const side = d.decision;
+    const sym = formatSymbol(d.symbol);
+    panel.innerHTML = `<div class="live-signal-card ${side.toLowerCase()}"
+        data-symbol="${sym}"
+        data-side="${side}"
+        data-entry="${d.entryPrice}"
+        data-sl="${d.stopLoss}"
+        data-tp="${d.takeProfit}"
+        data-decision-id="${decisionId}">
+      <h5><strong>${side}</strong> ${sym} (${d.confidence}% confidence)</h5>
+      <p>Entry: ${formatPrice(d.entryPrice)} | SL: ${formatPrice(d.stopLoss)} | TP: ${formatPrice(d.takeProfit)}</p>
+      <p><small>${d.reason || ''}</small></p>
+      <button class="btn btn-sm btn-primary" onclick="window.executeSignalFromCard(this)">
+        <i class="fas fa-rocket"></i> Execute Trade
+      </button>
+      <p class="text-muted small mt-2">${d.timestamp ? new Date(d.timestamp).toLocaleString() : ''}</p>
+    </div>`;
   }
 
   function displayOTIEState(data) {
-    if (!otieContent) return;
-    const { tradeId, symbol, profitR, scores, prediction, stateProbs, bestAction, actions, timestamp } = data;
-
-    let html = `
-      <div class="card mb-2">
-        <div class="card-header">
-          <strong>${symbol} (${tradeId})</strong>
-          <span class="badge bg-info float-end">Profit: ${profitR.toFixed(2)}R</span>
-        </div>
-        <div class="card-body">
-          <div class="row">
-            <div class="col-md-6">
-              <h6>Trade State Probabilities</h6>
-              <ul class="list-unstyled small">
-                ${Object.entries(stateProbs).map(([state, prob]) => `
-                  <li><span class="badge bg-secondary">${state}</span> ${(prob * 100).toFixed(1)}%</li>
-                `).join('')}
-              </ul>
-            </div>
-            <div class="col-md-6">
-              <h6>Continuous Scores</h6>
-              <ul class="list-unstyled small">
-                <li>Health: ${scores.health?.toFixed(0) || 'N/A'}</li>
-                <li>Trend Strength: ${scores.trendStrength?.toFixed(0) || 'N/A'}</li>
-                <li>Momentum: ${scores.momentum?.toFixed(0) || 'N/A'}</li>
-                <li>Liquidity: ${scores.liquidity?.toFixed(0) || 'N/A'}</li>
-                <li>Opportunity: ${scores.opportunity?.toFixed(0) || 'N/A'}</li>
-                <li>Risk: ${scores.risk?.toFixed(0) || 'N/A'}</li>
-                <li>Confidence: ${scores.confidence?.toFixed(0) || 'N/A'}</li>
-              </ul>
-            </div>
-          </div>
-          <div class="row">
-            <div class="col-12">
-              <h6>Prediction</h6>
-              <p class="small">Continuation: ${(prediction.continuationProbability * 100).toFixed(1)}% | Reversal: ${(prediction.reversalProbability * 100).toFixed(1)}% | Confidence: ${prediction.confidence.toFixed(0)}%</p>
-            </div>
-          </div>
-          <div class="row">
-            <div class="col-12">
-              <h6>Best Action: <span class="badge bg-success">${bestAction}</span></h6>
-              <ul class="list-unstyled small">
-                ${(actions || []).map(a => `<li>${a.type}: EV ${a.ev.toFixed(3)} (conf ${a.confidence.toFixed(0)}%)</li>`).join('')}
-              </ul>
-            </div>
-          </div>
-          <p class="text-muted small">${new Date(timestamp).toLocaleString()}</p>
-        </div>
-      </div>
-    `;
-
-    otieContent.innerHTML = html + otieContent.innerHTML;
-    const items = otieContent.querySelectorAll('.card');
-    if (items.length > 10) {
-      items[items.length - 1].remove();
-    }
+    const content = document.getElementById('otieContent');
+    if (!content || !data) return;
+    const div = document.createElement('div');
+    div.className = 'alert alert-info alert-dismissible fade show';
+    div.innerHTML = `<strong>OTIE:</strong> ${data.symbol || '?'} (${data.tradeId || '?'}) — profit ${data.profitR?.toFixed(2) ?? '?'}R, action ${data.bestAction || '?'}
+      <button type="button" class="btn-close" data-bs-dismiss="alert"></button>`;
+    content.prepend(div);
+    setTimeout(() => div.remove(), 8000);
   }
 
   function displayOTIEAction(data) {
-    if (!otieContent) return;
-    const { tradeId, action, details, timestamp } = data;
-    const alertDiv = document.createElement('div');
-    alertDiv.className = 'alert alert-info alert-dismissible fade show';
-    alertDiv.innerHTML = `
-      <strong>Action Executed:</strong> ${action} on trade ${tradeId} - ${details.reason || ''}
-      <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-    `;
-    otieContent.prepend(alertDiv);
-    setTimeout(() => {
-      if (alertDiv) alertDiv.remove();
-    }, 5000);
+    const content = document.getElementById('otieContent');
+    if (!content || !data) return;
+    const div = document.createElement('div');
+    div.className = 'alert alert-warning alert-dismissible fade show';
+    div.innerHTML = `<strong>OTIE Action:</strong> ${data.action} on ${data.tradeId}
+      <button type="button" class="btn-close" data-bs-dismiss="alert"></button>`;
+    content.prepend(div);
+    setTimeout(() => div.remove(), 8000);
   }
 
-  // ---- Update functions for positions and account ----
-  function updatePositions(positions) {
-    console.log('[Live] Positions update:', positions);
-    const badge = document.getElementById('positionCount');
-    if (badge) badge.textContent = positions ? positions.length : 0;
-
-    const container = document.getElementById('openTradesContainer');
-    if (container) {
-      if (!positions || positions.length === 0) {
-        container.innerHTML = '<p class="text-muted">No open trades.</p>';
-        document.getElementById('statOpenTrades').textContent = '0';
-        document.getElementById('statOpenPL').textContent = '—';
-        return;
-      }
-
-      let html = `<table class="table table-striped"><thead><tr>
-        <th>ID</th><th>Pair</th><th>Side</th><th>Open Price</th>
-        <th>Current Price</th><th>Units</th><th>P/L</th><th>Action</th>
-      </tr></thead><tbody>`;
-      let totalPL = 0;
-      for (const t of positions) {
-        const pl = t.unrealizedPL ? parseFloat(t.unrealizedPL).toFixed(2) : '0.00';
-        totalPL += parseFloat(pl) || 0;
-        html += `<tr>
-          <td>${t.id}</td>
-          <td>${t.instrument}</td>
-          <td><span class="badge ${t.side === 'BUY' ? 'bg-success' : 'bg-danger'}">${t.side}</span></td>
-          <td>${formatPrice(t.price)}</td>
-          <td>${formatPrice(t.currentPrice)}</td>
-          <td>${t.units}</td>
-          <td class="${pl >= 0 ? 'text-success' : 'text-danger'}">${pl}</td>
-          <td><button class="btn btn-sm btn-danger" onclick="window.closeTrade('${t.id}')"><i class="fas fa-times"></i> Close</button></td>
-        </tr>`;
-      }
-      html += `<tr><td colspan="6"><strong>Total Unrealized P&L</strong></td>
-               <td class="${totalPL >= 0 ? 'text-success' : 'text-danger'}"><strong>${totalPL.toFixed(2)}</strong></td><td></td></tr>`;
-      html += '</tbody></table>';
-      container.innerHTML = html;
-
-      document.getElementById('statOpenTrades').textContent = positions.length;
-      document.getElementById('statOpenPL').textContent = (totalPL >= 0 ? '+' : '') + totalPL.toFixed(2);
-      document.getElementById('statOpenPL').className = `stat-change ${totalPL >= 0 ? 'positive' : 'negative'}`;
-      if (window.updatePositionBadge) window.updatePositionBadge(positions.length);
-    }
-  }
-
-  function updateAccount(account) {
-    console.log('[Live] Account update:', account);
-    if (!account) return;
-    const balance = typeof account.balance === 'number' ? account.balance : parseFloat(account.balance) || 0;
-    const equity = typeof account.equity === 'number' ? account.equity : parseFloat(account.equity) || 0;
-    const currency = account.currency || 'USD';
-
-    document.getElementById('statBalance').textContent = `${balance} ${currency}`;
-    document.getElementById('statEquity').textContent = `${equity} ${currency}`;
-
-    if (window.updateAccountBadge) {
-      window.updateAccountBadge(account);
-    } else {
-      const idEl = document.getElementById('accountId');
-      const typeEl = document.getElementById('accountTypeLabel');
-      const currencyEl = document.getElementById('accountCurrency');
-      if (idEl) idEl.textContent = account.id || account.login || '—';
-      if (currencyEl) currencyEl.textContent = account.currency || 'USD';
-      if (typeEl) {
-        let type = 'demo';
-        const server = account.server || '';
-        type = server.toLowerCase().includes('demo') ? 'demo' : 'real';
-        typeEl.textContent = type.toUpperCase();
-        typeEl.className = 'account-type ' + type;
-      }
-    }
-  }
-
-  // ---- Execute signal from card ----
-  window.executeSignalFromCard = function(btn) {
-    const card = btn.closest('.live-signal-card');
-    if (!card) return;
-    const symbol = formatSymbol(card.dataset.symbol);
-    const side = card.dataset.side;
-    const entry = parseFloat(card.dataset.entry);
-    const sl = parseFloat(card.dataset.sl) || null;
-    const tp = parseFloat(card.dataset.tp) || null;
-    const lot = parseFloat(card.dataset.lot) || 0.01;
-    // Fill the trade form if available
-    const pairInput = document.getElementById('tradePair');
-    const sideSelect = document.getElementById('tradeSide');
-    const lotInput = document.getElementById('tradeLot');
-    const slInput = document.getElementById('tradeSL');
-    const tpInput = document.getElementById('tradeTP');
-    if (pairInput && sideSelect && lotInput) {
-      pairInput.value = symbol;
-      sideSelect.value = side;
-      lotInput.value = lot;
-      if (slInput) slInput.value = sl;
-      if (tpInput) tpInput.value = tp;
-      // Switch to trading tab
-      const tradingTab = document.querySelector('.sidebar-nav .nav-item[data-section="trading"]');
-      if (tradingTab) tradingTab.click();
-    } else {
-      alert('Trade form not available.');
-    }
-  };
-
-  // ---- Auto‑execute toggle: save state in localStorage ----
-  document.addEventListener('DOMContentLoaded', function() {
-    const toggle = document.getElementById('autoExecuteToggle');
-    if (toggle) {
-      const saved = localStorage.getItem('autoExecuteToggle');
-      if (saved === 'true') toggle.checked = true;
-      toggle.addEventListener('change', function() {
-        localStorage.setItem('autoExecuteToggle', this.checked);
-        console.log('[Live] Auto‑execute toggle:', this.checked ? 'ON' : 'OFF');
-      });
-    }
-  });
-
-  // Start WebSocket connection
   connectWebSocket();
 
-  // Expose reconnect function
-  window.reconnectLive = function() {
+  window.reconnectLive = function () {
     if (ws) ws.close();
     reconnectAttempts = 0;
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     connectWebSocket();
   };
-
 })();
