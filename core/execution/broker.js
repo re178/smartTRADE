@@ -21,6 +21,24 @@
 //         per Deriv's current multiplier workflow example. Targeted test.
 // [FIX 8] Added getSpread(instrument) — required by risk validation and
 //         trade placement. Returns spread in PRICE units (not pips).
+//
+// [CHANGE-1A/1B] placeMarketOrder() now extracts purchasePrice and entrySpot
+//   explicitly (purchasePrice = buy.buy_price ?? buy.price;
+//   entrySpot = buy.entry_spot ?? proposal.spot). The return value carries
+//   both, plus a compat `price` = entry spot (or null).
+// [CHANGE-1C] Broker no longer creates or saves Order documents inside
+//   placeMarketOrder(). orderService.js is the single owner of persistent
+//   order/trade records. In-memory _orders / _orderMap are still used and
+//   are also populated by _loadPendingOrders() and _reconcilePositions().
+//   closeTrade() falls back to a Mongo lookup by contractId if the map is
+//   empty.
+// [CHANGE-5] _normalizeContract() exposes id/contractId (String),
+//   purchasePrice, entryPrice, status: 'OPEN' and a `price` compat alias.
+// [CHANGE-8] placeMarketOrder(instrument, units, sl, tp, options = {}) —
+//   5th arg is options { multiplier }. The multiplier is validated BEFORE
+//   the proposal is sent and rejects invalid values instead of clamping.
+//   orderService.js must call this with { multiplier } for the value to
+//   reach Deriv.
 
 const WebSocket = require('ws');
 const axios = require('axios');
@@ -124,13 +142,13 @@ function isPatToken(token) {
   return typeof token === 'string' && token.startsWith('pat_');
 }
 
-// [FIX 6] Normalise any incoming multiplier to the nearest accepted value.
-// Anything invalid or below 100 → DEFAULT_MULTIPLIER (100).
+// [FIX 6] Legacy helper — retained for callers/tests but no longer used by
+// placeMarketOrder (which now validates and rejects invalid multipliers
+// rather than clamping them). Safe to remove in a future cleanup.
 function normaliseMultiplier(raw) {
   const n = Math.floor(Number(raw));
   if (!Number.isFinite(n) || n <= 0) return DEFAULT_MULTIPLIER;
   if (ACCEPTED_MULTIPLIERS.includes(n)) return n;
-  // Round down to the largest accepted value ≤ n. If n < 100 → default.
   const candidates = ACCEPTED_MULTIPLIERS.filter(v => v <= n);
   return candidates.length > 0 ? candidates[candidates.length - 1] : DEFAULT_MULTIPLIER;
 }
@@ -1112,19 +1130,19 @@ class DerivBroker extends EventEmitter {
       const pending = await Order.find({ status: { $in: ['PENDING', 'ACCEPTED', 'EXECUTING'] } });
       for (const o of pending) {
         this._orders.set(o.clientOrderId, o);
-        if (o.contractId) this._orderMap.set(o.contractId, o.clientOrderId);
+        if (o.contractId) this._orderMap.set(String(o.contractId), o.clientOrderId);
       }
       logger.info(`[DerivBroker] Loaded ${pending.length} pending orders.`);
     } catch (_) {}
   }
   async _updateOrderStatus(clientOrderId, status, contractId = null, txData = null) {
     const update = { status, updatedAt: new Date() };
-    if (contractId) update.contractId = contractId;
+    if (contractId) update.contractId = String(contractId);
     if (status === ORDER_STATUS.FILLED) update.filledAt = new Date();
     if (status === ORDER_STATUS.REJECTED) { update.rejectedAt = new Date(); update.rejectReason = txData?.error?.message || 'Unknown'; }
     await Order.findOneAndUpdate({ clientOrderId }, update, { upsert: true, new: true });
     const o = this._orders.get(clientOrderId);
-    if (o) { Object.assign(o, update); if (contractId) this._orderMap.set(contractId, clientOrderId); }
+    if (o) { Object.assign(o, update); if (contractId) this._orderMap.set(String(contractId), clientOrderId); }
     this.metrics.ordersPlaced++;
     if (status === ORDER_STATUS.FILLED) this.metrics.ordersFilled++;
     if (status === ORDER_STATUS.REJECTED) this.metrics.ordersRejected++;
@@ -1135,23 +1153,31 @@ class DerivBroker extends EventEmitter {
       const positions = await this.getOpenTrades();
       const dbOrders = await Order.find({ status: ORDER_STATUS.FILLED });
       const dbMap = new Map();
-      for (const ord of dbOrders) if (ord.contractId) dbMap.set(ord.contractId, ord);
+      for (const ord of dbOrders) if (ord.contractId) dbMap.set(String(ord.contractId), ord);
       for (const pos of positions) {
-        if (!dbMap.has(pos.id)) {
+        if (!dbMap.has(String(pos.id))) {
+          // Repair a missing record for a contract Deriv reports as open.
+          // orderService is the normal owner; this is the recovery path
+          // (File 2D: reconcile derivative portfolio against MongoDB).
           const newOrder = new Order({
             clientOrderId: generateClientOrderId(),
-            instrument: pos.instrument, side: pos.side, units: pos.units,
-            entryPrice: pos.price, status: ORDER_STATUS.FILLED,
-            contractId: pos.id, filledAt: new Date(pos.openTime || Date.now()),
+            instrument: pos.instrument,
+            side: pos.side,
+            units: pos.units,
+            entryPrice: pos.entryPrice ?? pos.price ?? 0,
+            purchasePrice: pos.purchasePrice ?? null,
+            status: ORDER_STATUS.FILLED,
+            contractId: String(pos.id),
+            filledAt: new Date(pos.openTime || Date.now()),
           });
           await newOrder.save();
           this._orders.set(newOrder.clientOrderId, newOrder);
-          this._orderMap.set(pos.id, newOrder.clientOrderId);
+          this._orderMap.set(String(pos.id), newOrder.clientOrderId);
         }
       }
-      const openIds = new Set(positions.map(p => p.id));
+      const openIds = new Set(positions.map(p => String(p.id)));
       for (const [cid, coid] of this._orderMap) {
-        if (!openIds.has(cid)) {
+        if (!openIds.has(String(cid))) {
           await this._updateOrderStatus(coid, ORDER_STATUS.CLOSED);
           this._orderMap.delete(cid);
         }
@@ -1159,18 +1185,62 @@ class DerivBroker extends EventEmitter {
       this.emit('positions', positions);
     } catch (err) { logger.error('[Reconcile] Failed:', err.message); }
   }
+
+  // [CHANGE-5] Normalise a Deriv contract / portfolio position. Exposes
+  // purchasePrice (amount paid for the contract) and entryPrice (underlying
+  // market entry spot) as distinct, clearly named fields, plus a String
+  // contract ID. `price` is kept as a compatibility alias for callers that
+  // still read it.
   _normalizeContract(c) {
+    const contractId = String(c.contract_id ?? c.id ?? '');
+    const derivSymbol = c.underlying_symbol ?? c.underlying ?? c.symbol;
+
+    const entrySpotRaw = c.entry_spot ?? c.entry_tick ?? c.entry_price;
+    const entrySpotNum = Number(entrySpotRaw);
+    const entryPrice = Number.isFinite(entrySpotNum) && entrySpotNum > 0 ? entrySpotNum : null;
+
+    const purchasePriceRaw = c.buy_price ?? c.purchase_price;
+    const purchasePriceNum = Number(purchasePriceRaw);
+    const purchasePrice = Number.isFinite(purchasePriceNum) && purchasePriceNum > 0
+      ? purchasePriceNum
+      : null;
+
+    const currentSpotRaw = c.current_spot ?? c.current_tick;
+    const currentSpotNum = Number(currentSpotRaw);
+    const currentPrice = Number.isFinite(currentSpotNum) && currentSpotNum > 0
+      ? currentSpotNum
+      : (entryPrice ?? 0);
+
+    let side = 'UNKNOWN';
+    if (c.direction === 'up' || /UP/i.test(c.contract_type || '')) side = 'BUY';
+    else if (c.direction === 'down' || /DOWN/i.test(c.contract_type || '')) side = 'SELL';
+
+    const startRaw = c.start_time ?? c.purchase_time ?? c.date_start;
+    let openTime = Date.now();
+    if (startRaw != null) {
+      if (typeof startRaw === 'number') openTime = startRaw > 1e12 ? startRaw : startRaw * 1000;
+      else {
+        const parsed = new Date(startRaw).getTime();
+        if (Number.isFinite(parsed)) openTime = parsed;
+      }
+    }
+
     return {
-      id: c.contract_id,
-      instrument: fromDerivSymbol(c.underlying_symbol || c.symbol, this.reverseMap) || 'UNKNOWN',
-      side: c.direction === 'up' ? 'BUY' : c.direction === 'down' ? 'SELL' : 'UNKNOWN',
-      price: c.entry_price || 0,
-      units: c.amount || 0,
-      unrealizedPL: c.profit_loss || 0,
-      currentPrice: c.current_spot || c.entry_price || 0,
-      stopLoss: c.stop_loss || 0,
-      takeProfit: c.take_profit || 0,
-      openTime: c.start_time ? c.start_time * 1000 : Date.now(),
+      id: contractId,
+      contractId,
+      instrument: fromDerivSymbol(derivSymbol, this.reverseMap) || 'UNKNOWN',
+      side,
+      purchasePrice,
+      entryPrice,
+      // Compatibility field for existing callers that read `price`.
+      price: entryPrice ?? 0,
+      units: c.amount ?? 0,
+      unrealizedPL: Number(c.profit ?? c.profit_loss ?? 0),
+      currentPrice,
+      stopLoss: Number(c.stop_loss ?? 0),
+      takeProfit: Number(c.take_profit ?? 0),
+      openTime,
+      status: 'OPEN',
       raw: c,
     };
   }
@@ -1254,7 +1324,9 @@ class DerivBroker extends EventEmitter {
     try {
       const resp = await this._sendAuthRequest({ portfolio: 1 });
       const contracts = (resp.portfolio?.contracts) || [];
-      return contracts.filter(c => c.status && ['open', 'active'].includes(c.status.toLowerCase())).map(c => this._normalizeContract(c));
+      return contracts
+        .filter(c => c.status && ['open', 'active'].includes(c.status.toLowerCase()))
+        .map(c => this._normalizeContract(c));
     } catch (err) { logger.error('[DerivBroker] Portfolio fetch failed:', err.message); return []; }
   }
   async getPositions() { return this.getOpenTrades(); }
@@ -1262,24 +1334,42 @@ class DerivBroker extends EventEmitter {
   // ============================================================
   // PLACE MARKET ORDER
   // ============================================================
-  async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null, duration = null, multiplier = null) {
+  // [CHANGE-8] Signature changed: 5th arg is now options { multiplier }.
+  // orderService.js MUST pass { multiplier } here for the requested value
+  // to reach Deriv. The multiplier is validated before any proposal is
+  // sent — invalid values throw instead of being silently clamped.
+  // [CHANGE-1A/1B] Extracts purchasePrice vs entrySpot explicitly and
+  // returns both, plus a compat `price` = entry spot (or null).
+  // [CHANGE-1C] No longer creates/saves an Order document. orderService
+  // owns persistent order/trade records. The `_orders` / `_orderMap`
+  // structures are preserved for close/status flows and are populated by
+  // _loadPendingOrders() and _reconcilePositions().
+  async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null, options = {}) {
     await this._ensureAuthReady();
     if (!this._account || this._account.balance == null) {
       try { await this._ensureBalanceLoaded(); } catch (_) {}
     }
+    const opts = (options && typeof options === 'object') ? options : {};
+
     const amount = Math.abs(Number(units));
     if (!Number.isFinite(amount) || amount <= 0) throw new Error('Order units must be positive.');
     const direction = units > 0 ? 'MULTUP' : 'MULTDOWN';
     const symbol = toDerivSymbol(instrument, this.symbolMap);
     if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
 
-    // [FIX 6] Clamp to Deriv's accepted multiplier set.
-    const finalMultiplier = normaliseMultiplier(multiplier);
-    if (finalMultiplier !== Math.floor(Number(multiplier))) {
-      logger.info(
-        `[DerivBroker] Multiplier adjusted: requested=${multiplier ?? 'null'} → using ${finalMultiplier} ` +
-        `(accepted: ${ACCEPTED_MULTIPLIERS.join(',')})`
-      );
+    // [CHANGE-8] Validate multiplier BEFORE any purchase request.
+    // If not provided → 100 (Deriv's smallest accepted). If provided but
+    // not in the accepted set → reject (do not silently clamp).
+    let finalMultiplier;
+    if (opts.multiplier == null) {
+      finalMultiplier = DEFAULT_MULTIPLIER;
+    } else {
+      finalMultiplier = Math.floor(Number(opts.multiplier));
+      if (!Number.isFinite(finalMultiplier) || !ACCEPTED_MULTIPLIERS.includes(finalMultiplier)) {
+        throw new Error(
+          `Invalid multiplier ${opts.multiplier}. Accepted values: ${ACCEPTED_MULTIPLIERS.join(', ')}`
+        );
+      }
     }
 
     // [FIX 5 / FIX 7] Deriv's current multiplier workflow example sends
@@ -1320,23 +1410,49 @@ class DerivBroker extends EventEmitter {
 
     const buyResp = await this._sendAuthRequest({ buy: proposal.id, price: askPrice });
     const buy = buyResp.buy;
-    if (!buy?.contract_id) throw new Error(`Buy failed: ${JSON.stringify(buyResp)}`);
 
-    const contractId = buy.contract_id;
-    const price = Number(buy.price) || 0;
+    // [CHANGE-1A] Explicit purchase-vs-entry extraction.
+    // purchasePrice = amount paid to Deriv for the contract.
+    // entrySpot     = underlying market's entry spot (may be absent).
+    const contractId = String(buy?.contract_id ?? '');
 
-    const newOrder = new Order({
-      clientOrderId: generateClientOrderId(), instrument,
-      side: units > 0 ? 'BUY' : 'SELL', units: amount,
-      entryPrice: price, status: ORDER_STATUS.FILLED,
-      contractId, filledAt: new Date(),
-    });
-    await newOrder.save();
-    this._orders.set(newOrder.clientOrderId, newOrder);
-    this._orderMap.set(contractId, newOrder.clientOrderId);
+    const purchasePrice = Number(
+      buy?.buy_price ?? buy?.price
+    );
+
+    const entrySpot = Number(
+      buy?.entry_spot ?? proposal.spot
+    );
+
+    if (!contractId || contractId === 'undefined') {
+      throw new Error('Deriv returned no contract ID: ' + JSON.stringify(buyResp));
+    }
+
+    if (!Number.isFinite(purchasePrice) || purchasePrice <= 0) {
+      throw new Error(
+        `Invalid purchase price: ${JSON.stringify(buyResp)}`
+      );
+    }
+
+    // [CHANGE-1C] Do NOT persist an Order here — orderService.js is the
+    // single owner of persistent order/trade records. Broker returns the
+    // confirmed contract details so orderService can record them. If the
+    // DB write fails there, reconciliation against the Deriv portfolio
+    // (see _reconcilePositions / getOpenTrades) will repair the record.
 
     this.getOpenTrades().then(p => this.emit('positions', p)).catch(() => {});
-    return { tradeID: String(contractId), ticket: String(contractId), price, raw: buyResp };
+
+    return {
+      contractId,
+      tradeID: contractId,
+      ticket: contractId,
+      purchasePrice,
+      entryPrice: Number.isFinite(entrySpot) && entrySpot > 0 ? entrySpot : null,
+      // [CHANGE-1B] Compatibility field — previously `buy.price` (ambiguous).
+      // Now the underlying entry spot when available, else null.
+      price: Number.isFinite(entrySpot) && entrySpot > 0 ? entrySpot : null,
+      raw: buyResp,
+    };
   }
 
   // ---------- Close / modify ----------
@@ -1345,8 +1461,31 @@ class DerivBroker extends EventEmitter {
     if (!tradeId) throw new Error('tradeId required');
     const resp = await this._sendAuthRequest({ sell: tradeId, price: 0 });
     if (!resp.sell) throw new Error('Close failed: ' + JSON.stringify(resp));
-    const coid = this._orderMap.get(tradeId);
-    if (coid) { await this._updateOrderStatus(coid, ORDER_STATUS.CLOSED); this._orderMap.delete(tradeId); }
+
+    // [CHANGE-1C] Broker no longer writes Order records on purchase.
+    // Resolve clientOrderId via the in-memory map, falling back to a DB
+    // lookup by contractId (orderService owns the persistent record).
+    // NOTE: The DB lookup requires Order.contractId to be typed as String
+    // (see File 3 / File 4). Until that migration is applied, the lookup
+    // returns null and the CLOSED status is skipped here (the position is
+    // still closed at Deriv — no financial risk).
+    let coid = this._orderMap.get(tradeId);
+    if (!coid) {
+      try {
+        const ord = await Order.findOne({ contractId: String(tradeId) });
+        if (ord) {
+          coid = ord.clientOrderId;
+          this._orderMap.set(tradeId, coid);
+          this._orders.set(coid, ord);
+        }
+      } catch (err) {
+        logger.warn(`[DerivBroker] closeTrade lookup failed for ${tradeId}: ${err.message}`);
+      }
+    }
+    if (coid) {
+      await this._updateOrderStatus(coid, ORDER_STATUS.CLOSED);
+      this._orderMap.delete(tradeId);
+    }
     this.getOpenTrades().then(p => this.emit('positions', p)).catch(() => {});
     return resp;
   }
