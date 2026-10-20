@@ -16,6 +16,24 @@
 // [LIVE-1..7]  proposal_open_contract subscription after buy, per-tick
 //              handling, throttled Trade persistence, startup + reconnect
 //              resume, closeTrade final-state write.
+//
+// [BUGFIX-A]   _subscribeOpenContract and closeTrade now convert the
+//              contract ID to Number() before sending to Deriv. Deriv
+//              rejects string contract_ids with:
+//                InputValidationFailed: contract_id must be an integer
+//              MongoDB storage stays String (opaque identifier); only the
+//              wire payload uses the integer form.
+// [BUGFIX-B]   _handleAuthMessage / _handlePublicMessage now respond to
+//              Deriv's server-initiated pings:
+//                inbound:  { "msg_type": "ping", "ping": "<uuid>" }
+//                outbound: { "pong": "<uuid>" }
+//              Without this, Deriv disconnects the WS every ~60s
+//              ("Auth WS heartbeat timeout" / "Public WS heartbeat timeout").
+// [BUGFIX-C]   _sendAuthRequest / _sendPublicRequest no longer retry
+//              permanent Deriv errors (InputValidationFailed,
+//              AuthorizationRequired, InvalidToken, InvalidSymbol,
+//              ContractCreationFailure, PermissionDenied). Retrying these
+//              wastes quota and delays surfacing the failure.
 
 const WebSocket = require('ws');
 const axios = require('axios');
@@ -118,6 +136,21 @@ function redactSensitive(obj) {
 
 function isPatToken(token) {
   return typeof token === 'string' && token.startsWith('pat_');
+}
+
+// [BUGFIX-C] Identify Deriv API errors that will never succeed on retry.
+// Retrying these wastes API quota and delays surfacing the failure.
+function isPermanentApiError(err) {
+  if (!err || !err.message) return false;
+  const msg = String(err.message);
+  return (
+    msg.includes('InputValidationFailed') ||
+    msg.includes('InvalidSymbol') ||
+    msg.includes('ContractCreationFailure') ||
+    msg.includes('AuthorizationRequired') ||
+    msg.includes('InvalidToken') ||
+    msg.includes('PermissionDenied')
+  );
 }
 
 // ============================================================
@@ -301,7 +334,6 @@ class DerivBroker extends EventEmitter {
       heartbeatTimeout: parseInt(config.heartbeatTimeout || process.env.DERIV_HEARTBEAT_TIMEOUT || 60000),
       balanceTimeout: parseInt(config.balanceTimeout || process.env.DERIV_BALANCE_TIMEOUT || 10000),
       // [LIVE-4] Minimum gap between Trade-document state writes per contract.
-      // Final settlement always writes immediately.
       contractPersistIntervalMs: parseInt(
         config.contractPersistIntervalMs
         || process.env.DERIV_CONTRACT_PERSIST_INTERVAL_MS
@@ -703,6 +735,8 @@ class DerivBroker extends EventEmitter {
         return await this._sendPublicRawRequest(payload, timeoutMs, signal);
       } catch (err) {
         lastErr = err;
+        // [BUGFIX-C] Do not retry permanent Deriv errors.
+        if (isPermanentApiError(err)) break;
         if (attempt < this.config.maxRetries) {
           await sleep(this._getReconnectDelay(attempt));
           if (this._publicState !== STATE.CONNECTED) await this._connectPublic();
@@ -737,6 +771,19 @@ class DerivBroker extends EventEmitter {
     try {
       const msg = JSON.parse(rawData);
       let handled = false;
+
+      // [BUGFIX-B] Deriv sends server-initiated pings we MUST respond to
+      // with a matching pong, otherwise Deriv disconnects us and we get
+      // "Public WS heartbeat timeout" every ~60s.
+      //   inbound:  { "msg_type": "ping", "ping": "<uuid>" }
+      //   outbound: { "pong": "<uuid>" }
+      if (msg.msg_type === 'ping' || (msg.ping && !msg.pong)) {
+        const pongValue = msg.ping != null ? msg.ping : 1;
+        this._sendPublicRaw({ pong: pongValue });
+        this._publicLastPong = Date.now();
+        handled = true;
+      }
+
       if (msg.pong) { this._publicLastPong = Date.now(); handled = true; }
       if (msg.error) logger.error('[In Public] API Error:', JSON.stringify(msg.error));
       if (msg.req_id && this._publicPendingRequests.has(msg.req_id)) {
@@ -910,6 +957,8 @@ class DerivBroker extends EventEmitter {
         return await this._sendAuthRawRequest(payload, timeoutMs, signal);
       } catch (err) {
         lastErr = err;
+        // [BUGFIX-C] Do not retry permanent Deriv errors.
+        if (isPermanentApiError(err)) break;
         if (attempt < this.config.maxRetries) {
           await sleep(this._getReconnectDelay(attempt));
           if (this._authState !== STATE.READY) await this._connectAuth();
@@ -944,6 +993,19 @@ class DerivBroker extends EventEmitter {
     try {
       const msg = JSON.parse(rawData);
       let handled = false;
+
+      // [BUGFIX-B] Deriv sends server-initiated pings we MUST respond to
+      // with a matching pong, otherwise Deriv disconnects us and we get
+      // "Auth WS heartbeat timeout" every ~60s.
+      //   inbound:  { "msg_type": "ping", "ping": "<uuid>" }
+      //   outbound: { "pong": "<uuid>" }
+      if (msg.msg_type === 'ping' || (msg.ping && !msg.pong)) {
+        const pongValue = msg.ping != null ? msg.ping : 1;
+        this._sendAuthRaw({ pong: pongValue });
+        this._authLastPong = Date.now();
+        handled = true;
+      }
+
       if (msg.pong) { this._authLastPong = Date.now(); handled = true; }
       if (msg.error) logger.error('[In Auth] API Error:', JSON.stringify(msg.error));
       if (msg.req_id && this._authPendingRequests.has(msg.req_id)) {
@@ -1083,15 +1145,26 @@ class DerivBroker extends EventEmitter {
   }
 
   // [LIVE-3] Subscribe to proposal_open_contract for a single contract.
+  // [BUGFIX-A] Deriv requires `contract_id` as an INTEGER. We store the ID
+  // as String in MongoDB (correct — opaque identifier), but the wire
+  // payload must be a number.
   async _subscribeOpenContract(contractId) {
     const key = String(contractId);
     if (!key) return;
     if (this._contractSubscriptions.has(key)) return;
 
+    const numericContractId = Number(key);
+    if (!Number.isInteger(numericContractId) || numericContractId <= 0) {
+      logger.warn(
+        `[DerivBroker] Cannot subscribe to contract ${key}: not a valid numeric contract_id`
+      );
+      return;
+    }
+
     const resp = await this._sendAuthRequest(
       {
         proposal_open_contract: 1,
-        contract_id: key,
+        contract_id: numericContractId,
         subscribe: 1,
       },
       this.config.contractSubscribeTimeout
@@ -1592,10 +1665,19 @@ class DerivBroker extends EventEmitter {
   }
 
   // ---------- Close / modify ----------
+  // [BUGFIX-A] The `sell` field requires an INTEGER contract_id, same as
+  // proposal_open_contract. Without this, close would fail with
+  // InputValidationFailed: contract_id must be an integer.
   async closeTrade(tradeId) {
     await this._ensureAuthReady();
     if (!tradeId) throw new Error('tradeId required');
-    const resp = await this._sendAuthRequest({ sell: tradeId, price: 0 });
+
+    const numericTradeId = Number(tradeId);
+    if (!Number.isInteger(numericTradeId) || numericTradeId <= 0) {
+      throw new Error(`Invalid contract ID for close: ${tradeId}`);
+    }
+
+    const resp = await this._sendAuthRequest({ sell: numericTradeId, price: 0 });
     if (!resp.sell) throw new Error('Close failed: ' + JSON.stringify(resp));
 
     // Update Order status
