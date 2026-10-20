@@ -4,12 +4,12 @@
 //
 // [CHANGE-3A] contractId is now a String. Deriv contract IDs are opaque
 //   identifiers, not numeric quantities. Existing documents were written
-//   under the old Number type; a one-off migration (see note in
-//   migration notes) is required. Any code that queries by contractId
-//   should pass String(contractId) for compatibility during the transition.
-// [CHANGE-3B] Added purchasePrice (amount paid for the Deriv contract).
-//   Distinct from openPrice (underlying market entry spot). Multiplier
-//   trades populate it; CFD trades leave it null.
+//   under the old Number type; run the Number→String migration (see
+//   deploy notes) before this schema goes live. All code that queries by
+//   contractId should pass String(contractId) for compatibility.
+// [CHANGE-3B] Added purchasePrice — the amount actually paid to Deriv
+//   for the contract. Distinct from openPrice (the underlying market
+//   entry spot). Populated for Multiplier trades; null for CFD.
 
 const mongoose = require('mongoose');
 
@@ -45,7 +45,7 @@ const TradeSchema = new mongoose.Schema(
     openPrice: {
       type: Number,
       required: true,
-      description: 'Price at which the trade was opened',
+      description: 'Underlying market entry price when the trade was opened',
     },
     closePrice: {
       type: Number,
@@ -89,34 +89,13 @@ const TradeSchema = new mongoose.Schema(
     },
 
     // ---- MT5 extra fields ----
-    stopLoss: {
-      type: Number,
-      default: 0,
-    },
-    takeProfit: {
-      type: Number,
-      default: 0,
-    },
-    swap: {
-      type: Number,
-      default: 0,
-    },
-    commission: {
-      type: Number,
-      default: 0,
-    },
-    margin: {
-      type: Number,
-      default: 0,
-    },
-    magic: {
-      type: Number,
-      default: 0,
-    },
-    comment: {
-      type: String,
-      default: '',
-    },
+    stopLoss: { type: Number, default: 0 },
+    takeProfit: { type: Number, default: 0 },
+    swap: { type: Number, default: 0 },
+    commission: { type: Number, default: 0 },
+    margin: { type: Number, default: 0 },
+    magic: { type: Number, default: 0 },
+    comment: { type: String, default: '' },
     dealId: {
       type: Number,
       default: null,
@@ -161,20 +140,14 @@ const TradeSchema = new mongoose.Schema(
     currentPrice: {
       type: Number,
       default: null,
-      description: 'Last known current price from MT5',
+      description: 'Last known current price from the live contract stream',
     },
 
     // ---- MAE/MFE (optional, for analytics) ----
-    mae: {
-      type: Number,
-      default: 0,
-    },
-    mfe: {
-      type: Number,
-      default: 0,
-    },
+    mae: { type: Number, default: 0 },
+    mfe: { type: Number, default: 0 },
 
-    // ---- NEW fields required by OTIE V5 (kept) ----
+    // ---- OTIE V5 fields ----
     atrAtEntry: {
       type: Number,
       default: null,
@@ -192,37 +165,28 @@ const TradeSchema = new mongoose.Schema(
     },
 
     // =============================================================
-    //  NEW FIELDS FOR MULTIPLIER TRADING
+    //  MULTIPLIER TRADING FIELDS
     // =============================================================
-    // ---- Stake (amount risked) ----
     stake: {
       type: Number,
       default: null,
       description: 'Stake amount in account currency (for Multiplier trades)',
     },
-
-    // ---- Multiplier (leverage) ----
     multiplier: {
       type: Number,
       default: null,
       description: 'Multiplier applied to the stake (for Multiplier trades)',
     },
-
-    // ---- Duration (in seconds) ----
     duration: {
       type: Number,
       default: null,
       description: 'Duration of the Multiplier contract in seconds',
     },
-
-    // ---- Knockout level (stop-loss price) ----
     knockoutLevel: {
       type: Number,
       default: null,
       description: 'Knockout price level (for Multiplier trades)',
     },
-
-    // ---- Take-profit level ----
     takeProfitLevel: {
       type: Number,
       default: null,
@@ -232,8 +196,7 @@ const TradeSchema = new mongoose.Schema(
     // ---- [CHANGE-3B] Contract purchase cost ----
     // Amount paid to Deriv for the contract. Distinct from openPrice,
     // which is the underlying market entry spot. Populated for
-    // Multiplier trades; null for CFD trades (which have no purchase
-    // cost in this sense).
+    // Multiplier trades; null for CFD trades.
     purchasePrice: {
       type: Number,
       default: null,
@@ -243,7 +206,6 @@ const TradeSchema = new mongoose.Schema(
 
     // ---- Entry Thesis (prediction snapshot) ----
     entryThesis: {
-      // Store the prediction that triggered the trade
       direction: { type: String, enum: ['up', 'down', 'neutral'], default: null },
       probability: { type: Number, default: null },
       expectedMove: { type: Number, default: null },
@@ -263,7 +225,6 @@ const TradeSchema = new mongoose.Schema(
 
     // ---- Thesis Monitor State ----
     thesisMonitorState: {
-      // Latest evaluation from thesis monitor
       lastEvaluation: { type: Date, default: null },
       thesisValid: { type: Boolean, default: true },
       reason: { type: String, default: '' },
@@ -280,8 +241,6 @@ TradeSchema.index({ contractId: 1, status: 1 });
 TradeSchema.index({ decisionId: 1 });
 TradeSchema.index({ openTime: -1 });
 TradeSchema.index({ closeTime: -1 });
-
-// ---- NEW INDEXES for Multiplier fields ----
 TradeSchema.index({ stake: 1, multiplier: 1 });
 TradeSchema.index({ knockoutLevel: 1 });
 TradeSchema.index({ 'thesisMonitorState.thesisValid': 1 });
