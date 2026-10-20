@@ -1,6 +1,30 @@
 // core/execution/orderService.js – Order Management with Multiplier Support
 // Skips CFD validation for Multiplier trades.
 // Uses options object for clarity.
+//
+// [CHANGE-2A] contractId / entryPrice / purchasePrice are now resolved
+//   explicitly. entryPrice prefers the broker's confirmed entry spot and
+//   falls back to RTS's currentPrice (approximation, per instruction). The
+//   old ambiguous `price` is kept only as a compat alias = entryPrice.
+// [CHANGE-2B] orderData.filledPrice now stores purchasePrice (amount paid
+//   for the contract), not the entry spot. tradeData.openPrice and
+//   currentPrice store the underlying entryPrice. Added tradeData.purchasePrice
+//   (multiplier only).
+// [CHANGE-2C] Spread is pre-computed with Promise.resolve().then(...).catch(0)
+//   before the analytics call; fixes the ".catch is not a function" error.
+// [CHANGE-2D] Order/Trade save failures are NOT swallowed. They are logged
+//   with the contractId and surfaced via the returned `recording` object
+//   and a `*.recordFailed` event. We do NOT throw on DB failure — the
+//   purchase is already confirmed at Deriv, so the caller must be able to
+//   tell "confirmed but unrecorded" apart from "rejected". Recovery is via
+//   the broker's portfolio reconciliation, not by re-buying.
+// [CHANGE-8] Multiplier is passed to broker.placeMarketOrder(..., { multiplier }).
+//   Removed the deceptive result._multiplier / result._duration mutations.
+//   Validate against Deriv's accepted multiplier set BEFORE the broker call.
+// [SUPPORTING] cancelOrder / closeTrade query with String(contractId) to
+//   survive the Number -> String migration in models/Trade.js and
+//   models/Order.js. Until that migration is applied, existing numeric
+//   contractIds will still match Mongoose's implicit casting.
 
 const { getBroker } = require('./brokerFactory');
 const marketProvider = require('../market/provider');
@@ -16,6 +40,11 @@ const logger = require('../../infrastructure/logger') || console;
 const executionAnalytics = new ExecutionAnalytics({ slippageTolerance: 1 });
 const MIN_CONFIDENCE = 60;
 const MIN_EDGE = 0.2;
+
+// [CHANGE-8] Mirror of the broker's accepted multiplier set. Used for
+// fail-fast validation BEFORE any network call so invalid values never
+// reach Deriv and the caller gets a clear error.
+const ACCEPTED_MULTIPLIERS = [100, 200, 300, 500, 800];
 
 function validateAutoTradeSignal(signal) {
   if (!signal || !signal.side) return { valid: false, reason: 'No valid signal side' };
@@ -40,7 +69,10 @@ function validateAutoTradeSignal(signal) {
  * @param {string} [options.product='deriv_cfd'] - Trading product
  * @param {string} [options.decisionId=null] - Decision ID
  * @param {boolean} [options.autoTrade=false] - Auto-trade flag
- * @returns {Promise<Object>} { contractId, price, raw }
+ * @returns {Promise<Object>} {
+ *   contractId, price, entryPrice, purchasePrice, raw,
+ *   recording: { order: {ok, error?}, trade: {ok, error?} }
+ * }
  */
 async function placeMarketOrder(options) {
   const {
@@ -82,8 +114,15 @@ async function placeMarketOrder(options) {
       throw new Error(validation.message);
     }
   } else {
-    // Multiplier validation
-    if (!multiplier || multiplier < 1) throw new Error('Multiplier must be at least 1');
+    // [CHANGE-8] Multiplier validation — fail fast before any network call.
+    // The broker re-validates; this is for a clearer error and to avoid
+    // a wasted round-trip.
+    const normalizedMultiplier = Math.floor(Number(multiplier));
+    if (!Number.isFinite(normalizedMultiplier) || !ACCEPTED_MULTIPLIERS.includes(normalizedMultiplier)) {
+      throw new Error(
+        `Multiplier must be one of: ${ACCEPTED_MULTIPLIERS.join(', ')} (got ${multiplier})`
+      );
+    }
     if (!duration || duration < 10) throw new Error('Duration must be at least 10 seconds');
     if (stake <= 0) throw new Error('Stake must be positive');
     if (knockoutLevel !== null && knockoutLevel !== undefined) {
@@ -149,19 +188,69 @@ async function placeMarketOrder(options) {
     const units = side.toUpperCase() === 'BUY' ? lotSize : -lotSize;
     result = await broker.placeMarketOrder(instrument, units, stopLoss || null, takeProfit || null);
   } else {
-    // Multiplier: pass stake as units (broker expects amount = Math.abs(units))
+    // [CHANGE-8] Multiplier: pass stake as units AND pass the selected
+    // multiplier as the 5th (options) argument. The broker validates and
+    // sends this value to Deriv — no more result._multiplier illusion.
     const units = side.toUpperCase() === 'BUY' ? stake : -stake;
-    result = await broker.placeMarketOrder(instrument, units, knockoutLevel || null, takeProfitLevel || null);
-    result._multiplier = multiplier;
-    result._duration = duration;
+    result = await broker.placeMarketOrder(
+      instrument,
+      units,
+      knockoutLevel || null,
+      takeProfitLevel || null,
+      { multiplier: Math.floor(Number(multiplier)) }
+    );
   }
 
   const latency = Date.now() - startTime;
-  const contractId = result.tradeID || result.id || result.ticket || null;
-  const price = result.price || result.averagePrice || null;
-  if (!contractId) throw new Error('Broker did not return a trade ID');
+
+  // ---- [CHANGE-2A] Resolve contractId / entryPrice / purchasePrice ----
+  const contractId = String(
+    result.contractId ?? result.tradeID ?? result.id ?? result.ticket ?? ''
+  );
+
+  if (!contractId) {
+    // Broker should have thrown already; defensive only.
+    const err = new Error('Broker did not return a contract ID');
+    err.executionConfirmed = false;
+    throw err;
+  }
+
+  // entryPrice: broker's confirmed entry spot, else RTS approximation.
+  // If BOTH are missing we cannot write a meaningful openPrice. Because
+  // the purchase has already been confirmed by the broker at this point,
+  // we tag the error so the controller (File 6) can distinguish
+  // "rejected" from "confirmed but unpriceable".
+  const entryPriceRaw = Number(result.entryPrice ?? currentPrice);
+  if (!Number.isFinite(entryPriceRaw) || entryPriceRaw <= 0) {
+    const err = new Error(
+      `Execution confirmed for contract ${contractId} but no valid entry spot ` +
+      `(broker entryPrice=${JSON.stringify(result.entryPrice)}, RTS currentPrice=${JSON.stringify(currentPrice)}). ` +
+      `The contract is live at Deriv; repair the record via reconciliation, do NOT retry the purchase.`
+    );
+    err.contractId = contractId;
+    err.executionConfirmed = true;
+    throw err;
+  }
+  const entryPrice = entryPriceRaw;
+
+  // purchasePrice: amount paid for the contract. Broker validates it for
+  // multipliers. For CFDs there's no purchase cost, so fall back to the
+  // market entry price so orderData.filledPrice stays meaningful.
+  let purchasePrice = Number(
+    result.purchasePrice
+    ?? result.raw?.buy?.buy_price
+    ?? (isMultiplier ? stake : (result.price ?? currentPrice))
+  );
+  if (!Number.isFinite(purchasePrice) || purchasePrice <= 0) {
+    logger.warn(
+      `[orderService] Broker returned invalid purchasePrice for contract ${contractId}; ` +
+      `falling back to ${isMultiplier ? 'stake' : 'entryPrice'}=${isMultiplier ? stake : entryPrice}`
+    );
+    purchasePrice = Number(isMultiplier ? stake : entryPrice);
+  }
 
   // ---- Save Order ----
+  // [CHANGE-2B] filledPrice = purchasePrice (amount paid), not entry spot.
   const orderData = {
     contractId,
     instrument,
@@ -173,7 +262,7 @@ async function placeMarketOrder(options) {
     takeProfit: isCFD ? takeProfit : takeProfitLevel,
     status: 'FILLED',
     product,
-    filledPrice: price,
+    filledPrice: purchasePrice,
     placedAt: new Date(),
     // Multiplier fields
     stake: isMultiplier ? stake : null,
@@ -182,27 +271,48 @@ async function placeMarketOrder(options) {
     knockoutLevel: isMultiplier ? knockoutLevel : null,
     takeProfitLevel: isMultiplier ? takeProfitLevel : null,
   };
+
+  // [CHANGE-2D] Do NOT swallow failures. Track them, log with contractId,
+  // emit an event so monitoring/reconciliation can pick up the gap, and
+  // let the caller see the partial success. Never throw here — the buy is
+  // already confirmed at Deriv; a retry would create a second contract.
+  let orderSaveError = null;
   try {
     const order = new Order(orderData);
     await order.save();
   } catch (err) {
-    logger.error(`[orderService] Failed to save Order: ${err.message}`);
+    orderSaveError = err;
+    logger.error(
+      `[orderService] EXECUTION CONFIRMED but ORDER RECORD FAILED for contractId=${contractId}: ${err.message}`
+    );
+    try {
+      eventBus.emit('order.recordFailed', {
+        contractId,
+        instrument,
+        orderData,
+        error: err.message,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (_) { /* event bus must never break the trade path */ }
   }
 
   // ---- Save Trade ----
+  // [CHANGE-2B] openPrice / currentPrice = entryPrice (underlying market).
+  // [CHANGE-3]  purchasePrice stored separately (multiplier only).
   let trade = null;
+  let tradeSaveError = null;
   try {
     const tradeData = {
       contractId,
       instrument,
       side: side.toLowerCase(),
       lotSize: isCFD ? lotSize : stake,
-      openPrice: price,
+      openPrice: entryPrice,
       status: 'OPEN',
       openTime: new Date(),
       product,
       decisionId: decisionId || null,
-      currentPrice: price,
+      currentPrice: entryPrice,
       floatingProfit: 0,
       atrAtEntry: null,
       riskAmount: null,
@@ -213,23 +323,40 @@ async function placeMarketOrder(options) {
       duration: isMultiplier ? duration : null,
       knockoutLevel: isMultiplier ? knockoutLevel : null,
       takeProfitLevel: isMultiplier ? takeProfitLevel : null,
+      purchasePrice: isMultiplier ? purchasePrice : null,
     };
     trade = new Trade(tradeData);
     await trade.save();
     logger.info(`[orderService] Trade created (OPEN) for ${contractId}`);
   } catch (err) {
-    logger.error(`[orderService] Failed to create Trade: ${err.message}`);
+    tradeSaveError = err;
+    logger.error(
+      `[orderService] EXECUTION CONFIRMED but TRADE RECORD FAILED for contractId=${contractId}: ${err.message}`
+    );
+    try {
+      eventBus.emit('trade.recordFailed', {
+        contractId,
+        instrument,
+        error: err.message,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (_) { /* event bus must never break the trade path */ }
   }
+
+  // ---- [CHANGE-2C] Pre-compute spread safely ----
+  const spread = await Promise.resolve()
+    .then(() => broker.getSpread(instrument))
+    .catch(() => 0);
 
   // ---- Analytics & Events ----
   executionAnalytics.recordExecution({
     orderId: contractId,
     instrument,
     side,
-    requestedPrice: price,
-    filledPrice: price,
+    requestedPrice: currentPrice,
+    filledPrice: entryPrice,
     latency,
-    spread: await broker.getSpread(instrument).catch(() => 0),
+    spread,
     status: 'FILLED',
     ticket: contractId,
     broker: product,
@@ -239,10 +366,17 @@ async function placeMarketOrder(options) {
     instrument,
     side,
     contractId,
-    price,
+    // [CHANGE-2A] `price` kept as compat alias = entryPrice.
+    price: entryPrice,
+    entryPrice,
+    purchasePrice,
     decisionId,
     timestamp: new Date().toISOString(),
     isMultiplier,
+    recording: {
+      order: orderSaveError ? { ok: false, error: orderSaveError.message } : { ok: true },
+      trade: tradeSaveError ? { ok: false, error: tradeSaveError.message } : { ok: true },
+    },
   };
   if (isCFD) {
     eventPayload.lotSize = lotSize;
@@ -256,7 +390,7 @@ async function placeMarketOrder(options) {
     eventPayload.takeProfitLevel = takeProfitLevel;
   }
   eventBus.emit('order.placed', eventPayload);
-  eventBus.emit('trade.placed', { instrument, side, contractId, price });
+  eventBus.emit('trade.placed', { instrument, side, contractId, price: entryPrice });
 
   if (decisionId) {
     try {
@@ -272,18 +406,37 @@ async function placeMarketOrder(options) {
     }
   }
 
-  return { contractId, price, raw: result };
+  // [CHANGE-2A/2D] Return shape:
+  //   contractId       — confirmed Deriv contract ID (String)
+  //   price            — compat alias = entryPrice
+  //   entryPrice       — underlying market entry spot
+  //   purchasePrice    — amount paid for the contract
+  //   raw              — broker response
+  //   recording        — per-record write outcome, so the controller can
+  //                      show "placed but not recorded" instead of "failed"
+  return {
+    contractId,
+    price: entryPrice,
+    entryPrice,
+    purchasePrice,
+    raw: result,
+    recording: {
+      order: orderSaveError ? { ok: false, error: orderSaveError.message } : { ok: true },
+      trade: tradeSaveError ? { ok: false, error: tradeSaveError.message } : { ok: true },
+    },
+  };
 }
 
-// ---- Other functions (unchanged) ----
+// ---- Other functions (unchanged unless noted) ----
 async function cancelOrder(contractId, product) {
   if (!contractId) throw new Error('contractId is required');
   const broker = getBroker(product);
   if (!broker.capabilities?.supportsCancel) throw new Error('Broker does not support cancelling pending orders');
   if (!broker.isConnected()) await broker.connect();
   const result = await broker.cancelOrder(contractId);
+  // [SUPPORTING] String() to survive the Number -> String migration.
   await Order.findOneAndUpdate(
-    { contractId },
+    { contractId: String(contractId) },
     { status: 'CANCELLED', updatedAt: new Date() },
     { upsert: false }
   );
@@ -299,7 +452,8 @@ async function closeTrade(contractId, product) {
   const result = await broker.closeTrade(contractId);
 
   try {
-    const closedTrade = await Trade.findOne({ contractId });
+    // [SUPPORTING] String() to survive the Number -> String migration.
+    const closedTrade = await Trade.findOne({ contractId: String(contractId) });
     if (closedTrade && closedTrade.decisionId) {
       await selfLearner.updateDecisionOutcome(closedTrade.decisionId, closedTrade);
     }
