@@ -2,6 +2,21 @@
 // Updated to accept stake, multiplier, duration, knockoutLevel, takeProfitLevel.
 // Falls back to legacy lotSize/stopLoss for backward compatibility.
 // Calls orderService.placeMarketOrder with options object.
+//
+// [CHANGE-6] Order-entry endpoints now distinguish three outcomes:
+//   * FILLED                      — purchase confirmed AND DB record saved
+//   * CONFIRMED_RECORD_FAILED     — purchase confirmed at Deriv but the
+//                                   Order/Trade record could not be written
+//                                   (returned HTTP 200 with contractId and
+//                                   warning; do NOT retry)
+//   * REJECTED / BROKER_ERROR     — no confirmed purchase; validation vs
+//                                   unknown-error paths are distinguished
+//                                   so the UI does not treat a broker error
+//                                   as an ordinary rejection.
+//   A confirmed purchase is never reported as `success: false`.
+//   All endpoints include the confirmed contractId at the top level when
+//   it is known. Queries by contractId use String(...) for consistency
+//   with the models/Trade.js migration.
 
 const Trade = require('../models/Trade');
 const Order = require('../models/Order');
@@ -48,7 +63,6 @@ async function getPerformanceLearner() {
 
 // ---------- Helper to get product from request ----------
 function getProduct(req) {
-  // If user has a preference, use it; otherwise default to deriv_cfd
   if (req.user && req.user.tradingProduct) {
     return req.user.tradingProduct;
   }
@@ -71,13 +85,105 @@ function enhanceAccount(accountData, broker) {
   };
 }
 
+// ================================================================
+//  [CHANGE-6] Shared order-outcome helpers
+// ================================================================
+// Known pre-purchase validation errors thrown by orderService before any
+// broker call. Matching these is safe: no purchase can have occurred, so a
+// retry (after fixing the input) is safe.
+const PRE_PURCHASE_VALIDATION_PATTERNS = [
+  /^Multiplier must be/,
+  /^Duration must be/,
+  /^Stake must be/,
+  /^Knockout must be/,
+  /^Take profit must be/,
+  /^Portfolio risk rejection/,
+  /^Auto[- ]trade rejected/,
+  /^Either stake/,
+  /^Order units must be/,
+  /^Unknown instrument/,
+  /^Invalid multiplier/,
+];
+
+// Classify the *result* of a successful orderService call. Returns 'FILLED'
+// when both Order and Trade were saved, otherwise 'CONFIRMED_RECORD_FAILED'.
+function classifyOrderOutcome(orderResult) {
+  const rec = orderResult && orderResult.recording;
+  if (!rec) return 'FILLED';
+  const orderOk = !rec.order || rec.order.ok !== false;
+  const tradeOk = !rec.trade || rec.trade.ok !== false;
+  return (orderOk && tradeOk) ? 'FILLED' : 'CONFIRMED_RECORD_FAILED';
+}
+
+// Response for a confirmed purchase whose DB record could not be written.
+// HTTP 200 so any frontend "success" check passes; the payload makes the
+// failure explicit so the UI can surface it without encouraging a retry.
+function respondConfirmedButUnrecorded(res, contractId, details, reason) {
+  logger.warn(
+    `[controllers] Purchase CONFIRMED for contract ${contractId || '<unknown>'} but not recorded: ${reason}`
+  );
+  return res.status(200).json({
+    success: true,
+    status: 'CONFIRMED_RECORD_FAILED',
+    contractId: contractId ? String(contractId) : null,
+    ...details,
+    warning:
+      'Deriv confirmed the purchase. The database record could not be written. ' +
+      'DO NOT retry — the broker will reconcile this contract against its portfolio. ' +
+      'Verify open positions before taking any further action.',
+  });
+}
+
+// Central error handler for all order-entry endpoints.
+// Distinguishes:
+//   * confirmed-but-unrecorded (err.executionConfirmed / err.contractId)
+//   * pre-purchase validation rejections (safe to retry)
+//   * unknown broker errors (may or may not have purchased)
+function handleOrderError(res, error, logTag) {
+  logger.error(`[${logTag}] Error:`, error.message);
+
+  // Case 1: purchase confirmed but the record could not be written.
+  if (error.executionConfirmed === true || error.contractId) {
+    return respondConfirmedButUnrecorded(
+      res,
+      error.contractId || null,
+      {},
+      error.message
+    );
+  }
+
+  // Case 2: known pre-purchase validation errors — safe to retry after fix.
+  const isValidation = PRE_PURCHASE_VALIDATION_PATTERNS.some(
+    (re) => re.test(error.message || '')
+  );
+  if (isValidation) {
+    return res.status(400).json({
+      success: false,
+      status: 'REJECTED',
+      error: error.message,
+      canRetry: true,
+    });
+  }
+
+  // Case 3: unknown broker error. We cannot know whether a purchase went
+  // through, so we MUST NOT report this as an ordinary rejection.
+  return res.status(500).json({
+    success: false,
+    status: 'BROKER_ERROR',
+    error: error.message,
+    canRetry: false,
+    warning:
+      'The broker returned an error during execution. The purchase may or may not have gone through. ' +
+      'Check open positions before retrying.',
+  });
+}
+
 // ---------- User Preferences ----------
 exports.getPreferences = async (req, res) => {
   try {
     const userId = req.user?.id || 'admin';
     let user = await User.findOne({ userId });
     if (!user) {
-      // Default to deriv_cfd
       user = new User({ userId, tradingProduct: 'deriv_cfd' });
       await user.save();
     }
@@ -117,7 +223,6 @@ exports.getAccount = async (req, res) => {
     const product = getProduct(req);
     const account = await accountService.getAccount(product);
 
-    // Enhance with tradeMode and server from broker's internal state
     let enhanced = account;
     try {
       const broker = getBroker(product);
@@ -225,12 +330,15 @@ exports.getTrades = async (req, res) => {
     const product = getProduct(req);
     const broker = getBroker(product);
     const rawTrades = await broker.getOpenTrades();
-    // Normalise to frontend format
+    // [CHANGE-6-H] Additive fields entryPrice / purchasePrice from the new
+    // _normalizeContract shape. `price` kept as compat alias = entryPrice.
     const trades = rawTrades.map(t => ({
       id: t.id,
       instrument: t.instrument,
       side: t.side,
       price: t.price,
+      entryPrice: t.entryPrice ?? null,
+      purchasePrice: t.purchasePrice ?? null,
       currentPrice: t.currentPrice,
       units: t.units,
       unrealizedPL: t.unrealizedPL,
@@ -294,16 +402,15 @@ exports.getPendingOrders = async (req, res) => {
 
 // ================================================================
 //  PLACE ORDER – Multiplier-aware, uses orderService options
+//  [CHANGE-6] Outcome-aware response shape.
 // ================================================================
 exports.placeOrder = async (req, res) => {
   const {
     pair,
     side,
-    // Legacy CFD fields
     lotSize,
     stopLoss,
     takeProfit,
-    // New Multiplier fields
     stake,
     multiplier,
     duration,
@@ -316,18 +423,21 @@ exports.placeOrder = async (req, res) => {
     const product = overrideProduct || getProduct(req);
     const instrument = pair.toUpperCase();
 
-    // Determine trade type
     const isMultiplier = stake !== undefined && stake !== null && stake > 0;
     const isCFD = lotSize !== undefined && lotSize !== null && lotSize > 0;
 
     if (!isMultiplier && !isCFD) {
-      return res.status(400).json({ error: 'Either stake (Multiplier) or lotSize (CFD) must be provided.' });
+      return res.status(400).json({
+        success: false,
+        status: 'REJECTED',
+        error: 'Either stake (Multiplier) or lotSize (CFD) must be provided.',
+        canRetry: true,
+      });
     }
 
     let orderResult;
 
     if (isMultiplier) {
-      // ---- Multiplier trade ----
       orderResult = await orderService.placeMarketOrder({
         instrument,
         side,
@@ -339,8 +449,6 @@ exports.placeOrder = async (req, res) => {
         product,
       });
     } else {
-      // ---- CFD trade (legacy) ----
-      // Validate CFD parameters (this will use the validator)
       const currentPrice = await marketProvider.getCurrentPrice(instrument, product);
       const validation = validateOrderInput({
         pair: instrument,
@@ -351,10 +459,14 @@ exports.placeOrder = async (req, res) => {
         currentPrice,
       });
       if (!validation.valid) {
-        return res.status(400).json({ error: validation.message });
+        return res.status(400).json({
+          success: false,
+          status: 'REJECTED',
+          error: validation.message,
+          canRetry: true,
+        });
       }
 
-      // Portfolio risk check for CFD
       const broker = getBroker(product);
       const account = await broker.getAccount();
       const currentPositions = await broker.getOpenTrades();
@@ -370,7 +482,12 @@ exports.placeOrder = async (req, res) => {
 
       const approval = await portfolioManager.canOpenTrade(signal, parseFloat(account.balance), currentPositions);
       if (!approval.allowed) {
-        return res.status(400).json({ error: approval.reason });
+        return res.status(400).json({
+          success: false,
+          status: 'REJECTED',
+          error: approval.reason,
+          canRetry: true,
+        });
       }
 
       orderResult = await orderService.placeMarketOrder({
@@ -383,21 +500,59 @@ exports.placeOrder = async (req, res) => {
       });
     }
 
-    // ---- Common post-order steps ----
-    const trade = await Trade.findOne({ contractId: orderResult.contractId });
+    // ---- [CHANGE-6] Outcome-aware response ----
+    const contractId = String(orderResult.contractId);
+    const outcome = classifyOrderOutcome(orderResult);
+
+    // Confirmed but not recorded: never report as failure, never drop the
+    // contractId. The broker will repair the record via reconciliation.
+    if (outcome === 'CONFIRMED_RECORD_FAILED') {
+      return respondConfirmedButUnrecorded(
+        res,
+        contractId,
+        {
+          entryPrice: orderResult.entryPrice,
+          purchasePrice: orderResult.purchasePrice,
+          recording: orderResult.recording,
+          raw: orderResult,
+        },
+        (orderResult.recording?.order?.error || orderResult.recording?.trade?.error || 'unknown')
+      );
+    }
+
+    // Normal path — Trade should exist.
+    // [CHANGE-6-G] String() for cross-model consistency with the schema migration.
+    const trade = await Trade.findOne({ contractId: String(contractId) });
     if (!trade) {
-      logger.warn(`[placeOrder] Trade not found by contractId ${orderResult.contractId}`);
-      return res.json({ success: true, raw: orderResult, trade: null });
+      logger.warn(
+        `[placeOrder] Purchase confirmed for ${contractId} but no Trade document found; ` +
+        `returning contractId so the UI can track it.`
+      );
+      return res.status(200).json({
+        success: true,
+        status: 'CONFIRMED_RECORD_MISSING',
+        contractId,
+        trade: null,
+        raw: orderResult,
+        warning: 'Purchase confirmed but the Trade record is not yet visible. It should appear after reconciliation.',
+      });
     }
 
     const broker = getBroker(product);
     const account = await broker.getAccount();
     notifyTrade('OPENED', trade, account).catch(err => logger.error('[Notification] Error:', err.message));
 
-    res.json({ success: true, trade, raw: orderResult });
+    return res.status(200).json({
+      success: true,
+      status: 'FILLED',
+      contractId,
+      entryPrice: orderResult.entryPrice,
+      purchasePrice: orderResult.purchasePrice,
+      trade,
+      raw: orderResult,
+    });
   } catch (error) {
-    logger.error('[placeOrder] Error:', error.message);
-    res.status(500).json({ error: error.message });
+    return handleOrderError(res, error, 'placeOrder');
   }
 };
 
@@ -408,8 +563,7 @@ exports.closeTrade = async (req, res) => {
   try {
     const product = getProduct(req);
     const result = await orderService.closeTrade(tradeId, product);
-    
-    // Broadcast updated positions and account
+
     try {
       const openTrades = await orderService.getOpenTrades(product);
       broadcastToDashboards('positions', openTrades);
@@ -422,7 +576,8 @@ exports.closeTrade = async (req, res) => {
     }
 
     portfolioManager.updateDailyPnL(result.pl || 0);
-    const updated = await Trade.findOne({ contractId: tradeId });
+    // [CHANGE-6-G] String() for cross-model consistency.
+    const updated = await Trade.findOne({ contractId: String(tradeId) });
     if (updated) {
       const broker = getBroker(product);
       const account = await broker.getAccount();
@@ -434,7 +589,7 @@ exports.closeTrade = async (req, res) => {
         logger.warn('[PerformanceLearner] Failed to record trade:', err.message);
       }
     }
-    res.json({ success: true, result });
+    res.json({ success: true, contractId: String(tradeId), result });
   } catch (error) {
     logger.error('[closeTrade] Error:', error.message);
     res.status(500).json({ error: error.message });
@@ -480,6 +635,7 @@ exports.getSignal = async (req, res) => {
 };
 
 // ---------- Auto Trade (Multiplier-aware) ----------
+// [CHANGE-6] Outcome-aware response shape.
 exports.autoTrade = async (req, res) => {
   const { pair, riskPercent = 1, strategy = 'sma', ...params } = req.body;
   if (!pair) return res.status(400).json({ error: 'pair required' });
@@ -488,17 +644,14 @@ exports.autoTrade = async (req, res) => {
     const instrument = pair.toUpperCase();
 
     const signal = await strategyEngine.generateSignal(instrument, strategy, { ...params, product });
-    if (!signal) return res.json({ success: false, message: 'No trading signal' });
+    if (!signal) return res.json({ success: false, status: 'NO_SIGNAL', message: 'No trading signal' });
 
     const currentPrice = signal.entryPrice;
-
-    // Determine if we should use Multiplier mode (if stake, multiplier, duration provided)
     const { stake, multiplier, duration, knockoutLevel, takeProfitLevel } = req.body;
     const isMultiplier = stake !== undefined && stake !== null && stake > 0;
 
     let orderResult;
     if (isMultiplier) {
-      // Multiplier auto-trade
       orderResult = await orderService.placeMarketOrder({
         instrument,
         side: signal.side,
@@ -512,7 +665,6 @@ exports.autoTrade = async (req, res) => {
         autoTrade: true,
       });
     } else {
-      // CFD auto-trade (legacy)
       const validation = validateOrderInput({
         pair: instrument,
         side: signal.side,
@@ -522,7 +674,12 @@ exports.autoTrade = async (req, res) => {
         currentPrice,
       });
       if (!validation.valid) {
-        return res.json({ success: false, message: validation.message });
+        return res.status(400).json({
+          success: false,
+          status: 'REJECTED',
+          error: validation.message,
+          canRetry: true,
+        });
       }
 
       const broker = getBroker(product);
@@ -530,7 +687,14 @@ exports.autoTrade = async (req, res) => {
       const currentPositions = await broker.getOpenTrades();
 
       const approval = await portfolioManager.canOpenTrade(signal, parseFloat(account.balance), currentPositions);
-      if (!approval.allowed) return res.json({ success: false, message: approval.reason });
+      if (!approval.allowed) {
+        return res.status(400).json({
+          success: false,
+          status: 'REJECTED',
+          error: approval.reason,
+          canRetry: true,
+        });
+      }
 
       let lotSize = signal.recommendedLotSize;
       if (!lotSize) {
@@ -549,24 +713,56 @@ exports.autoTrade = async (req, res) => {
       });
     }
 
-    const trade = await Trade.findOne({ contractId: orderResult.contractId });
+    const contractId = String(orderResult.contractId);
+    const outcome = classifyOrderOutcome(orderResult);
+
+    if (outcome === 'CONFIRMED_RECORD_FAILED') {
+      return respondConfirmedButUnrecorded(
+        res,
+        contractId,
+        {
+          signal,
+          entryPrice: orderResult.entryPrice,
+          purchasePrice: orderResult.purchasePrice,
+          recording: orderResult.recording,
+          raw: orderResult,
+        },
+        (orderResult.recording?.order?.error || orderResult.recording?.trade?.error || 'unknown')
+      );
+    }
+
+    const trade = await Trade.findOne({ contractId: String(contractId) });
     if (!trade) {
-      logger.warn(`[autoTrade] Trade not found by contractId ${orderResult.contractId}`);
-      return res.json({ success: true, raw: orderResult, trade: null });
+      logger.warn(`[autoTrade] Purchase confirmed for ${contractId} but no Trade document found; returning contractId.`);
+      return res.status(200).json({
+        success: true,
+        status: 'CONFIRMED_RECORD_MISSING',
+        contractId,
+        signal,
+        trade: null,
+        raw: orderResult,
+      });
     }
 
     const broker = getBroker(product);
     const account = await broker.getAccount();
     notifyTrade('OPENED', trade, account).catch(err => logger.error('[Notification] Error:', err.message));
 
-    res.json({ success: true, signal, trade, raw: orderResult });
+    return res.status(200).json({
+      success: true,
+      status: 'FILLED',
+      contractId,
+      signal,
+      trade,
+      raw: orderResult,
+    });
   } catch (error) {
-    logger.error('[autoTrade] Error:', error.message);
-    res.status(500).json({ error: error.message });
+    return handleOrderError(res, error, 'autoTrade');
   }
 };
 
 // ---------- Execute Live Signal (Multiplier-aware) ----------
+// [CHANGE-6] Outcome-aware response shape.
 exports.executeSignal = async (req, res) => {
   const {
     pair,
@@ -597,12 +793,10 @@ exports.executeSignal = async (req, res) => {
     const instrument = formattedPair;
 
     const currentPrice = entryPrice || await marketProvider.getCurrentPrice(instrument, product);
-
     const isMultiplier = stake !== undefined && stake !== null && stake > 0;
 
     let orderResult;
     if (isMultiplier) {
-      // Multiplier signal execution
       orderResult = await orderService.placeMarketOrder({
         instrument,
         side: cleanSide,
@@ -614,9 +808,13 @@ exports.executeSignal = async (req, res) => {
         product,
       });
     } else {
-      // CFD signal execution (legacy)
       if (!lotSize || lotSize <= 0) {
-        return res.status(400).json({ error: 'lotSize is required for CFD trade' });
+        return res.status(400).json({
+          success: false,
+          status: 'REJECTED',
+          error: 'lotSize is required for CFD trade',
+          canRetry: true,
+        });
       }
 
       const validation = validateOrderInput({
@@ -628,7 +826,12 @@ exports.executeSignal = async (req, res) => {
         currentPrice,
       });
       if (!validation.valid) {
-        return res.status(400).json({ error: validation.message });
+        return res.status(400).json({
+          success: false,
+          status: 'REJECTED',
+          error: validation.message,
+          canRetry: true,
+        });
       }
 
       orderResult = await orderService.placeMarketOrder({
@@ -641,20 +844,50 @@ exports.executeSignal = async (req, res) => {
       });
     }
 
-    const trade = await Trade.findOne({ contractId: orderResult.contractId });
+    const contractId = String(orderResult.contractId);
+    const outcome = classifyOrderOutcome(orderResult);
+
+    if (outcome === 'CONFIRMED_RECORD_FAILED') {
+      return respondConfirmedButUnrecorded(
+        res,
+        contractId,
+        {
+          entryPrice: orderResult.entryPrice,
+          purchasePrice: orderResult.purchasePrice,
+          recording: orderResult.recording,
+          raw: orderResult,
+        },
+        (orderResult.recording?.order?.error || orderResult.recording?.trade?.error || 'unknown')
+      );
+    }
+
+    const trade = await Trade.findOne({ contractId: String(contractId) });
     if (!trade) {
-      logger.warn(`[executeSignal] Trade not found for contractId: ${orderResult.contractId}`);
-      return res.json({ success: true, raw: orderResult, trade: null });
+      logger.warn(`[executeSignal] Purchase confirmed for ${contractId} but no Trade document found; returning contractId.`);
+      return res.status(200).json({
+        success: true,
+        status: 'CONFIRMED_RECORD_MISSING',
+        contractId,
+        trade: null,
+        raw: orderResult,
+      });
     }
 
     const broker = getBroker(product);
     const account = await broker.getAccount();
     notifyTrade('OPENED', trade, account).catch(err => logger.error('[Notification] Error:', err.message));
 
-    res.json({ success: true, trade, raw: orderResult });
+    return res.status(200).json({
+      success: true,
+      status: 'FILLED',
+      contractId,
+      entryPrice: orderResult.entryPrice,
+      purchasePrice: orderResult.purchasePrice,
+      trade,
+      raw: orderResult,
+    });
   } catch (error) {
-    logger.error('[executeSignal] Error:', error.message);
-    res.status(500).json({ error: error.message });
+    return handleOrderError(res, error, 'executeSignal');
   }
 };
 
