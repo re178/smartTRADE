@@ -1,23 +1,17 @@
 // models/Order.js – Order Schema (for persistence)
 // EXTENDED: Added Multiplier fields and proposal tracking.
 //
-// [CHANGE-4-1] contractId is already a String — verified against
-//   models/Trade.js (also String). No type change required; kept as-is so
-//   cross-model queries and the broker's closeTrade fallback agree.
-//
-// [CHANGE-4-2] Added purchasePrice (canonical, amount paid for the Deriv
-//   contract) and filledPrice (compat alias used by orderService's
-//   orderData.filledPrice per File 2B). A pre('save') hook keeps the two
-//   in sync. entryPrice remains the underlying market entry price — the
-//   two values are now clearly distinct, matching the openPrice vs
-//   purchasePrice split in Trade.js.
-//
+// [CHANGE-4-1] contractId is a String — already matched Trade.js.
+//   Kept as-is; description clarified.
+// [CHANGE-4-2] Added purchasePrice (canonical) and filledPrice (compat
+//   alias used by orderService's orderData.filledPrice per File 2B).
+//   A pre('save') hook keeps the two in sync. entryPrice remains the
+//   underlying market entry price — distinct from the purchase cost.
 // [CHANGE-4-3] contractId now has a PARTIAL UNIQUE index that applies
 //   only when it is a non-null string. Pending orders (contractId: null)
-//   are unconstrained; confirmed contracts cannot be duplicated by any
-//   code path (orderService's normal insert, or the broker's repair path
-//   in _reconcilePositions). The old non-unique contractId_1 index is
-//   replaced.
+//   are unconstrained; confirmed contracts cannot be duplicated by either
+//   orderService's normal insert or the broker's repair path in
+//   _reconcilePositions().
 //
 // NOTE: The broker no longer creates Order documents inside
 //   placeMarketOrder (see File 1C). The only insert paths are
@@ -53,7 +47,11 @@ const OrderSchema = new mongoose.Schema(
       default: 'PENDING',
     },
     // [CHANGE-4-1] String — matches Trade.contractId.
-    contractId: { type: String, default: null },
+    contractId: {
+      type: String,
+      default: null,
+      description: 'Deriv contract ID (opaque identifier)',
+    },
     broker: { type: String, default: 'deriv' },
 
     // ---- Timestamps ----
@@ -67,9 +65,8 @@ const OrderSchema = new mongoose.Schema(
     metadata: { type: mongoose.Schema.Types.Mixed, default: {} },
 
     // =============================================================
-    //  NEW FIELDS FOR MULTIPLIER TRADING
+    //  MULTIPLIER TRADING FIELDS
     // =============================================================
-    // ---- Multiplier parameters ----
     stake: {
       type: Number,
       default: null,
@@ -99,16 +96,16 @@ const OrderSchema = new mongoose.Schema(
     },
 
     // ---- [CHANGE-4-2] Contract purchase cost ----
-    // Canonical name (per File 4). Amount paid to Deriv for the contract.
-    // For multipliers this is the Deriv-confirmed purchase price; for CFDs
-    // this stays null (a CFD has no purchase cost in this sense).
+    // Canonical name. Amount paid to Deriv for the contract. For
+    // multipliers this is the Deriv-confirmed purchase price; for CFDs
+    // it stays null (a CFD has no purchase cost in this sense).
     purchasePrice: {
       type: Number,
       default: null,
       min: 0,
       description: 'Amount paid to purchase the Deriv contract',
     },
-    // Compatibility alias used by orderService's orderData
+    // Compat alias used by orderService's orderData
     // (see File 2B: filledPrice: purchasePrice). Kept in sync with
     // purchasePrice by the pre('save') hook below.
     filledPrice: {
@@ -118,7 +115,7 @@ const OrderSchema = new mongoose.Schema(
       description: 'Alias for purchasePrice (amount filled at); kept in sync by pre-save hook',
     },
 
-    // ---- Proposal tracking (for proposal‑first execution) ----
+    // ---- Proposal tracking (proposal-first execution) ----
     proposalId: {
       type: String,
       default: null,
@@ -140,7 +137,7 @@ const OrderSchema = new mongoose.Schema(
 
 // [CHANGE-4-2] Keep filledPrice and purchasePrice in lockstep.
 // orderService writes `filledPrice: purchasePrice` (File 2B) and the broker
-// repair path writes `purchasePrice` (File 1C/5). Whichever side sets one,
+// repair path writes `purchasePrice` (File 1C). Whichever side sets one,
 // the other is populated on save. This hook does NOT fire for
 // findOneAndUpdate — callers using that operator must set both explicitly.
 OrderSchema.pre('save', function (next) {
@@ -151,8 +148,6 @@ OrderSchema.pre('save', function (next) {
   } else if (this.filledPrice != null && this.purchasePrice != null
              && this.filledPrice !== this.purchasePrice) {
     // Prefer the canonical purchasePrice; log divergence for investigation.
-    // Use the model's own logger so it stays consistent with the rest of
-    // the schema-level code.
     try {
       const logger = require('../infrastructure/logger') || console;
       logger.warn(
