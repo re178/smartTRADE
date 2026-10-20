@@ -3,16 +3,16 @@
 // Falls back to legacy lotSize/stopLoss for backward compatibility.
 // Calls orderService.placeMarketOrder with options object.
 //
-// [CHANGE-6] Order-entry endpoints now distinguish three outcomes:
-//   * FILLED                      — purchase confirmed AND DB record saved
-//   * CONFIRMED_RECORD_FAILED     — purchase confirmed at Deriv but the
-//                                   Order/Trade record could not be written
-//                                   (returned HTTP 200 with contractId and
-//                                   warning; do NOT retry)
-//   * REJECTED / BROKER_ERROR     — no confirmed purchase; validation vs
-//                                   unknown-error paths are distinguished
-//                                   so the UI does not treat a broker error
-//                                   as an ordinary rejection.
+// [CHANGE-6] Order-entry endpoints distinguish three outcomes:
+//   * FILLED                    — purchase confirmed AND DB record saved
+//   * CONFIRMED_RECORD_FAILED   — purchase confirmed at Deriv but the
+//                                 Order/Trade record could not be written
+//                                 (HTTP 200 with contractId + warning;
+//                                 do NOT retry)
+//   * REJECTED / BROKER_ERROR   — no confirmed purchase; validation vs
+//                                 unknown-error paths are distinguished
+//                                 so the UI does not treat a broker error
+//                                 as an ordinary rejection.
 //   A confirmed purchase is never reported as `success: false`.
 //   All endpoints include the confirmed contractId at the top level when
 //   it is known. Queries by contractId use String(...) for consistency
@@ -78,11 +78,7 @@ function enhanceAccount(accountData, broker) {
     tradeMode = broker._account.is_virtual !== undefined ? (broker._account.is_virtual ? 1 : 0) : 0;
     server = broker._account.landing_company_name || 'Unknown';
   }
-  return {
-    ...accountData,
-    tradeMode,
-    server,
-  };
+  return { ...accountData, tradeMode, server };
 }
 
 // ================================================================
@@ -135,10 +131,6 @@ function respondConfirmedButUnrecorded(res, contractId, details, reason) {
 }
 
 // Central error handler for all order-entry endpoints.
-// Distinguishes:
-//   * confirmed-but-unrecorded (err.executionConfirmed / err.contractId)
-//   * pre-purchase validation rejections (safe to retry)
-//   * unknown broker errors (may or may not have purchased)
 function handleOrderError(res, error, logTag) {
   logger.error(`[${logTag}] Error:`, error.message);
 
@@ -269,9 +261,7 @@ exports.getSymbols = async (req, res) => {
   try {
     const product = getProduct(req);
     const broker = getBroker(product);
-    if (!broker.isConnected()) {
-      await broker.connect();
-    }
+    if (!broker.isConnected()) await broker.connect();
     let symbols = [];
     if (broker.symbolManager && typeof broker.symbolManager._symbols === 'object') {
       symbols = Array.from(broker.symbolManager._symbols.values());
@@ -281,9 +271,7 @@ exports.getSymbols = async (req, res) => {
       try {
         const allSymbols = await marketProvider.getSymbols(product);
         if (allSymbols) symbols = allSymbols;
-      } catch (e) {
-        // ignore
-      }
+      } catch (e) { /* ignore */ }
     }
     res.json(symbols);
   } catch (error) {
@@ -298,21 +286,20 @@ exports.getCapabilities = async (req, res) => {
     const product = getProduct(req);
     const broker = getBroker(product);
     const caps = broker.capabilities || {};
-    const info = {
+    res.json({
       product,
       name: broker.serverName || product,
       connected: broker.isConnected(),
       state: broker._state || 'unknown',
       capabilities: caps,
-    };
-    res.json(info);
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 };
 
 // ================================================================
-//  POSITIONS & TRADES – Normalised for frontend
+//  POSITIONS & TRADES
 // ================================================================
 exports.getPositions = async (req, res) => {
   try {
@@ -354,7 +341,7 @@ exports.getTrades = async (req, res) => {
 };
 
 // ================================================================
-//  TRADE HISTORY – Fixed field mapping
+//  TRADE HISTORY
 // ================================================================
 exports.getTradeHistory = async (req, res) => {
   try {
@@ -377,7 +364,7 @@ exports.getTradeHistory = async (req, res) => {
 };
 
 // ================================================================
-//  PENDING ORDERS – Normalised for frontend
+//  PENDING ORDERS
 // ================================================================
 exports.getPendingOrders = async (req, res) => {
   try {
@@ -401,8 +388,7 @@ exports.getPendingOrders = async (req, res) => {
 };
 
 // ================================================================
-//  PLACE ORDER – Multiplier-aware, uses orderService options
-//  [CHANGE-6] Outcome-aware response shape.
+//  PLACE ORDER – Multiplier-aware, outcome-aware response
 // ================================================================
 exports.placeOrder = async (req, res) => {
   const {
@@ -504,8 +490,6 @@ exports.placeOrder = async (req, res) => {
     const contractId = String(orderResult.contractId);
     const outcome = classifyOrderOutcome(orderResult);
 
-    // Confirmed but not recorded: never report as failure, never drop the
-    // contractId. The broker will repair the record via reconciliation.
     if (outcome === 'CONFIRMED_RECORD_FAILED') {
       return respondConfirmedButUnrecorded(
         res,
@@ -520,8 +504,7 @@ exports.placeOrder = async (req, res) => {
       );
     }
 
-    // Normal path — Trade should exist.
-    // [CHANGE-6-G] String() for cross-model consistency with the schema migration.
+    // [CHANGE-6-G] String() for cross-model consistency.
     const trade = await Trade.findOne({ contractId: String(contractId) });
     if (!trade) {
       logger.warn(
@@ -635,7 +618,6 @@ exports.getSignal = async (req, res) => {
 };
 
 // ---------- Auto Trade (Multiplier-aware) ----------
-// [CHANGE-6] Outcome-aware response shape.
 exports.autoTrade = async (req, res) => {
   const { pair, riskPercent = 1, strategy = 'sma', ...params } = req.body;
   if (!pair) return res.status(400).json({ error: 'pair required' });
@@ -762,7 +744,6 @@ exports.autoTrade = async (req, res) => {
 };
 
 // ---------- Execute Live Signal (Multiplier-aware) ----------
-// [CHANGE-6] Outcome-aware response shape.
 exports.executeSignal = async (req, res) => {
   const {
     pair,
@@ -892,9 +873,8 @@ exports.executeSignal = async (req, res) => {
 };
 
 // ============================================================
-//  REPORT GENERATION – Fully Implemented
+//  REPORT GENERATION
 // ============================================================
-
 exports.generateReport = async (req, res) => {
   try {
     const { from, to, includeTrades = true } = req.body;
