@@ -1,34 +1,35 @@
 // core/execution/broker.js – Stable Dual‑WebSocket Deriv Broker
-// Current Options API:
-//   PUBLIC WS : wss://api.derivws.com/trading/v1/options/ws/public
-//   AUTH      : GET /trading/v1/options/accounts
-//                 → POST /trading/v1/options/accounts/{account_id}/otp
-//                 → connect to returned WS URL (already authenticated)
 //
 // [FIX 1..8]   Pre-existing fixes.
-// [CHANGE-1A/1B/1C] / [CHANGE-5] / [CHANGE-8]   — see prior revisions.
+// [CHANGE-1A/1B/1C] / [CHANGE-5] / [CHANGE-8] — see prior revisions.
 // [LIVE-1..7]  — see prior revisions.
 // [BUGFIX-A]   contract_id as integer for proposal_open_contract and sell.
 // [BUGFIX-B]   respond to Deriv server-initiated pings with { pong }.
 // [BUGFIX-C]   do not retry permanent Deriv errors.
 // [BUGFIX-D]   removed our outbound { ping: 1 } (rejected with UnknownMethod).
+// [BUGFIX-E]   supportsClose / supportsModify declared.
+// [BUGFIX-F]   contract update logging (FIRST TICK, tick #30, settlement).
 //
-// [FIX-1]      Re-added `duration` to the proposal payload. The FIX 7
-//              workaround was causing Deriv to use its default 60s duration
-//              regardless of the user's choice, which made contracts expire
-//              mid-session. `options.duration` (seconds) is now honoured.
-// [FIX-2]      Heartbeat rewritten to use WebSocket protocol-level ping
-//              (ws.ping()) and to update _authLastPong / _publicLastPong on
-//              ANY inbound message. The old watchdog was firing every 60s
-//              because Deriv's newer Options API never sends server-side
-//              pings. Threshold raised to 120s.
-// [FIX-3]      Periodic Trade reconciliation (_reconcileTradeStatus). Every
-//              30s, compares MongoDB OPEN trades against Deriv portfolio
-//              and marks any Open trade not in portfolio as CLOSED (expired
-//              or sold externally). Fixes "expired contracts stuck at OPEN"
-//              and the missing history entries.
-// [FIX-4]      Log the raw portfolio response when it returns 0 contracts,
-//              so parsing issues can be diagnosed without a debugger.
+// [REVERT-1]   REMOVED `duration` from the proposal payload. Deriv's
+//              MULTUP/MULTDOWN contracts reject it with InvalidExpiry:
+//              "Invalid input (duration or date_expiry) for this contract
+//              type (MULTUP)". `duration_unit: 's'` alone is tolerated and
+//              kept. Multiplier contracts are open-ended — closed manually,
+//              by knockout/TP, or at Deriv's max contract duration.
+//              The user's chosen duration is still stored on the Trade /
+//              Order documents (intent record), it is simply not sent to
+//              Deriv.
+// [REVERT-2]   getOpenTrades() no longer swallows portfolio-fetch errors
+//              and returns []. Returning [] on error was being misread as
+//              "no open contracts" by _reconcilePositions and
+//              _reconcileTradeStatus, which then marked every MongoDB
+//              OPEN trade as CLOSED — the "contracts disappear" bug.
+//              It now throws; callers already have try/catch and will
+//              skip reconciliation instead of wrongly concluding "empty".
+// [GUARD-3]    _reconcileTradeStatus only runs when the portfolio fetch
+//              succeeded AND the trade is at least MIN_AGE_MS old (default
+//              15s) — protects against Deriv's eventual consistency on
+//              freshly-placed trades.
 
 const WebSocket = require('ws');
 const axios = require('axios');
@@ -68,7 +69,6 @@ let _requestCounter = 0;
 
 const ACCEPTED_MULTIPLIERS = [100, 200, 300, 500, 800];
 const DEFAULT_MULTIPLIER = 100;
-const DEFAULT_DURATION_SEC = 300;  // [FIX-1]
 
 function generateRequestId() { return ++_requestCounter; }
 
@@ -120,7 +120,8 @@ function isPermanentApiError(err) {
     msg.includes('ContractCreationFailure') ||
     msg.includes('AuthorizationRequired') ||
     msg.includes('InvalidToken') ||
-    msg.includes('PermissionDenied')
+    msg.includes('PermissionDenied') ||
+    msg.includes('InvalidExpiry')            // [REVERT-1] not retriable
   );
 }
 
@@ -275,16 +276,15 @@ class DerivBroker extends EventEmitter {
       fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || 3),
       readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 30000),
       symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 30000),
-      // [FIX-2] Raised to 120s. Heartbeat now uses WS-protocol ping which
-      // doesn't require Deriv to send us application JSON pings.
       heartbeatTimeout: parseInt(config.heartbeatTimeout || process.env.DERIV_HEARTBEAT_TIMEOUT || 120000),
-      // [FIX-2] WS-protocol ping interval.
       wsPingIntervalMs: parseInt(config.wsPingIntervalMs || process.env.DERIV_WS_PING_INTERVAL || 20000),
       balanceTimeout: parseInt(config.balanceTimeout || process.env.DERIV_BALANCE_TIMEOUT || 10000),
       contractPersistIntervalMs: parseInt(config.contractPersistIntervalMs || process.env.DERIV_CONTRACT_PERSIST_INTERVAL_MS || 3000),
       contractSubscribeTimeout: parseInt(config.contractSubscribeTimeout || process.env.DERIV_CONTRACT_SUBSCRIBE_TIMEOUT || 15000),
-      // [FIX-3] Trade reconciliation interval.
       tradeReconcileIntervalMs: parseInt(config.tradeReconcileIntervalMs || process.env.DERIV_TRADE_RECONCILE_INTERVAL || 30000),
+      // [GUARD-3] Skip reconciliation for trades younger than this. Protects
+      // against Deriv's eventual consistency on freshly-placed trades.
+      tradeReconcileMinAgeMs: parseInt(config.tradeReconcileMinAgeMs || process.env.DERIV_TRADE_RECONCILE_MIN_AGE || 15000),
     };
 
     this.validateConfig();
@@ -336,15 +336,17 @@ class DerivBroker extends EventEmitter {
     this._contractPersistTimers = new Map();
     this._contractUpdateCounts = new Map();
 
-    this._tradeReconcileTimer = null;   // [FIX-3]
+    this._tradeReconcileTimer = null;
 
     this.metrics = {
       connectedSince: null, requestsSent: 0, requestsFailed: 0, reconnections: 0,
       totalLatency: 0, latencyCount: 0, heartbeatMisses: 0, lastHeartbeat: null,
       ordersPlaced: 0, ordersFilled: 0, ordersRejected: 0, lastPong: Date.now(),
       contractSubscriptions: 0, contractUpdates: 0, contractUpdatesPersisted: 0,
-      tradesReconciledClosed: 0,            // [FIX-3]
-      portfolioEmptyResponses: 0,           // [FIX-4]
+      tradesReconciledClosed: 0,
+      reconcileSkippedFresh: 0,
+      reconcileSkippedFetchError: 0,
+      portfolioEmptyResponses: 0,
     };
 
     this.capabilities = { ...BROKER_CAPABILITIES };
@@ -360,7 +362,7 @@ class DerivBroker extends EventEmitter {
     logger.info(`[DerivBroker] Account type preference: ${this.config.accountType}`);
     logger.info(`[DerivBroker] Contract persist interval: ${this.config.contractPersistIntervalMs}ms`);
     logger.info(`[DerivBroker] WS-protocol ping interval: ${this.config.wsPingIntervalMs}ms`);
-    logger.info(`[DerivBroker] Trade reconciliation interval: ${this.config.tradeReconcileIntervalMs}ms`);
+    logger.info(`[DerivBroker] Trade reconciliation interval: ${this.config.tradeReconcileIntervalMs}ms (min age: ${this.config.tradeReconcileMinAgeMs}ms)`);
   }
 
   validateConfig() {
@@ -485,8 +487,8 @@ class DerivBroker extends EventEmitter {
     await this._reconcilePositions();
     await this._loadPendingOrders();
     await this._resumeContractSubscriptions();
-    await this._reconcileTradeStatus();  // [FIX-3]
-    this._startTradeReconcileTimer();    // [FIX-3]
+    await this._reconcileTradeStatus();
+    this._startTradeReconcileTimer();
   }
 
   async _ensureBalanceLoaded(timeoutMs = this.config.balanceTimeout) {
@@ -529,7 +531,6 @@ class DerivBroker extends EventEmitter {
           }
         }, this.config.connectionTimeout);
 
-        // [FIX-2] WS-protocol pong refreshes liveness.
         socket.on('pong', () => { this._publicLastPong = Date.now(); });
 
         socket.on('open', () => {
@@ -558,7 +559,6 @@ class DerivBroker extends EventEmitter {
     });
   }
 
-  // [FIX-2] WS-protocol ping instead of application JSON ping.
   _startPublicHeartbeat() {
     this._stopPublicHeartbeat();
     this._publicLastPong = Date.now();
@@ -659,7 +659,6 @@ class DerivBroker extends EventEmitter {
   _handlePublicMessage(rawData) {
     try {
       const msg = JSON.parse(rawData);
-      // [FIX-2] Any inbound message proves the socket is alive.
       this._publicLastPong = Date.now();
       let handled = false;
       if (msg.msg_type === 'ping' || (msg.ping && !msg.pong)) {
@@ -701,7 +700,7 @@ class DerivBroker extends EventEmitter {
     await sleep(200);
   }
 
-  // ---- AUTH SOCKET (OTP URL) ----
+  // ---- AUTH SOCKET ----
   async _connectAuth() {
     if (this._authState === STATE.READY) return;
     if (this._authConnectionPromise) return this._authConnectionPromise;
@@ -739,7 +738,6 @@ class DerivBroker extends EventEmitter {
           }
         }, this.config.connectionTimeout);
 
-        // [FIX-2] WS-protocol pong refreshes liveness.
         socket.on('pong', () => { this._authLastPong = Date.now(); });
 
         socket.on('open', () => {
@@ -771,7 +769,6 @@ class DerivBroker extends EventEmitter {
     if (this._authReconnectTimer) clearTimeout(this._authReconnectTimer);
     this._authReconnectTimer = setTimeout(() => { this._connectAuth().catch(() => {}); }, this._getReconnectDelay(0));
   }
-  // [FIX-2] WS-protocol ping.
   _startAuthHeartbeat() {
     this._stopAuthHeartbeat();
     this._authLastPong = Date.now();
@@ -874,7 +871,6 @@ class DerivBroker extends EventEmitter {
   _handleAuthMessage(rawData) {
     try {
       const msg = JSON.parse(rawData);
-      // [FIX-2] Any inbound message proves the socket is alive.
       this._authLastPong = Date.now();
       let handled = false;
 
@@ -896,16 +892,13 @@ class DerivBroker extends EventEmitter {
       }
       if (msg.portfolio) {
         const contracts = msg.portfolio.contracts || [];
-        // [FIX-4] Log the raw response shape when empty so we can diagnose
-        // parsing issues without a debugger.
         if (contracts.length === 0) {
           this.metrics.portfolioEmptyResponses++;
           if (this.metrics.portfolioEmptyResponses === 1 || this.metrics.portfolioEmptyResponses % 20 === 0) {
             logger.info(
               `[DerivBroker] Portfolio returned 0 contracts ` +
               `(empty#${this.metrics.portfolioEmptyResponses}). ` +
-              `Raw keys: ${Object.keys(msg.portfolio || {}).join(',')} ` +
-              `Raw shape: ${JSON.stringify(msg.portfolio).slice(0, 300)}`
+              `Raw keys: ${Object.keys(msg.portfolio || {}).join(',')}`
             );
           }
         }
@@ -968,14 +961,14 @@ class DerivBroker extends EventEmitter {
       logger.warn(`[DerivBroker] Balance restore failed: ${err.message}`);
     }
     await this._resumeContractSubscriptions();
-    await this._reconcileTradeStatus();  // [FIX-3]
+    await this._reconcileTradeStatus();
   }
 
   async _resumeContractSubscriptions() {
-    let positions = [];
+    let positions;
     try { positions = await this.getOpenTrades(); }
     catch (err) {
-      logger.warn(`[DerivBroker] Portfolio fetch during resume failed: ${err.message}`);
+      logger.warn(`[DerivBroker] Portfolio fetch during resume failed: ${err.message} — skipping resume this cycle.`);
       return;
     }
     if (positions.length === 0) {
@@ -1016,51 +1009,77 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // [FIX-3] Reconciliation: mark any MongoDB OPEN trade that's no longer
-  // in Deriv's portfolio as CLOSED. Catches:
-  //   - Contracts that expired naturally while we were disconnected
-  //   - Contracts sold outside the RTS UI
-  //   - Contracts whose subscription tick we missed
+  // [GUARD-3] Reconciliation with three safety rails:
+  //   1. Skip if auth WS is not READY (portfolio fetch would fail anyway).
+  //   2. Skip entirely if getOpenTrades() throws (fetch failed) — do NOT
+  //      conclude "portfolio is empty" from a network error.
+  //   3. Skip individual trades younger than tradeReconcileMinAgeMs.
   async _reconcileTradeStatus() {
     if (this._authState !== STATE.READY) return;
+
+    let openTrades;
     try {
-      const openTrades = await Trade.find({ status: 'OPEN', product: 'deriv_multiplier' }).lean();
-      if (openTrades.length === 0) return;
-
-      const portfolio = await this.getOpenTrades();
-      const portfolioIds = new Set(portfolio.map(p => String(p.id)));
-
-      let closedCount = 0;
-      for (const trade of openTrades) {
-        const cid = String(trade.contractId);
-        if (!portfolioIds.has(cid)) {
-          await Trade.findOneAndUpdate(
-            { contractId: cid },
-            {
-              $set: {
-                status: 'CLOSED',
-                closeTime: new Date(),
-                floatingProfit: 0,
-                // P/L unknown for expired-while-disconnected contracts.
-                // The Trade document retains the last known currentPrice
-                // and purchasePrice for reference.
-              },
-            }
-          );
-          closedCount++;
-          this.metrics.tradesReconciledClosed++;
-          logger.info(
-            `[DerivBroker] Reconciled trade ${cid} → CLOSED (not in Deriv portfolio — expired or sold externally)`
-          );
-        }
-      }
-      if (closedCount > 0) {
-        logger.info(`[DerivBroker] Trade reconciliation closed ${closedCount} orphaned OPEN trade(s).`);
-        // Emit positions so the dashboard reflects the cleanup.
-        this.emit('positions', portfolio);
-      }
+      openTrades = await Trade.find({ status: 'OPEN', product: 'deriv_multiplier' }).lean();
     } catch (err) {
-      logger.warn(`[DerivBroker] Trade reconciliation failed: ${err.message}`);
+      logger.warn(`[DerivBroker] Trade reconciliation DB read failed: ${err.message}`);
+      return;
+    }
+    if (openTrades.length === 0) return;
+
+    // [GUARD-3] Fetch portfolio. If this throws, we do NOT reconcile —
+    // a failed fetch looks identical to an empty portfolio in the old
+    // code and was marking every open trade CLOSED.
+    let portfolio;
+    try {
+      portfolio = await this.getOpenTrades();
+    } catch (err) {
+      this.metrics.reconcileSkippedFetchError++;
+      logger.warn(`[DerivBroker] Trade reconciliation skipped — portfolio fetch failed: ${err.message}`);
+      return;
+    }
+
+    const portfolioIds = new Set(portfolio.map(p => String(p.id)));
+    const now = Date.now();
+    const minAge = this.config.tradeReconcileMinAgeMs;
+
+    let closedCount = 0;
+    let skippedFresh = 0;
+
+    for (const trade of openTrades) {
+      const cid = String(trade.contractId);
+      if (portfolioIds.has(cid)) continue;  // still open — fine
+
+      // [GUARD-3] Skip trades younger than minAge — Deriv may not list them
+      // in portfolio yet due to eventual consistency.
+      const openedAt = trade.openTime ? new Date(trade.openTime).getTime() : 0;
+      if (openedAt && (now - openedAt) < minAge) {
+        skippedFresh++;
+        continue;
+      }
+
+      await Trade.findOneAndUpdate(
+        { contractId: cid },
+        {
+          $set: {
+            status: 'CLOSED',
+            closeTime: new Date(),
+            floatingProfit: 0,
+          },
+        }
+      );
+      closedCount++;
+      this.metrics.tradesReconciledClosed++;
+      logger.info(
+        `[DerivBroker] Reconciled trade ${cid} → CLOSED (not in Deriv portfolio — expired or sold externally)`
+      );
+    }
+
+    if (skippedFresh > 0) {
+      this.metrics.reconcileSkippedFresh += skippedFresh;
+    }
+    if (closedCount > 0) {
+      logger.info(`[DerivBroker] Trade reconciliation closed ${closedCount} orphaned OPEN trade(s).`);
+      this.emit('positions', portfolio);
     }
   }
 
@@ -1295,9 +1314,16 @@ class DerivBroker extends EventEmitter {
     if (status === ORDER_STATUS.REJECTED) this.metrics.ordersRejected++;
     this.emit('orderUpdate', { clientOrderId, status, contractId });
   }
+
   async _reconcilePositions() {
+    let positions;
     try {
-      const positions = await this.getOpenTrades();
+      positions = await this.getOpenTrades();
+    } catch (err) {
+      logger.warn(`[DerivBroker] _reconcilePositions skipped — portfolio fetch failed: ${err.message}`);
+      return;
+    }
+    try {
       const dbOrders = await Order.find({ status: ORDER_STATUS.FILLED });
       const dbMap = new Map();
       for (const ord of dbOrders) if (ord.contractId) dbMap.set(String(ord.contractId), ord);
@@ -1428,15 +1454,20 @@ class DerivBroker extends EventEmitter {
     const candles = (resp.candles || []).slice(-count);
     return candles.map(c => ({ mid: { o: c.open, h: c.high, l: c.low, c: c.close }, time: c.epoch, complete: true }));
   }
+
+  // [REVERT-2] Portfolio fetch no longer swallows errors. A failed fetch
+  // throws so callers can distinguish it from an empty portfolio. This
+  // is the fix for "contracts disappear from Open Positions" — the old
+  // [] return was being interpreted by _reconcilePositions and
+  // _reconcileTradeStatus as "no open contracts" and every OPEN trade
+  // in MongoDB was being marked CLOSED.
   async getOpenTrades() {
     await this._ensureAuthReady();
-    try {
-      const resp = await this._sendAuthRequest({ portfolio: 1 });
-      const contracts = (resp.portfolio?.contracts) || [];
-      return contracts
-        .filter(c => c.status && ['open', 'active'].includes(c.status.toLowerCase()))
-        .map(c => this._normalizeContract(c));
-    } catch (err) { logger.error('[DerivBroker] Portfolio fetch failed:', err.message); return []; }
+    const resp = await this._sendAuthRequest({ portfolio: 1 });
+    const contracts = (resp.portfolio?.contracts) || [];
+    return contracts
+      .filter(c => c.status && ['open', 'active'].includes(c.status.toLowerCase()))
+      .map(c => this._normalizeContract(c));
   }
   async getPositions() { return this.getOpenTrades(); }
 
@@ -1461,19 +1492,17 @@ class DerivBroker extends EventEmitter {
       }
     }
 
-    // [FIX-1] Honour the caller's requested duration.
-    const finalDuration = (() => {
-      const d = Math.floor(Number(opts.duration));
-      if (Number.isFinite(d) && d >= 10) return d;
-      return DEFAULT_DURATION_SEC;
-    })();
-
+    // [REVERT-1] No `duration` field — MULTUP/MULTDOWN rejects it with
+    // InvalidExpiry. `duration_unit: 's'` alone is tolerated. Contracts
+    // are open-ended; they close on manual sell, knockout/TP, or Deriv's
+    // max contract duration.
+    // `opts.duration` is NOT sent to Deriv but IS captured on the Trade
+    // document via orderService — it records the user's intent.
     const proposalPayload = {
       proposal: 1, amount, basis: 'stake', contract_type: direction,
       currency: this.accountCurrency || 'USD',
       underlying_symbol: symbol,
       multiplier: finalMultiplier,
-      duration: finalDuration,      // [FIX-1]
       duration_unit: 's',
       subscribe: 1,
     };
@@ -1588,11 +1617,12 @@ class DerivBroker extends EventEmitter {
       },
       tradeReconciliation: {
         intervalMs: this.config.tradeReconcileIntervalMs,
+        minAgeMs: this.config.tradeReconcileMinAgeMs,
         closedTrades: this.metrics.tradesReconciledClosed,
+        skippedFresh: this.metrics.reconcileSkippedFresh,
+        skippedFetchError: this.metrics.reconcileSkippedFetchError,
       },
-      portfolioDiagnostics: {
-        emptyResponses: this.metrics.portfolioEmptyResponses,
-      },
+      portfolioDiagnostics: { emptyResponses: this.metrics.portfolioEmptyResponses },
       accountLoaded: !!(this._account && this._account.balance != null),
       acceptedMultipliers: ACCEPTED_MULTIPLIERS,
     };
@@ -1647,6 +1677,7 @@ const brokerInstance = new DerivBroker({
   contractPersistIntervalMs: parseInt(process.env.DERIV_CONTRACT_PERSIST_INTERVAL_MS) || 3000,
   contractSubscribeTimeout: parseInt(process.env.DERIV_CONTRACT_SUBSCRIBE_TIMEOUT) || 15000,
   tradeReconcileIntervalMs: parseInt(process.env.DERIV_TRADE_RECONCILE_INTERVAL) || 30000,
+  tradeReconcileMinAgeMs: parseInt(process.env.DERIV_TRADE_RECONCILE_MIN_AGE) || 15000,
 });
 
 module.exports = brokerInstance;
