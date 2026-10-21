@@ -21,6 +21,9 @@
 // [CHANGE-8] Multiplier is passed to broker.placeMarketOrder(..., { multiplier }).
 //   Removed the deceptive result._multiplier / result._duration mutations.
 //   Validate against Deriv's accepted multiplier set BEFORE the broker call.
+// [FIX-1] Pass `duration` in the options object too, so the broker sends it
+//   to Deriv. Without this, Deriv uses its ~60s default regardless of what
+//   the user selected and the contract expires mid-session.
 // [SUPPORTING] cancelOrder / closeTrade query with String(contractId) to
 //   survive the Number -> String migration in models/Trade.js and
 //   models/Order.js.
@@ -173,13 +176,19 @@ async function placeMarketOrder(options) {
   } else {
     // [CHANGE-8] Multiplier: pass stake as units AND the selected
     // multiplier as the 5th (options) argument.
+    // [FIX-1] Also pass `duration` so broker.placeMarketOrder sends it to
+    // Deriv. Without this, Deriv uses its ~60s default regardless of what
+    // the user selected and the contract expires mid-session.
     const units = side.toUpperCase() === 'BUY' ? stake : -stake;
     result = await broker.placeMarketOrder(
       instrument,
       units,
       knockoutLevel || null,
       takeProfitLevel || null,
-      { multiplier: Math.floor(Number(multiplier)) }
+      {
+        multiplier: Math.floor(Number(multiplier)),
+        duration: parseInt(duration, 10) || 300,
+      }
     );
   }
 
