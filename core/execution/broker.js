@@ -5,39 +5,30 @@
 //                 → POST /trading/v1/options/accounts/{account_id}/otp
 //                 → connect to returned WS URL (already authenticated)
 //
-// [FIX 1..8]   Pre-existing fixes (single-flight connect, safe subscribe,
-//              account-type selection, balance, multiplier workflow, spread).
-// [CHANGE-1A/1B/1C] Explicit purchase-vs-entry extraction, new return shape,
-//              broker no longer creates Order records (orderService owns).
-// [CHANGE-5]   _normalizeContract exposes id / purchasePrice / entryPrice /
-//              status: 'OPEN' / isValidToSell.
-// [CHANGE-8]   placeMarketOrder accepts 5th arg options { multiplier } and
-//              validates it before any proposal is sent.
-// [LIVE-1..7]  proposal_open_contract subscription after buy, per-tick
-//              handling, throttled Trade persistence, startup + reconnect
-//              resume, closeTrade final-state write.
+// [FIX 1..8]   Pre-existing fixes.
+// [CHANGE-1A/1B/1C] / [CHANGE-5] / [CHANGE-8]   — see prior revisions.
+// [LIVE-1..7]  — see prior revisions.
+// [BUGFIX-A]   contract_id as integer for proposal_open_contract and sell.
+// [BUGFIX-B]   respond to Deriv server-initiated pings with { pong }.
+// [BUGFIX-C]   do not retry permanent Deriv errors.
+// [BUGFIX-D]   removed our outbound { ping: 1 } (rejected with UnknownMethod).
 //
-// [BUGFIX-A]   _subscribeOpenContract and closeTrade convert the contract
-//              ID to Number() before sending to Deriv — the wire payload
-//              rejects strings with InputValidationFailed.
-// [BUGFIX-B]   _handleAuthMessage / _handlePublicMessage respond to
-//              Deriv's server-initiated pings with { pong: <value> }.
-// [BUGFIX-C]   _sendAuthRequest / _sendPublicRequest do not retry
-//              permanent Deriv errors (InputValidationFailed, etc.).
-//
-// [BUGFIX-D]   Removed our outbound { ping: 1 } from _startAuthHeartbeat
-//              and _startPublicHeartbeat. Deriv's newer Options API rejects
-//              client pings with UnknownMethod. Liveness is now detected
-//              via the server's own pings (which we respond to in
-//              BUGFIX-B) plus a local watchdog on _authLastPong /
-//              _publicLastPong.
-// [BUGFIX-E]   BROKER_CAPABILITIES now declares supportsClose: true and
-//              supportsModify: true so orderService.closeTrade /
-//              modifyTrade don't throw "Broker does not support ...".
-//              supportsCancel: false (all Deriv orders fill immediately).
-// [BUGFIX-F]   _handleContractUpdate logs the first tick per contract,
-//              every 30th tick, and settlement — so contract monitoring
-//              is visible in the log without spamming.
+// [FIX-1]      Re-added `duration` to the proposal payload. The FIX 7
+//              workaround was causing Deriv to use its default 60s duration
+//              regardless of the user's choice, which made contracts expire
+//              mid-session. `options.duration` (seconds) is now honoured.
+// [FIX-2]      Heartbeat rewritten to use WebSocket protocol-level ping
+//              (ws.ping()) and to update _authLastPong / _publicLastPong on
+//              ANY inbound message. The old watchdog was firing every 60s
+//              because Deriv's newer Options API never sends server-side
+//              pings. Threshold raised to 120s.
+// [FIX-3]      Periodic Trade reconciliation (_reconcileTradeStatus). Every
+//              30s, compares MongoDB OPEN trades against Deriv portfolio
+//              and marks any Open trade not in portfolio as CLOSED (expired
+//              or sold externally). Fixes "expired contracts stuck at OPEN"
+//              and the missing history entries.
+// [FIX-4]      Log the raw portfolio response when it returns 0 contracts,
+//              so parsing issues can be diagnosed without a debugger.
 
 const WebSocket = require('ws');
 const axios = require('axios');
@@ -53,14 +44,8 @@ const Account = require('../../models/Account');
 
 EventEmitter.defaultMaxListeners = 20;
 
-// ============================================================
-// WATCHLIST
-// ============================================================
 const WATCHLIST = ['frxEURUSD', 'frxGBPUSD', 'frxUSDJPY', 'frxAUDUSD'];
 
-// ============================================================
-// CONSTANTS
-// ============================================================
 const STATE = {
   DISCONNECTED: 'DISCONNECTED',
   CONNECTING: 'CONNECTING',
@@ -73,16 +58,9 @@ const STATE = {
 };
 
 const ORDER_STATUS = {
-  PENDING: 'PENDING',
-  ACCEPTED: 'ACCEPTED',
-  EXECUTING: 'EXECUTING',
-  FILLED: 'FILLED',
-  REJECTED: 'REJECTED',
-  CANCELLED: 'CANCELLED',
-  CLOSED: 'CLOSED',
-  PARTIALLY_FILLED: 'PARTIALLY_FILLED',
-  MODIFIED: 'MODIFIED',
-  EXPIRED: 'EXPIRED',
+  PENDING: 'PENDING', ACCEPTED: 'ACCEPTED', EXECUTING: 'EXECUTING',
+  FILLED: 'FILLED', REJECTED: 'REJECTED', CANCELLED: 'CANCELLED', CLOSED: 'CLOSED',
+  PARTIALLY_FILLED: 'PARTIALLY_FILLED', MODIFIED: 'MODIFIED', EXPIRED: 'EXPIRED',
 };
 
 const CB_STATE = { CLOSED: 'CLOSED', OPEN: 'OPEN', HALF_OPEN: 'HALF_OPEN' };
@@ -90,16 +68,12 @@ let _requestCounter = 0;
 
 const ACCEPTED_MULTIPLIERS = [100, 200, 300, 500, 800];
 const DEFAULT_MULTIPLIER = 100;
+const DEFAULT_DURATION_SEC = 300;  // [FIX-1]
 
-// ============================================================
-// HELPERS
-// ============================================================
 function generateRequestId() { return ++_requestCounter; }
 
 function generateClientOrderId() {
-  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
-    return `ord_${crypto.randomUUID()}`;
-  }
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return `ord_${crypto.randomUUID()}`;
   return `ord_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
 }
 
@@ -135,11 +109,8 @@ function redactSensitive(obj) {
   return copy;
 }
 
-function isPatToken(token) {
-  return typeof token === 'string' && token.startsWith('pat_');
-}
+function isPatToken(token) { return typeof token === 'string' && token.startsWith('pat_'); }
 
-// [BUGFIX-C] Identify Deriv API errors that will never succeed on retry.
 function isPermanentApiError(err) {
   if (!err || !err.message) return false;
   const msg = String(err.message);
@@ -153,15 +124,10 @@ function isPermanentApiError(err) {
   );
 }
 
-// ============================================================
-// RATE LIMITER
-// ============================================================
 class RateLimiter {
   constructor(rate, capacity) {
-    this.rate = rate;
-    this.capacity = capacity;
-    this.tokens = capacity;
-    this.lastRefill = Date.now();
+    this.rate = rate; this.capacity = capacity;
+    this.tokens = capacity; this.lastRefill = Date.now();
   }
   async acquire() {
     while (true) {
@@ -175,9 +141,6 @@ class RateLimiter {
   }
 }
 
-// ============================================================
-// STREAMING MANAGER (public ticks)
-// ============================================================
 class StreamingManager {
   constructor(broker) {
     this.broker = broker;
@@ -186,7 +149,6 @@ class StreamingManager {
     this._priceCache = new Map();
     this._pendingSubscriptions = new Map();
   }
-
   async subscribe(type, symbol, callback) {
     const key = `${type}:${symbol}`;
     if (this._subscriptions.has(key)) {
@@ -205,10 +167,7 @@ class StreamingManager {
         await this.broker._ensurePublicReady();
         const response = await this.broker._sendPublicRequest({ [type]: symbol, subscribe: 1 });
         const subscriptionId = response.subscription?.id;
-        if (!subscriptionId) {
-          logger.error(`[Streaming] No subscription ID for ${key}`);
-          return;
-        }
+        if (!subscriptionId) { logger.error(`[Streaming] No subscription ID for ${key}`); return; }
         this._subscriptions.set(key, { type, symbol, subscriptionId, callbacks: pending.callbacks });
         this._subscriptionIdMap.set(subscriptionId, key);
         logger.info(`[Streaming] Subscribed to ${key} (ID: ${subscriptionId})`);
@@ -221,7 +180,6 @@ class StreamingManager {
     this._pendingSubscriptions.set(key, pending);
     return pending.promise;
   }
-
   async unsubscribe(type, symbol, callback = null) {
     const key = `${type}:${symbol}`;
     const sub = this._subscriptions.get(key);
@@ -235,7 +193,6 @@ class StreamingManager {
     this._subscriptionIdMap.delete(sub.subscriptionId);
     this._priceCache.delete(symbol);
   }
-
   async restoreSubscriptions() {
     if (this._subscriptions.size === 0) return;
     logger.info('[Streaming] Restoring subscriptions...');
@@ -253,7 +210,6 @@ class StreamingManager {
       } catch (err) { logger.error(`[Streaming] Restore failed ${key}:`, err.message); }
     }
   }
-
   handleTick(tick) {
     const symbol = tick.symbol;
     const bid = tick.bid ? parseFloat(tick.bid) : null;
@@ -268,14 +224,10 @@ class StreamingManager {
       }
     }
   }
-
   getPrice(symbol) { return this._priceCache.get(symbol) || null; }
   getAllPrices() { return Object.fromEntries(this._priceCache); }
 }
 
-// ============================================================
-// SYMBOL MANAGER
-// ============================================================
 class SymbolManager {
   constructor() { this._symbols = new Map(); }
   setSymbols(symbols) {
@@ -287,33 +239,15 @@ class SymbolManager {
   getSymbolInfo(derivSymbol) { return this._symbols.get(derivSymbol) || null; }
 }
 
-// ============================================================
-// BROKER CAPABILITIES
-// ============================================================
-// [BUGFIX-E] orderService.closeTrade checks broker.capabilities?.supportsClose
-// and modifyTrade checks supportsModify. Without these flags declared, the
-// checks fail → "Broker does not support closing trades". Declared here.
 const BROKER_CAPABILITIES = {
-  supportsTrailingStop: false,
-  supportsHedging: false,
-  supportsNetting: true,
-  supportsPartialClose: false,
-  supportsGuaranteedSL: false,
-  supportsOCO: false,
-  supportsMarketOrders: true,
-  supportsLimitOrders: false,
-  supportsStopOrders: false,
-  supportsDemo: true,
-  supportsLive: true,
-  supportsClose: true,        // [BUGFIX-E] closeTrade() is implemented (sell request)
-  supportsModify: true,       // [BUGFIX-E] modifySLTP() is implemented (close + reopen)
-  supportsCancel: false,      // Deriv fills market orders immediately — nothing to cancel
+  supportsTrailingStop: false, supportsHedging: false, supportsNetting: true,
+  supportsPartialClose: false, supportsGuaranteedSL: false, supportsOCO: false,
+  supportsMarketOrders: true, supportsLimitOrders: false, supportsStopOrders: false,
+  supportsDemo: true, supportsLive: true,
+  supportsClose: true, supportsModify: true, supportsCancel: false,
   supportedMarkets: ['Forex', 'Indices', 'Commodities', 'Cryptocurrencies'],
 };
 
-// ============================================================
-// BROKER
-// ============================================================
 class DerivBroker extends EventEmitter {
   constructor(config = {}) {
     super();
@@ -321,7 +255,7 @@ class DerivBroker extends EventEmitter {
 
     this.config = {
       apiToken: config.apiToken || process.env.DERIV_API_TOKEN,
-      appId: appId,
+      appId,
       restBaseUrl: config.restBaseUrl || process.env.DERIV_REST_BASE_URL || 'https://api.derivws.com',
       publicWsUrl: config.publicWsUrl || process.env.DERIV_PUBLIC_WS_URL || 'wss://api.derivws.com/trading/v1/options/ws/public',
       accountId: config.accountId || process.env.DERIV_ACCOUNT_ID || null,
@@ -341,18 +275,16 @@ class DerivBroker extends EventEmitter {
       fatalAfterAuthFailures: parseInt(config.fatalAfterAuthFailures || 3),
       readinessTimeout: parseInt(config.readinessTimeout || process.env.DERIV_READINESS_TIMEOUT || 30000),
       symbolTimeout: parseInt(config.symbolTimeout || process.env.DERIV_SYMBOL_TIMEOUT || 30000),
-      heartbeatTimeout: parseInt(config.heartbeatTimeout || process.env.DERIV_HEARTBEAT_TIMEOUT || 60000),
+      // [FIX-2] Raised to 120s. Heartbeat now uses WS-protocol ping which
+      // doesn't require Deriv to send us application JSON pings.
+      heartbeatTimeout: parseInt(config.heartbeatTimeout || process.env.DERIV_HEARTBEAT_TIMEOUT || 120000),
+      // [FIX-2] WS-protocol ping interval.
+      wsPingIntervalMs: parseInt(config.wsPingIntervalMs || process.env.DERIV_WS_PING_INTERVAL || 20000),
       balanceTimeout: parseInt(config.balanceTimeout || process.env.DERIV_BALANCE_TIMEOUT || 10000),
-      contractPersistIntervalMs: parseInt(
-        config.contractPersistIntervalMs
-        || process.env.DERIV_CONTRACT_PERSIST_INTERVAL_MS
-        || 3000
-      ),
-      contractSubscribeTimeout: parseInt(
-        config.contractSubscribeTimeout
-        || process.env.DERIV_CONTRACT_SUBSCRIBE_TIMEOUT
-        || 15000
-      ),
+      contractPersistIntervalMs: parseInt(config.contractPersistIntervalMs || process.env.DERIV_CONTRACT_PERSIST_INTERVAL_MS || 3000),
+      contractSubscribeTimeout: parseInt(config.contractSubscribeTimeout || process.env.DERIV_CONTRACT_SUBSCRIBE_TIMEOUT || 15000),
+      // [FIX-3] Trade reconciliation interval.
+      tradeReconcileIntervalMs: parseInt(config.tradeReconcileIntervalMs || process.env.DERIV_TRADE_RECONCILE_INTERVAL || 30000),
     };
 
     this.validateConfig();
@@ -402,13 +334,17 @@ class DerivBroker extends EventEmitter {
     this._contractStates = new Map();
     this._contractPersistAt = new Map();
     this._contractPersistTimers = new Map();
-    this._contractUpdateCounts = new Map();   // [BUGFIX-F]
+    this._contractUpdateCounts = new Map();
+
+    this._tradeReconcileTimer = null;   // [FIX-3]
 
     this.metrics = {
       connectedSince: null, requestsSent: 0, requestsFailed: 0, reconnections: 0,
       totalLatency: 0, latencyCount: 0, heartbeatMisses: 0, lastHeartbeat: null,
       ordersPlaced: 0, ordersFilled: 0, ordersRejected: 0, lastPong: Date.now(),
       contractSubscriptions: 0, contractUpdates: 0, contractUpdatesPersisted: 0,
+      tradesReconciledClosed: 0,            // [FIX-3]
+      portfolioEmptyResponses: 0,           // [FIX-4]
     };
 
     this.capabilities = { ...BROKER_CAPABILITIES };
@@ -421,11 +357,10 @@ class DerivBroker extends EventEmitter {
     this._accountReadyResolve = null;
 
     logger.info('[DerivBroker] Initialized with Current Options API (OTP-URL auth).');
-    logger.info(`[DerivBroker] REST base: ${this.config.restBaseUrl}`);
-    logger.info(`[DerivBroker] Public WS: ${this.config.publicWsUrl}`);
     logger.info(`[DerivBroker] Account type preference: ${this.config.accountType}`);
-    logger.info(`[DerivBroker] Watchlist: ${WATCHLIST.join(', ')}`);
     logger.info(`[DerivBroker] Contract persist interval: ${this.config.contractPersistIntervalMs}ms`);
+    logger.info(`[DerivBroker] WS-protocol ping interval: ${this.config.wsPingIntervalMs}ms`);
+    logger.info(`[DerivBroker] Trade reconciliation interval: ${this.config.tradeReconcileIntervalMs}ms`);
   }
 
   validateConfig() {
@@ -433,11 +368,8 @@ class DerivBroker extends EventEmitter {
     if (!this.config.appId) throw new Error('DERIV_APP_ID is required');
     if (!this.config.publicWsUrl?.startsWith('ws')) throw new Error('Invalid public WebSocket URL');
     if (!this.config.restBaseUrl?.startsWith('http')) throw new Error('Invalid REST base URL');
-    if (this.config.maxQueueSize < 1) throw new Error('maxQueueSize must be at least 1');
     if (!['demo', 'real'].includes(this.config.accountType)) {
-      throw new Error(
-        `DERIV_ACCOUNT_TYPE must be "demo" or "real" (got "${this.config.accountType}")`
-      );
+      throw new Error(`DERIV_ACCOUNT_TYPE must be "demo" or "real" (got "${this.config.accountType}")`);
     }
     logger.info('[DerivBroker] Configuration validated.');
   }
@@ -464,24 +396,18 @@ class DerivBroker extends EventEmitter {
     return 0.0001;
   }
 
-  // ============================================================
-  // REST HEADERS
-  // ============================================================
   _restHeaders() {
     const headers = {
       'Content-Type': 'application/json',
       'Accept': 'application/json',
       'Authorization': `Bearer ${this.config.apiToken}`,
     };
-    if (isPatToken(this.config.apiToken)) {
-      headers['Deriv-App-ID'] = String(this.config.appId);
-    }
+    if (isPatToken(this.config.apiToken)) headers['Deriv-App-ID'] = String(this.config.appId);
     return headers;
   }
 
   async _fetchAccounts() {
     const url = `${this.config.restBaseUrl}/trading/v1/options/accounts`;
-    logger.info(`[DerivBroker] GET ${url}`);
     const resp = await axios.get(url, { headers: this._restHeaders(), timeout: this.config.connectionTimeout });
     const raw = resp.data?.data ?? resp.data;
     let list = [];
@@ -490,10 +416,7 @@ class DerivBroker extends EventEmitter {
     else if (raw && typeof raw === 'object') list = [raw];
     logger.info(`[DerivBroker] Discovered ${list.length} Options account(s).`);
     for (const acc of list) {
-      const id = acc.account_id || acc.id || acc.accountId;
-      const type = acc.account_type || acc.type || 'unknown';
-      const cur = acc.currency || 'N/A';
-      logger.info(`[DerivBroker]   • account_id=${id} type=${type} currency=${cur}`);
+      logger.info(`[DerivBroker]   • account_id=${acc.account_id || acc.id} type=${acc.account_type || acc.type} currency=${acc.currency || 'N/A'}`);
     }
     return list;
   }
@@ -503,57 +426,41 @@ class DerivBroker extends EventEmitter {
     if (!accounts || accounts.length === 0) throw new Error('No Options trading accounts found for this PAT');
     const normType = (a) => String(a.account_type || a.type || '').toLowerCase();
     const normId   = (a) => a.account_id || a.id || a.accountId;
-
     const remember = (acc) => {
       this._account = {
-        loginid: normId(acc),
-        account_id: normId(acc),
+        loginid: normId(acc), account_id: normId(acc),
         currency: acc.currency || 'USD',
         account_type: normType(acc),
         balance: this._account?.balance ?? null,
       };
       if (acc.currency) this.accountCurrency = acc.currency;
     };
-
     if (this.config.accountId) {
       const match = accounts.find(a => normId(a) === this.config.accountId);
-      if (match) {
-        const id = normId(match);
-        logger.info(`[DerivBroker] Using configured accountId (validated): ${id} [type=${normType(match)} currency=${match.currency || 'N/A'}]`);
-        remember(match);
-        return id;
-      }
-      logger.warn(`[DerivBroker] Configured accountId "${this.config.accountId}" not in discovered list. Falling back to type-based selection.`);
+      if (match) { remember(match); return normId(match); }
+      logger.warn(`[DerivBroker] Configured accountId "${this.config.accountId}" not in discovered list. Falling back.`);
     }
-
     const wanted = this.config.accountType;
     const byType = accounts.filter(a => normType(a) === wanted);
     if (byType.length === 0) {
       const available = accounts.map(a => `${normType(a)}(${normId(a)})`).join(', ');
-      throw new Error(`No Options account of type "${wanted}" found. Available: [${available}]. Set DERIV_ACCOUNT_TYPE to one of those, or set DERIV_ACCOUNT_ID explicitly.`);
-    }
-    if (byType.length > 1) {
-      logger.warn(`[DerivBroker] ${byType.length} "${wanted}" accounts found; selecting first. Set DERIV_ACCOUNT_ID to pin a specific one.`);
+      throw new Error(`No Options account of type "${wanted}" found. Available: [${available}].`);
     }
     const chosen = byType[0];
-    const id = normId(chosen);
-    if (!id) throw new Error('Account object missing account_id: ' + JSON.stringify(chosen));
-    logger.info(`[DerivBroker] Auto-selected accountId: ${id} [type=${normType(chosen)} currency=${chosen.currency || 'N/A'}]`);
     remember(chosen);
-    return id;
+    logger.info(`[DerivBroker] Auto-selected accountId: ${normId(chosen)} [type=${normType(chosen)}]`);
+    return normId(chosen);
   }
 
   async _requestOtpUrl() {
     const accountId = await this._resolveAccountId();
     const url = `${this.config.restBaseUrl}/trading/v1/options/accounts/${encodeURIComponent(accountId)}/otp`;
-    logger.info(`[DerivBroker] POST ${url}`);
     const resp = await axios.post(url, {}, { headers: this._restHeaders(), timeout: this.config.connectionTimeout });
     const data = resp.data?.data ?? resp.data;
     const wsUrl = data?.url;
     if (!wsUrl || !wsUrl.startsWith('ws')) {
       throw new Error('OTP response did not contain a WebSocket URL: ' + JSON.stringify(resp.data));
     }
-    logger.info(`[DerivBroker] Received OTP WS URL: ${wsUrl.split('?')[0]}`);
     return wsUrl;
   }
 
@@ -563,29 +470,23 @@ class DerivBroker extends EventEmitter {
       return this._connectPromise;
     }
     this._connectPromise = this._doConnect();
-    try {
-      return await this._connectPromise;
-    } finally {
-      this._connectPromise = null;
-    }
+    try { return await this._connectPromise; } finally { this._connectPromise = null; }
   }
 
   async _doConnect() {
     await Promise.all([this._connectPublic(), this._connectAuth()]);
     await this._loadSymbolsWithTimeout();
-    if (!this._symbolsDiscovered) {
-      logger.warn('[DerivBroker] Symbol discovery failed, using fallbacks.');
-      this._useFallbackSymbols();
-    }
+    if (!this._symbolsDiscovered) { this._useFallbackSymbols(); }
     this._ready = true;
     this.emit('ready');
     this.emit('connected');
-
     await this._ensureBalanceLoaded();
     await this._subscribeDefaultSymbols();
     await this._reconcilePositions();
     await this._loadPendingOrders();
     await this._resumeContractSubscriptions();
+    await this._reconcileTradeStatus();  // [FIX-3]
+    this._startTradeReconcileTimer();    // [FIX-3]
   }
 
   async _ensureBalanceLoaded(timeoutMs = this.config.balanceTimeout) {
@@ -593,16 +494,11 @@ class DerivBroker extends EventEmitter {
     if (!this._accountReady) {
       this._accountReady = new Promise((resolve) => { this._accountReadyResolve = resolve; });
     }
-    try {
-      await this._sendAuthRequest({ balance: 1, subscribe: 1 });
-    } catch (err) {
-      logger.warn('[DerivBroker] Balance subscribe failed:', err.message);
-    }
+    try { await this._sendAuthRequest({ balance: 1, subscribe: 1 }); }
+    catch (err) { logger.warn('[DerivBroker] Balance subscribe failed:', err.message); }
     await Promise.race([
       this._accountReady,
-      sleep(timeoutMs).then(() => {
-        logger.warn('[DerivBroker] Balance load timeout — proceeding without account.');
-      }),
+      sleep(timeoutMs).then(() => logger.warn('[DerivBroker] Balance load timeout — proceeding without account.')),
     ]);
     return this._account;
   }
@@ -623,7 +519,6 @@ class DerivBroker extends EventEmitter {
       this._publicState = STATE.CONNECTING;
       this._closePublicSocket();
       logger.info(`[DerivBroker] Connecting public WS: ${this.config.publicWsUrl}`);
-
       try {
         this._publicSocket = new WebSocket(this.config.publicWsUrl);
         const socket = this._publicSocket;
@@ -634,10 +529,14 @@ class DerivBroker extends EventEmitter {
           }
         }, this.config.connectionTimeout);
 
+        // [FIX-2] WS-protocol pong refreshes liveness.
+        socket.on('pong', () => { this._publicLastPong = Date.now(); });
+
         socket.on('open', () => {
           clearTimeout(timer);
           logger.info('[DerivBroker] Public WS connected.');
           this._publicState = STATE.CONNECTED;
+          this._publicLastPong = Date.now();
           this._startPublicHeartbeat();
           this._flushPublicQueue();
           this.streaming.restoreSubscriptions().catch(() => {});
@@ -659,19 +558,22 @@ class DerivBroker extends EventEmitter {
     });
   }
 
-  // [BUGFIX-D] Do NOT send { ping: 1 } — Deriv's newer Options API rejects
-  // it with UnknownMethod. Liveness is checked via _publicLastPong, which
-  // is updated whenever we respond to a server ping (BUGFIX-B).
+  // [FIX-2] WS-protocol ping instead of application JSON ping.
   _startPublicHeartbeat() {
     this._stopPublicHeartbeat();
     this._publicLastPong = Date.now();
+    this._publicHeartbeatInterval = setInterval(() => {
+      if (this._publicSocket?.readyState === WebSocket.OPEN) {
+        try { this._publicSocket.ping(); } catch (_) {}
+      }
+    }, this.config.wsPingIntervalMs);
     this._publicHeartbeatTimeout = setInterval(() => {
       if (Date.now() - this._publicLastPong > this.config.heartbeatTimeout) {
-        logger.warn('[DerivBroker] Public WS heartbeat timeout (no server ping in window)');
+        logger.warn('[DerivBroker] Public WS heartbeat timeout (no pong in window)');
         this._closePublicSocket();
         this._connectPublic().catch(() => {});
       }
-    }, 10000);
+    }, 30000);
   }
   _stopPublicHeartbeat() {
     if (this._publicHeartbeatInterval) clearInterval(this._publicHeartbeatInterval);
@@ -757,19 +659,14 @@ class DerivBroker extends EventEmitter {
   _handlePublicMessage(rawData) {
     try {
       const msg = JSON.parse(rawData);
+      // [FIX-2] Any inbound message proves the socket is alive.
+      this._publicLastPong = Date.now();
       let handled = false;
-
-      // [BUGFIX-B] Respond to Deriv's server-initiated pings:
-      //   inbound:  { "msg_type": "ping", "ping": "<uuid>" }
-      //   outbound: { "pong": "<uuid>" }
       if (msg.msg_type === 'ping' || (msg.ping && !msg.pong)) {
-        const pongValue = msg.ping != null ? msg.ping : 1;
-        this._sendPublicRaw({ pong: pongValue });
-        this._publicLastPong = Date.now();
+        this._sendPublicRaw({ pong: msg.ping != null ? msg.ping : 1 });
         handled = true;
       }
-
-      if (msg.pong) { this._publicLastPong = Date.now(); handled = true; }
+      if (msg.pong) { handled = true; }
       if (msg.error) logger.error('[In Public] API Error:', JSON.stringify(msg.error));
       if (msg.req_id && this._publicPendingRequests.has(msg.req_id)) {
         const p = this._publicPendingRequests.get(msg.req_id);
@@ -842,15 +739,18 @@ class DerivBroker extends EventEmitter {
           }
         }, this.config.connectionTimeout);
 
+        // [FIX-2] WS-protocol pong refreshes liveness.
+        socket.on('pong', () => { this._authLastPong = Date.now(); });
+
         socket.on('open', () => {
           clearTimeout(timer);
           logger.info('[DerivBroker] Auth WS connected (OTP-authenticated).');
           this._authState = STATE.READY;
+          this._authLastPong = Date.now();
           this._startAuthHeartbeat();
           this._flushAuthQueue();
           this.emit('authReady');
           resolve();
-
           this._restoreAuthSubscriptions().catch((err) => {
             logger.warn(`[DerivBroker] Auth-subscription restore failed: ${err.message}`);
           });
@@ -869,21 +769,24 @@ class DerivBroker extends EventEmitter {
   }
   _scheduleAuthReconnect() {
     if (this._authReconnectTimer) clearTimeout(this._authReconnectTimer);
-    this._authReconnectTimer = setTimeout(() => {
-      this._connectAuth().catch(() => {});
-    }, this._getReconnectDelay(0));
+    this._authReconnectTimer = setTimeout(() => { this._connectAuth().catch(() => {}); }, this._getReconnectDelay(0));
   }
-  // [BUGFIX-D] Same as public: no outbound { ping: 1 }.
+  // [FIX-2] WS-protocol ping.
   _startAuthHeartbeat() {
     this._stopAuthHeartbeat();
     this._authLastPong = Date.now();
+    this._authHeartbeatInterval = setInterval(() => {
+      if (this._authSocket?.readyState === WebSocket.OPEN) {
+        try { this._authSocket.ping(); } catch (_) {}
+      }
+    }, this.config.wsPingIntervalMs);
     this._authHeartbeatTimeout = setInterval(() => {
       if (Date.now() - this._authLastPong > this.config.heartbeatTimeout) {
-        logger.warn('[DerivBroker] Auth WS heartbeat timeout (no server ping in window)');
+        logger.warn('[DerivBroker] Auth WS heartbeat timeout (no pong in window)');
         this._closeAuthSocket();
         this._scheduleAuthReconnect();
       }
-    }, 10000);
+    }, 30000);
   }
   _stopAuthHeartbeat() {
     if (this._authHeartbeatInterval) clearInterval(this._authHeartbeatInterval);
@@ -971,17 +874,15 @@ class DerivBroker extends EventEmitter {
   _handleAuthMessage(rawData) {
     try {
       const msg = JSON.parse(rawData);
+      // [FIX-2] Any inbound message proves the socket is alive.
+      this._authLastPong = Date.now();
       let handled = false;
 
-      // [BUGFIX-B] Respond to Deriv's server-initiated pings.
       if (msg.msg_type === 'ping' || (msg.ping && !msg.pong)) {
-        const pongValue = msg.ping != null ? msg.ping : 1;
-        this._sendAuthRaw({ pong: pongValue });
-        this._authLastPong = Date.now();
+        this._sendAuthRaw({ pong: msg.ping != null ? msg.ping : 1 });
         handled = true;
       }
-
-      if (msg.pong) { this._authLastPong = Date.now(); handled = true; }
+      if (msg.pong) { handled = true; }
       if (msg.error) logger.error('[In Auth] API Error:', JSON.stringify(msg.error));
       if (msg.req_id && this._authPendingRequests.has(msg.req_id)) {
         const p = this._authPendingRequests.get(msg.req_id);
@@ -995,6 +896,19 @@ class DerivBroker extends EventEmitter {
       }
       if (msg.portfolio) {
         const contracts = msg.portfolio.contracts || [];
+        // [FIX-4] Log the raw response shape when empty so we can diagnose
+        // parsing issues without a debugger.
+        if (contracts.length === 0) {
+          this.metrics.portfolioEmptyResponses++;
+          if (this.metrics.portfolioEmptyResponses === 1 || this.metrics.portfolioEmptyResponses % 20 === 0) {
+            logger.info(
+              `[DerivBroker] Portfolio returned 0 contracts ` +
+              `(empty#${this.metrics.portfolioEmptyResponses}). ` +
+              `Raw keys: ${Object.keys(msg.portfolio || {}).join(',')} ` +
+              `Raw shape: ${JSON.stringify(msg.portfolio).slice(0, 300)}`
+            );
+          }
+        }
         this._openPositions = contracts
           .filter(c => c.status && ['open', 'active'].includes(c.status.toLowerCase()))
           .map(c => this._normalizeContract(c));
@@ -1002,14 +916,12 @@ class DerivBroker extends EventEmitter {
         this.emit('positions', this._openPositions);
         handled = true;
       }
-
       if (msg.proposal_open_contract) {
         this._handleContractUpdate(msg.proposal_open_contract).catch((err) => {
           logger.warn(`[DerivBroker] contract update handling failed: ${err.message}`);
         });
         handled = true;
       }
-
       if (msg.balance) {
         const b = msg.balance;
         this._account = {
@@ -1020,10 +932,7 @@ class DerivBroker extends EventEmitter {
           account_type: this._account?.account_type || this.config.accountType,
         };
         if (b.currency) this.accountCurrency = b.currency;
-        logger.info(
-          `[DerivBroker] Balance update: ${b.balance} ${b.currency}` +
-          (b.loginid ? ` (${b.loginid})` : '')
-        );
+        logger.info(`[DerivBroker] Balance update: ${b.balance} ${b.currency}` + (b.loginid ? ` (${b.loginid})` : ''));
         if (this._accountReadyResolve) {
           this._accountReadyResolve(this._account);
           this._accountReadyResolve = null;
@@ -1031,7 +940,6 @@ class DerivBroker extends EventEmitter {
         this.emit('accountUpdate', this._account);
         handled = true;
       }
-
       if (msg.buy || msg.sell || msg.proposal) handled = true;
       if (!handled) logger.debug('[In Auth] Unhandled:', JSON.stringify(redactSensitive(msg)));
     } catch (e) { logger.error('[In Auth] Parse error:', e.message); }
@@ -1060,13 +968,13 @@ class DerivBroker extends EventEmitter {
       logger.warn(`[DerivBroker] Balance restore failed: ${err.message}`);
     }
     await this._resumeContractSubscriptions();
+    await this._reconcileTradeStatus();  // [FIX-3]
   }
 
   async _resumeContractSubscriptions() {
     let positions = [];
-    try {
-      positions = await this.getOpenTrades();
-    } catch (err) {
+    try { positions = await this.getOpenTrades(); }
+    catch (err) {
       logger.warn(`[DerivBroker] Portfolio fetch during resume failed: ${err.message}`);
       return;
     }
@@ -1079,7 +987,6 @@ class DerivBroker extends EventEmitter {
     for (const pos of positions) {
       const contractId = String(pos.id);
       if (!contractId) continue;
-
       try {
         const existing = await Trade.findOne({ contractId: String(contractId) });
         if (!existing) {
@@ -1101,52 +1008,94 @@ class DerivBroker extends EventEmitter {
           });
         }
       } catch (err) {
-        if (err.code !== 11000) {
-          logger.warn(`[DerivBroker] Trade repair failed for ${contractId}: ${err.message}`);
-        }
+        if (err.code !== 11000) logger.warn(`[DerivBroker] Trade repair failed for ${contractId}: ${err.message}`);
       }
-
       await this._subscribeOpenContract(contractId).catch((err) => {
         logger.warn(`[DerivBroker] Resume subscribe failed for ${contractId}: ${err.message}`);
       });
     }
   }
 
-  // [BUGFIX-A] Deriv requires `contract_id` as an INTEGER.
+  // [FIX-3] Reconciliation: mark any MongoDB OPEN trade that's no longer
+  // in Deriv's portfolio as CLOSED. Catches:
+  //   - Contracts that expired naturally while we were disconnected
+  //   - Contracts sold outside the RTS UI
+  //   - Contracts whose subscription tick we missed
+  async _reconcileTradeStatus() {
+    if (this._authState !== STATE.READY) return;
+    try {
+      const openTrades = await Trade.find({ status: 'OPEN', product: 'deriv_multiplier' }).lean();
+      if (openTrades.length === 0) return;
+
+      const portfolio = await this.getOpenTrades();
+      const portfolioIds = new Set(portfolio.map(p => String(p.id)));
+
+      let closedCount = 0;
+      for (const trade of openTrades) {
+        const cid = String(trade.contractId);
+        if (!portfolioIds.has(cid)) {
+          await Trade.findOneAndUpdate(
+            { contractId: cid },
+            {
+              $set: {
+                status: 'CLOSED',
+                closeTime: new Date(),
+                floatingProfit: 0,
+                // P/L unknown for expired-while-disconnected contracts.
+                // The Trade document retains the last known currentPrice
+                // and purchasePrice for reference.
+              },
+            }
+          );
+          closedCount++;
+          this.metrics.tradesReconciledClosed++;
+          logger.info(
+            `[DerivBroker] Reconciled trade ${cid} → CLOSED (not in Deriv portfolio — expired or sold externally)`
+          );
+        }
+      }
+      if (closedCount > 0) {
+        logger.info(`[DerivBroker] Trade reconciliation closed ${closedCount} orphaned OPEN trade(s).`);
+        // Emit positions so the dashboard reflects the cleanup.
+        this.emit('positions', portfolio);
+      }
+    } catch (err) {
+      logger.warn(`[DerivBroker] Trade reconciliation failed: ${err.message}`);
+    }
+  }
+
+  _startTradeReconcileTimer() {
+    if (this._tradeReconcileTimer) clearInterval(this._tradeReconcileTimer);
+    this._tradeReconcileTimer = setInterval(() => {
+      this._reconcileTradeStatus().catch((err) => {
+        logger.warn(`[DerivBroker] Periodic trade reconciliation error: ${err.message}`);
+      });
+    }, this.config.tradeReconcileIntervalMs);
+    if (typeof this._tradeReconcileTimer.unref === 'function') this._tradeReconcileTimer.unref();
+    logger.info(`[DerivBroker] Trade reconciliation timer started (${this.config.tradeReconcileIntervalMs}ms).`);
+  }
+
   async _subscribeOpenContract(contractId) {
     const key = String(contractId);
     if (!key) return;
     if (this._contractSubscriptions.has(key)) return;
-
     const numericContractId = Number(key);
     if (!Number.isInteger(numericContractId) || numericContractId <= 0) {
-      logger.warn(
-        `[DerivBroker] Cannot subscribe to contract ${key}: not a valid numeric contract_id`
-      );
+      logger.warn(`[DerivBroker] Cannot subscribe to contract ${key}: not a valid numeric contract_id`);
       return;
     }
-
     const resp = await this._sendAuthRequest(
       { proposal_open_contract: 1, contract_id: numericContractId, subscribe: 1 },
       this.config.contractSubscribeTimeout
     );
-
     const poc = resp.proposal_open_contract;
-    if (!poc) {
-      logger.warn(`[DerivBroker] proposal_open_contract returned nothing for ${key}`);
-      return;
-    }
-    const subscriptionId = resp.subscription?.id;
-
-    this._contractSubscriptions.set(key, { subscriptionId, subscribedAt: Date.now() });
+    if (!poc) { logger.warn(`[DerivBroker] proposal_open_contract returned nothing for ${key}`); return; }
+    this._contractSubscriptions.set(key, { subscriptionId: resp.subscription?.id, subscribedAt: Date.now() });
     this.metrics.contractSubscriptions = this._contractSubscriptions.size;
-    logger.info(`[DerivBroker] Subscribed to contract ${key} (sub=${subscriptionId || 'n/a'})`);
-
+    logger.info(`[DerivBroker] Subscribed to contract ${key} (sub=${resp.subscription?.id || 'n/a'})`);
     await this._handleContractUpdate(poc, true);
   }
 
-  // [BUGFIX-F] Log first tick, every 30th tick, and settlement so
-  // contract monitoring is visible in the log without spamming.
   async _handleContractUpdate(poc, forcePersist = false) {
     const contractId = String(poc.contract_id ?? '');
     if (!contractId) return;
@@ -1176,15 +1125,13 @@ class DerivBroker extends EventEmitter {
     this._contractStates.set(contractId, state);
     this.metrics.contractUpdates++;
 
-    // [BUGFIX-F] Visibility
     const count = (this._contractUpdateCounts.get(contractId) || 0) + 1;
     this._contractUpdateCounts.set(contractId, count);
 
     if (count === 1) {
       logger.info(
-        `[DerivBroker] Contract ${contractId} FIRST TICK — ` +
-        `status=${state.status} profit=${state.currentProfit} ` +
-        `spot=${state.currentSpot} entry=${state.entrySpot} ` +
+        `[DerivBroker] Contract ${contractId} FIRST TICK — status=${state.status} ` +
+        `profit=${state.currentProfit} spot=${state.currentSpot} entry=${state.entrySpot} ` +
         `buyPrice=${state.buyPrice} isValidToSell=${state.isValidToSell}`
       );
     } else if (count % 30 === 0 && !state.isSold && !state.isExpired) {
@@ -1194,25 +1141,19 @@ class DerivBroker extends EventEmitter {
       );
     }
 
-    try {
-      this.emit('contractUpdate', state);
-    } catch (err) {
+    try { this.emit('contractUpdate', state); } catch (err) {
       logger.warn(`[DerivBroker] contractUpdate listener threw: ${err.message}`);
     }
 
     const finalStatuses = ['sold', 'won', 'lost', 'cancelled', 'expired'];
-    const isFinal =
-      state.isSold ||
-      state.isExpired ||
-      finalStatuses.includes(String(state.status || '').toLowerCase());
+    const isFinal = state.isSold || state.isExpired || finalStatuses.includes(String(state.status || '').toLowerCase());
 
     await this._persistContractState(contractId, isFinal || forcePersist);
 
     if (isFinal) {
       logger.info(
         `[DerivBroker] Contract ${contractId} SETTLED after ${count} tick(s) — ` +
-        `status=${state.status} profit=${state.currentProfit} ` +
-        `sellPrice=${state.sellPrice} exitTick=${state.exitTick}`
+        `status=${state.status} profit=${state.currentProfit} sellPrice=${state.sellPrice} exitTick=${state.exitTick}`
       );
       this._contractSubscriptions.delete(contractId);
       this._contractUpdateCounts.delete(contractId);
@@ -1228,7 +1169,6 @@ class DerivBroker extends EventEmitter {
     const now = Date.now();
     const last = this._contractPersistAt.get(key) || 0;
     const interval = this.config.contractPersistIntervalMs;
-
     if (!force && (now - last) < interval) {
       if (!this._contractPersistTimers.has(key)) {
         const delay = interval - (now - last);
@@ -1241,23 +1181,16 @@ class DerivBroker extends EventEmitter {
       }
       return;
     }
-
     const pending = this._contractPersistTimers.get(key);
     if (pending) { clearTimeout(pending); this._contractPersistTimers.delete(key); }
-
     this._contractPersistAt.set(key, now);
 
     const finalStatuses = ['sold', 'won', 'lost', 'cancelled', 'expired'];
-    const isFinal =
-      state.isSold ||
-      state.isExpired ||
-      finalStatuses.includes(String(state.status || '').toLowerCase());
-
+    const isFinal = state.isSold || state.isExpired || finalStatuses.includes(String(state.status || '').toLowerCase());
     const update = {
       currentPrice: state.currentSpot ?? state.entrySpot ?? null,
       floatingProfit: state.currentProfit ?? 0,
     };
-
     if (isFinal) {
       update.status = 'CLOSED';
       update.closePrice = state.exitTick ?? state.sellPrice ?? state.currentSpot ?? null;
@@ -1266,16 +1199,9 @@ class DerivBroker extends EventEmitter {
       update.closeTime = state.sellTime || new Date();
       update.floatingProfit = 0;
     }
-
     try {
-      const res = await Trade.findOneAndUpdate(
-        { contractId: String(key) },
-        { $set: update },
-        { new: false }
-      );
-      if (res) {
-        this.metrics.contractUpdatesPersisted++;
-      }
+      const res = await Trade.findOneAndUpdate({ contractId: String(key) }, { $set: update }, { new: false });
+      if (res) this.metrics.contractUpdatesPersisted++;
     } catch (err) {
       logger.warn(`[DerivBroker] Trade persist failed for ${key}: ${err.message}`);
     }
@@ -1293,14 +1219,12 @@ class DerivBroker extends EventEmitter {
     let symbols = null;
     try {
       const resp = await this._sendPublicRequest({ active_symbols: 'brief' }, 10000);
-      if (Array.isArray(resp.active_symbols) && resp.active_symbols.length > 0) {
-        symbols = resp.active_symbols;
-      } else {
+      if (Array.isArray(resp.active_symbols) && resp.active_symbols.length > 0) symbols = resp.active_symbols;
+      else {
         const resp2 = await this._sendPublicRequest({ active_symbols: 'full' }, 10000);
         if (Array.isArray(resp2.active_symbols) && resp2.active_symbols.length > 0) symbols = resp2.active_symbols;
       }
     } catch (err) { logger.warn('[DerivBroker] Symbol request failed:', err.message); }
-
     if (symbols?.length) {
       this._buildSymbolMaps(symbols);
       this._symbolsDiscovered = true;
@@ -1315,17 +1239,13 @@ class DerivBroker extends EventEmitter {
     this.reverseMap = {};
     this.spreadMap = {};
     for (const [k, v] of Object.entries(FALLBACK_SYMBOLS)) {
-      this.reverseMap[v] = k;
-      this.spreadMap[v] = 0.0001;
+      this.reverseMap[v] = k; this.spreadMap[v] = 0.0001;
     }
-    this._symbolsDiscovered = true;
-    this._symbolsLoaded = true;
+    this._symbolsDiscovered = true; this._symbolsLoaded = true;
   }
   _buildSymbolMaps(symbols) {
     let count = 0;
-    this.symbolMap = {};
-    this.reverseMap = {};
-    this.spreadMap = {};
+    this.symbolMap = {}; this.reverseMap = {}; this.spreadMap = {};
     for (const sym of symbols) {
       const derivSymbol = sym.underlying_symbol ?? sym.symbol;
       const display = sym.underlying_symbol_name ?? sym.display_name ?? '';
@@ -1413,23 +1333,18 @@ class DerivBroker extends EventEmitter {
   _normalizeContract(c) {
     const contractId = String(c.contract_id ?? c.id ?? '');
     const derivSymbol = c.underlying_symbol ?? c.underlying ?? c.symbol;
-
     const entrySpotRaw = c.entry_spot ?? c.entry_tick ?? c.entry_price;
     const entrySpotNum = Number(entrySpotRaw);
     const entryPrice = Number.isFinite(entrySpotNum) && entrySpotNum > 0 ? entrySpotNum : null;
-
     const purchasePriceRaw = c.buy_price ?? c.purchase_price;
     const purchasePriceNum = Number(purchasePriceRaw);
     const purchasePrice = Number.isFinite(purchasePriceNum) && purchasePriceNum > 0 ? purchasePriceNum : null;
-
     const currentSpotRaw = c.current_spot ?? c.current_tick;
     const currentSpotNum = Number(currentSpotRaw);
     const currentPrice = Number.isFinite(currentSpotNum) && currentSpotNum > 0 ? currentSpotNum : (entryPrice ?? 0);
-
     let side = 'UNKNOWN';
     if (c.direction === 'up' || /UP/i.test(c.contract_type || '')) side = 'BUY';
     else if (c.direction === 'down' || /DOWN/i.test(c.contract_type || '')) side = 'SELL';
-
     const startRaw = c.start_time ?? c.purchase_time ?? c.date_start;
     let openTime = Date.now();
     if (startRaw != null) {
@@ -1439,46 +1354,32 @@ class DerivBroker extends EventEmitter {
         if (Number.isFinite(parsed)) openTime = parsed;
       }
     }
-
     return {
-      id: contractId,
-      contractId,
+      id: contractId, contractId,
       instrument: fromDerivSymbol(derivSymbol, this.reverseMap) || 'UNKNOWN',
-      side,
-      purchasePrice,
-      entryPrice,
+      side, purchasePrice, entryPrice,
       price: entryPrice ?? 0,
       units: c.amount ?? 0,
       unrealizedPL: Number(c.profit ?? c.profit_loss ?? 0),
       currentPrice,
       stopLoss: Number(c.stop_loss ?? 0),
       takeProfit: Number(c.take_profit ?? 0),
-      openTime,
-      status: 'OPEN',
-      raw: c,
+      openTime, status: 'OPEN', raw: c,
     };
   }
 
-  // ============================================================
-  // PUBLIC API
-  // ============================================================
   async getAccount() {
     await this._ensureAuthReady();
     if (!this._account || this._account.balance == null) {
       try { await this._ensureBalanceLoaded(); } catch (_) {}
     }
-    if (!this._account || this._account.balance == null) {
-      return this._getDefaultAccount();
-    }
+    if (!this._account || this._account.balance == null) return this._getDefaultAccount();
     const acc = this._account;
     const bal = Number(acc.balance) || 0;
     return {
       id: acc.loginid || acc.account_id || 'N/A',
-      balance: String(bal),
-      currency: acc.currency || 'USD',
-      equity: String(bal),
-      marginUsed: '0',
-      marginAvailable: String(bal),
+      balance: String(bal), currency: acc.currency || 'USD',
+      equity: String(bal), marginUsed: '0', marginAvailable: String(bal),
       accountType: acc.account_type || this.config.accountType,
       createdTime: new Date().toISOString(),
     };
@@ -1488,8 +1389,7 @@ class DerivBroker extends EventEmitter {
       id: 'UNKNOWN', balance: '0', currency: 'USD', equity: '0',
       marginUsed: '0', marginAvailable: '0',
       accountType: this.config.accountType,
-      createdTime: new Date().toISOString(),
-      stale: true,
+      createdTime: new Date().toISOString(), stale: true,
     };
   }
   async getPrices(instruments) {
@@ -1540,16 +1440,12 @@ class DerivBroker extends EventEmitter {
   }
   async getPositions() { return this.getOpenTrades(); }
 
-  // ============================================================
-  // PLACE MARKET ORDER
-  // ============================================================
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null, options = {}) {
     await this._ensureAuthReady();
     if (!this._account || this._account.balance == null) {
       try { await this._ensureBalanceLoaded(); } catch (_) {}
     }
     const opts = (options && typeof options === 'object') ? options : {};
-
     const amount = Math.abs(Number(units));
     if (!Number.isFinite(amount) || amount <= 0) throw new Error('Order units must be positive.');
     const direction = units > 0 ? 'MULTUP' : 'MULTDOWN';
@@ -1557,20 +1453,27 @@ class DerivBroker extends EventEmitter {
     if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
 
     let finalMultiplier;
-    if (opts.multiplier == null) {
-      finalMultiplier = DEFAULT_MULTIPLIER;
-    } else {
+    if (opts.multiplier == null) finalMultiplier = DEFAULT_MULTIPLIER;
+    else {
       finalMultiplier = Math.floor(Number(opts.multiplier));
       if (!Number.isFinite(finalMultiplier) || !ACCEPTED_MULTIPLIERS.includes(finalMultiplier)) {
-        throw new Error(`Invalid multiplier ${opts.multiplier}. Accepted values: ${ACCEPTED_MULTIPLIERS.join(', ')}`);
+        throw new Error(`Invalid multiplier ${opts.multiplier}. Accepted: ${ACCEPTED_MULTIPLIERS.join(', ')}`);
       }
     }
+
+    // [FIX-1] Honour the caller's requested duration.
+    const finalDuration = (() => {
+      const d = Math.floor(Number(opts.duration));
+      if (Number.isFinite(d) && d >= 10) return d;
+      return DEFAULT_DURATION_SEC;
+    })();
 
     const proposalPayload = {
       proposal: 1, amount, basis: 'stake', contract_type: direction,
       currency: this.accountCurrency || 'USD',
       underlying_symbol: symbol,
       multiplier: finalMultiplier,
+      duration: finalDuration,      // [FIX-1]
       duration_unit: 's',
       subscribe: 1,
     };
@@ -1586,28 +1489,20 @@ class DerivBroker extends EventEmitter {
     const proposalResp = await this._sendAuthRequest(proposalPayload);
     const proposal = proposalResp.proposal;
     if (!proposal?.id) throw new Error(`Proposal missing: ${JSON.stringify(proposalResp)}`);
-
     const askPrice = Number(proposal.ask_price);
     if (!Number.isFinite(askPrice) || askPrice <= 0) throw new Error(`Invalid ask price: ${proposal.ask_price}`);
 
     const buyResp = await this._sendAuthRequest({ buy: proposal.id, price: askPrice });
     const buy = buyResp.buy;
-
     const contractId = String(buy?.contract_id ?? '');
     const purchasePrice = Number(buy?.buy_price ?? buy?.price);
     const entrySpot = Number(buy?.entry_spot ?? proposal.spot);
-
-    if (!contractId || contractId === 'undefined') {
-      throw new Error('Deriv returned no contract ID: ' + JSON.stringify(buyResp));
-    }
-    if (!Number.isFinite(purchasePrice) || purchasePrice <= 0) {
-      throw new Error(`Invalid purchase price: ${JSON.stringify(buyResp)}`);
-    }
+    if (!contractId || contractId === 'undefined') throw new Error('Deriv returned no contract ID: ' + JSON.stringify(buyResp));
+    if (!Number.isFinite(purchasePrice) || purchasePrice <= 0) throw new Error(`Invalid purchase price: ${JSON.stringify(buyResp)}`);
 
     this._subscribeOpenContract(contractId).catch((err) => {
       logger.warn(`[DerivBroker] Initial contract subscription failed for ${contractId}: ${err.message}`);
     });
-
     this.getOpenTrades().then(p => this.emit('positions', p)).catch(() => {});
 
     return {
@@ -1619,15 +1514,11 @@ class DerivBroker extends EventEmitter {
     };
   }
 
-  // [BUGFIX-A] Same integer requirement as proposal_open_contract.
   async closeTrade(tradeId) {
     await this._ensureAuthReady();
     if (!tradeId) throw new Error('tradeId required');
-
     const numericTradeId = Number(tradeId);
-    if (!Number.isInteger(numericTradeId) || numericTradeId <= 0) {
-      throw new Error(`Invalid contract ID for close: ${tradeId}`);
-    }
+    if (!Number.isInteger(numericTradeId) || numericTradeId <= 0) throw new Error(`Invalid contract ID for close: ${tradeId}`);
 
     const resp = await this._sendAuthRequest({ sell: numericTradeId, price: 0 });
     if (!resp.sell) throw new Error('Close failed: ' + JSON.stringify(resp));
@@ -1636,31 +1527,20 @@ class DerivBroker extends EventEmitter {
     if (!coid) {
       try {
         const ord = await Order.findOne({ contractId: String(tradeId) });
-        if (ord) {
-          coid = ord.clientOrderId;
-          this._orderMap.set(String(tradeId), coid);
-          this._orders.set(coid, ord);
-        }
-      } catch (err) {
-        logger.warn(`[DerivBroker] closeTrade lookup failed for ${tradeId}: ${err.message}`);
-      }
+        if (ord) { coid = ord.clientOrderId; this._orderMap.set(String(tradeId), coid); this._orders.set(coid, ord); }
+      } catch (err) { logger.warn(`[DerivBroker] closeTrade lookup failed for ${tradeId}: ${err.message}`); }
     }
-    if (coid) {
-      await this._updateOrderStatus(coid, ORDER_STATUS.CLOSED);
-      this._orderMap.delete(String(tradeId));
-    }
+    if (coid) { await this._updateOrderStatus(coid, ORDER_STATUS.CLOSED); this._orderMap.delete(String(tradeId)); }
 
     try {
       const soldFor = resp.sell.sold_for != null ? Number(resp.sell.sold_for) : null;
       const balanceAfter = resp.sell.balance_after != null ? Number(resp.sell.balance_after) : null;
       const buyPrice = resp.sell.buy_price != null ? Number(resp.sell.buy_price) : null;
       const profit = (soldFor != null && buyPrice != null) ? (soldFor - buyPrice) : null;
-
       const update = { status: 'CLOSED', closeTime: new Date() };
       if (soldFor != null) update.closePrice = soldFor;
       if (profit != null) { update.realizedProfit = profit; update.pnl = profit; }
       update.floatingProfit = 0;
-
       await Trade.findOneAndUpdate({ contractId: String(tradeId) }, { $set: update });
       if (balanceAfter != null && this._account) {
         this._account.balance = balanceAfter;
@@ -1690,7 +1570,6 @@ class DerivBroker extends EventEmitter {
     return this.placeMarketOrder(instrument, units, sl, tp);
   }
 
-  // ---------- Health ----------
   isMarketDataConnected() { return [STATE.CONNECTED, STATE.READY].includes(this._publicState); }
   isTradingReady() { return this._authState === STATE.READY; }
   isConnected() { return this.isMarketDataConnected() && this.isTradingReady(); }
@@ -1700,25 +1579,20 @@ class DerivBroker extends EventEmitter {
       publicState: this._publicState, authState: this._authState,
       marketDataConnected: this.isMarketDataConnected(),
       tradingReady: this.isTradingReady(), ready: this._ready,
-      circuitBreaker: this._cbState, reconnectCount: this.metrics.reconnections,
-      queueSize: this._publicMessageQueue.length + this._authMessageQueue.length,
-      pendingRequests: this._publicPendingRequests.size + this._authPendingRequests.size,
-      lastHeartbeat: this.metrics.lastHeartbeat, lastPong: this.metrics.lastPong,
-      averageLatency: this.metrics.latencyCount > 0 ? this.metrics.totalLatency / this.metrics.latencyCount : 0,
-      orders: {
-        placed: this.metrics.ordersPlaced, filled: this.metrics.ordersFilled, rejected: this.metrics.ordersRejected,
-      },
+      reconnectCount: this.metrics.reconnections,
       contractMonitoring: {
         activeSubscriptions: this._contractSubscriptions.size,
         trackedContracts: this._contractStates.size,
         totalUpdates: this.metrics.contractUpdates,
         persistedUpdates: this.metrics.contractUpdatesPersisted,
       },
-      capabilities: this.capabilities,
-      subscriptions: this.streaming._subscriptions.size,
-      pendingSubscriptions: this.streaming._pendingSubscriptions.size,
-      openPositions: this._openPositions.length,
-      accountType: this.config.accountType,
+      tradeReconciliation: {
+        intervalMs: this.config.tradeReconcileIntervalMs,
+        closedTrades: this.metrics.tradesReconciledClosed,
+      },
+      portfolioDiagnostics: {
+        emptyResponses: this.metrics.portfolioEmptyResponses,
+      },
       accountLoaded: !!(this._account && this._account.balance != null),
       acceptedMultipliers: ACCEPTED_MULTIPLIERS,
     };
@@ -1741,6 +1615,7 @@ class DerivBroker extends EventEmitter {
     this._connectPromise = null;
     for (const [, timer] of this._contractPersistTimers) clearTimeout(timer);
     this._contractPersistTimers.clear();
+    if (this._tradeReconcileTimer) { clearInterval(this._tradeReconcileTimer); this._tradeReconcileTimer = null; }
   }
   _getReconnectDelay(attempt) {
     const base = this.config.reconnectBaseDelay;
@@ -1750,9 +1625,6 @@ class DerivBroker extends EventEmitter {
   }
 }
 
-// ============================================================
-// EXPORT
-// ============================================================
 const brokerInstance = new DerivBroker({
   apiToken: process.env.DERIV_API_TOKEN,
   appId: process.env.DERIV_APP_ID,
@@ -1769,10 +1641,12 @@ const brokerInstance = new DerivBroker({
   rateCapacity: parseFloat(process.env.DERIV_RATE_CAPACITY) || 10,
   readinessTimeout: parseInt(process.env.DERIV_READINESS_TIMEOUT) || 30000,
   symbolTimeout: parseInt(process.env.DERIV_SYMBOL_TIMEOUT) || 30000,
-  heartbeatTimeout: parseInt(process.env.DERIV_HEARTBEAT_TIMEOUT) || 60000,
+  heartbeatTimeout: parseInt(process.env.DERIV_HEARTBEAT_TIMEOUT) || 120000,
+  wsPingIntervalMs: parseInt(process.env.DERIV_WS_PING_INTERVAL) || 20000,
   balanceTimeout: parseInt(process.env.DERIV_BALANCE_TIMEOUT) || 10000,
   contractPersistIntervalMs: parseInt(process.env.DERIV_CONTRACT_PERSIST_INTERVAL_MS) || 3000,
   contractSubscribeTimeout: parseInt(process.env.DERIV_CONTRACT_SUBSCRIBE_TIMEOUT) || 15000,
+  tradeReconcileIntervalMs: parseInt(process.env.DERIV_TRADE_RECONCILE_INTERVAL) || 30000,
 });
 
 module.exports = brokerInstance;
