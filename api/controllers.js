@@ -17,6 +17,13 @@
 //   All endpoints include the confirmed contractId at the top level when
 //   it is known. Queries by contractId use String(...) for consistency
 //   with the models/Trade.js migration.
+//
+// [FIX-5] closeTrade now broadcasts a refreshed `history` array and an
+//   updated `positions` array to connected dashboards immediately after a
+//   successful close. Without this, the History tab and Open Positions
+//   table only update on the next manual refresh — the closed contract
+//   stays visible in History (or missing from it) until the user clicks
+//   the Refresh button.
 
 const Trade = require('../models/Trade');
 const Order = require('../models/Order');
@@ -168,6 +175,37 @@ function handleOrderError(res, error, logTag) {
       'The broker returned an error during execution. The purchase may or may not have gone through. ' +
       'Check open positions before retrying.',
   });
+}
+
+// ================================================================
+//  [FIX-5] History broadcast helper
+// ================================================================
+// Called after any state change that affects the closed-trades list
+// (close, reconciliation, or delete-history). Builds the same payload
+// shape that getTradeHistory() returns, so the frontend can drop it
+// straight into dashboardState.history.
+async function broadcastHistoryUpdate() {
+  try {
+    const recentClosed = await Trade.find({ status: 'CLOSED' })
+      .sort({ closeTime: -1 })
+      .limit(200)
+      .lean();
+
+    const historyPayload = recentClosed.map(t => ({
+      pair: t.instrument || t.pair || 'N/A',
+      side: t.side || 'N/A',
+      entryPrice: t.openPrice || t.entryPrice || null,
+      exitPrice: t.closePrice || t.exitPrice || null,
+      lotSize: t.lotSize || 0,
+      pnl: t.realizedProfit !== undefined ? t.realizedProfit : (t.pnl || 0),
+      status: t.status || 'CLOSED',
+      date: t.closeTime || t.updatedAt || t.createdAt,
+    }));
+
+    broadcastToDashboards('history', historyPayload);
+  } catch (err) {
+    logger.warn(`[controllers] broadcastHistoryUpdate failed: ${err.message}`);
+  }
 }
 
 // ---------- User Preferences ----------
@@ -540,6 +578,10 @@ exports.placeOrder = async (req, res) => {
 };
 
 // ---------- Close Trade ----------
+// [FIX-5] After a successful close, broadcast both an updated positions
+// list and a refreshed history so the dashboard's Open Positions table
+// clears the row immediately and History gets the new closed-trade entry —
+// without the user having to click Refresh.
 exports.closeTrade = async (req, res) => {
   const { tradeId } = req.params;
   if (!tradeId) return res.status(400).json({ error: 'tradeId required' });
@@ -547,16 +589,26 @@ exports.closeTrade = async (req, res) => {
     const product = getProduct(req);
     const result = await orderService.closeTrade(tradeId, product);
 
+    // Broadcast updated positions immediately so the row disappears
     try {
       const openTrades = await orderService.getOpenTrades(product);
       broadcastToDashboards('positions', openTrades);
+    } catch (broadcastErr) {
+      logger.warn('[controllers] Failed to broadcast positions after close:', broadcastErr.message);
+    }
+
+    // Broadcast updated account (balance changed by realized P/L)
+    try {
       const account = await accountService.getAccount(product);
       const broker = getBroker(product);
       const enhanced = enhanceAccount(account, broker);
       broadcastToDashboards('account', enhanced);
     } catch (broadcastErr) {
-      logger.warn('[controllers] Failed to broadcast after close:', broadcastErr.message);
+      logger.warn('[controllers] Failed to broadcast account after close:', broadcastErr.message);
     }
+
+    // [FIX-5] Broadcast refreshed history so the History tab updates without refresh
+    await broadcastHistoryUpdate();
 
     portfolioManager.updateDailyPnL(result.pl || 0);
     // [CHANGE-6-G] String() for cross-model consistency.
@@ -593,9 +645,11 @@ exports.cancelOrder = async (req, res) => {
 };
 
 // ---------- Delete History ----------
+// [FIX-5] Also broadcast the (now-empty) history after deletion.
 exports.deleteHistory = async (req, res) => {
   try {
     const count = await orderService.deleteClosedTrades();
+    await broadcastHistoryUpdate();
     res.json({ success: true, deletedCount: count });
   } catch (error) {
     res.status(500).json({ error: error.message });
