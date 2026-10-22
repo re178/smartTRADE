@@ -1,35 +1,41 @@
 // core/execution/broker.js – Stable Dual‑WebSocket Deriv Broker
+// Current Options API:
+//   PUBLIC WS : wss://api.derivws.com/trading/v1/options/ws/public
+//   AUTH      : GET /trading/v1/options/accounts
+//                 → POST /trading/v1/options/accounts/{account_id}/otp
+//                 → connect to returned WS URL (already authenticated)
 //
-// [FIX 1..8]   Pre-existing fixes.
-// [CHANGE-1A/1B/1C] / [CHANGE-5] / [CHANGE-8] — see prior revisions.
-// [LIVE-1..7]  — see prior revisions.
-// [BUGFIX-A]   contract_id as integer for proposal_open_contract and sell.
-// [BUGFIX-B]   respond to Deriv server-initiated pings with { pong }.
-// [BUGFIX-C]   do not retry permanent Deriv errors.
-// [BUGFIX-D]   removed our outbound { ping: 1 } (rejected with UnknownMethod).
-// [BUGFIX-E]   supportsClose / supportsModify declared.
-// [BUGFIX-F]   contract update logging (FIRST TICK, tick #30, settlement).
-//
-// [REVERT-1]   REMOVED `duration` from the proposal payload. Deriv's
-//              MULTUP/MULTDOWN contracts reject it with InvalidExpiry:
-//              "Invalid input (duration or date_expiry) for this contract
-//              type (MULTUP)". `duration_unit: 's'` alone is tolerated and
-//              kept. Multiplier contracts are open-ended — closed manually,
-//              by knockout/TP, or at Deriv's max contract duration.
-//              The user's chosen duration is still stored on the Trade /
-//              Order documents (intent record), it is simply not sent to
-//              Deriv.
-// [REVERT-2]   getOpenTrades() no longer swallows portfolio-fetch errors
-//              and returns []. Returning [] on error was being misread as
-//              "no open contracts" by _reconcilePositions and
-//              _reconcileTradeStatus, which then marked every MongoDB
-//              OPEN trade as CLOSED — the "contracts disappear" bug.
-//              It now throws; callers already have try/catch and will
-//              skip reconciliation instead of wrongly concluding "empty".
-// [GUARD-3]    _reconcileTradeStatus only runs when the portfolio fetch
-//              succeeded AND the trade is at least MIN_AGE_MS old (default
-//              15s) — protects against Deriv's eventual consistency on
-//              freshly-placed trades.
+// [FIX 1..8] Pre-existing fixes.
+// [CHANGE-1..8] / [LIVE-1..7] — see prior revisions.
+// [BUGFIX-A..F] — see prior revisions.
+// [REVERT-1..2] — see prior revisions.
+// [GUARD-3]     — see prior revisions.
+// [FILE-3.1]    Startup + runtime reconcile hardening:
+//   - tradeReconcileMinAgeMs raised from 15s to 60s
+//   - _verifyContractStatus() queries proposal_open_contract for a
+//     specific contract ID before marking any trade CLOSED. A trade is
+//     only CLOSED if Deriv confirms it (is_sold || is_expired ||
+//     terminal status). Portfolio absence alone is no longer sufficient.
+//   - Extracted sell_price / buy_price from proposal_open_contract when
+//     reconciling so the Trade doc gets correct realizedProfit and pnl
+//     even when reconciliation closes the trade.
+//   - Log 'Contract NOT in portfolio but confirmed OPEN via
+//     proposal_open_contract' warning when the false-alarm path is hit
+//     (this was the root cause of 'positions disappearing').
+// [FILE-3.2] Log knockout + take_profit on FIRST TICK for every contract.
+//   This is what surfaces the 'OTIE destroyed my knockout' problem — if
+//   the first tick shows limitStopLoss=null after a MODIFY, we'll see it
+//   immediately in the log.
+// [FILE-3.3] modifySLTP() preserved for backward compatibility but:
+//   - Logs a WARNING that this loses multiplier and creates an orphan Trade
+//   - Preserves both SL and TP from the current contract if not explicitly
+//     overridden (no more silently null-ing out one of them)
+//   - Preserves the multiplier from the current Trade document
+//   OTIE no longer calls this (File 2 removes it) but the method remains
+//   for any external caller that needs the close+reopen primitive.
+// [FILE-3.4] getContractStatus() public method — returns
+//   { status: 'open'|'closed'|'unknown', profit, soldFor, buyPrice,
+//     limitStopLoss, limitTakeProfit } for a single contract.
 
 const WebSocket = require('ws');
 const axios = require('axios');
@@ -109,7 +115,9 @@ function redactSensitive(obj) {
   return copy;
 }
 
-function isPatToken(token) { return typeof token === 'string' && token.startsWith('pat_'); }
+function isPatToken(token) {
+  return typeof token === 'string' && token.startsWith('pat_');
+}
 
 function isPermanentApiError(err) {
   if (!err || !err.message) return false;
@@ -121,7 +129,7 @@ function isPermanentApiError(err) {
     msg.includes('AuthorizationRequired') ||
     msg.includes('InvalidToken') ||
     msg.includes('PermissionDenied') ||
-    msg.includes('InvalidExpiry')            // [REVERT-1] not retriable
+    msg.includes('InvalidExpiry')
   );
 }
 
@@ -245,7 +253,7 @@ const BROKER_CAPABILITIES = {
   supportsPartialClose: false, supportsGuaranteedSL: false, supportsOCO: false,
   supportsMarketOrders: true, supportsLimitOrders: false, supportsStopOrders: false,
   supportsDemo: true, supportsLive: true,
-  supportsClose: true, supportsModify: true, supportsCancel: false,
+  supportsClose: true, supportsModify: false, supportsCancel: false,
   supportedMarkets: ['Forex', 'Indices', 'Commodities', 'Cryptocurrencies'],
 };
 
@@ -282,9 +290,11 @@ class DerivBroker extends EventEmitter {
       contractPersistIntervalMs: parseInt(config.contractPersistIntervalMs || process.env.DERIV_CONTRACT_PERSIST_INTERVAL_MS || 3000),
       contractSubscribeTimeout: parseInt(config.contractSubscribeTimeout || process.env.DERIV_CONTRACT_SUBSCRIBE_TIMEOUT || 15000),
       tradeReconcileIntervalMs: parseInt(config.tradeReconcileIntervalMs || process.env.DERIV_TRADE_RECONCILE_INTERVAL || 30000),
-      // [GUARD-3] Skip reconciliation for trades younger than this. Protects
-      // against Deriv's eventual consistency on freshly-placed trades.
-      tradeReconcileMinAgeMs: parseInt(config.tradeReconcileMinAgeMs || process.env.DERIV_TRADE_RECONCILE_MIN_AGE || 15000),
+      // [FILE-3.1] 60s minimum age before any trade is eligible for reconcile-close.
+      tradeReconcileMinAgeMs: parseInt(config.tradeReconcileMinAgeMs || process.env.DERIV_TRADE_RECONCILE_MIN_AGE || 60000),
+      // [FILE-3.1] Consecutive portfolio misses required before contract status is
+      // even queried. A single miss (network blip, eventual consistency) is ignored.
+      tradeReconcileMissesRequired: parseInt(config.tradeReconcileMissesRequired || process.env.DERIV_TRADE_RECONCILE_MISSES || 2),
     };
 
     this.validateConfig();
@@ -335,6 +345,8 @@ class DerivBroker extends EventEmitter {
     this._contractPersistAt = new Map();
     this._contractPersistTimers = new Map();
     this._contractUpdateCounts = new Map();
+    // [FILE-3.1] Per-contract portfolio-miss counter for reconcile hardening.
+    this._reconcileMissCounts = new Map();
 
     this._tradeReconcileTimer = null;
 
@@ -346,6 +358,7 @@ class DerivBroker extends EventEmitter {
       tradesReconciledClosed: 0,
       reconcileSkippedFresh: 0,
       reconcileSkippedFetchError: 0,
+      reconcileSkippedFalseAlarm: 0,     // [FILE-3.1]
       portfolioEmptyResponses: 0,
     };
 
@@ -362,7 +375,7 @@ class DerivBroker extends EventEmitter {
     logger.info(`[DerivBroker] Account type preference: ${this.config.accountType}`);
     logger.info(`[DerivBroker] Contract persist interval: ${this.config.contractPersistIntervalMs}ms`);
     logger.info(`[DerivBroker] WS-protocol ping interval: ${this.config.wsPingIntervalMs}ms`);
-    logger.info(`[DerivBroker] Trade reconciliation interval: ${this.config.tradeReconcileIntervalMs}ms (min age: ${this.config.tradeReconcileMinAgeMs}ms)`);
+    logger.info(`[DerivBroker] Trade reconciliation interval: ${this.config.tradeReconcileIntervalMs}ms (min age: ${this.config.tradeReconcileMinAgeMs}ms, misses required: ${this.config.tradeReconcileMissesRequired})`);
   }
 
   validateConfig() {
@@ -427,7 +440,7 @@ class DerivBroker extends EventEmitter {
     const accounts = await this._fetchAccounts();
     if (!accounts || accounts.length === 0) throw new Error('No Options trading accounts found for this PAT');
     const normType = (a) => String(a.account_type || a.type || '').toLowerCase();
-    const normId   = (a) => a.account_id || a.id || a.accountId;
+    const normId = (a) => a.account_id || a.id || a.accountId;
     const remember = (acc) => {
       this._account = {
         loginid: normId(acc), account_id: normId(acc),
@@ -530,9 +543,7 @@ class DerivBroker extends EventEmitter {
             reject(new Error('Public WS connection timeout'));
           }
         }, this.config.connectionTimeout);
-
         socket.on('pong', () => { this._publicLastPong = Date.now(); });
-
         socket.on('open', () => {
           clearTimeout(timer);
           logger.info('[DerivBroker] Public WS connected.');
@@ -737,9 +748,7 @@ class DerivBroker extends EventEmitter {
             reject(new Error('Auth WS connection timeout'));
           }
         }, this.config.connectionTimeout);
-
         socket.on('pong', () => { this._authLastPong = Date.now(); });
-
         socket.on('open', () => {
           clearTimeout(timer);
           logger.info('[DerivBroker] Auth WS connected (OTP-authenticated).');
@@ -1009,11 +1018,17 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // [GUARD-3] Reconciliation with three safety rails:
-  //   1. Skip if auth WS is not READY (portfolio fetch would fail anyway).
-  //   2. Skip entirely if getOpenTrades() throws (fetch failed) — do NOT
-  //      conclude "portfolio is empty" from a network error.
-  //   3. Skip individual trades younger than tradeReconcileMinAgeMs.
+  // ============================================================
+  // [FILE-3.1] HARDENED RECONCILE
+  // ============================================================
+  // A trade is only marked CLOSED when:
+  //   1. The portfolio has missed it for tradeReconcileMissesRequired consecutive cycles
+  //   2. The trade is at least tradeReconcileMinAgeMs old
+  //   3. proposal_open_contract CONFIRMS the contract is closed (is_sold ||
+  //      is_expired || terminal status)
+  //
+  // Missing from portfolio alone is NOT sufficient. This is the fix for
+  // 'positions disappearing'.
   async _reconcileTradeStatus() {
     if (this._authState !== STATE.READY) return;
 
@@ -1026,9 +1041,7 @@ class DerivBroker extends EventEmitter {
     }
     if (openTrades.length === 0) return;
 
-    // [GUARD-3] Fetch portfolio. If this throws, we do NOT reconcile —
-    // a failed fetch looks identical to an empty portfolio in the old
-    // code and was marking every open trade CLOSED.
+    // Fetch portfolio. Skip entire cycle on fetch failure.
     let portfolio;
     try {
       portfolio = await this.getOpenTrades();
@@ -1041,46 +1054,133 @@ class DerivBroker extends EventEmitter {
     const portfolioIds = new Set(portfolio.map(p => String(p.id)));
     const now = Date.now();
     const minAge = this.config.tradeReconcileMinAgeMs;
-
-    let closedCount = 0;
-    let skippedFresh = 0;
+    const missesRequired = this.config.tradeReconcileMissesRequired;
 
     for (const trade of openTrades) {
       const cid = String(trade.contractId);
-      if (portfolioIds.has(cid)) continue;  // still open — fine
 
-      // [GUARD-3] Skip trades younger than minAge — Deriv may not list them
-      // in portfolio yet due to eventual consistency.
-      const openedAt = trade.openTime ? new Date(trade.openTime).getTime() : 0;
-      if (openedAt && (now - openedAt) < minAge) {
-        skippedFresh++;
+      // Contract is still in portfolio — clear miss count, no action.
+      if (portfolioIds.has(cid)) {
+        if (this._reconcileMissCounts.has(cid)) {
+          logger.info(`[DerivBroker] Contract ${cid} reappeared in portfolio — clearing miss counter.`);
+          this._reconcileMissCounts.delete(cid);
+        }
         continue;
       }
 
-      await Trade.findOneAndUpdate(
-        { contractId: cid },
-        {
-          $set: {
-            status: 'CLOSED',
-            closeTime: new Date(),
-            floatingProfit: 0,
-          },
+      // Missing from portfolio. Skip if fresh (eventual consistency).
+      const openedAt = trade.openTime ? new Date(trade.openTime).getTime() : 0;
+      if (openedAt && (now - openedAt) < minAge) {
+        this.metrics.reconcileSkippedFresh++;
+        continue;
+      }
+
+      // Increment miss counter.
+      const misses = (this._reconcileMissCounts.get(cid) || 0) + 1;
+      this._reconcileMissCounts.set(cid, misses);
+
+      if (misses < missesRequired) {
+        logger.info(
+          `[DerivBroker] Contract ${cid} missing from portfolio (miss ${misses}/${missesRequired}) — ` +
+          `waiting before verifying.`
+        );
+        continue;
+      }
+
+      // Enough misses. Verify via proposal_open_contract before closing.
+      logger.info(`[DerivBroker] Contract ${cid} missed ${misses}× portfolio checks — verifying status.`);
+      const verify = await this._verifyContractStatus(cid);
+
+      if (verify.status === 'open') {
+        // Portfolio is behind, contract is actually open. Skip.
+        this.metrics.reconcileSkippedFalseAlarm++;
+        logger.warn(
+          `[DerivBroker] Contract ${cid} NOT in portfolio but proposal_open_contract reports OPEN — ` +
+          `skipping reconcile (false alarm). Trade remains OPEN.`
+        );
+        this._reconcileMissCounts.delete(cid);
+        continue;
+      }
+
+      if (verify.status === 'closed') {
+        // Confirmed closed by Deriv. Mark closed with accurate P/L.
+        try {
+          await Trade.findOneAndUpdate(
+            { contractId: cid },
+            {
+              $set: {
+                status: 'CLOSED',
+                closeTime: new Date(),
+                floatingProfit: 0,
+                realizedProfit: verify.profit || 0,
+                pnl: verify.profit || 0,
+                closePrice: verify.soldFor || null,
+              },
+            }
+          );
+          this.metrics.tradesReconciledClosed++;
+          logger.info(
+            `[DerivBroker] Reconciled trade ${cid} → CLOSED (verified via proposal_open_contract). ` +
+            `soldFor=${verify.soldFor} buyPrice=${verify.buyPrice} profit=${verify.profit}`
+          );
+        } catch (err) {
+          logger.warn(`[DerivBroker] Reconcile close failed for ${cid}: ${err.message}`);
         }
-      );
-      closedCount++;
-      this.metrics.tradesReconciledClosed++;
-      logger.info(
-        `[DerivBroker] Reconciled trade ${cid} → CLOSED (not in Deriv portfolio — expired or sold externally)`
-      );
+        this._reconcileMissCounts.delete(cid);
+        continue;
+      }
+
+      // status === 'unknown' — API failed. Skip this cycle, retry next.
+      logger.warn(`[DerivBroker] Contract ${cid} verification returned UNKNOWN — skipping reconcile this cycle.`);
     }
 
-    if (skippedFresh > 0) {
-      this.metrics.reconcileSkippedFresh += skippedFresh;
-    }
-    if (closedCount > 0) {
-      logger.info(`[DerivBroker] Trade reconciliation closed ${closedCount} orphaned OPEN trade(s).`);
+    if (this.metrics.tradesReconciledClosed > 0) {
       this.emit('positions', portfolio);
     }
+  }
+
+  // [FILE-3.1] Query a single contract's status directly. Returns:
+  //   { status: 'open'|'closed'|'unknown', profit, soldFor, buyPrice,
+  //     limitStopLoss, limitTakeProfit }
+  // 'unknown' means the API failed OR returned no data — caller must retry.
+  async _verifyContractStatus(contractId) {
+    const key = String(contractId);
+    const numericId = Number(key);
+    if (!Number.isInteger(numericId) || numericId <= 0) {
+      return { status: 'unknown' };
+    }
+    try {
+      const resp = await this._sendAuthRequest(
+        { proposal_open_contract: 1, contract_id: numericId },
+        8000
+      );
+      const poc = resp?.proposal_open_contract;
+      if (!poc) return { status: 'unknown' };
+
+      const finalStatuses = ['sold', 'won', 'lost', 'cancelled', 'expired'];
+      const statusLower = String(poc.status || '').toLowerCase();
+      const isFinal = poc.is_sold || poc.is_expired || finalStatuses.includes(statusLower);
+
+      const soldFor = poc.sell_price != null ? Number(poc.sell_price) : null;
+      const buyPrice = poc.buy_price != null ? Number(poc.buy_price) : null;
+      const profit = (soldFor != null && buyPrice != null) ? (soldFor - buyPrice) : null;
+      const limitStopLoss = poc.limit_order?.stop_loss != null ? Number(poc.limit_order.stop_loss) : null;
+      const limitTakeProfit = poc.limit_order?.take_profit != null ? Number(poc.limit_order.take_profit) : null;
+
+      if (isFinal) {
+        return { status: 'closed', profit, soldFor, buyPrice, limitStopLoss, limitTakeProfit };
+      }
+      return { status: 'open', profit, soldFor, buyPrice, limitStopLoss, limitTakeProfit };
+    } catch (err) {
+      logger.debug(`[DerivBroker] _verifyContractStatus(${key}) failed: ${err.message}`);
+      return { status: 'unknown' };
+    }
+  }
+
+  // [FILE-3.4] Public method — safe to call from controllers or scripts.
+  async getContractStatus(contractId) {
+    await this._ensureAuthReady();
+    return this._verifyContractStatus(contractId);
   }
 
   _startTradeReconcileTimer() {
@@ -1119,6 +1219,10 @@ class DerivBroker extends EventEmitter {
     const contractId = String(poc.contract_id ?? '');
     if (!contractId) return;
 
+    // [FILE-3.2] Extract knockout / TP from the response
+    const limitStopLoss = poc.limit_order?.stop_loss != null ? Number(poc.limit_order.stop_loss) : null;
+    const limitTakeProfit = poc.limit_order?.take_profit != null ? Number(poc.limit_order.take_profit) : null;
+
     const state = {
       contractId,
       symbol: poc.underlying,
@@ -1137,6 +1241,8 @@ class DerivBroker extends EventEmitter {
       isValidToSell: !!poc.is_valid_to_sell,
       sellTime: poc.sell_time ? new Date(poc.sell_time * 1000) : null,
       entryTime: poc.entry_tick_time ? new Date(poc.entry_tick_time * 1000) : null,
+      limitStopLoss,
+      limitTakeProfit,
       raw: poc,
       receivedAt: Date.now(),
     };
@@ -1148,15 +1254,19 @@ class DerivBroker extends EventEmitter {
     this._contractUpdateCounts.set(contractId, count);
 
     if (count === 1) {
+      // [FILE-3.2] Log knockout/TP on FIRST TICK so we can see if OTIE
+      // destroyed the user's SL after a MODIFY.
       logger.info(
         `[DerivBroker] Contract ${contractId} FIRST TICK — status=${state.status} ` +
         `profit=${state.currentProfit} spot=${state.currentSpot} entry=${state.entrySpot} ` +
-        `buyPrice=${state.buyPrice} isValidToSell=${state.isValidToSell}`
+        `buyPrice=${state.buyPrice} isValidToSell=${state.isValidToSell} ` +
+        `KNOCKOUT=${limitStopLoss ?? 'none'} TAKEPROFIT=${limitTakeProfit ?? 'none'}`
       );
     } else if (count % 30 === 0 && !state.isSold && !state.isExpired) {
       logger.info(
         `[DerivBroker] Contract ${contractId} tick #${count} — ` +
-        `profit=${state.currentProfit} spot=${state.currentSpot} status=${state.status}`
+        `profit=${state.currentProfit} spot=${state.currentSpot} status=${state.status} ` +
+        `KO=${limitStopLoss ?? 'none'}`
       );
     }
 
@@ -1446,7 +1556,7 @@ class DerivBroker extends EventEmitter {
     await this._ensurePublicReady();
     const symbol = toDerivSymbol(instrument, this.symbolMap);
     if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
-    const intervalMap = { M1: 60, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400, D: 86400 };
+    const intervalMap = { M1: 60, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400, D1: 86400 };
     const sec = intervalMap[granularity] || 300;
     const end = Math.floor(Date.now() / 1000);
     const start = end - (count * sec + 10);
@@ -1454,13 +1564,6 @@ class DerivBroker extends EventEmitter {
     const candles = (resp.candles || []).slice(-count);
     return candles.map(c => ({ mid: { o: c.open, h: c.high, l: c.low, c: c.close }, time: c.epoch, complete: true }));
   }
-
-  // [REVERT-2] Portfolio fetch no longer swallows errors. A failed fetch
-  // throws so callers can distinguish it from an empty portfolio. This
-  // is the fix for "contracts disappear from Open Positions" — the old
-  // [] return was being interpreted by _reconcilePositions and
-  // _reconcileTradeStatus as "no open contracts" and every OPEN trade
-  // in MongoDB was being marked CLOSED.
   async getOpenTrades() {
     await this._ensureAuthReady();
     const resp = await this._sendAuthRequest({ portfolio: 1 });
@@ -1492,12 +1595,6 @@ class DerivBroker extends EventEmitter {
       }
     }
 
-    // [REVERT-1] No `duration` field — MULTUP/MULTDOWN rejects it with
-    // InvalidExpiry. `duration_unit: 's'` alone is tolerated. Contracts
-    // are open-ended; they close on manual sell, knockout/TP, or Deriv's
-    // max contract duration.
-    // `opts.duration` is NOT sent to Deriv but IS captured on the Trade
-    // document via orderService — it records the user's intent.
     const proposalPayload = {
       proposal: 1, amount, basis: 'stake', contract_type: direction,
       currency: this.accountCurrency || 'USD',
@@ -1583,17 +1680,47 @@ class DerivBroker extends EventEmitter {
     return resp;
   }
 
+  // [FILE-3.3] modifySLTP preserved for external callers but hardened:
+  // - Preserves both SL and TP from the current contract if not overridden
+  // - Preserves multiplier from the current Trade doc
+  // - Logs a WARNING that this loses the original contract and creates an
+  //   orphan Trade for the new contract
+  // OTIE no longer calls this (File 2 removes it entirely).
   async modifySLTP(tradeId, stopLoss, takeProfit) {
     await this._ensureAuthReady();
     const positions = await this.getOpenTrades();
     const pos = positions.find(p => p.id === String(tradeId));
     if (!pos) throw new Error(`Trade ${tradeId} not open`);
+
+    // Preserve missing values from current contract
+    const finalSL = (stopLoss != null) ? Number(stopLoss) : (pos.stopLoss || null);
+    const finalTP = (takeProfit != null) ? Number(takeProfit) : (pos.takeProfit || null);
+
+    // Preserve multiplier from the Trade document
+    let finalMultiplier = DEFAULT_MULTIPLIER;
+    try {
+      const tradeDoc = await Trade.findOne({ contractId: String(tradeId) }).lean();
+      if (tradeDoc && tradeDoc.multiplier) finalMultiplier = Number(tradeDoc.multiplier);
+    } catch (_) {}
+
+    logger.warn(
+      `[DerivBroker] modifySLTP(${tradeId}) — close+reopen. ` +
+      `SL was ${pos.stopLoss} → ${finalSL}, TP was ${pos.takeProfit} → ${finalTP}, ` +
+      `multiplier preserved as ${finalMultiplier}. ` +
+      `Original contract ${tradeId} will be CLOSED and a NEW contract will be opened. ` +
+      `A Trade document will NOT be created for the new contract.`
+    );
+
     await this.closeTrade(tradeId);
     const units = pos.units * (pos.side === 'BUY' ? 1 : -1);
-    const r = await this.placeMarketOrder(pos.instrument, units, stopLoss, takeProfit);
+    const r = await this.placeMarketOrder(
+      pos.instrument, units, finalSL, finalTP,
+      { multiplier: finalMultiplier }
+    );
     return { message: 'Reopened with new SL/TP', newTradeId: r.tradeID, price: r.price };
   }
-  async partialClose() { throw new Error('Partial close not supported'); }
+
+  async partialClose() { throw new Error('Partial close not supported on Deriv Multipliers'); }
   async placeLimitOrder(instrument, units, price, sl = null, tp = null) {
     logger.warn('[DerivBroker] Limit orders not supported, using market order');
     return this.placeMarketOrder(instrument, units, sl, tp);
@@ -1618,9 +1745,11 @@ class DerivBroker extends EventEmitter {
       tradeReconciliation: {
         intervalMs: this.config.tradeReconcileIntervalMs,
         minAgeMs: this.config.tradeReconcileMinAgeMs,
+        missesRequired: this.config.tradeReconcileMissesRequired,
         closedTrades: this.metrics.tradesReconciledClosed,
         skippedFresh: this.metrics.reconcileSkippedFresh,
         skippedFetchError: this.metrics.reconcileSkippedFetchError,
+        skippedFalseAlarm: this.metrics.reconcileSkippedFalseAlarm,
       },
       portfolioDiagnostics: { emptyResponses: this.metrics.portfolioEmptyResponses },
       accountLoaded: !!(this._account && this._account.balance != null),
@@ -1646,6 +1775,7 @@ class DerivBroker extends EventEmitter {
     for (const [, timer] of this._contractPersistTimers) clearTimeout(timer);
     this._contractPersistTimers.clear();
     if (this._tradeReconcileTimer) { clearInterval(this._tradeReconcileTimer); this._tradeReconcileTimer = null; }
+    this._reconcileMissCounts.clear();
   }
   _getReconnectDelay(attempt) {
     const base = this.config.reconnectBaseDelay;
@@ -1677,7 +1807,8 @@ const brokerInstance = new DerivBroker({
   contractPersistIntervalMs: parseInt(process.env.DERIV_CONTRACT_PERSIST_INTERVAL_MS) || 3000,
   contractSubscribeTimeout: parseInt(process.env.DERIV_CONTRACT_SUBSCRIBE_TIMEOUT) || 15000,
   tradeReconcileIntervalMs: parseInt(process.env.DERIV_TRADE_RECONCILE_INTERVAL) || 30000,
-  tradeReconcileMinAgeMs: parseInt(process.env.DERIV_TRADE_RECONCILE_MIN_AGE) || 15000,
+  tradeReconcileMinAgeMs: parseInt(process.env.DERIV_TRADE_RECONCILE_MIN_AGE) || 60000,
+  tradeReconcileMissesRequired: parseInt(process.env.DERIV_TRADE_RECONCILE_MISSES) || 2,
 });
 
 module.exports = brokerInstance;
