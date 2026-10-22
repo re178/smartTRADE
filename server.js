@@ -1,48 +1,13 @@
 // server.js – RTS Entry Point (Deriv‑only)
-// INTEGRATED: Prediction Engine, Opportunity Engine, Risk Engine.
-// Now broadcasts 'prediction' and 'opportunity' events to dashboard.
-// SYMBOL FIX: Watched symbols changed to canonical (EURUSD, etc.)
-// PIPELINE: Timer and candle‑close triggers active.
-// LOGGING: Verbose logging removed. Summary-only output.
+// INTEGRATED: Prediction Engine, Opportunity Engine, Risk Engine, OTIE V6.
+// Now broadcasts 'prediction', 'opportunity', and 'otieState' events.
 //
-// [WIRE-1] broadcastToDashboards / broadcast are defined AND exported
-//   BEFORE ./api/routes is required. Fixes the circular-require bug where
-//   controllers.js destructured `broadcastToDashboards` from a still-empty
-//   exports object and then threw "broadcastToDashboards is not a function"
-//   every time it tried to push to the dashboard.
-// [WIRE-2] dashboardClients Set moved above the route require — same reason.
-// [WIRE-3] broker.on(...) handlers attached BEFORE await broker.connect()
-//   so the initial accountUpdate, positions and contractUpdate events fired
-//   during _doConnect / _reconcilePositions / _resumeContractSubscriptions
-//   are not dropped on the floor.
-// [WIRE-4] broker.on('account', ...) renamed to broker.on('accountUpdate', ...)
-//   to match the event the broker actually emits.
-// [WIRE-5] NEW handler: broker.on('contractUpdate', ...). This is the event
-//   that carries live profit / currentSpot / status / isSold per tick.
-//   Without this the dashboard has no live P/L source.
-// [WIRE-6] SIGINT / SIGTERM now also call broker.disconnect() so the auth
-//   and public WS do not keep reconnecting during shutdown.
-//
-// [FILE-9A] outcomeLabeler.startScheduler() is now called at startup.
-//   Previously the log said "⏸️ Outcome labeler scheduler disabled." and
-//   no outcome5 field was ever written to historicalstates, so
-//   predictionEngine.predict always returned null.
-// [FILE-9B] analyticsDashboard.start() is now called at startup. Was not
-//   required or started anywhere, so Live Metrics panel never populated.
-// [FILE-9C] candleBootstrapper.bootstrap() is now called at startup
-//   (fire-and-forget). Was dead code; now warms up candle buffers on boot.
-// [FILE-9D] Broker is started BEFORE the pipeline timer. Pipeline timer
-//   starts on broker ready. Previously the pipeline ran at t=0 against an
-//   unready broker, producing pipeline errors for the first 3-6 seconds.
-// [FILE-9E] runPredictionPipeline now logs every prediction skip and every
-//   opportunity outcome (TRADE or NO_TRADE with reason), so the pipeline's
-//   behavior is visible without turning on debug logging.
-// [FILE-9F] /debug/pipeline route exposes broker state, market cache symbols,
-//   deep state buffer count, outcome labeler last-label time, analytics
-//   dashboard metrics status, and pipeline timer state.
-// [FILE-9G] /health/pipeline route returns 503 when broker is disconnected,
-//   market cache is empty, or labeler is stale (>30 min since last label).
-// [FILE-9H] Subsystem status log at t+15s shows which subsystems are up.
+// [WIRE-1..6] Circular-require, listener ordering, contractUpdate, shutdown.
+// [FILE-9A..9H] Outcome labeler, analytics dashboard, candle bootstrapper,
+//               broker-first pipeline, pipeline logging, debug routes,
+//               subsystem status log.
+// [FILE-2-OF-4] NEW: broadcast 'otieState' from OTIE V6 to the frontend.
+//   Without this line, the frontend OTIE panel has nothing to render.
 
 require('dotenv').config();
 
@@ -55,12 +20,7 @@ const http = require('http');
 
 // ============================================================
 // [WIRE-1 / WIRE-2] Broadcast helpers MUST be defined and exported
-// before anything that requires them is loaded. controllers.js does
-//   const { broadcastToDashboards } = require('../server');
-// at the top of the file. Because server -> routes -> controllers -> server
-// is a circular require, the destructure on the controllers side runs
-// against a partial exports object. If broadcastToDashboards is not yet
-// assigned, it is `undefined` and any later call throws.
+// before anything that requires them is loaded.
 // ============================================================
 const dashboardClients = new Set();
 
@@ -114,7 +74,7 @@ const analyticsDashboard = require('./core/analytics/dashboard');
 // ---------- CANDLE BOOTSTRAPPER [FILE-9C] ----------
 const candleBootstrapper = require('./core/data/candleBootstrapper');
 
-// ---------- OTIE V5 ----------
+// ---------- OTIE V5/V6 ----------
 const otie = require('./core/intelligence/openTradeIntelligenceV5');
 
 // ---------- PERFORMANCE MONITOR ----------
@@ -309,6 +269,11 @@ app.get('/debug/pipeline', async (req, res) => {
       dashboardMetrics = analyticsDashboard.getMetrics ? analyticsDashboard.getMetrics() : {};
     } catch (_) {}
 
+    let otieState = {};
+    try {
+      otieState = otie.getAllStates ? otie.getAllStates() : {};
+    } catch (_) {}
+
     res.json({
       timestamp: new Date().toISOString(),
       broker: {
@@ -328,6 +293,10 @@ app.get('/debug/pipeline', async (req, res) => {
       analyticsDashboard: {
         hasMetrics: Object.keys(dashboardMetrics).length > 0,
         totalTrades: dashboardMetrics.totalTrades || 0,
+      },
+      otie: {
+        observerCount: otie.observerCount || 0,
+        states: otieState,
       },
       watchedSymbols: WATCHED_SYMBOLS,
     });
@@ -425,7 +394,15 @@ async function sendDashboardInitialState(ws) {
     try { broker = getBroker('deriv_cfd'); } catch (e) {}
     const enhancedAccount = enhanceAccount(account, broker);
 
-    ws.send(JSON.stringify({ type: 'init', data: { trades, account: enhancedAccount, positions } }));
+    let otieState = {};
+    try {
+      otieState = otie.getAllStates ? otie.getAllStates() : {};
+    } catch (_) {}
+
+    ws.send(JSON.stringify({
+      type: 'init',
+      data: { trades, account: enhancedAccount, positions, otieStates: otieState }
+    }));
   } catch (err) {
     console.error('[WS] Failed to send initial state:', err.message);
   }
@@ -441,6 +418,10 @@ eventBus.on('order.placed', (data) => broadcast('trade.placed', data));
 eventBus.on('position.updated', (data) => broadcast('positions', data));
 otie.on('otieV5State', (state) => broadcast('otieV5State', state));
 otie.on('otieV5Action', (action) => broadcast('otieV5Action', action));
+
+// [FILE-2-OF-4] Broadcast OTIE V6 trajectory state to the frontend.
+// Without this line, live.js receives nothing and the OTIE panel is empty.
+otie.on('otieState', (state) => broadcast('otieState', state));
 
 // ---------- Performance Monitor ----------
 eventBus.on('trade.closed', async (data) => {
@@ -484,7 +465,6 @@ async function runPredictionPipeline(symbol) {
 
     const prediction = await predictionEngine.predict(state, symbol);
     if (!prediction) {
-      // [FILE-9E] Structured skip log
       console.log(`[Pipeline] ${symbol}: no prediction (state quality insufficient)`);
       return false;
     }
@@ -500,8 +480,6 @@ async function runPredictionPipeline(symbol) {
     );
 
     broadcastToDashboards('opportunity', opportunity);
-
-    // [FILE-9E] Log every opportunity outcome
     console.log(
       `[Pipeline] ${symbol}: ${opportunity.decision || 'NO_TRADE'} ` +
       `${opportunity.tradable
@@ -549,7 +527,7 @@ function startPipelineTimer() {
 // ---------- Start Cognitive Engines ----------
 async function startCognitiveEngines() {
   try {
-    console.log('[CTOS] Cognitive engines active: Awareness, Regime, Decision, OTIE V5, PerformanceMonitor.');
+    console.log('[CTOS] Cognitive engines active: Awareness, Regime, Decision, OTIE V6, PerformanceMonitor.');
   } catch (err) {
     console.error('[CTOS] Initialization error:', err.message);
   }
@@ -560,22 +538,12 @@ async function startDerivBroker() {
   try {
     const broker = getBroker('deriv_cfd');
 
-    // [WIRE-3] Attach ALL listeners BEFORE connect() so we do not miss the
-    // events emitted during _doConnect / _ensureBalanceLoaded /
-    // _reconcilePositions / _resumeContractSubscriptions.
     broker.on('tick', (data) => broadcastToDashboards('price', data));
-
-    // [WIRE-4] Renamed from 'account' — the broker emits 'accountUpdate'.
     broker.on('accountUpdate', async (accountData) => {
       const enhanced = enhanceAccount(accountData, broker);
       broadcastToDashboards('account', enhanced);
     });
-
-    // [WIRE-5] NEW — live per-contract P/L, status, isValidToSell.
-    broker.on('contractUpdate', (state) => {
-      broadcastToDashboards('contractUpdate', state);
-    });
-
+    broker.on('contractUpdate', (state) => broadcastToDashboards('contractUpdate', state));
     broker.on('positions', (positions) => broadcastToDashboards('positions', positions));
     broker.on('orderUpdate', (data) => broadcastToDashboards('orderUpdate', data));
     broker.on('_portfolioUpdated', (positions) => broadcastToDashboards('positions', positions));
@@ -604,6 +572,7 @@ async function startServer() {
     console.log('🧠 CTOS Cognitive Engine: enabled');
     console.log('📦 Deriv broker: active');
     console.log('🧪 Prediction/Opportunity Pipeline: enabled');
+    console.log('📈 OTIE V6: tick-driven profit observer');
     console.log('==============================================');
 
     startWSPing();
@@ -619,7 +588,6 @@ async function startServer() {
 
     setTimeout(startCognitiveEngines, 2000);
 
-    // [FILE-9A] Start outcome labeler (was disabled)
     try {
       outcomeLabeler.startScheduler();
       console.log('✅ Outcome labeler scheduler started.');
@@ -627,7 +595,6 @@ async function startServer() {
       console.error('❌ Outcome labeler failed to start:', err.message);
     }
 
-    // [FILE-9B] Start analytics dashboard
     try {
       analyticsDashboard.start();
       console.log('✅ Analytics dashboard started.');
@@ -635,7 +602,6 @@ async function startServer() {
       console.error('❌ Analytics dashboard failed to start:', err.message);
     }
 
-    // [FILE-9C] Bootstrap candles (fire-and-forget)
     try {
       candleBootstrapper.bootstrap().then(() => {
         console.log('✅ Candle bootstrap complete.');
@@ -646,7 +612,6 @@ async function startServer() {
       console.warn('⚠️ Candle bootstrap threw (non-fatal):', err.message);
     }
 
-    // [FILE-9D] Broker first, then pipeline
     setTimeout(() => {
       startDerivBroker().then(() => {
         const broker = getBroker('deriv_cfd');
@@ -671,7 +636,6 @@ async function startServer() {
       });
     }, 3000);
 
-    // [FILE-9H] Subsystem status at t+15s
     setTimeout(() => {
       console.log('==============================================');
       console.log('📊 RTS Subsystem Status:');
@@ -684,6 +648,9 @@ async function startServer() {
       console.log(`   Pipeline timer:    ${pipelineTimer ? '🟢 running' : '🔴 stopped'}`);
       console.log(`   Outcome labeler:   🟢 scheduled`);
       console.log(`   Analytics dash:    🟢 running`);
+      try {
+        console.log(`   OTIE observers:    ${otie.observerCount || 0} contract(s)`);
+      } catch (_) {}
       try {
         console.log(`   Market cache:      ${marketStateCache._cache.size} symbols`);
       } catch (_) {}
@@ -705,19 +672,16 @@ async function startServer() {
     } catch (err) {
       console.error('Error during shutdown:', err.message);
     }
-    // [FILE-9A] Stop outcome labeler
     try {
       if (typeof outcomeLabeler.stopScheduler === 'function') outcomeLabeler.stopScheduler();
     } catch (_) {}
-    // [FILE-9B] Stop analytics dashboard
     try {
       if (typeof analyticsDashboard.stop === 'function') analyticsDashboard.stop();
     } catch (_) {}
-    // [WIRE-6] Disconnect broker
     try {
       const broker = getBroker('deriv_cfd');
       if (broker && typeof broker.disconnect === 'function') await broker.disconnect();
-    } catch (_) { /* best effort */ }
+    } catch (_) {}
     process.exit(0);
   }
 
