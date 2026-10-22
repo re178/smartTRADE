@@ -1,10 +1,16 @@
 // core/intelligence/openTradeIntelligenceV5.js
-// OTIE v6 – Tick-driven profit trajectory observer for Deriv Multipliers.
+// OTIE v6.1 – Tick-driven profit trajectory observer for Deriv Multipliers.
 //
-// [FILE-1] Emits 'otieState' every 5s + on every close trigger so the
-//   frontend can render a live trajectory panel.
-//   Fixed re-adoption to check `status: 'OPEN'` so a just-closed trade
-//   isn't re-added when its final contractUpdate tick arrives.
+// [FILE-1] Bug fix: OTIE used to require a Trade document in MongoDB to
+//   observe a contract. If the Trade doc was missing (creation failed,
+//   marked CLOSED by reconcile, or legacy), OTIE silently dropped every
+//   tick and the frontend stayed empty — even though contracts were open
+//   at Deriv. Fix: adopt from contractUpdate state directly when no Trade
+//   doc is present. Enrich from state.raw (multiplier, buy_price,
+//   entry_spot, contract_type). Periodic resync closes the gap when a
+//   Trade doc appears after the contract was already being tracked.
+//   Every adoption path logs which source it used, so silent drops are
+//   impossible to miss in logs.
 
 const EventEmitter = require('events');
 const Trade = require('../../models/Trade');
@@ -32,6 +38,7 @@ const CONFIG = {
   closeCooldownMs: parseInt(process.env.OTIE_CLOSE_COOLDOWN_MS) || 15000,
   logIntervalMs: parseInt(process.env.OTIE_LOG_INTERVAL_MS) || 5000,
   fallbackTickMs: parseInt(process.env.OTIE_FALLBACK_TICK_MS) || 30000,
+  resyncIntervalMs: parseInt(process.env.OTIE_RESYNC_INTERVAL_MS) || 60000,
   maxSeriesLength: 120,
 };
 
@@ -40,8 +47,11 @@ function normalizeSymbol(symbol) {
   return symbol.replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
 }
 
+// ========================================================================
+// ContractObserver
+// ========================================================================
 class ContractObserver {
-  constructor(trade, config = CONFIG) {
+  constructor(trade, config = CONFIG, source = 'trade-doc') {
     this.tradeId = String(trade.contractId);
     this.symbol = normalizeSymbol(trade.instrument);
     this.side = String(trade.side || '').toUpperCase();
@@ -49,6 +59,7 @@ class ContractObserver {
     this.multiplier = Number(trade.multiplier) || 100;
     this.openPrice = Number(trade.openPrice) || 0;
     this.config = config;
+    this.source = source;
 
     this.series = [];
     this.peak = { profit: 0, at: 0 };
@@ -61,6 +72,7 @@ class ContractObserver {
     this.lastCloseAttempt = 0;
     this.lastLogAt = 0;
     this.isClosing = false;
+    this.loggedReversalsWarn = false;
   }
 
   observe(state) {
@@ -145,13 +157,19 @@ class ContractObserver {
   }
 }
 
+// ========================================================================
+// Engine
+// ========================================================================
 class OpenTradeIntelligenceV6 extends EventEmitter {
   constructor(broker = null) {
     super();
     this.broker = broker || getBroker('deriv_cfd');
     this._observers = new Map();
     this._fallbackTimer = null;
+    this._resyncTimer = null;
     this._restorePromise = null;
+    // [FILE-1] Dedupe warnings for contracts we can't adopt
+    this._warnedAdoptFail = new Set();
 
     if (!this.broker.isConnected || !this.broker.isConnected()) {
       this.broker.connect().catch((err) => {
@@ -171,8 +189,9 @@ class OpenTradeIntelligenceV6 extends EventEmitter {
       this.broker.on('contractUpdate', (state) => {
         this._onContractUpdate(state);
       });
+      logger.info('[OTIE] Attached to broker.contractUpdate.');
     } catch (err) {
-      logger.warn(`[OTIE] Could not attach contractUpdate listener: ${err.message}`);
+      logger.error(`[OTIE] FAILED to attach contractUpdate listener: ${err.message}`);
     }
 
     this._restorePromise = this._restoreFromDB().catch((err) => {
@@ -186,32 +205,61 @@ class OpenTradeIntelligenceV6 extends EventEmitter {
     }, CONFIG.fallbackTickMs);
     if (typeof this._fallbackTimer.unref === 'function') this._fallbackTimer.unref();
 
-    logger.info('[OTIE] Initialized (v6 — tick-driven profit trajectory observer).');
+    // [FILE-1] Periodic resync
+    this._resyncTimer = setInterval(() => {
+      this._resync().catch((err) => {
+        logger.warn(`[OTIE] Resync failed: ${err.message}`);
+      });
+    }, CONFIG.resyncIntervalMs);
+    if (typeof this._resyncTimer.unref === 'function') this._resyncTimer.unref();
+
+    logger.info('[OTIE] Initialized (v6.1 — tick-driven observer, adopts without Trade doc).');
     logger.info(
       `[OTIE] Thresholds: maxLoss=${CONFIG.maxLossR}R dd=${(CONFIG.drawdownClosePct * 100).toFixed(0)}% ` +
       `chop=${CONFIG.chopMaxReversals}revs/${CONFIG.chopWindowMs / 1000}s ` +
       `slopeMin=${CONFIG.slopeMinMagnitude} flat=${CONFIG.flatCloseMs / 1000}s ` +
-      `stale=${CONFIG.stalePeakMs / 60000}min`
+      `stale=${CONFIG.stalePeakMs / 60000}min resync=${CONFIG.resyncIntervalMs / 1000}s`
     );
   }
 
+  // ======================================================================
+  // [FILE-1] Tick handler — adopt from DB OR state, never give up
+  // ======================================================================
   async _onContractUpdate(state) {
     if (!state || !state.contractId) return;
     const contractId = String(state.contractId);
 
     let observer = this._observers.get(contractId);
+
+    // Path 1: not tracked yet — try DB, then state
     if (!observer) {
-      // [FILE-1] Only re-adopt if the Trade is still OPEN in DB
+      // Path 1a: Trade doc exists → full metadata
       try {
         const trade = await Trade.findOne({ contractId, status: 'OPEN' }).lean();
         if (trade) {
-          this._adoptTradeSync(trade);
+          this._adoptTradeSync(trade, 'trade-doc');
           observer = this._observers.get(contractId);
         }
-      } catch (_) {}
-      if (!observer) return;
+      } catch (err) {
+        logger.debug(`[OTIE] Trade lookup for ${contractId} failed: ${err.message}`);
+      }
+
+      // Path 1b: no Trade doc → synthesize from state
+      if (!observer) {
+        try {
+          observer = this._adoptFromState(state);
+          this._warnedAdoptFail.delete(contractId);
+        } catch (err) {
+          if (!this._warnedAdoptFail.has(contractId)) {
+            this._warnedAdoptFail.add(contractId);
+            logger.warn(`[OTIE] Cannot adopt ${contractId} from state either: ${err.message}`);
+          }
+          return;
+        }
+      }
     }
 
+    // Feed + analyze
     observer.observe(state);
     const verdict = this._analyze(observer, state);
 
@@ -239,7 +287,6 @@ class OpenTradeIntelligenceV6 extends EventEmitter {
         `action=${verdict.action}${verdict.action === 'CLOSE' ? ` (${verdict.reason})` : ''}`
       );
 
-      // [FILE-1] Emit state for frontend
       try {
         this.emit('otieState', {
           tradeId: contractId,
@@ -247,6 +294,7 @@ class OpenTradeIntelligenceV6 extends EventEmitter {
           side: observer.side,
           stake: observer.stake,
           multiplier: observer.multiplier,
+          source: observer.source,
           profit: m.current,
           peak: m.peak,
           drawdown: m.drawdown,
@@ -279,6 +327,76 @@ class OpenTradeIntelligenceV6 extends EventEmitter {
     }
   }
 
+  // ======================================================================
+  // [FILE-1] Adopt from state — no Trade doc required
+  // ======================================================================
+  _adoptFromState(state) {
+    const contractId = String(state.contractId);
+    if (this._observers.has(contractId)) return this._observers.get(contractId);
+
+    const raw = state.raw || {};
+
+    // Side: derive from contract_type
+    const contractType = String(state.contractType || raw.contract_type || '').toUpperCase();
+    const side = contractType.includes('UP') ? 'BUY'
+               : contractType.includes('DOWN') ? 'SELL'
+               : 'BUY';
+
+    // Multiplier: Deriv reports it in poc for MULTUP/MULTDOWN
+    let multiplier = 100;
+    if (raw.multiplier != null && Number.isFinite(Number(raw.multiplier))) {
+      multiplier = Number(raw.multiplier);
+    } else if (raw.multiplier_range != null && Number.isFinite(Number(raw.multiplier_range))) {
+      multiplier = Number(raw.multiplier_range);
+    }
+
+    // Stake: what was paid. buy_price is exactly that.
+    const stakeCandidate =
+      Number(state.buyPrice) ||
+      Number(raw.buy_price) ||
+      Number(raw.purchase_price) ||
+      0;
+    const stake = stakeCandidate > 0 ? stakeCandidate : 1;
+
+    // Symbol: normalize Deriv symbol
+    const symbol = normalizeSymbol(state.symbol || raw.underlying || raw.underlying_symbol || 'UNKNOWN');
+
+    // Entry price
+    const openPrice =
+      Number(state.entrySpot) ||
+      Number(raw.entry_spot) ||
+      Number(raw.entry_tick) ||
+      Number(state.currentSpot) ||
+      0;
+
+    if (!symbol || symbol === 'UNKNOWN') {
+      throw new Error(`Cannot adopt ${contractId}: no symbol in state or raw`);
+    }
+
+    const synthetic = {
+      contractId,
+      instrument: symbol,
+      side: side.toLowerCase(),
+      stake,
+      multiplier,
+      openPrice,
+    };
+
+    const observer = new ContractObserver(synthetic, CONFIG, 'state-synthesized');
+    this._observers.set(contractId, observer);
+
+    logger.info(
+      `[OTIE] Adopted ${contractId} from STATE (no Trade doc). ` +
+      `symbol=${symbol} side=${side} stake=${stake}$ mult=${multiplier}x ` +
+      `openPrice=${openPrice}`
+    );
+
+    return observer;
+  }
+
+  // ======================================================================
+  // Analysis
+  // ======================================================================
   _analyze(observer, state) {
     const m = observer.metrics();
     const cfg = observer.config;
@@ -347,14 +465,8 @@ class OpenTradeIntelligenceV6 extends EventEmitter {
 
   async _executeClose(observer, verdict) {
     const now = Date.now();
-    if (observer.isClosing) {
-      logger.debug(`[OTIE] ${observer.tradeId} close already in-flight — skipping`);
-      return;
-    }
-    if (now - observer.lastCloseAttempt < CONFIG.closeCooldownMs) {
-      logger.debug(`[OTIE] ${observer.tradeId} close cooldown — deferring`);
-      return;
-    }
+    if (observer.isClosing) return;
+    if (now - observer.lastCloseAttempt < CONFIG.closeCooldownMs) return;
 
     observer.lastCloseAttempt = now;
     observer.isClosing = true;
@@ -408,6 +520,9 @@ class OpenTradeIntelligenceV6 extends EventEmitter {
     }
   }
 
+  // ======================================================================
+  // Adoption / release
+  // ======================================================================
   _adoptTrade(contractId, instrument) {
     if (!contractId) return;
     const cid = String(contractId);
@@ -415,22 +530,22 @@ class OpenTradeIntelligenceV6 extends EventEmitter {
 
     Trade.findOne({ contractId: cid, status: 'OPEN' }).lean().then(trade => {
       if (!trade) {
-        logger.warn(`[OTIE] Cannot adopt ${cid} — Trade doc not found or not OPEN`);
+        logger.warn(`[OTIE] trade.placed for ${cid} but no OPEN Trade doc — will adopt from next tick`);
         return;
       }
-      this._adoptTradeSync(trade);
+      this._adoptTradeSync(trade, 'trade-placed-event');
     }).catch(err => {
       logger.warn(`[OTIE] Adopt ${cid} failed: ${err.message}`);
     });
   }
 
-  _adoptTradeSync(trade) {
+  _adoptTradeSync(trade, source = 'trade-doc') {
     const cid = String(trade.contractId);
     if (this._observers.has(cid)) return;
-    const observer = new ContractObserver(trade, CONFIG);
+    const observer = new ContractObserver(trade, CONFIG, source);
     this._observers.set(cid, observer);
     logger.info(
-      `[OTIE] Adopted ${cid} (${observer.symbol} ${observer.side} ` +
+      `[OTIE] Adopted ${cid} from ${source} (${observer.symbol} ${observer.side} ` +
       `stake=${observer.stake}$ mult=${observer.multiplier}x)`
     );
   }
@@ -444,9 +559,10 @@ class OpenTradeIntelligenceV6 extends EventEmitter {
     const m = observer.metrics();
     logger.info(
       `[OTIE] Released ${cid} — final profit=${m.current.toFixed(2)}$ peak=${m.peak.toFixed(2)}$ ` +
-      `ticks=${m.tickCount} duration=${(m.elapsedMs / 1000).toFixed(0)}s`
+      `ticks=${m.tickCount} duration=${(m.elapsedMs / 1000).toFixed(0)}s source=${observer.source}`
     );
     this._observers.delete(cid);
+    this._warnedAdoptFail.delete(cid);
 
     try {
       this.emit('otieState', {
@@ -457,20 +573,40 @@ class OpenTradeIntelligenceV6 extends EventEmitter {
     } catch (_) {}
   }
 
+  // ======================================================================
+  // Restore from DB on startup
+  // ======================================================================
   async _restoreFromDB() {
-    const openTrades = await Trade.find({ status: 'OPEN' }).lean();
-    logger.info(`[OTIE] Restoring ${openTrades.length} open trade(s) from DB.`);
+    let openTrades = [];
+    try {
+      openTrades = await Trade.find({ status: 'OPEN' }).lean();
+    } catch (err) {
+      logger.error(`[OTIE] DB query failed during restore: ${err.message}`);
+      return;
+    }
+
+    logger.info(`[OTIE] Startup restore: ${openTrades.length} OPEN Trade doc(s) in DB.`);
+
+    if (openTrades.length === 0) {
+      logger.warn(
+        '[OTIE] Startup restore: ZERO open Trade docs in DB. ' +
+        'This is expected if you have no open contracts. If you DO have open contracts ' +
+        'at Deriv, OTIE will adopt them from the first contractUpdate tick — ' +
+        'you will see "Adopted <id> from STATE" lines within ~1s of the next tick.'
+      );
+      return;
+    }
 
     for (const trade of openTrades) {
       const contractId = String(trade.contractId);
       if (!contractId || this._observers.has(contractId)) continue;
 
-      const observer = new ContractObserver(trade, CONFIG);
+      const observer = new ContractObserver(trade, CONFIG, 'trade-doc-restore');
 
       try {
         const status = await this.broker.getContractStatus(contractId);
         if (status.status === 'closed') {
-          logger.info(`[OTIE] ${contractId} closed at Deriv — skipping restore`);
+          logger.info(`[OTIE] ${contractId} is CLOSED at Deriv — will reconcile to CLOSED via broker`);
           continue;
         }
         if (status.status === 'open' && status.profit != null && Number.isFinite(Number(status.profit))) {
@@ -479,13 +615,13 @@ class OpenTradeIntelligenceV6 extends EventEmitter {
           observer.series.push({ t: Date.now(), profit: currentProfit, price: 0 });
           logger.info(
             `[OTIE] Restored ${contractId} (${observer.symbol} ${observer.side}): ` +
-            `currentProfit=${currentProfit.toFixed(2)}$ peak seeded=${currentProfit.toFixed(2)}$`
+            `currentProfit=${currentProfit.toFixed(2)}$ peak seeded`
           );
         } else {
           logger.info(`[OTIE] Restored ${contractId} — peak will build from first tick`);
         }
       } catch (err) {
-        logger.warn(`[OTIE] Restore status check failed for ${contractId}: ${err.message}`);
+        logger.warn(`[OTIE] Restore status check failed for ${contractId} (will still track): ${err.message}`);
       }
 
       this._observers.set(contractId, observer);
@@ -494,21 +630,59 @@ class OpenTradeIntelligenceV6 extends EventEmitter {
     logger.info(`[OTIE] Restore complete. Tracking ${this._observers.size} contract(s).`);
   }
 
+  // ======================================================================
+  // [FILE-1] Periodic resync
+  // ======================================================================
+  async _resync() {
+    let openTrades = [];
+    try {
+      openTrades = await Trade.find({ status: 'OPEN' }).lean();
+    } catch (err) {
+      logger.debug(`[OTIE] Resync DB query failed: ${err.message}`);
+      return;
+    }
+
+    const dbIds = new Set(openTrades.map(t => String(t.contractId)));
+
+    // Adopt any OPEN trades we're not tracking
+    for (const trade of openTrades) {
+      const cid = String(trade.contractId);
+      if (!this._observers.has(cid)) {
+        logger.info(`[OTIE] Resync: adopting ${cid} (missed by startup/trade.placed)`);
+        this._adoptTradeSync(trade, 'trade-doc-resync');
+      }
+    }
+
+    // Release observers whose trades are no longer OPEN AND have gone silent
+    const now = Date.now();
+    for (const [cid, observer] of this._observers) {
+      if (dbIds.has(cid)) continue;
+      const lastTickAt = observer.series[observer.series.length - 1]?.t || 0;
+      const silentMs = now - lastTickAt;
+      if (silentMs > 120000) {
+        logger.info(
+          `[OTIE] Resync: releasing ${cid} — not OPEN in DB and silent for ${(silentMs / 1000).toFixed(0)}s`
+        );
+        this._releaseTrade(cid);
+      }
+    }
+  }
+
+  // ======================================================================
+  // Fallback check
+  // ======================================================================
   async _fallbackCheck() {
     if (this._observers.size === 0) return;
 
     for (const [contractId, observer] of this._observers) {
       const stillOpen = await Trade.findOne({ contractId, status: 'OPEN' }).lean().catch(() => null);
-      if (!stillOpen) {
-        this._releaseTrade(contractId);
-        continue;
-      }
-
       const timeSinceLastTick = Date.now() - (observer.series[observer.series.length - 1]?.t || 0);
+
       if (timeSinceLastTick > CONFIG.fallbackTickMs * 3) {
         try {
           const status = await this.broker.getContractStatus(contractId);
           if (status.status === 'closed') {
+            logger.info(`[OTIE] Fallback: ${contractId} closed at Deriv — releasing`);
             this._releaseTrade(contractId);
           } else if (status.status === 'open' && status.profit != null) {
             this._onContractUpdate({
@@ -525,6 +699,9 @@ class OpenTradeIntelligenceV6 extends EventEmitter {
     }
   }
 
+  // ======================================================================
+  // Public API
+  // ======================================================================
   updateConfig(newThresholds) {
     if (!newThresholds) return;
     if (Number.isFinite(newThresholds.maxLossR)) CONFIG.maxLossR = newThresholds.maxLossR;
@@ -542,7 +719,14 @@ class OpenTradeIntelligenceV6 extends EventEmitter {
   getAllStates() {
     const out = {};
     for (const [cid, obs] of this._observers) {
-      out[cid] = obs.metrics();
+      out[cid] = {
+        ...obs.metrics(),
+        symbol: obs.symbol,
+        side: obs.side,
+        stake: obs.stake,
+        multiplier: obs.multiplier,
+        source: obs.source,
+      };
     }
     return out;
   }
@@ -550,10 +734,10 @@ class OpenTradeIntelligenceV6 extends EventEmitter {
   get observerCount() { return this._observers.size; }
 
   stop() {
-    if (this._fallbackTimer) {
-      clearInterval(this._fallbackTimer);
-      this._fallbackTimer = null;
-    }
+    if (this._fallbackTimer) clearInterval(this._fallbackTimer);
+    if (this._resyncTimer) clearInterval(this._resyncTimer);
+    this._fallbackTimer = null;
+    this._resyncTimer = null;
     logger.info('[OTIE] Stopped.');
   }
 }
