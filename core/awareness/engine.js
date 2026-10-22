@@ -8,6 +8,23 @@
 //   • One compact summary line per minute so the pipeline can still be
 //     verified as alive without flooding stdout.
 //   • Constructor emits a single init log.
+//
+// [FILE-1A] Symbol normalization at every persistence and emit boundary.
+//   Broker emits Deriv symbols ('frxEURUSD'); candles, regime, deep state,
+//   and the dashboard all use canonical 'EURUSD'. This file is the ONLY
+//   writer to marketStateCache — normalizing here fixes the entire
+//   downstream read path without touching a dozen other consumers.
+//   Internal _state uses the normalized key too, so decisionEngine
+//   (which iterates _state.keys()) naturally yields the right format.
+//
+// [FILE-1B] Emit both `unusual` and `unusualEvents` on the awareness
+//   event. Three consumers read `data.unusualEvents`; historically this
+//   file wrote `unusual`, so those consumers always saw undefined.
+//   Both fields point to the same array so no downstream code changes
+//   are needed.
+//
+// [FILE-1C] Log once per new tracked symbol — makes it obvious when
+//   awareness starts (or stops) receiving ticks.
 
 const priceBuffer = require('../data/priceBuffer');
 const marketStateCache = require('../data/marketStateCache');
@@ -24,21 +41,25 @@ const CONFIG = {
 // How often to emit the summary line.
 const SUMMARY_INTERVAL_MS = 60_000;
 
+// [FILE-1A] Shared normalizer. 'frxEURUSD' → 'EURUSD', 'EUR_USD' → 'EURUSD'.
+// Idempotent — safe to call on already-normalized symbols.
+function normalizeSymbol(symbol) {
+  if (!symbol) return '';
+  return symbol.replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
+}
+
 class MarketAwarenessEngine {
   constructor() {
-    this._state = new Map(); // symbol -> internal state
+    this._state = new Map(); // normalized symbol -> internal state
     this._tickCount = 0;
     this._tickCountBySymbol = new Map();
-    this._lastUpdateBySymbol = new Map(); // symbol -> last computed stateUpdate
+    this._lastUpdateBySymbol = new Map(); // normalized symbol -> last computed stateUpdate
     this._lastSummaryAt = Date.now();
+    this._knownSymbols = new Set();       // [FILE-1C] tracks symbols we've logged about
 
     // Listen to every tick from the price buffer
     priceBuffer.on('tick', (tick) => {
       this._tickCount++;
-      this._tickCountBySymbol.set(
-        tick.symbol,
-        (this._tickCountBySymbol.get(tick.symbol) || 0) + 1
-      );
       this._processTick(tick);
     });
 
@@ -46,8 +67,26 @@ class MarketAwarenessEngine {
   }
 
   _processTick(tick) {
-    const { symbol, bid, ask, mid, time } = tick;
+    // [FILE-1A] Normalize at entry. Broker emits 'frxEURUSD'; internal
+    // state, marketStateCache, and emitted events all use 'EURUSD'.
+    const rawSymbol = tick.symbol;
+    const symbol = normalizeSymbol(rawSymbol);
+    if (!symbol) return;
+
+    const { bid, ask, mid, time } = tick;
     const spread = ask - bid;
+
+    // [FILE-1C] Log once per newly-tracked symbol.
+    if (!this._state.has(symbol) && !this._knownSymbols.has(symbol)) {
+      this._knownSymbols.add(symbol);
+      logger.info(`[Awareness] Now tracking: ${symbol} (raw: ${rawSymbol})`);
+    }
+
+    // Per-symbol tick counting uses the normalized key
+    this._tickCountBySymbol.set(
+      symbol,
+      (this._tickCountBySymbol.get(symbol) || 0) + 1
+    );
 
     // 1. Get or create symbol state
     if (!this._state.has(symbol)) {
@@ -123,7 +162,9 @@ class MarketAwarenessEngine {
     // 8. Detect unusual events
     const unusual = this._detectUnusual({ velocity, acceleration, spread, liquidity }, state);
 
-    // 9. Update the market state cache
+    // 9. Update the market state cache — [FILE-1A] normalized symbol.
+    //    [FILE-1B] Both `unusual` and `unusualEvents` point to the same
+    //    array. Consumers that read either field will see real data.
     const stateUpdate = {
       symbol,
       bid,
@@ -134,13 +175,15 @@ class MarketAwarenessEngine {
       acceleration,
       liquidity,
       unusual,
+      unusualEvents: unusual,   // [FILE-1B] alias
       lastUpdated: new Date(time),
     };
 
     marketStateCache.update(symbol, stateUpdate);
 
-    // 10. Emit marketAwareness event
-    const awarenessEvent = { symbol, ...stateUpdate };
+    // 10. Emit marketAwareness event — [FILE-1A] normalized symbol.
+    //     [FILE-1B] spread includes `unusualEvents` via stateUpdate.
+    const awarenessEvent = { ...stateUpdate };
     this.emit('marketAwareness', awarenessEvent);
 
     // Retain the latest computed state for summary logging
