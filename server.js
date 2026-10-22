@@ -22,6 +22,27 @@
 //   Without this the dashboard has no live P/L source.
 // [WIRE-6] SIGINT / SIGTERM now also call broker.disconnect() so the auth
 //   and public WS do not keep reconnecting during shutdown.
+//
+// [FILE-9A] outcomeLabeler.startScheduler() is now called at startup.
+//   Previously the log said "⏸️ Outcome labeler scheduler disabled." and
+//   no outcome5 field was ever written to historicalstates, so
+//   predictionEngine.predict always returned null.
+// [FILE-9B] analyticsDashboard.start() is now called at startup. Was not
+//   required or started anywhere, so Live Metrics panel never populated.
+// [FILE-9C] candleBootstrapper.bootstrap() is now called at startup
+//   (fire-and-forget). Was dead code; now warms up candle buffers on boot.
+// [FILE-9D] Broker is started BEFORE the pipeline timer. Pipeline timer
+//   starts on broker ready. Previously the pipeline ran at t=0 against an
+//   unready broker, producing pipeline errors for the first 3-6 seconds.
+// [FILE-9E] runPredictionPipeline now logs every prediction skip and every
+//   opportunity outcome (TRADE or NO_TRADE with reason), so the pipeline's
+//   behavior is visible without turning on debug logging.
+// [FILE-9F] /debug/pipeline route exposes broker state, market cache symbols,
+//   deep state buffer count, outcome labeler last-label time, analytics
+//   dashboard metrics status, and pipeline timer state.
+// [FILE-9G] /health/pipeline route returns 503 when broker is disconnected,
+//   market cache is empty, or labeler is stale (>30 min since last label).
+// [FILE-9H] Subsystem status log at t+15s shows which subsystems are up.
 
 require('dotenv').config();
 
@@ -84,8 +105,14 @@ const predictionEngine = require('./core/intelligence/predictionEngine');
 const opportunityEngine = require('./core/intelligence/opportunityEngine');
 const riskEngine = require('./core/risk/riskEngine');
 
-// ---------- OUTCOME LABELER ----------
-const { startScheduler } = require('./core/intelligence/lab/outcomeLabeler');
+// ---------- OUTCOME LABELER [FILE-9A] ----------
+const outcomeLabeler = require('./core/intelligence/lab/outcomeLabeler');
+
+// ---------- ANALYTICS DASHBOARD [FILE-9B] ----------
+const analyticsDashboard = require('./core/analytics/dashboard');
+
+// ---------- CANDLE BOOTSTRAPPER [FILE-9C] ----------
+const candleBootstrapper = require('./core/data/candleBootstrapper');
 
 // ---------- OTIE V5 ----------
 const otie = require('./core/intelligence/openTradeIntelligenceV5');
@@ -221,6 +248,115 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'OK', message: 'RTS is running with Deriv broker' });
 });
 
+// ---------- [FILE-9G] Pipeline health check ----------
+app.get('/health/pipeline', async (req, res) => {
+  try {
+    const broker = getBroker('deriv_cfd');
+    const connected = broker.isConnected ? broker.isConnected() : false;
+    const cache = marketStateCache._cache || new Map();
+    const hasMarketData = cache.size > 0;
+
+    let labelStale = true;
+    try {
+      const HistoricalState = require('./models/HistoricalState');
+      const recent = await HistoricalState.findOne({ outcome5: { $exists: true } })
+        .sort({ labeledAt: -1 })
+        .select('labeledAt')
+        .lean();
+      if (recent?.labeledAt) {
+        const ageMin = (Date.now() - new Date(recent.labeledAt).getTime()) / 60000;
+        labelStale = ageMin > 30;
+      }
+    } catch (_) {}
+
+    const healthy = connected && hasMarketData && !labelStale;
+    res.status(healthy ? 200 : 503).json({
+      healthy,
+      brokerConnected: connected,
+      marketCachePopulated: hasMarketData,
+      labelerActive: !labelStale,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, healthy: false });
+  }
+});
+
+// ---------- [FILE-9F] Comprehensive pipeline diagnostic ----------
+app.get('/debug/pipeline', async (req, res) => {
+  try {
+    const broker = getBroker('deriv_cfd');
+    const brokerHealth = broker.getHealth ? broker.getHealth() : {};
+    const cache = marketStateCache._cache || new Map();
+
+    let deepBuffers = 0;
+    try {
+      deepBuffers = require('./core/intelligence/deep/marketState')._buffers?.size || 0;
+    } catch (_) {}
+
+    let lastLabel = null;
+    try {
+      const HistoricalState = require('./models/HistoricalState');
+      const last = await HistoricalState.findOne({ outcome5: { $exists: true } })
+        .sort({ labeledAt: -1 })
+        .select('labeledAt symbol')
+        .lean();
+      if (last) lastLabel = { symbol: last.symbol, at: last.labeledAt };
+    } catch (_) {}
+
+    let dashboardMetrics = {};
+    try {
+      dashboardMetrics = analyticsDashboard.getMetrics ? analyticsDashboard.getMetrics() : {};
+    } catch (_) {}
+
+    res.json({
+      timestamp: new Date().toISOString(),
+      broker: {
+        connected: broker.isConnected ? broker.isConnected() : false,
+        publicState: brokerHealth.publicState,
+        authState: brokerHealth.authState,
+        contractMonitoring: brokerHealth.contractMonitoring,
+        accountLoaded: brokerHealth.accountLoaded,
+      },
+      marketCache: {
+        symbolCount: cache.size,
+        symbols: Array.from(cache.keys()),
+      },
+      deepState: { bufferCount: deepBuffers },
+      pipeline: { timerRunning: !!pipelineTimer },
+      outcomeLabeler: { lastLabel },
+      analyticsDashboard: {
+        hasMetrics: Object.keys(dashboardMetrics).length > 0,
+        totalTrades: dashboardMetrics.totalTrades || 0,
+      },
+      watchedSymbols: WATCHED_SYMBOLS,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- DEBUG ROUTE (existing) ----------
+app.get('/debug/status', (req, res) => {
+  const lastState = marketStateCache.get('EURUSD') || null;
+  const lastRegime = deepRegime.getLatestRegime('EURUSD') || null;
+  const lastDecision = decisionEngine.getLastDecision('EURUSD') || null;
+  res.json({
+    engine: {
+      candleBuilder: typeof candleStore !== 'undefined' ? 'running' : 'not loaded',
+      marketAwareness: awarenessEngine ? 'running' : 'not loaded',
+      deepRegime: deepRegime ? 'running' : 'not loaded',
+      decisionEngine: decisionEngine ? 'running' : 'not loaded',
+      otieV5: otie ? 'running' : 'not loaded',
+    },
+    lastCandle: candleStore.getHistory('EURUSD', 'M5', 1)[0] || null,
+    lastMarketState: lastState,
+    lastRegime: lastRegime,
+    lastDecision: lastDecision,
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // ---------- SPA Fallback ----------
 app.get('*', (req, res) => {
   if (!req.path.startsWith('/api')) {
@@ -234,7 +370,6 @@ app.get('*', (req, res) => {
 const server = http.createServer(app);
 
 // ---------- WebSocket Server ----------
-// [WIRE-2] dashboardClients Set is defined at the top of the file.
 const wss = new WebSocket.Server({ server });
 
 const WS_PING_INTERVAL = 30000;
@@ -348,7 +483,11 @@ async function runPredictionPipeline(symbol) {
     };
 
     const prediction = await predictionEngine.predict(state, symbol);
-    if (!prediction) return false;
+    if (!prediction) {
+      // [FILE-9E] Structured skip log
+      console.log(`[Pipeline] ${symbol}: no prediction (state quality insufficient)`);
+      return false;
+    }
 
     broadcastToDashboards('prediction', prediction);
 
@@ -361,6 +500,14 @@ async function runPredictionPipeline(symbol) {
     );
 
     broadcastToDashboards('opportunity', opportunity);
+
+    // [FILE-9E] Log every opportunity outcome
+    console.log(
+      `[Pipeline] ${symbol}: ${opportunity.decision || 'NO_TRADE'} ` +
+      `${opportunity.tradable
+        ? (opportunity.multiplier + 'x ' + opportunity.direction)
+        : (opportunity.reason || '')}`
+    );
     return true;
   } catch (err) {
     console.error(`[Pipeline] Error for ${symbol}:`, err.message);
@@ -373,6 +520,9 @@ async function runPredictionPipelineAll() {
   for (const symbol of WATCHED_SYMBOLS) {
     const result = await runPredictionPipeline(symbol);
     if (result) ok++;
+  }
+  if (ok === 0) {
+    console.debug(`[Pipeline] Cycle complete: 0/${WATCHED_SYMBOLS.length} produced predictions`);
   }
 }
 
@@ -395,27 +545,6 @@ function startPipelineTimer() {
   }, intervalMs);
   console.log(`[Pipeline] Timer started (${intervalMs}ms).`);
 }
-
-// ---------- DEBUG ROUTE ----------
-app.get('/debug/status', (req, res) => {
-  const lastState = marketStateCache.get('EURUSD') || null;
-  const lastRegime = deepRegime.getLatestRegime('EURUSD') || null;
-  const lastDecision = decisionEngine.getLastDecision('EURUSD') || null;
-  res.json({
-    engine: {
-      candleBuilder: typeof candleStore !== 'undefined' ? 'running' : 'not loaded',
-      marketAwareness: awarenessEngine ? 'running' : 'not loaded',
-      deepRegime: deepRegime ? 'running' : 'not loaded',
-      decisionEngine: decisionEngine ? 'running' : 'not loaded',
-      otieV5: otie ? 'running' : 'not loaded',
-    },
-    lastCandle: candleStore.getHistory('EURUSD', 'M5', 1)[0] || null,
-    lastMarketState: lastState,
-    lastRegime: lastRegime,
-    lastDecision: lastDecision,
-    timestamp: new Date().toISOString(),
-  });
-});
 
 // ---------- Start Cognitive Engines ----------
 async function startCognitiveEngines() {
@@ -443,7 +572,6 @@ async function startDerivBroker() {
     });
 
     // [WIRE-5] NEW — live per-contract P/L, status, isValidToSell.
-    // This is the channel the frontend needs to render running trades.
     broker.on('contractUpdate', (state) => {
       broadcastToDashboards('contractUpdate', state);
     });
@@ -456,6 +584,7 @@ async function startDerivBroker() {
     console.log('[Deriv] Broker connected.');
   } catch (err) {
     console.error('[Deriv] Failed to start Deriv broker:', err.message);
+    throw err;
   }
 }
 
@@ -470,6 +599,8 @@ async function startServer() {
     console.log(`🔌 API base:       http://localhost:${PORT}/api`);
     console.log(`🔬 Research:       http://localhost:${PORT}/api/research`);
     console.log(`📡 Deriv REST:     http://localhost:${PORT}/api/deriv`);
+    console.log(`🩺 Health:         http://localhost:${PORT}/health/pipeline`);
+    console.log(`🔧 Debug:          http://localhost:${PORT}/debug/pipeline`);
     console.log('🧠 CTOS Cognitive Engine: enabled');
     console.log('📦 Deriv broker: active');
     console.log('🧪 Prediction/Opportunity Pipeline: enabled');
@@ -487,9 +618,81 @@ async function startServer() {
     });
 
     setTimeout(startCognitiveEngines, 2000);
-    startPipelineTimer();
-    console.log('⏸️ Outcome labeler scheduler disabled.');
-    setTimeout(startDerivBroker, 3000);
+
+    // [FILE-9A] Start outcome labeler (was disabled)
+    try {
+      outcomeLabeler.startScheduler();
+      console.log('✅ Outcome labeler scheduler started.');
+    } catch (err) {
+      console.error('❌ Outcome labeler failed to start:', err.message);
+    }
+
+    // [FILE-9B] Start analytics dashboard
+    try {
+      analyticsDashboard.start();
+      console.log('✅ Analytics dashboard started.');
+    } catch (err) {
+      console.error('❌ Analytics dashboard failed to start:', err.message);
+    }
+
+    // [FILE-9C] Bootstrap candles (fire-and-forget)
+    try {
+      candleBootstrapper.bootstrap().then(() => {
+        console.log('✅ Candle bootstrap complete.');
+      }).catch(err => {
+        console.warn('⚠️ Candle bootstrap failed (non-fatal):', err.message);
+      });
+    } catch (err) {
+      console.warn('⚠️ Candle bootstrap threw (non-fatal):', err.message);
+    }
+
+    // [FILE-9D] Broker first, then pipeline
+    setTimeout(() => {
+      startDerivBroker().then(() => {
+        const broker = getBroker('deriv_cfd');
+        if (broker.isConnected()) {
+          console.log('✅ Broker ready — starting pipeline timer.');
+          startPipelineTimer();
+          setTimeout(() => {
+            runPredictionPipelineAll().catch(err => {
+              console.error('[Pipeline] Initial run error:', err.message);
+            });
+          }, 2000);
+        } else {
+          console.warn('⚠️ Broker not connected — pipeline will start on ready event.');
+          broker.once('ready', () => {
+            console.log('✅ Broker ready (delayed) — starting pipeline timer.');
+            startPipelineTimer();
+          });
+        }
+      }).catch(err => {
+        console.error('❌ startDerivBroker failed:', err.message);
+        startPipelineTimer();
+      });
+    }, 3000);
+
+    // [FILE-9H] Subsystem status at t+15s
+    setTimeout(() => {
+      console.log('==============================================');
+      console.log('📊 RTS Subsystem Status:');
+      try {
+        const broker = getBroker('deriv_cfd');
+        console.log(`   Broker:            ${broker.isConnected() ? '🟢 connected' : '🔴 disconnected'}`);
+      } catch (_) {
+        console.log('   Broker:            🔴 not initialized');
+      }
+      console.log(`   Pipeline timer:    ${pipelineTimer ? '🟢 running' : '🔴 stopped'}`);
+      console.log(`   Outcome labeler:   🟢 scheduled`);
+      console.log(`   Analytics dash:    🟢 running`);
+      try {
+        console.log(`   Market cache:      ${marketStateCache._cache.size} symbols`);
+      } catch (_) {}
+      try {
+        const buffers = require('./core/intelligence/deep/marketState')._buffers?.size || 0;
+        console.log(`   Deep state:        ${buffers} buffers`);
+      } catch (_) {}
+      console.log('==============================================');
+    }, 15000);
   });
 
   async function shutdown(signal) {
@@ -502,7 +705,15 @@ async function startServer() {
     } catch (err) {
       console.error('Error during shutdown:', err.message);
     }
-    // [WIRE-6] Disconnect broker so auth/public WS don't keep reconnecting.
+    // [FILE-9A] Stop outcome labeler
+    try {
+      if (typeof outcomeLabeler.stopScheduler === 'function') outcomeLabeler.stopScheduler();
+    } catch (_) {}
+    // [FILE-9B] Stop analytics dashboard
+    try {
+      if (typeof analyticsDashboard.stop === 'function') analyticsDashboard.stop();
+    } catch (_) {}
+    // [WIRE-6] Disconnect broker
     try {
       const broker = getBroker('deriv_cfd');
       if (broker && typeof broker.disconnect === 'function') await broker.disconnect();
