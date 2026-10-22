@@ -1,21 +1,14 @@
 // public/js/live.js – WebSocket dispatcher
-// All state updates go through window.updateDashboardState (app.js renders).
-// Only contractUpdate, price, positions, and account bypass full-rerender
-// for performance — they call targeted render functions from app.js.
+// All state updates flow through window.updateDashboardState (app.js).
+// contractUpdate / otieState / price / positions / account use targeted
+// repaint hooks so live ticks don't rerender every widget.
 //
-// [FIX-1] case 'contractUpdate' — the missing handler that was keeping
-//   the dashboard frozen. Merges live tick into dashboardState.positions,
-//   stores state in dashboardState.contractStates, then repaints only the
-//   positions widget and the monitor line (not all 16 widgets).
-// [FIX-2] Removed local updatePositions() / updateAccount() renderers.
-//   app.js is the single renderer.
-// [FIX-3] Removed displayAwareness / displayRegime / displayMetrics /
-//   displayFusion — app.js renders those panels via its widget functions.
-// [FIX-4] Removed executeSignalFromCard — app.js owns it.
-// [FIX-5] init case no longer writes msg.data.trades into history (that
-//   field is OPEN trades on the server; history comes from /api/trade-history).
-// [FIX-6] Auto-execute block honours the new controller response shape and
-//   never retries on BROKER_ERROR.
+// [FILE-3-OF-4] Handles 'otieState' from OTIE V6 — forwards to
+//   window.onOtieState so the trajectory panel and positions table update.
+//   Also handles OTIE 'RELEASED' action (contract closed by OTIE) by
+//   clearing the state entry.
+//   Handles otieStates in the init payload so the panel populates
+//   immediately on page load.
 
 (function () {
   'use strict';
@@ -100,7 +93,7 @@
   }
 
   // ============================================================
-  //  [FIX-1] Per-contract live tick
+  //  [FILE-3-OF-4] Per-contract live tick
   // ============================================================
   function handleContractUpdate(cu) {
     const s = state();
@@ -108,7 +101,6 @@
     const contractId = String(cu.contractId || '');
     if (!contractId) return;
 
-    // Store latest state
     if (!s.contractStates) s.contractStates = {};
     s.contractStates[contractId] = cu;
     s.lastContractUpdateAt = cu.receivedAt || Date.now();
@@ -119,10 +111,8 @@
 
     if (idx >= 0) {
       if (isClosed) {
-        // Settlement arrived — drop from positions
         positions.splice(idx, 1);
       } else {
-        // Merge latest values in place
         positions[idx] = {
           ...positions[idx],
           currentPrice: cu.currentSpot != null ? cu.currentSpot : positions[idx].currentPrice,
@@ -133,7 +123,6 @@
         };
       }
     } else if (!isClosed) {
-      // First tick before a positions snapshot — synthesize an entry
       const ct = String(cu.contractType || '').toUpperCase();
       positions.push({
         id: contractId,
@@ -151,16 +140,46 @@
         lastUpdate: cu.receivedAt,
       });
     } else {
-      // Closed contract we never saw open — nothing to do
-      return;
+      // Closed contract we never saw open — nothing to do except clear OTIE
+    }
+
+    // If contract closed, also clear any OTIE state for it
+    if (isClosed && s.otieStates && s.otieStates[contractId]) {
+      delete s.otieStates[contractId];
+      if (typeof window.renderOTIEPanel === 'function') window.renderOTIEPanel();
     }
 
     s.positions = positions;
 
-    // [FIX-1] Targeted repaint — do NOT call updateDashboardState (would
-    // rerender all 16 widgets every tick). app.js exposes these on window.
     if (typeof window.renderPositionsWidget === 'function') window.renderPositionsWidget();
     if (typeof window.renderLiveMonitorStatus === 'function') window.renderLiveMonitorStatus();
+  }
+
+  // ============================================================
+  //  [FILE-3-OF-4] OTIE V6 trajectory update
+  // ============================================================
+  function handleOtieState(payload) {
+    if (!payload || !payload.tradeId) return;
+
+    // Forward to app.js handler (defines window.onOtieState).
+    // That function is responsible for storing into dashboardState.otieStates
+    // and repainting the OTIE panel + positions table.
+    if (typeof window.onOtieState === 'function') {
+      window.onOtieState(payload);
+    } else {
+      // Fallback: store directly so the panel can still render if File 4
+      // wasn't fully deployed. Not ideal — but avoids silent drop.
+      const s = state();
+      if (!s) return;
+      if (!s.otieStates) s.otieStates = {};
+      if (payload.action === 'RELEASED') {
+        delete s.otieStates[payload.tradeId];
+      } else {
+        s.otieStates[payload.tradeId] = payload;
+      }
+      if (typeof window.renderOTIEPanel === 'function') window.renderOTIEPanel();
+      if (typeof window.renderPositionsWidget === 'function') window.renderPositionsWidget();
+    }
   }
 
   // ============================================================
@@ -169,16 +188,14 @@
   function handleMessage(msg) {
     switch (msg.type) {
 
-      // ============================================================
-      // [FIX-1] Live per-contract tick — the missing handler
-      // ============================================================
       case 'contractUpdate':
         handleContractUpdate(msg.data || {});
         break;
 
-      // ============================================================
-      // Prediction / Opportunity
-      // ============================================================
+      case 'otieState':
+        handleOtieState(msg.data);
+        break;
+
       case 'prediction':
         if (window.updateDashboardState) window.updateDashboardState({ prediction: msg.data });
         break;
@@ -188,10 +205,6 @@
         maybeAutoExecute(msg.data);
         break;
 
-      // ============================================================
-      // Intelligence feeds — dispatched to updateDashboardState;
-      // app.js render*Widget functions paint them.
-      // ============================================================
       case 'marketAwareness':
         if (window.updateDashboardState) window.updateDashboardState({ awareness: msg.data });
         break;
@@ -209,10 +222,6 @@
         if (window.updateDashboardState) window.updateDashboardState({ liveSignal: msg.data });
         break;
 
-      // ============================================================
-      // OTIE — app.js has no render widget for #otieContent, so
-      // live.js owns these two.
-      // ============================================================
       case 'otieV5State':
         displayOTIEState(msg.data);
         break;
@@ -220,15 +229,18 @@
         displayOTIEAction(msg.data);
         break;
 
-      // ============================================================
-      // Order / trade events
-      // ============================================================
       case 'tradeClosed': {
         const s = state();
-        if (s && s.positions) {
-          const cid = String(msg.data.contractId);
-          s.positions = s.positions.filter(p => String(p.id ?? p.contractId) !== cid);
+        if (s) {
+          const cid = String(msg.data?.contractId || '');
+          if (s.positions) {
+            s.positions = s.positions.filter(p => String(p.id ?? p.contractId) !== cid);
+          }
+          if (s.otieStates && s.otieStates[cid]) {
+            delete s.otieStates[cid];
+          }
           if (typeof window.renderPositionsWidget === 'function') window.renderPositionsWidget();
+          if (typeof window.renderOTIEPanel === 'function') window.renderOTIEPanel();
         }
         playSound('tradeClose');
         break;
@@ -237,17 +249,23 @@
         playSound('tradeOpen');
         break;
 
-      // ============================================================
-      // [FIX-5] init — do NOT touch history
-      // ============================================================
       case 'init': {
         const s = state();
         if (!s) break;
         s.account = msg.data.account || s.account;
         if (Array.isArray(msg.data.positions)) s.positions = msg.data.positions;
-        // history intentionally untouched — /api/trade-history owns it
+
+        // [FILE-3-OF-4] Merge otieStates from init payload
+        if (msg.data.otieStates && typeof msg.data.otieStates === 'object') {
+          if (!s.otieStates) s.otieStates = {};
+          for (const [cid, st] of Object.entries(msg.data.otieStates)) {
+            s.otieStates[cid] = st;
+          }
+        }
+
         if (typeof window.renderAccountWidget === 'function') window.renderAccountWidget();
         if (typeof window.renderPositionsWidget === 'function') window.renderPositionsWidget();
+        if (typeof window.renderOTIEPanel === 'function') window.renderOTIEPanel();
         break;
       }
 
@@ -276,8 +294,22 @@
         break;
       }
 
+      case 'history': {
+        const s = state();
+        if (s) {
+          s.history = Array.isArray(msg.data) ? msg.data : [];
+          if (typeof window.renderHistoryWidget === 'function') window.renderHistoryWidget();
+        }
+        break;
+      }
+
+      case 'order.rejected': {
+        playSound('reject');
+        console.log('[Live] Order rejected:', msg.data?.reason || msg.data);
+        break;
+      }
+
       case 'positionUpdated':
-        // No-op — 'positions' and 'contractUpdate' handle position state
         break;
 
       default:
@@ -286,7 +318,7 @@
   }
 
   // ============================================================
-  // [FIX-6] Auto-execute — status-aware, never retries on error
+  //  Auto-execute — status-aware, never retries on error
   // ============================================================
   function maybeAutoExecute(opp) {
     if (!opp || !opp.tradable) return;
@@ -317,12 +349,11 @@
           playSound('tradeOpen');
           console.log('[Live] Auto-trade placed:', body.contractId);
         } else if (body.status === 'CONFIRMED_RECORD_FAILED') {
-          console.warn('[Live] Auto-trade confirmed but not recorded:', body.contractId, '— DO NOT retry');
+          console.warn('[Live] Auto-trade confirmed but not recorded:', body.contractId);
         } else if (body.status === 'REJECTED') {
           playSound('reject');
           console.log('[Live] Auto-trade rejected:', body.error);
         } else {
-          // BROKER_ERROR or network — do NOT retry
           console.error('[Live] Auto-trade broker error — do not retry:', body.error || status);
         }
       })
@@ -334,7 +365,7 @@
   }
 
   // ============================================================
-  // Display functions owned by live.js (panels app.js doesn't render)
+  //  Legacy display functions
   // ============================================================
   function displayDecision(d) {
     const panel = document.getElementById('liveSignalPanel');
@@ -386,8 +417,9 @@
     if (!content || !data) return;
     const div = document.createElement('div');
     div.className = 'alert alert-warning alert-dismissible fade show';
-    div.innerHTML = `<strong>OTIE Action:</strong> ${data.action} on ${data.tradeId}
-      <button type="button" class="btn-close" data-bs-dismiss="alert"></button>`;
+    div.innerHTML = `<strong>OTIE Action:</strong> ${data.action} on ${data.tradeId}` +
+      (data.reason ? ` — ${data.reason}` : '') +
+      `<button type="button" class="btn-close" data-bs-dismiss="alert"></button>`;
     content.prepend(div);
     setTimeout(() => div.remove(), 8000);
   }
