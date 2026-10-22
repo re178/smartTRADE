@@ -1,22 +1,15 @@
-// public/js/app.js – Dashboard Logic (Fully Event-Driven)
-// All state updates flow through updateDashboardState().
-// HTTP is only for manual actions.
+// public/js/app.js – Dashboard logic
+// Renders all widgets. Live updates come from live.js.
 //
-// [FIX-1] window.dashboardState exposed — live.js reads it to merge live
-//   contract ticks. Without this, duplicate position rows appear on every
-//   tick (live.js starts from an empty array each time and appends).
-// [FIX-2] Render functions exposed on window so live.js can drive targeted
-//   repaints (positions widget on tick, price widget on tick) without
-//   rerendering every widget 10×/second.
-// [FIX-3] placeOrderFetch() helper — reads the response body on 400/500
-//   so callers can distinguish REJECTED from BROKER_ERROR from
-//   CONFIRMED_RECORD_FAILED. The existing fetchJson throws on non-2xx
-//   and hides the status field.
-// [FIX-4] showOrderOutcome() — one place for all four response branches.
-// [FIX-5] Trade / auto-trade submit handlers use the new pattern.
-// [FIX-6] executeSignalFromCard fills the Multiplier form (pair, side,
-//   default stake) — the old version referenced CFD-only fields that no
-//   longer exist and always alerted "Trade form not available".
+// [FILE-4-OF-4] OTIE V6 trajectory panel:
+//   • renderOTIEPanel() paints one card per open contract with profit,
+//     peak, drawdown %, reversal count, live sparkline, and the active
+//     close reason when triggered.
+//   • window.onOtieState() is called by live.js on every 'otieState'
+//     event; stores into dashboardState.otieStates and repaints.
+//   • Open Positions table has an OTIE column showing peak + dd%.
+//   • renderAllWidgets() includes renderOTIEPanel() so first paint on
+//     page load reflects any state received in the 'init' payload.
 
 const HISTORY_PAGE_SIZE = 20;
 let isSubmitting = false;
@@ -45,7 +38,7 @@ const SoundManager = {
   reject() { this._playTone(300, 0.3, 'square', 0.2); setTimeout(() => this._playTone(200, 0.4, 'square', 0.2), 350); }
 };
 
-// ---- API helper ----
+// ---- API helpers ----
 async function fetchJson(url, options = {}) {
   const res = await fetch((CONFIG.API_BASE || '') + url, {
     headers: { 'Content-Type': 'application/json' },
@@ -55,9 +48,6 @@ async function fetchJson(url, options = {}) {
   return res.json();
 }
 
-// [FIX-3] Order-specific fetch: never throws on 400/500 so callers can
-// read body.status. Network failures still return a synthetic response so
-// the caller can distinguish "never reached server" from "server rejected".
 async function placeOrderFetch(url, body) {
   let res;
   try {
@@ -69,12 +59,7 @@ async function placeOrderFetch(url, body) {
   } catch (networkErr) {
     return {
       httpStatus: 0,
-      body: {
-        success: false,
-        status: 'NETWORK_ERROR',
-        error: networkErr.message,
-        canRetry: false,
-      },
+      body: { success: false, status: 'NETWORK_ERROR', error: networkErr.message, canRetry: false },
     };
   }
   let payload = {};
@@ -104,6 +89,7 @@ const dashboardState = {
   fusion: null,
   otieDecisions: [],
   otieActions: [],
+  otieStates: {},
   belief: null,
   prediction: null,
   opportunity: null,
@@ -131,6 +117,7 @@ function renderAllWidgets() {
   renderPredictionWidget();
   renderOpportunityWidget();
   renderLiveMonitorStatus();
+  renderOTIEPanel();
 }
 
 function renderLiveMonitorStatus() {
@@ -162,11 +149,12 @@ function renderAccountWidget() {
   const currency = acc.currency || 'USD';
   const elB = document.getElementById('statBalance');
   const elE = document.getElementById('statEquity');
-  if (elB) elB.textContent = `${balance} ${currency}`;
-  if (elE) elE.textContent = `${equity} ${currency}`;
+  if (elB) elB.textContent = `${balance.toFixed(2)} ${currency}`;
+  if (elE) elE.textContent = `${equity.toFixed(2)} ${currency}`;
   if (window.updateAccountBadge) window.updateAccountBadge(acc);
 }
 
+// [FILE-4-OF-4] Positions table with OTIE column
 function renderPositionsWidget() {
   const positions = dashboardState.positions || [];
   const badge = document.getElementById('positionCount');
@@ -186,19 +174,38 @@ function renderPositionsWidget() {
 
   let html = `<table class="table table-striped"><thead><tr>
     <th>ID</th><th>Pair</th><th>Side</th><th>Entry</th><th>Paid</th>
-    <th>Current</th><th>Units</th><th>P/L</th><th>Status</th><th>Action</th>
+    <th>Current</th><th>Units</th><th>P/L</th>
+    <th>OTIE</th><th>Status</th><th>Action</th>
   </tr></thead><tbody>`;
   let totalPL = 0;
 
   for (const t of positions) {
     const pl = Number(t.unrealizedPL ?? 0) || 0;
     totalPL += pl;
-    const live = dashboardState.contractStates[String(t.id ?? t.contractId)];
+    const cid = String(t.id ?? t.contractId);
+    const live = dashboardState.contractStates[cid];
+    const otie = dashboardState.otieStates[cid];
     const status = live?.status || t.status || 'OPEN';
     const canClose = live
       ? (live.isValidToSell !== false && !live.isSold && !live.isExpired)
       : status === 'OPEN';
     const plClass = pl > 0 ? 'text-success' : pl < 0 ? 'text-danger' : 'text-muted';
+
+    // OTIE cell
+    let otieCell = '<span class="text-muted small">—</span>';
+    if (otie) {
+      const actionBadge = otie.action === 'CLOSE'
+        ? '<span class="badge bg-danger">CLOSE</span>'
+        : '<span class="badge bg-success">HOLD</span>';
+      const peakStr = Number(otie.peak || 0).toFixed(2);
+      const ddStr = (Number(otie.drawdownPct || 0) * 100).toFixed(0);
+      const ddClass = Number(otie.drawdownPct) > 0.30 ? 'text-danger' : 'text-muted';
+      otieCell = `${actionBadge}
+        <div class="${ddClass}" style="font-size:0.7em; line-height:1.1; margin-top:2px;">
+          peak ${peakStr}$<br>dd ${ddStr}%
+        </div>`;
+    }
+
     html += `<tr>
       <td style="font-family:monospace; font-size:0.85em;">${t.id ?? t.contractId ?? '—'}</td>
       <td>${t.instrument ?? '—'}</td>
@@ -208,13 +215,14 @@ function renderPositionsWidget() {
       <td>${formatPrice(t.currentPrice)}</td>
       <td>${t.units ?? '—'}</td>
       <td class="${plClass}">${pl.toFixed(2)}</td>
+      <td>${otieCell}</td>
       <td><span class="badge ${status === 'OPEN' ? 'bg-primary' : 'bg-secondary'}">${status}</span></td>
       <td>${canClose
-        ? `<button class="btn btn-sm btn-danger" onclick="window.closeTrade('${t.id ?? t.contractId}')"><i class="fas fa-times"></i> Close</button>`
+        ? `<button class="btn btn-sm btn-danger" onclick="window.closeTrade('${cid}')"><i class="fas fa-times"></i> Close</button>`
         : '<span class="small text-muted">settling…</span>'}</td>
     </tr>`;
   }
-  html += `<tr><td colspan="7"><strong>Total Unrealized P&L</strong></td>
+  html += `<tr><td colspan="8"><strong>Total Unrealized P&L</strong></td>
            <td class="${totalPL > 0 ? 'text-success' : totalPL < 0 ? 'text-danger' : ''}"><strong>${totalPL.toFixed(2)}</strong></td>
            <td colspan="2"></td></tr></tbody></table>`;
   container.innerHTML = html;
@@ -307,9 +315,9 @@ function renderAwarenessWidget() {
   if (!a) { panel.innerHTML = '<p class="text-muted">Waiting for market awareness...</p>'; return; }
   panel.innerHTML = `<div class="card"><div class="card-body">
     <h6 class="card-title">Market Awareness (${a.symbol})</h6>
-    <p>Spread: ${a.spread.toFixed(5)} | Velocity: ${a.velocity.toFixed(6)}</p>
-    <p>Acceleration: ${a.acceleration.toFixed(6)} | Liquidity: ${(a.liquidity * 100).toFixed(0)}%</p>
-    <p>Unusual: ${a.unusualEvents ? a.unusualEvents.join(', ') : 'None'}</p>
+    <p>Spread: ${(a.spread || 0).toFixed(5)} | Velocity: ${(a.velocity || 0).toFixed(6)}</p>
+    <p>Acceleration: ${(a.acceleration || 0).toFixed(6)} | Liquidity: ${((a.liquidity || 0) * 100).toFixed(0)}%</p>
+    <p>Unusual: ${a.unusualEvents ? a.unusualEvents.join(', ') : (a.unusual ? a.unusual.join(', ') : 'None')}</p>
     <p class="small text-muted">${new Date(a.lastUpdated).toLocaleString()}</p>
   </div></div>`;
 }
@@ -322,16 +330,16 @@ function renderMetricsWidget() {
   panel.innerHTML = `<div class="card"><div class="card-body">
     <h6 class="card-title">Live Performance</h6>
     <div class="row">
-      <div class="col-6">Win Rate: ${(m.winRate * 100).toFixed(1)}%</div>
-      <div class="col-6">Profit Factor: ${m.profitFactor.toFixed(2)}</div>
-      <div class="col-6">Sharpe: ${m.sharpe.toFixed(2)}</div>
-      <div class="col-6">Max DD: ${(m.maxDrawdown * 100).toFixed(1)}%</div>
-      <div class="col-6">Expectancy: ${m.expectancy.toFixed(2)}</div>
-      <div class="col-6">Trades: ${m.totalTrades}</div>
-      <div class="col-6">Daily P&L: ${m.dailyPnL.toFixed(2)}</div>
-      <div class="col-6">Current DD: ${(m.currentDrawdown * 100).toFixed(1)}%</div>
+      <div class="col-6">Win Rate: ${((m.winRate || 0) * 100).toFixed(1)}%</div>
+      <div class="col-6">Profit Factor: ${(m.profitFactor || 0).toFixed(2)}</div>
+      <div class="col-6">Sharpe: ${(m.sharpe || 0).toFixed(2)}</div>
+      <div class="col-6">Max DD: ${((m.maxDrawdown || 0) * 100).toFixed(1)}%</div>
+      <div class="col-6">Expectancy: ${(m.expectancy || 0).toFixed(2)}</div>
+      <div class="col-6">Trades: ${m.totalTrades || 0}</div>
+      <div class="col-6">Daily P&L: ${(m.dailyPnL || 0).toFixed(2)}</div>
+      <div class="col-6">Current DD: ${((m.currentDrawdown || 0) * 100).toFixed(1)}%</div>
     </div>
-    <p class="small text-muted mt-2">${new Date(m.timestamp).toLocaleString()}</p>
+    <p class="small text-muted mt-2">${m.timestamp ? new Date(m.timestamp).toLocaleString() : ''}</p>
   </div></div>`;
 }
 
@@ -393,8 +401,8 @@ function renderPredictionWidget() {
           <div><small>Sample: <strong>${p.sampleSize || 0}</strong></small></div>
         </div>
       </div>
-      <div class="mt-2"><small>Expected: <strong>${(p.expectedMove * 10000).toFixed(1)} pips</strong> | Fav: ${(p.expectedFavorable * 10000).toFixed(1)} | Adv: ${(p.expectedAdverse * 10000).toFixed(1)}</small></div>
-      <div class="mt-1"><small>MFE: ${(p.mfe * 10000).toFixed(1)} | MAE: ${(p.mae * 10000).toFixed(1)} | Quality: ${p.marketQuality || 50}/100</small></div>
+      <div class="mt-2"><small>Expected: <strong>${((p.expectedMove || 0) * 10000).toFixed(1)} pips</strong> | Fav: ${((p.expectedFavorable || 0) * 10000).toFixed(1)} | Adv: ${((p.expectedAdverse || 0) * 10000).toFixed(1)}</small></div>
+      <div class="mt-1"><small>MFE: ${((p.mfe || 0) * 10000).toFixed(1)} | MAE: ${((p.mae || 0) * 10000).toFixed(1)} | Quality: ${p.marketQuality || 50}/100</small></div>
     </div>
   </div>`;
 }
@@ -420,7 +428,177 @@ function renderOpportunityWidget() {
 }
 
 // ================================================================
-// 2. HISTORY TABLE
+// [FILE-4-OF-4] OTIE v6 trajectory panel
+// ================================================================
+
+window.onOtieState = function (state) {
+  if (!state || !state.tradeId) return;
+  if (!dashboardState.otieStates) dashboardState.otieStates = {};
+
+  if (state.action === 'RELEASED') {
+    delete dashboardState.otieStates[state.tradeId];
+  } else {
+    dashboardState.otieStates[state.tradeId] = state;
+  }
+
+  if (typeof window.renderOTIEPanel === 'function') window.renderOTIEPanel();
+  if (typeof window.renderPositionsWidget === 'function') window.renderPositionsWidget();
+};
+
+// Sparkline: convert a profit series to SVG polyline points + zero-line Y
+function _sparklinePoints(values, width, height) {
+  if (!Array.isArray(values) || values.length < 2) return null;
+  const min = Math.min(...values, 0);
+  const max = Math.max(...values, 0);
+  const range = max - min || 1;
+  const pad = height * 0.1;
+  const usable = height - pad * 2;
+  const stepX = width / Math.max(values.length - 1, 1);
+  const points = values.map((v, i) => {
+    const x = i * stepX;
+    const y = pad + (1 - (v - min) / range) * usable;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  const zeroY = pad + (1 - (0 - min) / range) * usable;
+  return { points, zeroY: zeroY.toFixed(1) };
+}
+
+function renderOTIEPanel() {
+  const container = document.getElementById('otieContent');
+  if (!container) return;
+
+  const states = dashboardState.otieStates || {};
+  const ids = Object.keys(states).sort();
+
+  const placeholder = document.querySelector('#otiePanel > p.text-muted');
+  if (placeholder) {
+    placeholder.style.display = ids.length > 0 ? 'none' : 'block';
+  }
+
+  const headerBadge = document.querySelector('#section-trademanagement .card-header .badge');
+  if (headerBadge) {
+    const pendingClose = ids.filter(id => states[id].action === 'CLOSE').length;
+    if (pendingClose > 0) {
+      headerBadge.textContent = `${ids.length} monitored · ${pendingClose} closing`;
+      headerBadge.className = 'badge bg-danger';
+    } else if (ids.length > 0) {
+      headerBadge.textContent = `${ids.length} monitored`;
+      headerBadge.className = 'badge bg-success';
+    } else {
+      headerBadge.textContent = 'Idle';
+      headerBadge.className = 'badge bg-secondary';
+    }
+  }
+
+  if (ids.length === 0) {
+    container.innerHTML = '<p class="text-muted">No open contracts to monitor.</p>';
+    return;
+  }
+
+  let html = '';
+  for (const id of ids) {
+    html += _renderOtieCard(states[id]);
+  }
+  container.innerHTML = html;
+}
+
+function _renderOtieCard(s) {
+  const isClose = s.action === 'CLOSE';
+  const borderColor = isClose ? '#e74c5e' : '#00b894';
+  const bgColor = isClose ? '#fef2f2' : '#f0fdf4';
+  const statusColor = isClose ? 'bg-danger' : 'bg-success';
+  const profitColor = Number(s.profit) >= 0 ? '#00b894' : '#e74c5e';
+
+  const t = s.thresholds || {};
+  const ddPct = (Number(s.drawdownPct || 0) * 100).toFixed(0);
+  const ddThreshold = t.drawdownClosePct ? (t.drawdownClosePct * 100).toFixed(0) : '40';
+  const ddWarn = parseFloat(ddPct) > parseFloat(ddThreshold) * 0.75;
+  const ddColor = ddWarn ? '#e74c5e' : '#6b7a8f';
+
+  const revThreshold = t.chopMaxReversals || 8;
+  const revWarn = Number(s.reversals) >= revThreshold * 0.75;
+  const revColor = revWarn ? '#e74c5e' : '#6b7a8f';
+
+  const spark = _sparklinePoints(s.history, 300, 50);
+  const sparkSvg = spark ? `
+    <svg width="100%" height="50" viewBox="0 0 300 50" preserveAspectRatio="none" style="display:block;">
+      <line x1="0" y1="${spark.zeroY}" x2="300" y2="${spark.zeroY}" stroke="#cbd5e1" stroke-dasharray="2,2" stroke-width="1"/>
+      <polyline points="${spark.points}" fill="none" stroke="${profitColor}" stroke-width="2"/>
+    </svg>
+  ` : '';
+
+  return `
+    <div style="border-left: 4px solid ${borderColor}; background: ${bgColor}; border-radius: 8px; padding: 16px; margin-bottom: 12px;">
+      <div class="d-flex justify-content-between align-items-center mb-2">
+        <div>
+          <strong style="font-size: 1.05em;">${s.symbol}</strong>
+          <span class="badge ${s.side === 'BUY' ? 'bg-success' : 'bg-danger'} ms-2">${s.side}</span>
+          <span class="badge bg-primary ms-1">${s.multiplier}x</span>
+          <span class="text-muted ms-2 small">$${Number(s.stake).toFixed(2)} stake</span>
+        </div>
+        <div>
+          <span class="badge ${statusColor}">${s.action}</span>
+          <span class="text-muted ms-2" style="font-size:0.75em;">
+            ${(Number(s.age) / 1000).toFixed(0)}s · ${s.tickCount || 0} ticks
+          </span>
+        </div>
+      </div>
+
+      <div class="row text-center mb-2">
+        <div class="col-3">
+          <div class="small text-muted" style="font-size:0.7em; text-transform:uppercase;">Profit</div>
+          <div style="font-size: 1.3em; font-weight: 700; color: ${profitColor};">
+            ${Number(s.profit) >= 0 ? '+' : ''}$${Number(s.profit).toFixed(2)}
+          </div>
+          <div class="small text-muted" style="font-size:0.7em;">${Number(s.profitR) >= 0 ? '+' : ''}${Number(s.profitR).toFixed(2)}R</div>
+        </div>
+        <div class="col-3">
+          <div class="small text-muted" style="font-size:0.7em; text-transform:uppercase;">Peak</div>
+          <div style="font-size: 1.3em; font-weight: 700; color: #00b894;">
+            +$${Number(s.peak).toFixed(2)}
+          </div>
+          <div class="small text-muted" style="font-size:0.7em;">${Number(s.peakR).toFixed(2)}R</div>
+        </div>
+        <div class="col-3">
+          <div class="small text-muted" style="font-size:0.7em; text-transform:uppercase;">Drawdown</div>
+          <div style="font-size: 1.3em; font-weight: 700; color: ${ddColor};">
+            ${ddPct}%
+          </div>
+          <div class="small text-muted" style="font-size:0.7em;">limit ${ddThreshold}%</div>
+        </div>
+        <div class="col-3">
+          <div class="small text-muted" style="font-size:0.7em; text-transform:uppercase;">Reversals</div>
+          <div style="font-size: 1.3em; font-weight: 700; color: ${revColor};">
+            ${s.reversals || 0}
+          </div>
+          <div class="small text-muted" style="font-size:0.7em;">limit ${revThreshold}</div>
+        </div>
+      </div>
+
+      ${sparkSvg ? `<div style="margin: 8px 0 4px;">${sparkSvg}</div>` : ''}
+
+      <div class="d-flex justify-content-between small text-muted" style="font-size:0.75em;">
+        <div>
+          <strong>Slope:</strong> ${Number(s.slope || 0).toFixed(4)}$/tick
+          · <strong>Flat:</strong> ${(Number(s.flatTime) / 1000).toFixed(0)}s
+          · <strong>Since peak:</strong> ${(Number(s.timeSincePeak) / 1000).toFixed(0)}s
+        </div>
+        <div><strong>Contract:</strong> <span style="font-family: monospace;">${s.tradeId}</span></div>
+      </div>
+
+      ${isClose && s.reason ? `
+        <div class="alert alert-danger mt-2 mb-0 py-2 small">
+          <strong>CLOSE TRIGGER:</strong> ${s.reason}
+        </div>
+      ` : ''}
+    </div>
+  `;
+}
+
+window.renderOTIEPanel = renderOTIEPanel;
+
+// ================================================================
+// 2. History table
 // ================================================================
 function applyHistoryFilters() { historyPage = 1; renderHistoryTable(); }
 
@@ -487,7 +665,7 @@ function renderHistoryTable() {
 }
 
 // ================================================================
-// 3. MANUAL REFRESH
+// 3. Manual refresh
 // ================================================================
 async function refreshAllData() {
   try {
@@ -502,7 +680,7 @@ async function refreshAllData() {
 }
 
 // ================================================================
-// 4. USER ACTIONS
+// 4. User actions
 // ================================================================
 async function closeTrade(tradeId) {
   if (!confirm(`Close contract ${tradeId}?`)) return;
@@ -524,10 +702,8 @@ async function cancelPending(orderId) {
 }
 
 // ================================================================
-// 5. TRADE FORM — status-aware
+// 5. Trade form — status-aware
 // ================================================================
-// [FIX-4] Show a distinct message per outcome. The wording matters:
-// BROKER_ERROR must explicitly warn against retrying.
 function showOrderOutcome(result) {
   const status = result.body?.status;
   const contractId = result.body?.contractId ? String(result.body.contractId) : null;
@@ -553,20 +729,16 @@ function showOrderOutcome(result) {
 }
 
 // ================================================================
-// 6. EXPOSE TO live.js
+// 6. Expose to live.js
 // ================================================================
-// [FIX-1] CRITICAL — exposes the state OBJECT itself. live.js reads
-//   window.dashboardState.positions / .prices / .contractStates. Without
-//   this line, those reads are undefined and every contractUpdate tick
-//   appends a new row, then every tradeClosed wipes positions entirely.
 window.dashboardState = dashboardState;
 window.updateDashboardState = updateDashboardState;
-// [FIX-2] Targeted repaint hooks — live.js calls these instead of
-//   updateDashboardState (which rerenders all 16 widgets).
 window.renderPositionsWidget = renderPositionsWidget;
 window.renderLiveMonitorStatus = renderLiveMonitorStatus;
 window.renderPriceWidgets = renderPriceWidgets;
 window.renderAccountWidget = renderAccountWidget;
+window.renderHistoryWidget = renderHistoryWidget;
+window.renderOTIEPanel = renderOTIEPanel;
 window.SoundManager = SoundManager;
 window.closeTrade = closeTrade;
 window.cancelPending = cancelPending;
@@ -597,9 +769,6 @@ window.updateAccountBadge = function (acc) {
   }
 };
 
-// [FIX-6] Fixed: fills Multiplier form fields that actually exist.
-// The old version referenced #tradeLot and #tradeSL (CFD-only) and always
-// alerted "Trade form not available".
 window.executeSignalFromCard = function (btn) {
   const card = btn.closest('.live-signal-card');
   if (!card) return;
@@ -636,7 +805,7 @@ window.exportHistoryCSV = function () {
 };
 
 // ================================================================
-// 7. DOM WIRING
+// 7. DOM wiring
 // ================================================================
 document.addEventListener('DOMContentLoaded', async function () {
   try {
@@ -645,7 +814,6 @@ document.addEventListener('DOMContentLoaded', async function () {
 
   await refreshAllData();
 
-  // Signal generator
   document.getElementById('getSignalBtn')?.addEventListener('click', async function () {
     const pair = document.getElementById('signalPair').value.trim();
     const strategy = document.getElementById('signalStrategy').value;
@@ -663,7 +831,6 @@ document.addEventListener('DOMContentLoaded', async function () {
     } catch (e) { alert('Error: ' + e.message); }
   });
 
-  // [FIX-5] Trade form uses status-aware fetch
   document.getElementById('tradeForm')?.addEventListener('submit', async function (e) {
     e.preventDefault();
     if (isSubmitting) return;
@@ -689,7 +856,6 @@ document.addEventListener('DOMContentLoaded', async function () {
     isSubmitting = false;
   });
 
-  // [FIX-5] Auto-trade form uses the same pattern
   document.getElementById('autoTradeForm')?.addEventListener('submit', async function (e) {
     e.preventDefault();
     if (isAutoSubmitting) return;
@@ -718,7 +884,6 @@ document.addEventListener('DOMContentLoaded', async function () {
     isAutoSubmitting = false;
   });
 
-  // History filters / pagination
   document.getElementById('applyHistoryFilter')?.addEventListener('click', applyHistoryFilters);
   document.getElementById('resetHistoryFilter')?.addEventListener('click', function () {
     ['historyFrom', 'historyTo', 'historySymbol', 'historySide', 'historyStatus'].forEach(id => {
@@ -734,12 +899,10 @@ document.addEventListener('DOMContentLoaded', async function () {
     if (historyPage < historyTotalPages) { historyPage++; renderHistoryTable(); }
   });
 
-  // Refresh buttons
   document.getElementById('refreshTrades')?.addEventListener('click', refreshAllData);
   document.getElementById('refreshHistory')?.addEventListener('click', refreshAllData);
   document.getElementById('refreshPending')?.addEventListener('click', refreshAllData);
 
-  // Delete history
   document.getElementById('deleteHistoryBtn')?.addEventListener('click', async function () {
     if (!confirm('Delete all closed trades? This cannot be undone.')) return;
     try {
@@ -749,7 +912,6 @@ document.addEventListener('DOMContentLoaded', async function () {
     } catch (e) { alert('Error: ' + e.message); }
   });
 
-  // Export / report (owned here, not in index.html — deduped)
   document.getElementById('exportCSVBtn')?.addEventListener('click', function () {
     if (typeof window.exportHistoryCSV === 'function') window.exportHistoryCSV();
   });
@@ -760,4 +922,4 @@ document.addEventListener('DOMContentLoaded', async function () {
   });
 });
 
-console.log('✅ app.js loaded — event-driven with live contract monitoring.');
+console.log('✅ app.js loaded — OTIE V6 trajectory panel + positions OTIE column active.');
