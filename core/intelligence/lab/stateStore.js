@@ -20,6 +20,9 @@
 // [FILE-4I] findSimilar projection includes `confidence` for calibration.
 // [FILE-4J] getPredictionDistribution correctly reads s.outcome.win.
 // [FILE-4K] Empty-result handling returns stats: {} rather than undefined.
+// [FILE-4.1] Per-symbol movement threshold in getPredictionDistribution.
+//   Was CONFIG.MOVEMENT_THRESHOLD = 0.0005 fixed, which classified ~95%
+//   of EUR/USD 5-min moves as neutral. Now uses pipSize(symbol) × 2.
 
 const HistoricalState = require('../../../models/HistoricalState');
 
@@ -42,12 +45,13 @@ const CONFIG = {
   },
   RECENCY_HALF_LIFE_DAYS: 30,
   NORMALIZER_REFRESH_INTERVAL_MS: 60 * 60 * 1000,
-  MIN_STATES_FOR_REFRESH: 200,   // [FILE-4G] lowered from 10000
+  MIN_STATES_FOR_REFRESH: 200,                 // [FILE-4G]
   GAUSSIAN_SIGMA: 0.15,
-  MOVEMENT_THRESHOLD: 0.0005,
-  // [FILE-4F] qualified threshold raised from 1.0 to 2.0
-  QUALIFIED_DISTANCE_THRESHOLD: 2.0,
-  // Regime compatibility mapping (higher = more compatible)
+  MOVEMENT_THRESHOLD: 0.0005,                  // fallback only; per-symbol threshold used below
+  QUALIFIED_DISTANCE_THRESHOLD: 2.0,           // [FILE-4F]
+  // [FILE-4.1] Pips used for movement threshold. `pipSize(symbol) × 2` gives
+  // each pair a "small but meaningful 5-min directional move" boundary.
+  MOVEMENT_THRESHOLD_PIPS: 2,
   REGIME_WEIGHTS: {
     'STRONG_TREND_BULL':   { 'STRONG_TREND_BULL': 1.0, 'WEAK_TREND': 0.7, 'NEUTRAL': 0.5, 'STRONG_TREND_BEAR': 0.1, 'HIGH_VOLATILITY': 0.4, 'LOW_VOLATILITY': 0.6, 'RANGING': 0.3, 'BREAKOUT': 0.6, 'REVERSAL': 0.3 },
     'STRONG_TREND_BEAR':   { 'STRONG_TREND_BEAR': 1.0, 'WEAK_TREND': 0.7, 'NEUTRAL': 0.5, 'STRONG_TREND_BULL': 0.1, 'HIGH_VOLATILITY': 0.4, 'LOW_VOLATILITY': 0.6, 'RANGING': 0.3, 'BREAKOUT': 0.6, 'REVERSAL': 0.3 },
@@ -60,6 +64,23 @@ const CONFIG = {
     'LOW_VOLATILITY':      { 'LOW_VOLATILITY': 1.0, 'RANGING': 0.7, 'NEUTRAL': 0.7, 'WEAK_TREND': 0.6, 'STRONG_TREND_BULL': 0.4, 'STRONG_TREND_BEAR': 0.4, 'HIGH_VOLATILITY': 0.2, 'BREAKOUT': 0.3, 'REVERSAL': 0.3 },
   },
 };
+
+// -------------------- Pip sizes (for movement threshold) --------------------
+// [FILE-4.1] Per-symbol pip size. Used to scale the movement threshold
+// so a "meaningful 5-min move" isn't the same absolute price for USD/JPY
+// (pip = 0.01) as for EUR/USD (pip = 0.0001).
+function getPipSize(symbol) {
+  if (!symbol) return 0.0001;
+  const clean = symbol.replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
+  const pipMap = {
+    EURUSD: 0.0001, GBPUSD: 0.0001, AUDUSD: 0.0001, NZDUSD: 0.0001,
+    USDCHF: 0.0001, USDCAD: 0.0001,
+    USDJPY: 0.01, EURJPY: 0.01, GBPJPY: 0.01, AUDJPY: 0.01,
+    XAUUSD: 0.01, XAGUSD: 0.001,
+    BTCUSD: 0.1, ETHUSD: 0.01,
+  };
+  return pipMap[clean] || 0.0001;
+}
 
 // -------------------- Symbol variants --------------------
 // [FILE-4E] Strip 'frx' prefix before generating variants.
@@ -125,7 +146,9 @@ class RobustNormalizer {
     let totalStates = 0;
     try {
       totalStates = await HistoricalState.countDocuments({ 'outcome5.return': { $ne: null } });
-    } catch (_) { totalStates = 0; }
+    } catch (_) {
+      totalStates = 0;
+    }
 
     const shouldRefresh =
       !this.isLoaded ||
@@ -201,7 +224,7 @@ class RobustNormalizer {
             const iqr = (vals.q3 - vals.q1) || 1e-6;
             this.stats[key] = { median: vals.med, iqr };
           }
-          console.log('[StateStore] loadStats refreshed from', totalStates, 'labeled states.');
+          console.log(`[StateStore] loadStats refreshed from ${totalStates} labeled states.`);
         }
 
         this.isLoaded = true;
@@ -361,7 +384,7 @@ class StateStore {
     const candidates = await HistoricalState.aggregate(pipeline);
 
     if (candidates.length === 0) {
-      // [FILE-4K] Return stats: {} so consumers don't crash
+      // [FILE-4K] Return stats: {} so consumers don't crash on .stats access
       return {
         states: [],
         distanceStats: null,
@@ -402,12 +425,17 @@ class StateStore {
     const medianDist = sortedDists[Math.floor(sortedDists.length / 2)];
 
     const totalW = weightedStates.reduce((s, c) => s + c.totalWeight, 0);
-    const weightedAvgDist = totalW > 0 ? weightedStates.reduce((s, c) => s + c.distance * c.totalWeight, 0) / totalW : avgDist;
+    const weightedAvgDist = totalW > 0
+      ? weightedStates.reduce((s, c) => s + c.distance * c.totalWeight, 0) / totalW
+      : avgDist;
 
     // [FILE-4F] Threshold raised to 2.0
     const qualified = weightedStates.filter(c => c.distance <= CONFIG.QUALIFIED_DISTANCE_THRESHOLD);
 
-    const distBuckets = { '<0.1': 0, '0.1-0.2': 0, '0.2-0.3': 0, '0.3-0.5': 0, '0.5-1.0': 0, '1.0-2.0': 0, '>=2.0': 0 };
+    const distBuckets = {
+      '<0.1': 0, '0.1-0.2': 0, '0.2-0.3': 0, '0.3-0.5': 0,
+      '0.5-1.0': 0, '1.0-2.0': 0, '>=2.0': 0,
+    };
     for (const c of weightedStates) {
       if (c.distance < 0.1) distBuckets['<0.1']++;
       else if (c.distance < 0.2) distBuckets['0.1-0.2']++;
@@ -462,7 +490,10 @@ class StateStore {
 
     return {
       states: weightedStates,
-      distanceStats: { min: minDist, max: maxDist, avg: avgDist, median: medianDist, weightedAvg: weightedAvgDist },
+      distanceStats: {
+        min: minDist, max: maxDist, avg: avgDist,
+        median: medianDist, weightedAvg: weightedAvgDist,
+      },
       stats: statsAlias,   // [FILE-4D] alias
       candidateCount: weightedStates.length,
       qualifiedCount: qualified.length,
@@ -491,6 +522,12 @@ class StateStore {
     let sumTimeMFE = 0, sumTimeMAE = 0;
     let sumReturnR = 0, sumWeightR = 0;
 
+    // [FILE-4.1] Per-symbol movement threshold. Was fixed at CONFIG.MOVEMENT_THRESHOLD
+    // (0.0005) which classified ~95% of EUR/USD 5-min moves as neutral.
+    // Now scales with pip size: 2 pips per symbol.
+    const symbolPipSize = getPipSize(symbol || 'EURUSD');
+    const moveThreshold = symbolPipSize * CONFIG.MOVEMENT_THRESHOLD_PIPS;
+
     for (const s of states) {
       const w = s.totalWeight;
       const entry = s.price?.current || 0;
@@ -499,8 +536,8 @@ class StateStore {
       const lastPrice = futurePrices[lookahead][futurePrices[lookahead].length - 1];
       const move = lastPrice - entry;
       totalValidWeight += w;
-      if (move > CONFIG.MOVEMENT_THRESHOLD) upWeight += w;
-      else if (move < -CONFIG.MOVEMENT_THRESHOLD) downWeight += w;
+      if (move > moveThreshold) upWeight += w;
+      else if (move < -moveThreshold) downWeight += w;
       else neutralWeight += w;
 
       sumMove += move * w;
@@ -653,7 +690,6 @@ class StateStore {
         ? { symbol: variants[0] }
         : { $or: variants.map(s => ({ symbol: s })) };
 
-      // Fetch a broad pool of historical states with both confidence and outcome
       const pipeline = [
         {
           $match: {
@@ -676,13 +712,11 @@ class StateStore {
 
       const docs = await HistoricalState.aggregate(pipeline);
       if (docs.length < 30) {
-        // Not enough data to calibrate
         return { calibratedConfidence: confidence, sampleSize: docs.length, bucket: null };
       }
 
-      // Bucket by 10-unit confidence range
       const bucketSize = 10;
-      const buckets = new Map(); // floor(conf/bucketSize) -> { wins, total }
+      const buckets = new Map();
       for (const d of docs) {
         const b = Math.floor(d.confidence / bucketSize) * bucketSize;
         if (!buckets.has(b)) buckets.set(b, { wins: 0, total: 0 });
@@ -691,7 +725,6 @@ class StateStore {
         if (d.win) bucket.wins++;
       }
 
-      // Find the bucket matching the query confidence
       const queryBucket = Math.floor(confidence / bucketSize) * bucketSize;
       const match = buckets.get(queryBucket);
 
