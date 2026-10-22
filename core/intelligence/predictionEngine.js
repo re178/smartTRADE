@@ -1,9 +1,24 @@
 // core/intelligence/predictionEngine.js – Forecast Engine
 // Consumes raw evidence from StateStore, applies direction and computes
-// directional‑specific favorable/adverse moves, uncertainty, and confidence.
+// directional-specific favorable/adverse moves, uncertainty, and confidence.
 // Preserves analogues for OpportunityEngine.
+//
+// [FILE-5A] Real confidence calibration via stateStore.calibrateConfidence.
+//   Previous version used rawConfidence as calibratedConfidence (placeholder).
+// [FILE-5B] Uses real regime from state.regime.code (File 2). Previously
+//   state.regime was always 'NEUTRAL', so regime weighting in stateStore
+//   was uniformly uniform.
+// [FILE-5C] Distinct null-return log reasons so we can diagnose where the
+//   pipeline is blocked: no candidates / low qualified / low ESS.
+// [FILE-5D] Direction fallback from expectedMove sign when discrete
+//   probabilities are ambiguous (rare after File 4.1 threshold fix).
+// [FILE-5E] confidenceInterval guards against missing outcome.returnR.
+// [FILE-5F] modeLabel distinguishes 'empirical_edge', 'low_sample', 'no_data'.
+// [FILE-5G] analogues array passed through untouched for opportunityEngine.
+// [FILE-5H] regime + regimeDetail both returned.
 
 const stateStore = require('./lab/stateStore');
+const logger = require('../../infrastructure/logger') || console;
 
 // ---- Symbol Normalization ----
 function normalizeSymbol(sym) {
@@ -16,15 +31,16 @@ const CONFIG = {
   DEFAULT_LOOKAHEAD: 5,
   MIN_QUALIFIED: 20,
   MIN_EFFECTIVE_SAMPLE: 15,
-  MOVEMENT_THRESHOLD: 0.0005,
-  // Confidence calibration placeholder – will be replaced with real calibration later
-  CALIBRATION_PLACEHOLDER: true,
+  MOVEMENT_THRESHOLD: 0.0005,     // fallback if expectedMove-based fallback used
+  // [FILE-5D] Direction fallback: expectedMove must exceed this fraction of
+  // expectedAdverse before we accept a direction from move alone.
+  DIRECTION_FALLBACK_RATIO: 0.5,
+  // [FILE-5A] Calibration minimum sample before trusting the empirical rate.
+  CALIBRATION_MIN_SAMPLE: 10,
 };
 
 /**
  * Extract a flat feature vector from a market state.
- * @param {Object} state - Full market state from deepMarketState.compute().
- * @returns {Object} Feature vector with numeric values.
  */
 function extractFeatures(state) {
   const features = {
@@ -49,7 +65,6 @@ function extractFeatures(state) {
 
 /**
  * Compute prediction entropy (uncertainty) from probabilities.
- * Higher entropy = more uncertain.
  */
 function calculateEntropy(probs) {
   const values = Object.values(probs).filter(p => p > 0);
@@ -59,62 +74,77 @@ function calculateEntropy(probs) {
 }
 
 /**
- * Get the regime code from state, with fallback to deepRegime cache.
- * @param {Object} state - Market state.
- * @param {string} symbol - Symbol (used for fallback).
- * @returns {string} Regime code.
+ * Get the regime code from state. [FILE-5B] state.regime.code is now real.
  */
-function getRegimeCode(state, symbol) {
-  if (state.regime?.code) {
-    return state.regime.code;
-  }
-  // Fallback: we could call deepRegime.getLatestRegime(symbol) if needed
-  return 'NEUTRAL';
+function getRegimeCode(state) {
+  return state?.regime?.code || 'NEUTRAL';
 }
 
 /**
  * Compute a prediction from a market state.
- * @param {Object} state - Full market state from deepMarketState.compute().
- * @param {string} symbol - Symbol (e.g., 'EURUSD', 'frxEURUSD', etc.).
- * @param {number} lookahead - Lookahead in candles (default 5).
- * @param {number} k - Number of analogues to retrieve (default 500).
- * @returns {Promise<Object>} Prediction object.
  */
 async function predict(state, symbol, lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = 500) {
   try {
     // 1. Normalize symbol
     const canonicalSymbol = normalizeSymbol(symbol);
     if (!canonicalSymbol) {
+      logger.debug('[PredictionEngine] Empty symbol — skipping.');
       return null;
     }
 
     // 2. Extract features
     const features = extractFeatures(state);
 
-    // 3. Get regime code (for logging and regime weighting)
-    const regimeCode = getRegimeCode(state, canonicalSymbol);
+    // 3. Get regime code — real after File 2
+    const regimeCode = getRegimeCode(state);
 
-    // 4. Call StateStore (regime is passed for compatibility weighting)
+    // 4. Call StateStore
     const distribution = await stateStore.getPredictionDistribution(
       features,
       canonicalSymbol,
       state.timeframe || 'M5',
       lookahead,
       k,
-      regimeCode  // passed for regime weighting
+      regimeCode
     );
 
-    if (!distribution || distribution.qualifiedCount < CONFIG.MIN_QUALIFIED || distribution.effectiveSampleSize < CONFIG.MIN_EFFECTIVE_SAMPLE) {
+    // 5. Distinct null-return diagnostics
+    if (!distribution || distribution.sampleSize === 0) {
+      logger.debug(
+        `[PredictionEngine] ${canonicalSymbol}: no candidates ` +
+        `(candidateCount=${distribution?.candidateCount ?? 0}). ` +
+        `Historical data may not be labeled yet (see File 3).`
+      );
       return null;
     }
 
-    // 5. Compute probabilities (already normalized by StateStore)
+    if (distribution.qualifiedCount < CONFIG.MIN_QUALIFIED) {
+      logger.debug(
+        `[PredictionEngine] ${canonicalSymbol}: low qualified count ` +
+        `(${distribution.qualifiedCount}/${CONFIG.MIN_QUALIFIED}, ` +
+        `candidateCount=${distribution.candidateCount}, ` +
+        `avgDist=${distribution.averageDistance.toFixed(2)}, ` +
+        `weightedAvgDist=${distribution.weightedAverageDistance.toFixed(2)}). ` +
+        `Analogue pool may be too dissimilar to current state.`
+      );
+      return null;
+    }
+
+    if (distribution.effectiveSampleSize < CONFIG.MIN_EFFECTIVE_SAMPLE) {
+      logger.debug(
+        `[PredictionEngine] ${canonicalSymbol}: low effective sample ` +
+        `(ESS=${distribution.effectiveSampleSize.toFixed(1)}/${CONFIG.MIN_EFFECTIVE_SAMPLE}). ` +
+        `Weights too concentrated on few analogues.`
+      );
+      return null;
+    }
+
+    // 6. Probabilities — already normalized by StateStore
     const probs = {
       up: distribution.probUp,
       down: distribution.probDown,
       neutral: distribution.probNeutral,
     };
-    // Ensure they sum to 1 (should already, but guard against floating errors)
     const sum = probs.up + probs.down + probs.neutral;
     if (sum !== 0 && Math.abs(sum - 1) > 0.0001) {
       probs.up /= sum;
@@ -122,40 +152,71 @@ async function predict(state, symbol, lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = 
       probs.neutral /= sum;
     }
 
-    // 6. Determine direction and directional‑specific favorable/adverse moves
+    // 7. Direction determination
     let direction = 'NEUTRAL';
     let expectedFavorable = 0;
     let expectedAdverse = 0;
     let expectedMove = distribution.expectedMove || 0;
 
+    // [FILE-5D] Primary rule: discrete probabilities
     if (probs.up > probs.down && probs.up > probs.neutral) {
       direction = 'BUY';
-      // For BUY: favorable = upward moves, adverse = downward moves
-      expectedFavorable = distribution.expectedFavorable;   // positive moves
-      expectedAdverse = -distribution.expectedAdverse;      // negative moves converted to positive distance
-      expectedMove = distribution.expectedMove; // signed move (positive)
     } else if (probs.down > probs.up && probs.down > probs.neutral) {
       direction = 'SELL';
-      // For SELL: favorable = downward moves, adverse = upward moves
-      expectedFavorable = -distribution.expectedAdverse;    // negative moves become favorable (positive distance)
-      expectedAdverse = distribution.expectedFavorable;     // positive moves become adverse (positive distance)
-      expectedMove = -distribution.expectedMove; // signed move (negative)
     } else {
-      direction = 'NEUTRAL';
+      // [FILE-5D] Fallback: expectedMove magnitude vs expectedAdverse
+      const absMove = Math.abs(expectedMove);
+      const absAdverse = Math.abs(distribution.expectedAdverse || 0);
+      const meaningfullyDirectional =
+        absMove > CONFIG.MOVEMENT_THRESHOLD * 0.5 &&
+        absMove > absAdverse * CONFIG.DIRECTION_FALLBACK_RATIO;
+
+      if (meaningfullyDirectional) {
+        direction = expectedMove > 0 ? 'BUY' : 'SELL';
+      }
     }
 
-    // 7. Confidence – placeholder for calibration
-    // Use raw win rate, no sample-size boost. We'll replace with calibrated value later.
-    const rawConfidence = distribution.winRate * 100; // 0-100
-    // TEMPORARY: just pass through raw win rate as "confidence".
-    const calibratedConfidence = rawConfidence; // placeholder
+    // 8. Directional-specific favorable/adverse
+    if (direction === 'BUY') {
+      expectedFavorable = distribution.expectedFavorable;
+      expectedAdverse = -distribution.expectedAdverse;
+      expectedMove = distribution.expectedMove;
+    } else if (direction === 'SELL') {
+      expectedFavorable = -distribution.expectedAdverse;
+      expectedAdverse = distribution.expectedFavorable;
+      expectedMove = -distribution.expectedMove;
+    }
 
-    // 8. Uncertainty – entropy
+    // 9. [FILE-5A] Real confidence calibration
+    const rawConfidence = distribution.winRate * 100;  // 0-100
+    let calibratedConfidence = rawConfidence;
+    let calibrationSampleSize = 0;
+
+    try {
+      const cal = await stateStore.calibrateConfidence({
+        symbol: canonicalSymbol,
+        confidence: rawConfidence,
+        timeframe: state.timeframe || 'M5',
+      }, lookahead, k);
+
+      if (cal && cal.sampleSize >= CONFIG.CALIBRATION_MIN_SAMPLE) {
+        // Blend: 60% raw win rate, 40% calibrated empirical rate
+        calibratedConfidence = Math.round(rawConfidence * 0.6 + cal.calibratedConfidence * 0.4);
+        calibrationSampleSize = cal.sampleSize;
+      }
+    } catch (calErr) {
+      logger.debug(`[PredictionEngine] Calibration failed for ${canonicalSymbol}: ${calErr.message}`);
+    }
+
+    // 10. Uncertainty
     const entropy = calculateEntropy(probs);
 
-    // 9. Confidence interval – standard deviation of analogue returns
-    const returns = distribution.analogues.map(a => a.outcome?.returnR).filter(r => r !== null && typeof r === 'number' && !isNaN(r));
-    let confidenceInterval = { lower: 0, upper: 0 };
+    // 11. [FILE-5E] Confidence interval from outcome.returnR
+    const returns = (distribution.analogues || [])
+      .map(a => a.outcome?.returnR)
+      .filter(r => r !== null && r !== undefined && typeof r === 'number' && !isNaN(r));
+
+    let confidenceInterval = { lower: null, upper: null };
     if (returns.length > 1) {
       const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
       const std = Math.sqrt(returns.reduce((s, r) => s + (r - mean) ** 2, 0) / returns.length);
@@ -163,29 +224,40 @@ async function predict(state, symbol, lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = 
       confidenceInterval = { lower: mean - half, upper: mean + half };
     }
 
-    // 10. Build the Prediction object
+    // 12. [FILE-5F] Mode label
+    let modeLabel = 'empirical_edge';
+    if (distribution.qualifiedCount < CONFIG.MIN_QUALIFIED * 2) {
+      modeLabel = 'low_sample';
+    }
+
+    // 13. [FILE-5H] Regime detail from state
+    const regimeDetail = state.regime ? {
+      code: state.regime.code,
+      name: state.regime.name,
+      confidence: state.regime.confidence,
+      description: state.regime.description,
+    } : { code: 'NEUTRAL', name: 'Neutral / Mixed', confidence: 50, description: '' };
+
+    // 14. Build the Prediction object
     const prediction = {
       symbol: canonicalSymbol,
       timeframe: state.timeframe || 'M5',
       timestamp: new Date().toISOString(),
       regime: regimeCode,
-      direction, // 'BUY', 'SELL', or 'NEUTRAL'
+      regimeDetail,
+      direction,
 
-      // Probabilities
       probabilities: probs,
 
-      // Expected moves (direction‑specific)
-      expectedMove: expectedMove,
-      expectedFavorable: expectedFavorable,
-      expectedAdverse: expectedAdverse,
+      expectedMove,
+      expectedFavorable,
+      expectedAdverse,
 
-      // Path extremes (absolute)
       mfe: distribution.mfe || 0,
       mae: distribution.mae || 0,
-      timeToMaxFavorable: distribution.timeToMaxFavorable || null,
-      timeToMaxAdverse: distribution.timeToMaxAdverse || null,
+      timeToMaxFavorable: distribution.timeToMaxFavorable ?? null,
+      timeToMaxAdverse: distribution.timeToMaxAdverse ?? null,
 
-      // Sample & quality
       sampleSize: distribution.sampleSize || 0,
       effectiveSampleSize: distribution.effectiveSampleSize || 0,
       candidateCount: distribution.candidateCount || 0,
@@ -196,37 +268,42 @@ async function predict(state, symbol, lookahead = CONFIG.DEFAULT_LOOKAHEAD, k = 
       medianDistance: distribution.medianDistance || 0,
       distanceDistribution: distribution.distanceDistribution || {},
 
-      // Confidence & uncertainty
       confidence: Math.round(rawConfidence),
       calibratedConfidence: Math.round(calibratedConfidence),
+      calibrationSampleSize,
       predictionUncertainty: entropy,
-      confidenceInterval: confidenceInterval,
+      confidenceInterval,
 
-      // Market quality
       marketQuality: state.summary?.marketQuality || 50,
       noiseLevel: state.summary?.noiseLevel || 'medium',
 
-      // ---- CRITICAL: Preserve analogues with full data ----
-      analogues: distribution.analogues || [], // contains futurePrices, mfe, mae, etc.
+      // [FILE-5G] Analogue array preserved untouched
+      analogues: distribution.analogues || [],
+
+      // [FILE-5F] Pipeline status marker
+      modeLabel,
+
+      // Compat field for callers that still read prediction.winRate directly
+      winRate: distribution.winRate,
+      avgReturnR: distribution.avgReturnR,
     };
 
     return prediction;
   } catch (err) {
+    logger.warn(`[PredictionEngine] Error for ${symbol}: ${err.message}`);
     return null;
   }
 }
 
 /**
  * Get a NO TRADE reason based on prediction quality.
- * This is a convenience helper – OpportunityEngine will make the final decision.
- * @param {Object} prediction - Prediction object.
- * @returns {string} NO TRADE reason code.
+ * Convenience helper — OpportunityEngine makes the final decision.
  */
 function getNoTradeReason(prediction) {
   if (!prediction) return 'LOW_SAMPLE';
   if (prediction.qualifiedCount < CONFIG.MIN_QUALIFIED) return 'LOW_SAMPLE';
   if (prediction.effectiveSampleSize < CONFIG.MIN_EFFECTIVE_SAMPLE) return 'LOW_SAMPLE';
-  if (prediction.weightedAverageDistance > 0.30) return 'POOR_SIMILARITY';
+  if (prediction.weightedAverageDistance > 2.0) return 'POOR_SIMILARITY';
   if (prediction.probabilities.up < 0.50 && prediction.probabilities.down < 0.50) return 'LOW_PROBABILITY';
   if (Math.abs(prediction.expectedMove) < 0.0001) return 'LOW_EXPECTED_MOVE';
   if (prediction.mae < -0.001) return 'HIGH_MAE';
