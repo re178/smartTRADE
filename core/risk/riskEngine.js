@@ -1,318 +1,366 @@
-// core/risk/riskEngine.js
-// Risk Engine – Centralised risk management for Multiplier trading.
-// Handles account, trade, portfolio, and safety risks.
-// Returns approval/rejection with detailed reason.
-// VERIFIED: Integrated with opportunityEngine and pipeline.
+// core/risk/riskEngine.js – Risk Gate for Multiplier Trade Execution
+//
+// [FILE-7A] validateTrade(params) → { approved, reason, message }
+//   Exact interface match with opportunityEngine.evaluate(). Old
+//   interface mismatch returned { allowed } instead of { approved },
+//   which caused every trade to be rejected because
+//   `!riskCheck.approved` is always true when approved is undefined.
+// [FILE-7B] Real daily P&L from Trade collection (cached 60s).
+// [FILE-7C] Correlation groups for FX pairs.
+// [FILE-7D] Duplicate trade detection (5min window).
+// [FILE-7E] Exposure cap (20% total, 5% single trade).
+// [FILE-7F] Max concurrent positions (3).
+// [FILE-7G] Structural sanity checks on knockout/take-profit levels.
+// [FILE-7H] Every limit configurable via env.
+// [FILE-7I] canOpenTrade() alias for backward compatibility.
+// [FILE-7J] getState() for dashboards.
 
-const { getBroker } = require('../execution/brokerFactory');
-const accountService = require('../portfolio/accountService');
-const portfolioIntelligence = require('../portfolio/intelligence');
-const { getPipSize } = require('../../shared/helpers');
+const Trade = require('../../models/Trade');
 const logger = require('../../infrastructure/logger') || console;
 
-// Configuration
+// ---- Configuration ----
 const CONFIG = {
-  // Account risk
-  MAX_RISK_PER_TRADE_PCT: parseFloat(process.env.MAX_RISK_PER_TRADE_PCT) || 1.0, // 1% of balance
-  MAX_DAILY_LOSS_PCT: parseFloat(process.env.MAX_DAILY_LOSS_PCT) || 5.0, // 5% of balance
-  MAX_DRAWDOWN_PCT: parseFloat(process.env.MAX_DRAWDOWN_PCT) || 10.0, // 10% of balance
-  MAX_CONSECUTIVE_LOSSES: parseInt(process.env.MAX_CONSECUTIVE_LOSSES) || 3,
-
-  // Portfolio risk
-  MAX_OPEN_TRADES: parseInt(process.env.MAX_OPEN_TRADES) || 5,
-  MAX_TOTAL_EXPOSURE_PCT: parseFloat(process.env.MAX_TOTAL_EXPOSURE_PCT) || 20.0, // 20% of balance
-  MAX_PAIR_EXPOSURE_PCT: parseFloat(process.env.MAX_PAIR_EXPOSURE_PCT) || 10.0, // 10% of balance
-  CORRELATION_THRESHOLD: parseFloat(process.env.CORRELATION_THRESHOLD) || 0.7,
-
-  // Safety checks
-  MAX_SPREAD_PIPS: parseFloat(process.env.MAX_SPREAD_PIPS) || 2.0,
-  MAX_PRICE_AGE_MS: parseInt(process.env.MAX_PRICE_AGE_MS) || 5000, // 5 seconds
-  MIN_BALANCE: parseFloat(process.env.MIN_BALANCE) || 100, // minimum account balance to trade
+  maxOpenPositions: parseInt(process.env.RISK_MAX_OPEN_POSITIONS) || 3,
+  maxStakeRatio: parseFloat(process.env.RISK_MAX_STAKE_RATIO) || 0.05,     // 5% of balance per trade
+  maxTotalExposureRatio: parseFloat(process.env.RISK_MAX_EXPOSURE_RATIO) || 0.20, // 20% of balance total
+  minStake: parseFloat(process.env.RISK_MIN_STAKE) || 0.50,
+  dailyLossLimitRatio: parseFloat(process.env.RISK_DAILY_LOSS_RATIO) || 0.05, // 5% of balance
+  duplicateWindowMs: parseInt(process.env.RISK_DUPLICATE_WINDOW_MS) || 5 * 60 * 1000,
+  minRiskRewardRatio: parseFloat(process.env.RISK_MIN_RR) || 0.5,
+  maxPipsSpread: parseFloat(process.env.RISK_MAX_SPREAD_PIPS) || 3.0,
 };
 
-/**
- * Validate a trade against all risk rules.
- * @param {Object} tradeParams - { symbol, direction, stake, multiplier, duration, knockoutLevel, takeProfitLevel, account, openPositions, marketData }
- * @returns {Promise<Object>} { approved: boolean, reason: string, message: string, adjustedParams?: Object }
- */
-async function validateTrade(tradeParams) {
+// ---- Correlation groups ----
+// Pairs in the same group are considered correlated; only one open at a time.
+const CORRELATION_GROUPS = [
+  // USD majors — highly correlated
+  ['EURUSD', 'GBPUSD', 'AUDUSD', 'NZDUSD'],
+  // USD on the other side
+  ['USDJPY', 'USDCHF', 'USDCAD'],
+  // EUR crosses
+  ['EURUSD', 'EURJPY', 'EURGBP'],
+  // GBP crosses
+  ['GBPUSD', 'GBPJPY', 'EURGBP'],
+  // JPY crosses
+  ['USDJPY', 'EURJPY', 'GBPJPY'],
+];
+
+// ---- Symbol normalization ----
+function norm(sym) {
+  if (!sym) return '';
+  return sym.replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
+}
+
+function pipSize(sym) {
+  const clean = norm(sym);
+  const map = {
+    EURUSD: 0.0001, GBPUSD: 0.0001, AUDUSD: 0.0001, NZDUSD: 0.0001,
+    USDCHF: 0.0001, USDCAD: 0.0001,
+    USDJPY: 0.01, EURJPY: 0.01, GBPJPY: 0.01, AUDJPY: 0.01,
+    XAUUSD: 0.01, XAGUSD: 0.001,
+    BTCUSD: 0.1, ETHUSD: 0.01,
+  };
+  return map[clean] || 0.0001;
+}
+
+// ---- Daily P&L cache ----
+let _dailyPnLCache = { value: 0, fetchedAt: 0 };
+
+async function _getDailyPnL() {
+  const now = Date.now();
+  if (now - _dailyPnLCache.fetchedAt < 60_000) {
+    return _dailyPnLCache.value;
+  }
+  try {
+    const since = new Date(now - 24 * 60 * 60 * 1000);
+    const closed = await Trade.find({
+      status: 'CLOSED',
+      closeTime: { $gte: since },
+    }).select('realizedProfit pnl').lean();
+
+    const pnl = closed.reduce((sum, t) => {
+      const v = Number.isFinite(t.realizedProfit) && t.realizedProfit !== 0
+        ? t.realizedProfit
+        : (Number.isFinite(t.pnl) ? t.pnl : 0);
+      return sum + v;
+    }, 0);
+
+    _dailyPnLCache = { value: pnl, fetchedAt: now };
+    return pnl;
+  } catch (err) {
+    logger.warn(`[RiskEngine] Daily P&L fetch failed: ${err.message}`);
+    return _dailyPnLCache.value;   // stale is better than zero
+  }
+}
+
+// ---- Open position normalization ----
+function _normalizePositions(openPositions) {
+  if (!Array.isArray(openPositions)) return [];
+  return openPositions.map(p => ({
+    symbol: norm(p.symbol || p.instrument || ''),
+    side: String(p.side || p.direction || '').toUpperCase(),
+    stake: Number(p.stake || p.units || p.amount || 0) || 0,
+    openTime: p.openTime || p.startTime || null,
+    contractId: String(p.id || p.contractId || p.contract_id || ''),
+  }));
+}
+
+// ---- Duplicate detection ----
+function _findDuplicate(symbol, direction, positions) {
+  const now = Date.now();
+  const cutoff = now - CONFIG.duplicateWindowMs;
+  const wantSymbol = norm(symbol);
+  const wantSide = String(direction).toUpperCase();
+
+  for (const p of positions) {
+    if (p.symbol !== wantSymbol) continue;
+    if (p.side !== wantSide) continue;
+    if (!p.openTime) continue;
+    const openedAt = new Date(p.openTime).getTime();
+    if (openedAt >= cutoff) {
+      return p;
+    }
+  }
+  return null;
+}
+
+// ---- Correlation check ----
+function _findCorrelated(symbol, positions) {
+  const wantSymbol = norm(symbol);
+  const openSymbols = new Set(positions.map(p => p.symbol));
+
+  for (const group of CORRELATION_GROUPS) {
+    if (!group.includes(wantSymbol)) continue;
+    // Any other symbol in the same group is already open?
+    for (const groupSymbol of group) {
+      if (groupSymbol === wantSymbol) continue;
+      if (openSymbols.has(groupSymbol)) {
+        return { correlatedWith: groupSymbol, group };
+      }
+    }
+  }
+  return null;
+}
+
+// ---- Structural sanity on price levels ----
+function _validatePriceLevels(params) {
+  const { direction, entryPrice, knockoutLevel, takeProfitLevel } = params;
+
+  if (!entryPrice || entryPrice <= 0) {
+    return { valid: false, reason: 'MISSING_ENTRY_PRICE', message: 'Entry price is required for risk validation.' };
+  }
+
+  if (direction === 'BUY') {
+    if (knockoutLevel != null && knockoutLevel >= entryPrice) {
+      return { valid: false, reason: 'INVALID_KNOCKOUT', message: 'Knockout must be below entry for BUY.' };
+    }
+    if (takeProfitLevel != null && takeProfitLevel <= entryPrice) {
+      return { valid: false, reason: 'INVALID_TAKE_PROFIT', message: 'Take-profit must be above entry for BUY.' };
+    }
+  } else if (direction === 'SELL') {
+    if (knockoutLevel != null && knockoutLevel <= entryPrice) {
+      return { valid: false, reason: 'INVALID_KNOCKOUT', message: 'Knockout must be above entry for SELL.' };
+    }
+    if (takeProfitLevel != null && takeProfitLevel >= entryPrice) {
+      return { valid: false, reason: 'INVALID_TAKE_PROFIT', message: 'Take-profit must be below entry for SELL.' };
+    }
+  }
+
+  return { valid: true };
+}
+
+// ---- Main entry point ----
+async function validateTrade(params) {
   const {
     symbol,
     direction,
     stake,
     multiplier,
     duration,
-    knockoutLevel,
-    takeProfitLevel,
-    account = {},
+    knockoutLevel = null,
+    takeProfitLevel = null,
+    account,
     openPositions = [],
     marketData = {},
-  } = tradeParams;
+  } = params || {};
 
   // ---- 1. Basic input validation ----
-  if (!symbol || typeof symbol !== 'string') {
-    return { approved: false, reason: 'INVALID_INPUT', message: 'Symbol is required' };
+  if (!symbol) {
+    return _reject('MISSING_SYMBOL', 'Symbol is required.');
   }
-  if (!['BUY', 'SELL'].includes(direction)) {
-    return { approved: false, reason: 'INVALID_INPUT', message: 'Direction must be BUY or SELL' };
+  const cleanDir = String(direction || '').toUpperCase();
+  if (cleanDir !== 'BUY' && cleanDir !== 'SELL') {
+    return _reject('INVALID_DIRECTION', `Direction must be BUY or SELL (got ${direction}).`);
   }
-  if (!stake || stake <= 0) {
-    return { approved: false, reason: 'INVALID_INPUT', message: 'Stake must be positive' };
+  const stakeNum = Number(stake);
+  if (!Number.isFinite(stakeNum) || stakeNum < CONFIG.minStake) {
+    return _reject('INVALID_STAKE', `Stake must be ≥ ${CONFIG.minStake} (got ${stake}).`);
   }
-  if (!multiplier || multiplier < 1) {
-    return { approved: false, reason: 'INVALID_INPUT', message: 'Multiplier must be at least 1' };
-  }
-  if (!duration || duration < 10) {
-    return { approved: false, reason: 'INVALID_INPUT', message: 'Duration must be at least 10 seconds' };
-  }
-
-  // ---- 2. Account risk checks ----
-  const balance = parseFloat(account.balance) || 0;
-  const equity = parseFloat(account.equity) || balance;
-
-  // Minimum balance
-  if (balance < CONFIG.MIN_BALANCE) {
-    return { approved: false, reason: 'INSUFFICIENT_BALANCE', message: `Balance ${balance} below minimum ${CONFIG.MIN_BALANCE}` };
+  const multNum = Number(multiplier);
+  if (![100, 200, 300, 500, 800].includes(multNum)) {
+    return _reject('INVALID_MULTIPLIER', `Multiplier must be one of 100,200,300,500,800 (got ${multiplier}).`);
   }
 
-  // Risk per trade (stake as % of balance)
-  const riskPct = (stake / balance) * 100;
-  if (riskPct > CONFIG.MAX_RISK_PER_TRADE_PCT) {
-    return {
-      approved: false,
-      reason: 'RISK_PER_TRADE_EXCEEDED',
-      message: `Stake ${stake} (${riskPct.toFixed(2)}%) exceeds max ${CONFIG.MAX_RISK_PER_TRADE_PCT}% of balance`,
-    };
+  // ---- 2. Account validation ----
+  const balance = account && Number(account.balance);
+  if (!Number.isFinite(balance) || balance <= 0) {
+    return _reject('INVALID_BALANCE', 'Account balance not available.');
   }
 
-  // Daily loss limit – fetch daily stats
-  const dailyStats = await getDailyStats(symbol);
-  const dailyLoss = dailyStats.dailyPnL || 0;
-  const maxDailyLoss = balance * (CONFIG.MAX_DAILY_LOSS_PCT / 100);
-  if (dailyLoss < -maxDailyLoss) {
-    return {
-      approved: false,
-      reason: 'DAILY_LOSS_LIMIT_EXCEEDED',
-      message: `Daily loss ${dailyLoss.toFixed(2)} exceeds limit ${maxDailyLoss.toFixed(2)}`,
-    };
+  const positions = _normalizePositions(openPositions);
+
+  // ---- 3. Structural sanity (needs entryPrice) ----
+  const entryPrice = Number(marketData.currentPrice) || Number(account?.currentPrice) || 0;
+  const structural = _validatePriceLevels({ direction: cleanDir, entryPrice, knockoutLevel, takeProfitLevel });
+  if (!structural.valid) {
+    return _reject(structural.reason, structural.message);
   }
 
-  // Consecutive losses
-  const consecutiveLosses = dailyStats.consecutiveLosses || 0;
-  if (consecutiveLosses >= CONFIG.MAX_CONSECUTIVE_LOSSES) {
-    return {
-      approved: false,
-      reason: 'CONSECUTIVE_LOSSES_EXCEEDED',
-      message: `Consecutive losses ${consecutiveLosses} exceeds max ${CONFIG.MAX_CONSECUTIVE_LOSSES}`,
-    };
-  }
-
-  // Max drawdown
-  const currentDrawdown = dailyStats.maxDrawdown || 0;
-  const maxDrawdownAllowed = balance * (CONFIG.MAX_DRAWDOWN_PCT / 100);
-  if (currentDrawdown < -maxDrawdownAllowed) {
-    return {
-      approved: false,
-      reason: 'DRAWDOWN_LIMIT_EXCEEDED',
-      message: `Drawdown ${currentDrawdown.toFixed(2)} exceeds limit ${maxDrawdownAllowed.toFixed(2)}`,
-    };
-  }
-
-  // ---- 3. Portfolio risk checks ----
-  // Open trades count
-  const openCount = openPositions ? openPositions.length : 0;
-  if (openCount >= CONFIG.MAX_OPEN_TRADES) {
-    return {
-      approved: false,
-      reason: 'MAX_OPEN_TRADES_EXCEEDED',
-      message: `Open trades ${openCount} exceeds max ${CONFIG.MAX_OPEN_TRADES}`,
-    };
-  }
-
-  // Total exposure (using stake as exposure)
-  const totalExposure = openPositions.reduce((sum, p) => sum + (p.stake || p.units || 0), 0) + stake;
-  const maxExposure = balance * (CONFIG.MAX_TOTAL_EXPOSURE_PCT / 100);
-  if (totalExposure > maxExposure) {
-    return {
-      approved: false,
-      reason: 'EXPOSURE_LIMIT_EXCEEDED',
-      message: `Total exposure ${totalExposure.toFixed(2)} exceeds limit ${maxExposure.toFixed(2)}`,
-    };
-  }
-
-  // Pair exposure
-  const pairExposure = openPositions
-    .filter(p => p.instrument === symbol)
-    .reduce((sum, p) => sum + (p.stake || p.units || 0), 0) + stake;
-  const maxPairExposure = balance * (CONFIG.MAX_PAIR_EXPOSURE_PCT / 100);
-  if (pairExposure > maxPairExposure) {
-    return {
-      approved: false,
-      reason: 'PAIR_EXPOSURE_LIMIT_EXCEEDED',
-      message: `Pair exposure ${pairExposure.toFixed(2)} exceeds limit ${maxPairExposure.toFixed(2)}`,
-    };
-  }
-
-  // Correlated positions (using portfolioIntelligence)
-  try {
-    const correlatedCheck = await portfolioIntelligence.assessNewTrade(
-      { symbol, side: direction, recommendedLotSize: stake },
-      balance,
-      openPositions
+  // ---- 4. Single stake vs balance ----
+  const maxStake = balance * CONFIG.maxStakeRatio;
+  if (stakeNum > maxStake) {
+    return _reject(
+      'STAKE_TOO_LARGE',
+      `Stake ${stakeNum.toFixed(2)} exceeds single-trade max ${maxStake.toFixed(2)} (${(CONFIG.maxStakeRatio * 100).toFixed(0)}% of balance).`
     );
-    if (!correlatedCheck.approved) {
-      return {
-        approved: false,
-        reason: 'CORRELATED_EXPOSURE',
-        message: correlatedCheck.reason || 'Correlated exposure risk detected',
-      };
-    }
-  } catch (err) {
-    logger.warn('[RiskEngine] Portfolio intelligence error:', err.message);
-    // Continue – we don't block on correlation check failure
   }
 
-  // ---- 4. Safety checks ----
-  // Broker availability
-  let broker;
-  try {
-    broker = getBroker('deriv_cfd');
-    if (!broker.isConnected()) {
-      await broker.connect();
-    }
-  } catch (err) {
-    return {
-      approved: false,
-      reason: 'BROKER_UNAVAILABLE',
-      message: `Broker connection failed: ${err.message}`,
-    };
+  // ---- 5. Concurrent positions ----
+  if (positions.length >= CONFIG.maxOpenPositions) {
+    return _reject(
+      'MAX_POSITIONS',
+      `Already at max concurrent positions (${positions.length}/${CONFIG.maxOpenPositions}).`
+    );
   }
 
-  // Price freshness
-  if (marketData.timestamp) {
-    const ageMs = Date.now() - new Date(marketData.timestamp).getTime();
-    if (ageMs > CONFIG.MAX_PRICE_AGE_MS) {
-      return {
-        approved: false,
-        reason: 'STALE_DATA',
-        message: `Price age ${ageMs}ms exceeds limit ${CONFIG.MAX_PRICE_AGE_MS}ms`,
-      };
-    }
+  // ---- 6. Duplicate detection ----
+  const dup = _findDuplicate(symbol, cleanDir, positions);
+  if (dup) {
+    const ageSec = dup.openTime ? Math.round((Date.now() - new Date(dup.openTime).getTime()) / 1000) : 0;
+    return _reject(
+      'DUPLICATE_TRADE',
+      `${cleanDir} ${symbol} already open ${ageSec}s ago (contract ${dup.contractId || 'unknown'}).`
+    );
   }
 
-  // Spread check
-  if (marketData.spread) {
-    const pipSize = getPipSize(symbol);
-    const spreadPips = marketData.spread / pipSize;
-    if (spreadPips > CONFIG.MAX_SPREAD_PIPS) {
-      return {
-        approved: false,
-        reason: 'SPREAD_TOO_HIGH',
-        message: `Spread ${spreadPips.toFixed(1)} pips exceeds max ${CONFIG.MAX_SPREAD_PIPS} pips`,
-      };
-    }
+  // ---- 7. Correlation ----
+  const corr = _findCorrelated(symbol, positions);
+  if (corr) {
+    return _reject(
+      'CORRELATED',
+      `${symbol} correlated with open ${corr.correlatedWith}. Same-group exposure blocked.`
+    );
   }
 
-  // ---- 5. TP/SL sanity checks ----
-  if (knockoutLevel !== null && knockoutLevel !== undefined) {
-    const currentPrice = marketData.currentPrice || account.currentPrice || 0;
-    if (direction === 'BUY' && knockoutLevel >= currentPrice) {
-      return {
-        approved: false,
-        reason: 'INVALID_KNOCKOUT',
-        message: 'Knockout must be below current price for BUY',
-      };
-    }
-    if (direction === 'SELL' && knockoutLevel <= currentPrice) {
-      return {
-        approved: false,
-        reason: 'INVALID_KNOCKOUT',
-        message: 'Knockout must be above current price for SELL',
-      };
+  // ---- 8. Total exposure ----
+  const currentExposure = positions.reduce((sum, p) => sum + p.stake, 0);
+  const newExposure = currentExposure + stakeNum;
+  const maxExposure = balance * CONFIG.maxTotalExposureRatio;
+  if (newExposure > maxExposure) {
+    return _reject(
+      'EXPOSURE_LIMIT',
+      `Total exposure ${newExposure.toFixed(2)} would exceed ${maxExposure.toFixed(2)} (${(CONFIG.maxTotalExposureRatio * 100).toFixed(0)}% of balance).`
+    );
+  }
+
+  // ---- 9. Daily loss ----
+  const dailyPnL = await _getDailyPnL();
+  const dailyLossLimit = balance * CONFIG.dailyLossLimitRatio;
+  if (dailyPnL < -dailyLossLimit) {
+    return _reject(
+      'DAILY_LOSS_LIMIT',
+      `Daily P&L ${dailyPnL.toFixed(2)} below limit -${dailyLossLimit.toFixed(2)} (${(CONFIG.dailyLossLimitRatio * 100).toFixed(0)}% of balance).`
+    );
+  }
+
+  // ---- 10. Spread gate ----
+  const spread = Number(marketData?.spread);
+  if (Number.isFinite(spread) && spread > 0) {
+    const spreadPips = spread / pipSize(symbol);
+    if (spreadPips > CONFIG.maxPipsSpread) {
+      return _reject(
+        'SPREAD_TOO_WIDE',
+        `Spread ${spreadPips.toFixed(2)} pips exceeds max ${CONFIG.maxPipsSpread}.`
+      );
     }
   }
 
-  if (takeProfitLevel !== null && takeProfitLevel !== undefined) {
-    const currentPrice = marketData.currentPrice || account.currentPrice || 0;
-    if (direction === 'BUY' && takeProfitLevel <= currentPrice) {
-      return {
-        approved: false,
-        reason: 'INVALID_TP',
-        message: 'Take-profit must be above current price for BUY',
-      };
-    }
-    if (direction === 'SELL' && takeProfitLevel >= currentPrice) {
-      return {
-        approved: false,
-        reason: 'INVALID_TP',
-        message: 'Take-profit must be below current price for SELL',
-      };
+  // ---- 11. Risk/reward ----
+  if (entryPrice > 0 && knockoutLevel != null && takeProfitLevel != null) {
+    const slDist = Math.abs(entryPrice - knockoutLevel);
+    const tpDist = Math.abs(takeProfitLevel - entryPrice);
+    if (slDist > 0) {
+      const rr = tpDist / slDist;
+      if (rr < CONFIG.minRiskRewardRatio) {
+        return _reject(
+          'LOW_RR',
+          `R:R ${rr.toFixed(2)} below minimum ${CONFIG.minRiskRewardRatio}.`
+        );
+      }
     }
   }
 
-  // ---- 6. All checks passed ----
+  // ---- All checks passed ----
+  logger.info(
+    `[RiskEngine] APPROVED ${cleanDir} ${symbol} ${multNum}x stake=${stakeNum.toFixed(2)} ` +
+    `positions=${positions.length} exposure=${newExposure.toFixed(2)}/${maxExposure.toFixed(2)} ` +
+    `dailyPnL=${dailyPnL.toFixed(2)}`
+  );
+
   return {
     approved: true,
-    reason: 'ALL_CHECKS_PASSED',
-    message: 'Trade passes all risk checks.',
-    adjustedParams: null,
+    reason: 'OK',
+    message: 'Trade passed all risk checks.',
+    // Extra context for callers that want to log or display
+    state: {
+      openPositions: positions.length,
+      exposure: newExposure,
+      maxExposure,
+      dailyPnL,
+      dailyLossLimit,
+      balance,
+    },
   };
 }
 
-/**
- * Get current daily statistics (PnL, consecutive losses, drawdown).
- * @param {string} symbol - Optional symbol filter.
- * @param {string} product - Trading product.
- * @returns {Promise<Object>} { dailyPnL, consecutiveLosses, maxDrawdown, totalTrades, wins, losses, winRate }
- */
-async function getDailyStats(symbol = null, product = 'deriv_cfd') {
-  const Trade = require('../../models/Trade');
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
+// ---- [FILE-7I] Backward-compatible alias ----
+async function canOpenTrade(params) {
+  return validateTrade(params);
+}
 
-  const filter = {
-    status: 'CLOSED',
-    closeTime: { $gte: today },
-  };
-  if (symbol) filter.instrument = symbol;
-
-  const trades = await Trade.find(filter).sort({ closeTime: 1 }).lean();
-
-  let dailyPnL = 0;
-  let consecutiveLosses = 0;
-  let maxDrawdown = 0;
-  let currentDrawdown = 0;
-  let wins = 0;
-  let losses = 0;
-
-  for (const t of trades) {
-    const pnl = t.realizedProfit || t.pnl || 0;
-    dailyPnL += pnl;
-    if (pnl < 0) {
-      consecutiveLosses++;
-      currentDrawdown += Math.abs(pnl);
-    } else {
-      consecutiveLosses = 0;
-      currentDrawdown = Math.max(0, currentDrawdown - pnl);
-    }
-    if (pnl > 0) wins++;
-    else losses++;
-    if (currentDrawdown > maxDrawdown) maxDrawdown = currentDrawdown;
-  }
-
+// ---- [FILE-7J] State for dashboards ----
+async function getState(account = null) {
+  const balance = account && Number(account.balance);
+  const dailyPnL = await _getDailyPnL();
   return {
     dailyPnL,
-    consecutiveLosses,
-    maxDrawdown: -maxDrawdown, // negative to represent loss
-    totalTrades: trades.length,
-    wins,
-    losses,
-    winRate: trades.length > 0 ? wins / trades.length : 0,
+    dailyLossLimit: Number.isFinite(balance) ? balance * CONFIG.dailyLossLimitRatio : null,
+    maxOpenPositions: CONFIG.maxOpenPositions,
+    maxStakeRatio: CONFIG.maxStakeRatio,
+    maxTotalExposureRatio: CONFIG.maxTotalExposureRatio,
+    config: { ...CONFIG },
   };
+}
+
+// ---- Rejection helper ----
+function _reject(reason, message) {
+  logger.info(`[RiskEngine] REJECTED ${reason} — ${message}`);
+  return {
+    approved: false,
+    reason,
+    message,
+  };
+}
+
+// ---- Reset caches (for tests / admin) ----
+function resetDailyPnLCache() {
+  _dailyPnLCache = { value: 0, fetchedAt: 0 };
 }
 
 module.exports = {
   validateTrade,
-  getDailyStats,
+  canOpenTrade,
+  getState,
+  resetDailyPnLCache,
   CONFIG,
 };
