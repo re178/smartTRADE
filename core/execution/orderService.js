@@ -1,32 +1,24 @@
 // core/execution/orderService.js – Order Management with Multiplier Support
-// Skips CFD validation for Multiplier trades.
-// Uses options object for clarity.
 //
-// [CHANGE-2A] contractId / entryPrice / purchasePrice are now resolved
-//   explicitly. entryPrice prefers the broker's confirmed entry spot and
-//   falls back to RTS's currentPrice (approximation). The old ambiguous
-//   `price` is kept only as a compat alias = entryPrice.
-// [CHANGE-2B] orderData.filledPrice now stores purchasePrice (amount paid
-//   for the contract), not the entry spot. tradeData.openPrice and
-//   currentPrice store the underlying entryPrice. Added
-//   tradeData.purchasePrice (multiplier only).
-// [CHANGE-2C] Spread is pre-computed with Promise.resolve().then(...).catch(0)
-//   before the analytics call; fixes the ".catch is not a function" error.
-// [CHANGE-2D] Order/Trade save failures are NOT swallowed. They are logged
-//   with the contractId and surfaced via the returned `recording` object
-//   and a `*.recordFailed` event. We do NOT throw on DB failure — the
-//   purchase is already confirmed at Deriv, so the caller must be able to
-//   tell "confirmed but unrecorded" apart from "rejected". Recovery is via
-//   the broker's portfolio reconciliation, not by re-buying.
-// [CHANGE-8] Multiplier is passed to broker.placeMarketOrder(..., { multiplier }).
-//   Removed the deceptive result._multiplier / result._duration mutations.
-//   Validate against Deriv's accepted multiplier set BEFORE the broker call.
-// [FIX-1] Pass `duration` in the options object too, so the broker sends it
-//   to Deriv. Without this, Deriv uses its ~60s default regardless of what
-//   the user selected and the contract expires mid-session.
-// [SUPPORTING] cancelOrder / closeTrade query with String(contractId) to
-//   survive the Number -> String migration in models/Trade.js and
-//   models/Order.js.
+// [FILE-ORDERFIX-1] Robust current-price fetch before SL/TP validation.
+//   Previously, marketProvider.getCurrentPrice was called BEFORE the broker
+//   was obtained/connected. On the first trade after restart, or after any
+//   auth-WS blip, it returned null or 0. Because `knockoutLevel >= null`
+//   evaluates to `knockoutLevel >= 0` (which is true for any positive SL),
+//   EVERY valid stop loss was rejected with "Knockout must be below current
+//   price for BUY". This was the root cause of the SL-not-functioning bug.
+//
+//   The fix:
+//     1. Broker is obtained and connected FIRST.
+//     2. Price is fetched from broker.getPrices() (authoritative, live,
+//        from the streaming tick cache).
+//     3. Falls back to marketProvider.getCurrentPrice() only if broker fails.
+//     4. hasValidPrice guard: SL/TP validation is skipped with a clear
+//        error if BOTH sources fail — no more silent `null >= 0` rejection.
+//     5. Error messages include the actual current price and a suggested
+//        valid SL/TP (10 pips from current price).
+//     6. Half-pip tolerance on the boundary so a SL/TP that's very close to
+//        current price doesn't get rejected with a confusing message.
 
 const { getBroker } = require('./brokerFactory');
 const marketProvider = require('../market/provider');
@@ -42,11 +34,21 @@ const logger = require('../../infrastructure/logger') || console;
 const executionAnalytics = new ExecutionAnalytics({ slippageTolerance: 1 });
 const MIN_CONFIDENCE = 60;
 const MIN_EDGE = 0.2;
-
-// [CHANGE-8] Mirror of the broker's accepted multiplier set. Used for
-// fail-fast validation BEFORE any network call so invalid values never
-// reach Deriv and the caller gets a clear error.
 const ACCEPTED_MULTIPLIERS = [100, 200, 300, 500, 800];
+
+// ---- Pip size lookup (for SL/TP tolerance + suggested values) ----
+function getPipSize(symbol) {
+  if (!symbol) return 0.0001;
+  const clean = symbol.replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
+  const pipMap = {
+    EURUSD: 0.0001, GBPUSD: 0.0001, AUDUSD: 0.0001, NZDUSD: 0.0001,
+    USDCHF: 0.0001, USDCAD: 0.0001,
+    USDJPY: 0.01, EURJPY: 0.01, GBPJPY: 0.01, AUDJPY: 0.01,
+    XAUUSD: 0.01, XAGUSD: 0.001,
+    BTCUSD: 0.1, ETHUSD: 0.01,
+  };
+  return pipMap[clean] || 0.0001;
+}
 
 function validateAutoTradeSignal(signal) {
   if (!signal || !signal.side) return { valid: false, reason: 'No valid signal side' };
@@ -56,11 +58,40 @@ function validateAutoTradeSignal(signal) {
 }
 
 /**
+ * Fetch current price. Broker cache first (authoritative), marketProvider
+ * fallback. Returns null if neither source has a usable number.
+ */
+async function fetchCurrentPrice(broker, instrument, product) {
+  // 1. Broker (live from streaming cache)
+  try {
+    const prices = await broker.getPrices([instrument]);
+    if (prices && prices.length > 0) {
+      const p = prices[0];
+      if (p.bids?.[0]?.price != null && p.asks?.[0]?.price != null) {
+        const bid = parseFloat(p.bids[0].price);
+        const ask = parseFloat(p.asks[0].price);
+        if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0) {
+          return (bid + ask) / 2;
+        }
+      }
+    }
+  } catch (err) {
+    logger.warn(`[orderService] Broker price fetch failed for ${instrument}: ${err.message}`);
+  }
+
+  // 2. marketProvider
+  try {
+    const mp = await marketProvider.getCurrentPrice(instrument, product);
+    if (Number.isFinite(mp) && mp > 0) return mp;
+  } catch (err) {
+    logger.warn(`[orderService] marketProvider price fetch failed for ${instrument}: ${err.message}`);
+  }
+
+  return null;
+}
+
+/**
  * Place a market order – supports both CFD and Multiplier.
- * @returns {Promise<Object>} {
- *   contractId, price, entryPrice, purchasePrice, raw,
- *   recording: { order: {ok, error?}, trade: {ok, error?} }
- * }
  */
 async function placeMarketOrder(options) {
   const {
@@ -86,10 +117,37 @@ async function placeMarketOrder(options) {
     throw new Error('Either stake (Multiplier) or lotSize (CFD) must be provided.');
   }
 
-  const currentPrice = await marketProvider.getCurrentPrice(instrument, product);
+  // ============ STEP 1: Broker + connection FIRST ============
+  const broker = getBroker(product);
+  if (!broker.isConnected()) {
+    try {
+      await broker.connect();
+    } catch (err) {
+      logger.warn(`[orderService] Broker connect failed: ${err.message}`);
+    }
+  }
 
-  // ---- Validation ----
+  // ============ STEP 2: Fetch price with validated fallback ============
+  const currentPrice = await fetchCurrentPrice(broker, instrument, product);
+  const hasValidPrice = Number.isFinite(currentPrice) && currentPrice > 0;
+
+  if (hasValidPrice) {
+    logger.info(`[orderService] ${instrument} current price: ${currentPrice.toFixed(5)}`);
+  } else {
+    logger.warn(`[orderService] No valid price for ${instrument} (got ${currentPrice}) — SL/TP validation will require price.`);
+  }
+
+  // ============ STEP 3: Validation ============
+  const pipSize = getPipSize(instrument);
+  const tolerance = pipSize * 0.5;
+
   if (isCFD) {
+    if (!hasValidPrice) {
+      throw new Error(
+        `Cannot validate CFD order: current market price for ${instrument} is unavailable. ` +
+        `Wait a few seconds and retry.`
+      );
+    }
     const validation = validateOrderInput({
       pair: instrument,
       side,
@@ -102,35 +160,68 @@ async function placeMarketOrder(options) {
       throw new Error(validation.message);
     }
   } else {
-    // [CHANGE-8] Multiplier validation — fail fast before any network call.
+    // Multiplier — non-price validation first
     const normalizedMultiplier = Math.floor(Number(multiplier));
     if (!Number.isFinite(normalizedMultiplier) || !ACCEPTED_MULTIPLIERS.includes(normalizedMultiplier)) {
-      throw new Error(
-        `Multiplier must be one of: ${ACCEPTED_MULTIPLIERS.join(', ')} (got ${multiplier})`
-      );
+      throw new Error(`Multiplier must be one of: ${ACCEPTED_MULTIPLIERS.join(', ')} (got ${multiplier})`);
     }
     if (!duration || duration < 10) throw new Error('Duration must be at least 10 seconds');
     if (stake <= 0) throw new Error('Stake must be positive');
-    if (knockoutLevel !== null && knockoutLevel !== undefined) {
-      if (side.toUpperCase() === 'BUY' && knockoutLevel >= currentPrice) {
-        throw new Error('Knockout must be below current price for BUY');
+
+    // SL/TP validation — only if user provided one
+    const hasSL = knockoutLevel != null && knockoutLevel !== '';
+    const hasTP = takeProfitLevel != null && takeProfitLevel !== '';
+
+    if (hasSL || hasTP) {
+      if (!hasValidPrice) {
+        throw new Error(
+          `Cannot validate ${hasSL ? 'stop loss' : 'take profit'}: ` +
+          `current market price for ${instrument} is unavailable. ` +
+          `Wait a few seconds and retry, or remove the ${hasSL ? 'stop loss' : 'take profit'}.`
+        );
       }
-      if (side.toUpperCase() === 'SELL' && knockoutLevel <= currentPrice) {
-        throw new Error('Knockout must be above current price for SELL');
+
+      const isBuy = side.toUpperCase() === 'BUY';
+      const slNum = hasSL ? Number(knockoutLevel) : null;
+      const tpNum = hasTP ? Number(takeProfitLevel) : null;
+
+      if (slNum != null && Number.isFinite(slNum)) {
+        if (isBuy && slNum >= currentPrice - tolerance) {
+          const suggested = (currentPrice - pipSize * 10).toFixed(5);
+          throw new Error(
+            `Stop loss (${slNum.toFixed(5)}) must be below current price (${currentPrice.toFixed(5)}) for BUY. ` +
+            `Suggested SL: ${suggested} (10 pips below current price).`
+          );
+        }
+        if (!isBuy && slNum <= currentPrice + tolerance) {
+          const suggested = (currentPrice + pipSize * 10).toFixed(5);
+          throw new Error(
+            `Stop loss (${slNum.toFixed(5)}) must be above current price (${currentPrice.toFixed(5)}) for SELL. ` +
+            `Suggested SL: ${suggested} (10 pips above current price).`
+          );
+        }
       }
-    }
-    if (takeProfitLevel !== null && takeProfitLevel !== undefined) {
-      if (side.toUpperCase() === 'BUY' && takeProfitLevel <= currentPrice) {
-        throw new Error('Take profit must be above current price for BUY');
-      }
-      if (side.toUpperCase() === 'SELL' && takeProfitLevel >= currentPrice) {
-        throw new Error('Take profit must be below current price for SELL');
+
+      if (tpNum != null && Number.isFinite(tpNum)) {
+        if (isBuy && tpNum <= currentPrice + tolerance) {
+          const suggested = (currentPrice + pipSize * 10).toFixed(5);
+          throw new Error(
+            `Take profit (${tpNum.toFixed(5)}) must be above current price (${currentPrice.toFixed(5)}) for BUY. ` +
+            `Suggested TP: ${suggested} (10 pips above current price).`
+          );
+        }
+        if (!isBuy && tpNum >= currentPrice - tolerance) {
+          const suggested = (currentPrice - pipSize * 10).toFixed(5);
+          throw new Error(
+            `Take profit (${tpNum.toFixed(5)}) must be below current price (${currentPrice.toFixed(5)}) for SELL. ` +
+            `Suggested TP: ${suggested} (10 pips below current price).`
+          );
+        }
       }
     }
   }
 
-  // ---- Portfolio risk assessment ----
-  const broker = getBroker(product);
+  // ============ STEP 4: Portfolio risk ============
   const account = await broker.getAccount();
   const currentPositions = await broker.getOpenTrades();
 
@@ -143,14 +234,16 @@ async function placeMarketOrder(options) {
     recommendedLotSize: isCFD ? lotSize : stake,
   };
 
-  const portfolioApproval = await portfolioIntelligence.assessNewTrade(signal, parseFloat(account.balance), currentPositions);
+  const portfolioApproval = await portfolioIntelligence.assessNewTrade(
+    signal, parseFloat(account.balance), currentPositions
+  );
   if (!portfolioApproval.approved) {
     logger.warn(`[orderService] Portfolio risk rejected ${instrument} ${side}: ${portfolioApproval.reason}`);
     eventBus.emit('order.rejected', { instrument, side, reason: portfolioApproval.reason });
     throw new Error(`Portfolio risk rejection: ${portfolioApproval.reason}`);
   }
 
-  // ---- Auto-trade pre-flight ----
+  // ============ STEP 5: Auto-trade pre-flight ============
   if (autoTrade && decisionId) {
     const Decision = require('../../models/HistoricalDecision');
     const decision = await Decision.findById(decisionId);
@@ -164,21 +257,15 @@ async function placeMarketOrder(options) {
     }
   }
 
-  // ---- Execute order ----
+  // ============ STEP 6: Execute order ============
   const startTime = Date.now();
   if (!broker.capabilities?.supportsMarketOrders) throw new Error('Broker does not support market orders');
-  if (!broker.isConnected()) await broker.connect();
 
   let result;
   if (isCFD) {
     const units = side.toUpperCase() === 'BUY' ? lotSize : -lotSize;
     result = await broker.placeMarketOrder(instrument, units, stopLoss || null, takeProfit || null);
   } else {
-    // [CHANGE-8] Multiplier: pass stake as units AND the selected
-    // multiplier as the 5th (options) argument.
-    // [FIX-1] Also pass `duration` so broker.placeMarketOrder sends it to
-    // Deriv. Without this, Deriv uses its ~60s default regardless of what
-    // the user selected and the contract expires mid-session.
     const units = side.toUpperCase() === 'BUY' ? stake : -stake;
     result = await broker.placeMarketOrder(
       instrument,
@@ -194,7 +281,7 @@ async function placeMarketOrder(options) {
 
   const latency = Date.now() - startTime;
 
-  // ---- [CHANGE-2A] Resolve contractId / entryPrice / purchasePrice ----
+  // ============ STEP 7: Resolve contractId / prices ============
   const contractId = String(
     result.contractId ?? result.tradeID ?? result.id ?? result.ticket ?? ''
   );
@@ -209,8 +296,8 @@ async function placeMarketOrder(options) {
   if (!Number.isFinite(entryPriceRaw) || entryPriceRaw <= 0) {
     const err = new Error(
       `Execution confirmed for contract ${contractId} but no valid entry spot ` +
-      `(broker entryPrice=${JSON.stringify(result.entryPrice)}, RTS currentPrice=${JSON.stringify(currentPrice)}). ` +
-      `The contract is live at Deriv; repair the record via reconciliation, do NOT retry the purchase.`
+      `(broker entryPrice=${JSON.stringify(result.entryPrice)}, currentPrice=${JSON.stringify(currentPrice)}). ` +
+      `Contract is live at Deriv; repair via reconciliation, do NOT retry.`
     );
     err.contractId = contractId;
     err.executionConfirmed = true;
@@ -231,8 +318,7 @@ async function placeMarketOrder(options) {
     purchasePrice = Number(isMultiplier ? stake : entryPrice);
   }
 
-  // ---- Save Order ----
-  // [CHANGE-2B] filledPrice = purchasePrice (amount paid), not entry spot.
+  // ============ STEP 8: Save Order ============
   const orderData = {
     contractId,
     instrument,
@@ -253,10 +339,6 @@ async function placeMarketOrder(options) {
     takeProfitLevel: isMultiplier ? takeProfitLevel : null,
   };
 
-  // [CHANGE-2D] Do NOT swallow failures. Track them, log with contractId,
-  // emit an event so monitoring/reconciliation can pick up the gap, and
-  // let the caller see the partial success. Never throw here — the buy is
-  // already confirmed at Deriv; a retry would create a second contract.
   let orderSaveError = null;
   try {
     const order = new Order(orderData);
@@ -268,18 +350,13 @@ async function placeMarketOrder(options) {
     );
     try {
       eventBus.emit('order.recordFailed', {
-        contractId,
-        instrument,
-        orderData,
-        error: err.message,
+        contractId, instrument, orderData, error: err.message,
         timestamp: new Date().toISOString(),
       });
     } catch (_) {}
   }
 
-  // ---- Save Trade ----
-  // [CHANGE-2B] openPrice / currentPrice = entryPrice (underlying market).
-  // [CHANGE-3]  purchasePrice stored separately (multiplier only).
+  // ============ STEP 9: Save Trade ============
   let trade = null;
   let tradeSaveError = null;
   try {
@@ -315,20 +392,18 @@ async function placeMarketOrder(options) {
     );
     try {
       eventBus.emit('trade.recordFailed', {
-        contractId,
-        instrument,
-        error: err.message,
+        contractId, instrument, error: err.message,
         timestamp: new Date().toISOString(),
       });
     } catch (_) {}
   }
 
-  // ---- [CHANGE-2C] Pre-compute spread safely ----
+  // ============ STEP 10: Spread (safe) ============
   const spread = await Promise.resolve()
     .then(() => broker.getSpread(instrument))
     .catch(() => 0);
 
-  // ---- Analytics & Events ----
+  // ============ STEP 11: Analytics & events ============
   executionAnalytics.recordExecution({
     orderId: contractId,
     instrument,
@@ -398,14 +473,13 @@ async function placeMarketOrder(options) {
   };
 }
 
-// ---- Other functions (unchanged unless noted) ----
+// ---- Other functions unchanged ----
 async function cancelOrder(contractId, product) {
   if (!contractId) throw new Error('contractId is required');
   const broker = getBroker(product);
   if (!broker.capabilities?.supportsCancel) throw new Error('Broker does not support cancelling pending orders');
   if (!broker.isConnected()) await broker.connect();
   const result = await broker.cancelOrder(contractId);
-  // [SUPPORTING] String() to survive the Number -> String migration.
   await Order.findOneAndUpdate(
     { contractId: String(contractId) },
     { status: 'CANCELLED', updatedAt: new Date() },
@@ -423,7 +497,6 @@ async function closeTrade(contractId, product) {
   const result = await broker.closeTrade(contractId);
 
   try {
-    // [SUPPORTING] String() to survive the Number -> String migration.
     const closedTrade = await Trade.findOne({ contractId: String(contractId) });
     if (closedTrade && closedTrade.decisionId) {
       await selfLearner.updateDecisionOutcome(closedTrade.decisionId, closedTrade);
@@ -433,21 +506,14 @@ async function closeTrade(contractId, product) {
   }
 
   executionAnalytics.recordExecution({
-    orderId: contractId,
-    instrument: 'unknown',
-    side: 'unknown',
-    requestedPrice: 0,
-    filledPrice: result.price || 0,
-    latency: 0,
-    spread: 0,
-    status: 'CLOSED',
-    ticket: contractId,
+    orderId: contractId, instrument: 'unknown', side: 'unknown',
+    requestedPrice: 0, filledPrice: result.price || 0,
+    latency: 0, spread: 0, status: 'CLOSED', ticket: contractId,
     broker: product || 'default',
   });
 
   eventBus.emit('trade.closed', { contractId, result, timestamp: new Date().toISOString() });
   eventBus.emit('trade.closed.sound', { contractId });
-
   return { ...result, pl: 0 };
 }
 
