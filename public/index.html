@@ -250,6 +250,20 @@
     .btn-warning { background: var(--warning); border: none; border-radius: 8px; }
 
     .form-control, .form-select { border-radius: 8px; border-color: var(--border-light); }
+
+    /* Live Signal Engine panel — distinctive accent */
+    #liveSignalEngine {
+      border-top: 3px solid var(--primary);
+    }
+    #liveSignalEngine .card-header {
+      background: linear-gradient(180deg, #eff6ff 0%, #ffffff 100%);
+    }
+    #liveSignalEngine .card-title {
+      font-size: 1rem;
+    }
+    #liveSignalEngineContent .card {
+      box-shadow: 0 1px 4px rgba(0,0,0,0.04);
+    }
   </style>
 </head>
 <body>
@@ -374,19 +388,35 @@
       </div>
     </div>
 
-    <!-- [HTML-A] Live monitoring status line — renderLiveMonitorStatus() in
-         app.js writes "N contracts · last live tick Ns ago" here so the
-         operator can see whether the contractUpdate stream is alive. If
-         this element is missing, that function no-ops silently. -->
+    <!-- ============================================================
+         [FILE-9] LIVE SIGNAL ENGINE
+         Rendered by renderLiveSignalPanel() in app.js.
+         Receives updates via window.onStrategyConsensus() and
+         window.onOpportunityUpdate() from live.js WS events.
+         ============================================================ -->
+    <div class="card" id="liveSignalEngine">
+      <div class="card-header">
+        <span class="card-title">
+          <i class="fas fa-crosshairs"></i> Live Signal Engine
+          <span class="badge bg-secondary ms-2" id="liveSignalEngineBadge">Waiting...</span>
+        </span>
+        <button class="btn btn-sm btn-outline-primary" id="refreshLiveSignals" title="Refresh signal state">
+          <i class="fas fa-sync-alt"></i> Refresh
+        </button>
+      </div>
+      <div class="card-body" id="liveSignalEngineContent">
+        <p class="text-muted">Waiting for the first pipeline cycle (runs every 30 seconds).</p>
+      </div>
+    </div>
+
+    <!-- Live monitoring status -->
     <div class="row mb-3">
       <div class="col-12">
         <div id="liveMonitorStatus" class="small text-muted">Live monitoring idle</div>
       </div>
     </div>
 
-    <!-- [HTML-B] Live prices widget — renderPriceWidgets() writes here for
-         every 'price' event. Previously missing, so prices arrived at the
-         browser but were never displayed. -->
+    <!-- Live prices -->
     <div class="row g-3 mb-3">
       <div class="col-12">
         <div class="card">
@@ -407,7 +437,7 @@
         <div class="card">
           <div class="card-header">
             <span class="card-title"><i class="fas fa-brain text-primary"></i> Market Prediction</span>
-            <span class="badge bg-info">Real‑time</span>
+            <span class="badge bg-info">Real-time</span>
           </div>
           <div class="card-body" id="predictionPanel">
             <p class="text-muted">Waiting for prediction data...</p>
@@ -416,13 +446,13 @@
       </div>
     </div>
 
-    <!-- Trade Opportunity -->
+    <!-- Trade Opportunity (legacy single-symbol view) -->
     <div class="row g-3 mb-3">
       <div class="col-12">
         <div class="card">
           <div class="card-header">
-            <span class="card-title"><i class="fas fa-bullseye text-success"></i> Trade Opportunity</span>
-            <span class="badge bg-secondary">EV‑Based</span>
+            <span class="card-title"><i class="fas fa-bullseye text-success"></i> Trade Opportunity (latest)</span>
+            <span class="badge bg-secondary">EV-Based</span>
           </div>
           <div class="card-body" id="opportunityPanel">
             <p class="text-muted">Waiting for opportunity data...</p>
@@ -485,6 +515,7 @@
     </div>
   </div>
 
+  <!-- ===== TRADING SECTION ===== -->
   <div id="section-trading" class="section-content" style="display:none;">
     <div class="row g-3">
       <div class="col-lg-6">
@@ -521,9 +552,6 @@
                 </div>
                 <div class="col-4"><label class="form-label small">Stake ($)</label><input type="number" step="0.01" class="form-control" id="tradeStake" value="10" required /></div>
                 <div class="col-4"><label class="form-label small">Multiplier</label>
-                  <!-- [HTML-E] Constrained to Deriv's accepted values. Prevents
-                       an invalid value triggering a REJECTED response that the
-                       user would misinterpret as a trade failure. -->
                   <select class="form-select" id="tradeMultiplier" required>
                     <option value="100">100</option>
                     <option value="200">200</option>
@@ -581,6 +609,7 @@
     </div>
   </div>
 
+  <!-- ===== PREDICTION SECTION ===== -->
   <div id="section-prediction" class="section-content" style="display:none;">
     <div class="row">
       <div class="col-12">
@@ -597,6 +626,7 @@
     </div>
   </div>
 
+  <!-- ===== POSITIONS SECTION ===== -->
   <div id="section-positions" class="section-content" style="display:none;">
     <div class="row">
       <div class="col-12">
@@ -620,6 +650,7 @@
     </div>
   </div>
 
+  <!-- ===== HISTORY SECTION ===== -->
   <div id="section-history" class="section-content" style="display:none;">
     <div class="card">
       <div class="card-header">
@@ -642,7 +673,9 @@
             <span id="historyCount">0</span> records
           </span>
         </div>
+
         <div id="historyContainer"><p class="text-muted">Loading...</p></div>
+
         <div class="pagination-wrapper">
           <div class="page-info">Showing <span id="pageStart">0</span>–<span id="pageEnd">0</span> of <span id="pageTotal">0</span></div>
           <div>
@@ -655,6 +688,7 @@
     </div>
   </div>
 
+  <!-- ===== RESEARCH LAB SECTION ===== -->
   <div id="section-research" class="section-content" style="display:none;">
     <div class="card">
       <div class="card-header"><span class="card-title"><i class="fas fa-flask"></i> Knowledge Explorer</span></div>
@@ -686,19 +720,21 @@
     </div>
   </div>
 
+  <!-- ===== TRADE MANAGEMENT SECTION (OTIE) ===== -->
   <div id="section-trademanagement" class="section-content" style="display:none;">
     <div class="card">
       <div class="card-header">
-        <span class="card-title"><i class="fas fa-robot text-primary"></i> Open Trade Intelligence (OTIE V5)</span>
+        <span class="card-title"><i class="fas fa-robot text-primary"></i> Open Trade Intelligence (OTIE V6)</span>
         <span class="badge bg-success">Active</span>
       </div>
       <div class="card-body" id="otiePanel">
-        <p class="text-muted">Real‑time trade management decisions will appear here.</p>
+        <p class="text-muted">Real-time trade management decisions will appear here.</p>
         <div id="otieContent"></div>
       </div>
     </div>
   </div>
 
+  <!-- ===== NOTIFICATIONS SECTION ===== -->
   <div id="section-notifications" class="section-content" style="display:none;">
     <div class="card">
       <div class="card-header"><span class="card-title"><i class="fas fa-bell"></i> Notification Settings</span></div>
@@ -728,7 +764,7 @@
 </div><!-- /.main-content -->
 
 <!-- ============================================================ -->
-<!-- ============== REPORT GENERATION MODAL ===================== -->
+<!-- REPORT GENERATION MODAL -->
 <!-- ============================================================ -->
 <div class="modal fade" id="reportModal" tabindex="-1" aria-labelledby="reportModalLabel" aria-hidden="true">
   <div class="modal-dialog modal-md">
@@ -761,9 +797,7 @@
   </div>
 </div>
 
-<!-- ============================================================ -->
-<!-- ========== DECISION INSPECTOR MODAL ========================= -->
-<!-- ============================================================ -->
+<!-- DECISION INSPECTOR MODAL -->
 <div class="modal fade" id="decisionInspectorModal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog modal-lg">
     <div class="modal-content">
@@ -776,21 +810,23 @@
   </div>
 </div>
 
+<!-- ============================================================
+     Scripts — load order matters:
+       config.js  → CONFIG (WS_URL, API_BASE)
+       app.js     → defines dashboardState, all render functions,
+                    window.onStrategyConsensus, window.onOtieState,
+                    window.executeLiveSignal
+       live.js    → connects WS, dispatches messages to app.js handlers
+     ============================================================ -->
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 <script src="js/config.js"></script>
 <script src="js/app.js"></script>
 <script src="js/live.js"></script>
 
-<!-- ============================================================
-     Dashboard navigation, modal wiring, and small helpers.
-     [HTML-D] Duplicate listeners for #exportCSVBtn and
-     #generateReportBtn (previously bound both here and in app.js)
-     have been REMOVED — app.js is the single owner.
-     #updatePositionBadge and #updateApiStatus duplicates also
-     removed — app.js (File 8) owns both.
-     ============================================================ -->
+<!-- Inline helpers: navigation, product toggle, report modal defaults -->
 <script>
 (function() {
+  // Sidebar toggle
   const sidebar = document.getElementById('sidebar');
   const toggleBtn = document.getElementById('sidebarToggle');
   if (toggleBtn) {
@@ -807,6 +843,7 @@
     }
   });
 
+  // Navigation switching
   const navItems = document.querySelectorAll('.sidebar-nav .nav-item[data-section]');
   const sections = {
     dashboard: document.getElementById('section-dashboard'),
@@ -834,9 +871,7 @@
       navItems.forEach(n => n.classList.remove('active'));
       this.classList.add('active');
       Object.keys(sections).forEach(key => {
-        if (sections[key]) {
-          sections[key].style.display = key === section ? 'block' : 'none';
-        }
+        if (sections[key]) sections[key].style.display = key === section ? 'block' : 'none';
       });
       pageTitle.textContent = sectionNames[section] || section.charAt(0).toUpperCase() + section.slice(1);
       if (window.innerWidth <= 992) sidebar.classList.remove('open');
@@ -844,6 +879,7 @@
     });
   });
 
+  // Notification dropdown
   const notifToggle = document.getElementById('notifToggle');
   const notifDropdown = document.getElementById('notifDropdown');
   if (notifToggle) {
@@ -864,9 +900,7 @@
     notifDropdown.classList.remove('open');
   });
 
-  // [HTML-C] Product toggle handler — previously undefined, so the toggle
-  // did nothing. Now it updates #currentProduct (which app.js reads when
-  // building the /api/trade payload) and persists the choice.
+  // Product toggle
   window.handleProductChange = function(event) {
     const value = event && event.target ? event.target.value : null;
     if (!value) return;
@@ -876,11 +910,11 @@
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ tradingProduct: value }),
-    }).catch(() => { /* preference persistence is best-effort */ });
+    }).catch(() => {});
     console.log('[Product] switched to', value);
   };
 
-  // Report modal default dates (last 30 days)
+  // Report modal default dates
   const now = new Date();
   const thirtyDaysAgo = new Date(now);
   thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
