@@ -1,21 +1,26 @@
 // public/js/app.js – Dashboard logic
 // Renders all widgets. Live updates come from live.js.
 //
-// [FILE-4-OF-4] OTIE V6 trajectory panel:
-//   • renderOTIEPanel() paints one card per open contract with profit,
-//     peak, drawdown %, reversal count, live sparkline, and the active
-//     close reason when triggered.
-//   • window.onOtieState() is called by live.js on every 'otieState'
-//     event; stores into dashboardState.otieStates and repaints.
-//   • Open Positions table has an OTIE column showing peak + dd%.
-//   • renderAllWidgets() includes renderOTIEPanel() so first paint on
-//     page load reflects any state received in the 'init' payload.
+// [FILE-8] Live Signal Engine panel:
+//   • renderLiveSignalPanel() paints one card per WATCHED_SYMBOL
+//   • Each card shows: consensus action/direction/confidence, per-strategy
+//     rows with side/status/weight/trades, and (when tradable) the concrete
+//     entry/stop/target/multiplier with an Execute button
+//   • window.onStrategyConsensus() handles the WS event from server.js
+//   • window.onOpportunityUpdate() merges opportunity updates into the panel
+//   • Execute button POSTs /api/trade with strategy + regimeCode attribution
+//     so the ranker learns from the resulting closed trade
+//   • Panel also loads /api/signal/active on page load for immediate state
+//
+// [FILE-4-OF-4] OTIE trajectory panel — retained from prior version
+// All other widgets — retained
 
 const HISTORY_PAGE_SIZE = 20;
 let isSubmitting = false;
 let isAutoSubmitting = false;
 let historyPage = 1;
 let historyTotalPages = 1;
+let _activeSignalFetchInFlight = false;
 
 // ---- Sound Manager ----
 const SoundManager = {
@@ -73,6 +78,17 @@ function formatPrice(p) {
   return Number.isFinite(n) ? n.toFixed(5) : '—';
 }
 
+function formatSymbol(s) {
+  if (!s || typeof s !== 'string') return s;
+  return s.replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
+}
+
+function symbolToDisplay(sym) {
+  const clean = formatSymbol(sym);
+  if (clean.length === 6) return clean.slice(0, 3) + '/' + clean.slice(3);
+  return clean;
+}
+
 // ================================================================
 // 1. STATE STORE
 // ================================================================
@@ -95,6 +111,10 @@ const dashboardState = {
   opportunity: null,
   contractStates: {},
   lastContractUpdateAt: null,
+  // [FILE-8] Per-symbol signal pipeline state
+  strategyConsensus: {},   // symbol -> flattened consensus
+  signalOpportunities: {}, // symbol -> opportunity
+  signalPredictions: {},   // symbol -> prediction (for the panel)
 };
 
 function updateDashboardState(newState) {
@@ -118,6 +138,7 @@ function renderAllWidgets() {
   renderOpportunityWidget();
   renderLiveMonitorStatus();
   renderOTIEPanel();
+  renderLiveSignalPanel();
 }
 
 function renderLiveMonitorStatus() {
@@ -154,7 +175,6 @@ function renderAccountWidget() {
   if (window.updateAccountBadge) window.updateAccountBadge(acc);
 }
 
-// [FILE-4-OF-4] Positions table with OTIE column
 function renderPositionsWidget() {
   const positions = dashboardState.positions || [];
   const badge = document.getElementById('positionCount');
@@ -191,7 +211,6 @@ function renderPositionsWidget() {
       : status === 'OPEN';
     const plClass = pl > 0 ? 'text-success' : pl < 0 ? 'text-danger' : 'text-muted';
 
-    // OTIE cell
     let otieCell = '<span class="text-muted small">—</span>';
     if (otie) {
       const actionBadge = otie.action === 'CLOSE'
@@ -390,6 +409,9 @@ function renderPredictionWidget() {
   const up = (p.probabilities?.up || 0) * 100;
   const down = (p.probabilities?.down || 0) * 100;
   const neu = (p.probabilities?.neutral || 0) * 100;
+  const srcBadge = p.source
+    ? `<span class="badge bg-${p.source === 'combined' ? 'success' : p.source === 'strategy' ? 'info' : 'secondary'} ms-2">${p.source}</span>`
+    : '';
   panel.innerHTML = `<div class="row">
     <div class="col-md-8">
       <div class="prediction-bar">
@@ -397,12 +419,12 @@ function renderPredictionWidget() {
         <div class="prob-block prob-down"><div class="value">${down.toFixed(0)}%</div><div class="label">DOWN</div></div>
         <div class="prob-block prob-neutral"><div class="value">${neu.toFixed(0)}%</div><div class="label">NEUTRAL</div></div>
         <div style="margin-left:auto; text-align:right;">
-          <div><small>Confidence: <strong>${p.calibratedConfidence || 0}%</strong></small></div>
-          <div><small>Sample: <strong>${p.sampleSize || 0}</strong></small></div>
+          <div><small>Confidence: <strong>${p.calibratedConfidence || 0}%</strong>${srcBadge}</small></div>
+          <div><small>Direction: <strong>${p.direction || '—'}</strong></small></div>
         </div>
       </div>
       <div class="mt-2"><small>Expected: <strong>${((p.expectedMove || 0) * 10000).toFixed(1)} pips</strong> | Fav: ${((p.expectedFavorable || 0) * 10000).toFixed(1)} | Adv: ${((p.expectedAdverse || 0) * 10000).toFixed(1)}</small></div>
-      <div class="mt-1"><small>MFE: ${((p.mfe || 0) * 10000).toFixed(1)} | MAE: ${((p.mae || 0) * 10000).toFixed(1)} | Quality: ${p.marketQuality || 50}/100</small></div>
+      <div class="mt-1"><small>Sample: ${p.sampleSize || 0} · Effective: ${(p.effectiveSampleSize || 0).toFixed(1)} · Mode: ${p.modeLabel || '—'}</small></div>
     </div>
   </div>`;
 }
@@ -420,32 +442,338 @@ function renderOpportunityWidget() {
     return;
   }
   panel.innerHTML = `<div class="opportunity-card trade">
-    <h6 class="mb-1"><i class="fas fa-check-circle text-success"></i> TRADE OPPORTUNITY</h6>
-    <p class="mb-1"><strong>${o.direction}</strong> | Stake: $${o.stake?.toFixed(2)} | Mult: ${o.multiplier}x | Dur: ${o.duration}s</p>
+    <h6 class="mb-1"><i class="fas fa-check-circle text-success"></i> TRADE OPPORTUNITY (${o.source || 'analogue'})</h6>
+    <p class="mb-1"><strong>${o.direction}</strong> | Stake: $${(o.stake || 0).toFixed(2)} | Mult: ${o.multiplier}x | Dur: ${o.duration}s</p>
     <p class="mb-1 small">Entry: ${formatPrice(o.entryPrice)} | KO: ${formatPrice(o.knockoutLevel)} | TP: ${formatPrice(o.takeProfitLevel)}</p>
     <p class="mb-0 small">EV: $${(o.tradeEconomics?.ev || 0).toFixed(2)} | P(TP): ${((o.tradeEconomics?.probTP || 0) * 100).toFixed(0)}% | P(SL): ${((o.tradeEconomics?.probSL || 0) * 100).toFixed(0)}%</p>
   </div>`;
 }
 
 // ================================================================
-// [FILE-4-OF-4] OTIE v6 trajectory panel
+// [FILE-8] Live Signal Engine panel
 // ================================================================
+// Called by live.js on 'strategyConsensus' WS events.
+window.onStrategyConsensus = function (payload) {
+  if (!payload || !payload.symbol) return;
+  const sym = formatSymbol(payload.symbol);
+  if (!dashboardState.strategyConsensus) dashboardState.strategyConsensus = {};
+  dashboardState.strategyConsensus[sym] = payload;
+  renderLiveSignalPanel();
+};
 
+// Called by live.js on 'opportunity' WS events (in addition to the widget).
+window.onOpportunityUpdate = function (payload) {
+  if (!payload || !payload.prediction?.symbol) return;
+  const sym = formatSymbol(payload.prediction.symbol);
+  if (!dashboardState.signalOpportunities) dashboardState.signalOpportunities = {};
+  dashboardState.signalOpportunities[sym] = payload;
+  if (payload.prediction) {
+    if (!dashboardState.signalPredictions) dashboardState.signalPredictions = {};
+    dashboardState.signalPredictions[sym] = payload.prediction;
+  }
+  renderLiveSignalPanel();
+};
+
+// Called by live.js on 'prediction' WS events
+window.onPredictionUpdate = function (payload) {
+  if (!payload || !payload.symbol) return;
+  const sym = formatSymbol(payload.symbol);
+  if (!dashboardState.signalPredictions) dashboardState.signalPredictions = {};
+  dashboardState.signalPredictions[sym] = payload;
+  // Note: don't re-render Live Signal panel on every prediction —
+  // the opportunity event (which follows) drives the actionable state.
+};
+
+// Build the full signal view for one symbol from the state maps.
+function buildSignalView(symbol) {
+  const sym = formatSymbol(symbol);
+  const consensus = dashboardState.strategyConsensus[sym] || null;
+  const prediction = dashboardState.signalPredictions[sym] || null;
+  const opportunity = dashboardState.signalOpportunities[sym] || null;
+  return { sym, consensus, prediction, opportunity };
+}
+
+// Render the Live Signal Engine panel.
+function renderLiveSignalPanel() {
+  const container = document.getElementById('liveSignalEngineContent');
+  if (!container) return;
+
+  const symbols = (window.WATCHED_SYMBOLS || ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD'])
+    .map(s => formatSymbol(s));
+
+  // Header badge
+  const headerBadge = document.getElementById('liveSignalEngineBadge');
+  if (headerBadge) {
+    const ready = symbols.filter(s => {
+      const c = dashboardState.strategyConsensus[s];
+      const o = dashboardState.signalOpportunities[s];
+      return c && o && o.tradable;
+    }).length;
+    const active = symbols.filter(s => dashboardState.strategyConsensus[s]).length;
+    if (ready > 0) {
+      headerBadge.textContent = `${ready} actionable`;
+      headerBadge.className = 'badge bg-success';
+    } else if (active > 0) {
+      headerBadge.textContent = `${active} evaluated`;
+      headerBadge.className = 'badge bg-info';
+    } else {
+      headerBadge.textContent = 'Waiting...';
+      headerBadge.className = 'badge bg-secondary';
+    }
+  }
+
+  const cards = symbols.map(sym => {
+    const { consensus, prediction, opportunity } = buildSignalView(sym);
+    if (!consensus && !prediction && !opportunity) {
+      return renderWaitingSignalCard(sym);
+    }
+    return renderSignalCard(sym, consensus, prediction, opportunity);
+  });
+
+  container.innerHTML = cards.join('');
+}
+
+function renderWaitingSignalCard(sym) {
+  return `
+    <div class="card mb-3">
+      <div class="card-body text-muted small">
+        <strong>${symbolToDisplay(sym)}</strong> — awaiting first pipeline cycle (runs every 30s)
+      </div>
+    </div>
+  `;
+}
+
+function renderSignalCard(sym, consensus, prediction, opportunity) {
+  const c = consensus || {};
+  const o = opportunity || null;
+  const p = prediction || {};
+
+  // Determine overall card state
+  const isTradable = o && o.tradable === true;
+  const isConflict = c.action === 'CONFLICT';
+  const isNeutral = c.action === 'NEUTRAL';
+  const isSignal = c.action === 'SIGNAL';
+
+  const borderColor = isTradable ? '#00b894'
+    : isConflict ? '#e74c5e'
+    : isNeutral ? '#cbd5e1'
+    : isSignal ? '#3b82f6'
+    : '#e2e8f0';
+
+  const bgColor = isTradable ? '#f0fdf4'
+    : isConflict ? '#fef2f2'
+    : '#ffffff';
+
+  // Consensus header line
+  let consensusLine = '';
+  if (isSignal && c.direction) {
+    const dirClass = c.direction === 'BUY' ? 'success' : 'danger';
+    consensusLine = `<span class="badge bg-${dirClass} fs-6">${c.direction}</span>
+      <span class="ms-2">confidence <strong>${c.confidence}%</strong></span>
+      <span class="ms-2 text-muted small">${(c.agreeing || []).length}/${(c.strategies || []).length} strategies agree</span>
+      ${c.anchorStrategy ? `<span class="ms-2 small">anchor: <strong>${c.anchorStrategy}</strong></span>` : ''}`;
+  } else if (isConflict) {
+    consensusLine = `<span class="badge bg-danger fs-6">CONFLICT</span>
+      <span class="ms-2 text-muted small">strategies disagree — no trade</span>`;
+  } else if (isNeutral) {
+    consensusLine = `<span class="badge bg-secondary fs-6">NEUTRAL</span>
+      <span class="ms-2 text-muted small">insufficient weight — no trade</span>`;
+  } else {
+    consensusLine = `<span class="badge bg-secondary fs-6">—</span>
+      <span class="ms-2 text-muted small">no consensus yet</span>`;
+  }
+
+  // Strategy rows
+  const rows = (c.strategies || []).map(r => {
+    let statusIcon = '';
+    let statusClass = 'text-muted';
+    if (r.status === 'AGREE') { statusIcon = '✓'; statusClass = 'text-success fw-bold'; }
+    else if (r.status === 'CONFLICT') { statusIcon = '✗'; statusClass = 'text-danger fw-bold'; }
+    else if (r.status === 'FLAGGED') { statusIcon = '⊘'; statusClass = 'text-warning'; }
+    else if (r.status === 'BELOW_THRESHOLD') { statusIcon = '·'; statusClass = 'text-muted'; }
+
+    const sideBadge = r.signalSide
+      ? `<span class="badge bg-${r.signalSide === 'BUY' ? 'success' : 'danger'}" style="font-size:0.7em;">${r.signalSide}</span>`
+      : `<span class="badge bg-light text-muted" style="font-size:0.7em;">—</span>`;
+
+    const wr = Number(r.effectiveWinRate || 0) * 100;
+    const wrClass = wr >= 60 ? 'text-success' : (wr >= 50 ? 'text-muted' : 'text-danger');
+
+    return `<div class="d-flex justify-content-between align-items-center py-1" style="font-size:0.8em; border-bottom:1px solid #f1f5f9;">
+      <div class="d-flex align-items-center gap-2">
+        <span class="${statusClass}" style="width:14px; display:inline-block; text-align:center;">${statusIcon}</span>
+        <span style="min-width:80px;"><strong>${r.name}</strong></span>
+        ${sideBadge}
+      </div>
+      <div class="d-flex align-items-center gap-3">
+        <span class="${wrClass}" title="effective win rate">
+          ${wr.toFixed(0)}%<span class="text-muted"> (${r.trades || 0})</span>
+        </span>
+        <span class="text-muted" title="weight">w=${(r.weight || 0).toFixed(2)}</span>
+      </div>
+    </div>`;
+  }).join('');
+
+  // Opportunity block (only when tradable)
+  let opportunityBlock = '';
+  if (isTradable) {
+    const eco = o.tradeEconomics || {};
+    const stratInfo = o.strategyInfo || {};
+    opportunityBlock = `
+      <div class="mt-3 p-3 rounded" style="background:rgba(255,255,255,0.7); border:1px solid #bbf7d0;">
+        <div class="row small">
+          <div class="col-md-6">
+            <div><strong>Trade:</strong> ${o.direction} ${symbolToDisplay(sym)}</div>
+            <div><strong>Entry:</strong> ${formatPrice(o.entryPrice)}</div>
+            <div><strong>Stop:</strong> ${formatPrice(o.knockoutLevel)}</div>
+            <div><strong>Target:</strong> ${formatPrice(o.takeProfitLevel)}</div>
+          </div>
+          <div class="col-md-6">
+            <div><strong>Stake:</strong> $${(o.stake || 0).toFixed(2)}</div>
+            <div><strong>Multiplier:</strong> ${o.multiplier}x</div>
+            <div><strong>Duration:</strong> ${o.duration}s</div>
+            <div><strong>Source:</strong> <span class="badge bg-info">${o.source || 'analogue'}</span></div>
+          </div>
+        </div>
+        <div class="row small mt-2">
+          <div class="col-4">P(TP): <strong>${((eco.probTP || 0) * 100).toFixed(0)}%</strong></div>
+          <div class="col-4">P(SL): <strong>${((eco.probSL || 0) * 100).toFixed(0)}%</strong></div>
+          <div class="col-4">EV: <strong>$${(eco.ev || 0).toFixed(2)}</strong> (${((eco.evOverStake || 0) * 100).toFixed(1)}% of stake)</div>
+        </div>
+        ${stratInfo.anchorStrategy ? `
+          <div class="small mt-1 text-muted">
+            Anchor: <strong>${stratInfo.anchorStrategy}</strong>
+            ${(stratInfo.agreeing || []).length > 1 ? ` · Also agree: ${(stratInfo.agreeing || []).filter(s => s !== stratInfo.anchorStrategy).join(', ')}` : ''}
+          </div>
+        ` : ''}
+        <div class="mt-2">
+          <button class="btn btn-sm btn-success" onclick="window.executeLiveSignal('${sym}')">
+            <i class="fas fa-play"></i> Execute Trade
+          </button>
+          <button class="btn btn-sm btn-outline-secondary ms-2" onclick="window.dismissSignal('${sym}')">
+            Dismiss
+          </button>
+        </div>
+      </div>
+    `;
+  } else if (o && !o.tradable) {
+    opportunityBlock = `
+      <div class="mt-2 small text-muted">
+        <i class="fas fa-ban"></i> ${o.reason || 'Not tradable'}
+      </div>
+    `;
+  }
+
+  // Prediction summary line
+  let predictionLine = '';
+  if (p && p.modeLabel) {
+    const srcBadge = p.source
+      ? `<span class="badge bg-${p.source === 'combined' ? 'success' : p.source === 'strategy' ? 'info' : 'secondary'}" style="font-size:0.7em;">${p.source}</span>`
+      : '';
+    predictionLine = `<div class="small text-muted mt-1">
+      Prediction: ${p.direction || '—'} · ${p.calibratedConfidence || 0}% · mode ${p.modeLabel} ${srcBadge}
+    </div>`;
+  }
+
+  return `
+    <div class="card mb-3" style="border-left: 4px solid ${borderColor}; background: ${bgColor};">
+      <div class="card-body">
+        <div class="d-flex justify-content-between align-items-start mb-2">
+          <div>
+            <h6 class="mb-1">${symbolToDisplay(sym)} <span class="text-muted small ms-2">${c.regime || ''}</span></h6>
+            <div>${consensusLine}</div>
+          </div>
+          <div class="text-end small text-muted">
+            ${c.evaluatedAt ? new Date(c.evaluatedAt).toLocaleTimeString() : ''}
+          </div>
+        </div>
+        ${predictionLine}
+        ${rows ? `<div class="mt-2">${rows}</div>` : ''}
+        ${opportunityBlock}
+      </div>
+    </div>
+  `;
+}
+
+// Execute button handler — posts with strategy attribution
+window.executeLiveSignal = async function (symbol) {
+  const sym = formatSymbol(symbol);
+  const opportunity = dashboardState.signalOpportunities[sym];
+  const consensus = dashboardState.strategyConsensus[sym];
+
+  if (!opportunity || !opportunity.tradable) {
+    alert('No tradable opportunity for ' + symbol);
+    return;
+  }
+
+  const stratInfo = opportunity.strategyInfo || {};
+  const strategy = stratInfo.anchorStrategy
+    || opportunity.prediction?.strategyConsensus?.anchorStrategy
+    || consensus?.anchorStrategy
+    || null;
+  const regimeCode = opportunity.prediction?.regime
+    || consensus?.regime
+    || null;
+
+  const confirmMsg =
+    `Execute ${opportunity.direction} ${symbolToDisplay(sym)}?\n\n` +
+    `Entry:  ${formatPrice(opportunity.entryPrice)}\n` +
+    `Stop:   ${formatPrice(opportunity.knockoutLevel)}\n` +
+    `Target: ${formatPrice(opportunity.takeProfitLevel)}\n` +
+    `Stake:  $${(opportunity.stake || 0).toFixed(2)}\n` +
+    `Mult:   ${opportunity.multiplier}x\n` +
+    `Dur:    ${opportunity.duration}s\n` +
+    `Source: ${opportunity.source || 'analogue'}\n` +
+    (strategy ? `Strategy: ${strategy}\n` : '') +
+    (regimeCode ? `Regime: ${regimeCode}\n` : '');
+
+  if (!confirm(confirmMsg)) return;
+
+  const body = {
+    pair: symbol.replace(/_/g, '/'),
+    side: opportunity.direction,
+    stake: opportunity.stake,
+    multiplier: opportunity.multiplier,
+    duration: opportunity.duration,
+    knockoutLevel: opportunity.knockoutLevel,
+    takeProfitLevel: opportunity.takeProfitLevel,
+    product: 'deriv_cfd',
+    // [FILE-8] strategy attribution
+    strategy,
+    regimeCode,
+  };
+
+  const result = await placeOrderFetch('/api/trade', body);
+  showOrderOutcome(result);
+
+  // Clear the signal from local state so the same one isn't re-executed
+  if (result.body?.success && (result.body?.status === 'FILLED' || result.body?.status === 'CONFIRMED_RECORD_FAILED')) {
+    delete dashboardState.signalOpportunities[sym];
+    renderLiveSignalPanel();
+  }
+};
+
+window.dismissSignal = function (symbol) {
+  const sym = formatSymbol(symbol);
+  delete dashboardState.signalOpportunities[sym];
+  renderLiveSignalPanel();
+};
+
+// ================================================================
+// OTIE panel (unchanged from File-4-of-4)
+// ================================================================
 window.onOtieState = function (state) {
   if (!state || !state.tradeId) return;
   if (!dashboardState.otieStates) dashboardState.otieStates = {};
-
   if (state.action === 'RELEASED') {
     delete dashboardState.otieStates[state.tradeId];
   } else {
     dashboardState.otieStates[state.tradeId] = state;
   }
-
   if (typeof window.renderOTIEPanel === 'function') window.renderOTIEPanel();
   if (typeof window.renderPositionsWidget === 'function') window.renderPositionsWidget();
 };
 
-// Sparkline: convert a profit series to SVG polyline points + zero-line Y
 function _sparklinePoints(values, width, height) {
   if (!Array.isArray(values) || values.length < 2) return null;
   const min = Math.min(...values, 0);
@@ -471,9 +799,7 @@ function renderOTIEPanel() {
   const ids = Object.keys(states).sort();
 
   const placeholder = document.querySelector('#otiePanel > p.text-muted');
-  if (placeholder) {
-    placeholder.style.display = ids.length > 0 ? 'none' : 'block';
-  }
+  if (placeholder) placeholder.style.display = ids.length > 0 ? 'none' : 'block';
 
   const headerBadge = document.querySelector('#section-trademanagement .card-header .badge');
   if (headerBadge) {
@@ -496,9 +822,7 @@ function renderOTIEPanel() {
   }
 
   let html = '';
-  for (const id of ids) {
-    html += _renderOtieCard(states[id]);
-  }
+  for (const id of ids) html += _renderOtieCard(states[id]);
   container.innerHTML = html;
 }
 
@@ -596,9 +920,10 @@ function _renderOtieCard(s) {
 }
 
 window.renderOTIEPanel = renderOTIEPanel;
+window.renderLiveSignalPanel = renderLiveSignalPanel;
 
 // ================================================================
-// 2. History table
+// History table
 // ================================================================
 function applyHistoryFilters() { historyPage = 1; renderHistoryTable(); }
 
@@ -665,7 +990,7 @@ function renderHistoryTable() {
 }
 
 // ================================================================
-// 3. Manual refresh
+// Manual refresh
 // ================================================================
 async function refreshAllData() {
   try {
@@ -679,8 +1004,35 @@ async function refreshAllData() {
   } catch (e) { console.error('Refresh error:', e); }
 }
 
+// [FILE-8] Fetch the full signal state from /api/signal/active
+async function refreshSignals() {
+  if (_activeSignalFetchInFlight) return;
+  _activeSignalFetchInFlight = true;
+  try {
+    const data = await fetchJson('/api/signal/active');
+    if (data && data.signals) {
+      const consensus = {};
+      const opportunities = {};
+      const predictions = {};
+      for (const [sym, payload] of Object.entries(data.signals)) {
+        if (payload.consensus) consensus[sym] = payload.consensus;
+        if (payload.opportunity) opportunities[sym] = payload.opportunity;
+        if (payload.prediction) predictions[sym] = payload.prediction;
+      }
+      dashboardState.strategyConsensus = { ...dashboardState.strategyConsensus, ...consensus };
+      dashboardState.signalOpportunities = { ...dashboardState.signalOpportunities, ...opportunities };
+      dashboardState.signalPredictions = { ...dashboardState.signalPredictions, ...predictions };
+      renderLiveSignalPanel();
+    }
+  } catch (e) {
+    console.warn('[App] refreshSignals failed:', e.message);
+  } finally {
+    _activeSignalFetchInFlight = false;
+  }
+}
+
 // ================================================================
-// 4. User actions
+// User actions
 // ================================================================
 async function closeTrade(tradeId) {
   if (!confirm(`Close contract ${tradeId}?`)) return;
@@ -702,7 +1054,7 @@ async function cancelPending(orderId) {
 }
 
 // ================================================================
-// 5. Trade form — status-aware
+// Trade form — status-aware
 // ================================================================
 function showOrderOutcome(result) {
   const status = result.body?.status;
@@ -710,7 +1062,7 @@ function showOrderOutcome(result) {
 
   if (status === 'FILLED' || (result.body?.success && status !== 'CONFIRMED_RECORD_FAILED')) {
     SoundManager.tradeOpen();
-    alert(`✅ Trade placed\n\nContract: ${contractId || '?'}\nEntry: ${result.body?.entryPrice ?? '—'}\nPurchase: ${result.body?.purchasePrice ?? '—'}\n\nLive P/L will appear in Open Positions.`);
+    alert(`✅ Trade placed\n\nContract: ${contractId || '?'}\nEntry: ${result.body?.entryPrice ?? '—'}\nPurchase: ${result.body?.purchasePrice ?? '—'}\nStrategy: ${result.body?.strategy ?? '(none)'}\n\nLive P/L will appear in Open Positions.`);
     refreshAllData();
   } else if (status === 'CONFIRMED_RECORD_FAILED') {
     SoundManager.danger();
@@ -729,7 +1081,7 @@ function showOrderOutcome(result) {
 }
 
 // ================================================================
-// 6. Expose to live.js
+// Expose to live.js
 // ================================================================
 window.dashboardState = dashboardState;
 window.updateDashboardState = updateDashboardState;
@@ -743,6 +1095,7 @@ window.SoundManager = SoundManager;
 window.closeTrade = closeTrade;
 window.cancelPending = cancelPending;
 window.refreshDashboard = refreshAllData;
+window.refreshSignals = refreshSignals;
 
 window.updatePositionBadge = function (count) {
   const b = document.getElementById('positionCount');
@@ -805,14 +1158,22 @@ window.exportHistoryCSV = function () {
 };
 
 // ================================================================
-// 7. DOM wiring
+// DOM wiring
 // ================================================================
 document.addEventListener('DOMContentLoaded', async function () {
   try {
     if (typeof loadProductPreference === 'function') await loadProductPreference();
   } catch (e) {}
 
-  await refreshAllData();
+  await Promise.all([
+    refreshAllData().catch(() => {}),
+    refreshSignals().catch(() => {}),
+  ]);
+
+  // Poll /api/signal/active every 30s as a fallback if WS is down
+  setInterval(() => {
+    if (document.visibilityState === 'visible') refreshSignals();
+  }, 30000);
 
   document.getElementById('getSignalBtn')?.addEventListener('click', async function () {
     const pair = document.getElementById('signalPair').value.trim();
@@ -902,6 +1263,7 @@ document.addEventListener('DOMContentLoaded', async function () {
   document.getElementById('refreshTrades')?.addEventListener('click', refreshAllData);
   document.getElementById('refreshHistory')?.addEventListener('click', refreshAllData);
   document.getElementById('refreshPending')?.addEventListener('click', refreshAllData);
+  document.getElementById('refreshLiveSignals')?.addEventListener('click', refreshSignals);
 
   document.getElementById('deleteHistoryBtn')?.addEventListener('click', async function () {
     if (!confirm('Delete all closed trades? This cannot be undone.')) return;
@@ -920,6 +1282,9 @@ document.addEventListener('DOMContentLoaded', async function () {
     if (modal) modal.hide();
     alert('Report generation endpoint not yet implemented on the server.');
   });
+
+  // Initial render of Live Signal panel (empty until first WS event)
+  renderLiveSignalPanel();
 });
 
-console.log('✅ app.js loaded — OTIE V6 trajectory panel + positions OTIE column active.');
+console.log('✅ app.js loaded — Live Signal Engine + OTIE V6 trajectory panel active.');
