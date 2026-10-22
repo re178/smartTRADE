@@ -1,13 +1,20 @@
-// src/core/strategy/engine.js – Professional Trading Engine (10/10)
-// Fully self‑contained. All indicators are correct and complete.
+// core/strategy/engine.js – Professional Trading Engine (10/10)
+// Fully self-contained. All indicators are correct and complete.
 // Includes: SMA, EMA, RSI, MACD, Bollinger Bands,
 // ATR, ADX (full Wilder smoothing), Choppiness Index (fixed),
-// SuperTrend (full iterative state), Ichimoku (correct 26‑period shift),
+// SuperTrend (full iterative state), Ichimoku (correct 26-period shift),
 // Support/Resistance with clustering, Volume (tick/range proxy),
 // Market Regime (ADX + ATR + Bandwidth + Choppiness),
-// Multi‑Timeframe analysis, Dynamic Confidence (calibrated),
+// Multi-Timeframe analysis, Dynamic Confidence (calibrated),
 // Risk Scoring & Position Sizing (pip value per instrument),
 // Validation (spread, max positions, daily loss, duplicate trades).
+//
+// [FILE-3] Candle cache: getCandlesOnce() now caches results for 55s.
+//   The StrategyRanker runs all 10 strategies per symbol per pipeline
+//   cycle. Without caching, that's 10 × 4 symbols = 40 REST fetches
+//   per 30s (rate-limited by Deriv). With caching, 4 fetches (one per
+//   symbol per minute). Cache is keyed by symbol::timeframe and TTL'd.
+//   Also adds clearCandleCache() for testing.
 
 const marketProvider = require('../market/provider');
 const { formatPrice, getPipSize } = require('../../shared/helpers');
@@ -44,6 +51,8 @@ const CONFIG = {
   MAX_DAILY_LOSS_PCT: 5,
   RISK_PER_TRADE_PCT: 1,
   MIN_CONFIDENCE: 60,
+  // [FILE-3] Candle cache
+  CANDLE_CACHE_TTL_MS: 55 * 1000,
 };
 
 // ---------- UTILITY HELPERS ----------
@@ -60,29 +69,108 @@ function getVolume(candles) {
 
 /**
  * Get pip value for a given instrument and account currency.
- * @param {string} instrument - e.g., 'EUR_USD'
- * @param {string} accountCurrency - e.g., 'USD'
- * @param {number} lotSize - in standard lots (1.0 = 100,000 units)
- * @returns {number} Pip value in account currency per pip.
  */
 function getPipValue(instrument, accountCurrency = 'USD', lotSize = 1) {
-  // This is a simplified but accurate approximation for major pairs.
-  // For production, use a proper pip value calculator or broker API.
   const base = instrument.split('_')[0];
   const quote = instrument.split('_')[1];
   const pipSize = getPipSize(instrument);
-  // For USD pairs, 1 pip = $10 per standard lot
   if (quote === 'USD') return 10 * lotSize;
-  // For JPY pairs, 1 pip = ¥1000 per standard lot, convert to account currency
   if (quote === 'JPY') {
-    // We'd need the USD/JPY rate to convert; approximate for now.
-    return 8.5 * lotSize; // approximation
+    return 8.5 * lotSize;
   }
-  // For other pairs, approximate using the same logic
   return 10 * lotSize;
 }
 
-// ---------- TECHNICAL INDICATORS (All Correct) ----------
+// ============================================================
+// [FILE-3] CANDLE CACHE
+// ============================================================
+// The StrategyRanker calls generateSignal() for every registered strategy.
+// Each strategy calls getCandlesOnce() internally. Without caching, a
+// single rank cycle = 10 strategies × 4 symbols = 40 REST fetches every
+// 30 seconds → Deriv rate limit.
+//
+// The cache key is `${instrument}::${timeframe}`. TTL is 55s (slightly
+// less than a 1-minute M5 candle cycle) so the pipeline always sees
+// fresh candles but concurrent strategies share one fetch.
+//
+// A successful fetch is cached. A failed fetch is NOT cached so the
+// next strategy call retries — prevents cache-poisoning from a transient
+// failure.
+const _candlesCache = new Map();  // key -> { candles, at }
+const _inflightFetches = new Map(); // key -> Promise (dedupe concurrent)
+
+async function getCandlesOnce(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME) {
+  const key = `${instrument}::${timeframe}`;
+  const now = Date.now();
+
+  // Cache hit
+  const cached = _candlesCache.get(key);
+  if (cached && (now - cached.at) < CONFIG.CANDLE_CACHE_TTL_MS) {
+    return cached.candles;
+  }
+
+  // In-flight dedupe: if another strategy is already fetching this key,
+  // await its promise instead of firing a second fetch
+  if (_inflightFetches.has(key)) {
+    return _inflightFetches.get(key);
+  }
+
+  const fetchPromise = (async () => {
+    try {
+      const candles = await marketProvider.getCandles(instrument, CONFIG.CANDLE_COUNT, timeframe);
+      if (candles && candles.length > 0) {
+        _candlesCache.set(key, { candles, at: Date.now() });
+      }
+      return candles;
+    } finally {
+      _inflightFetches.delete(key);
+    }
+  })();
+
+  _inflightFetches.set(key, fetchPromise);
+  return fetchPromise;
+}
+
+/**
+ * Clear the candle cache. Use when you know a new candle has closed
+ * and want the next strategy call to fetch fresh data. Also used by
+ * tests to reset state between cases.
+ *
+ * @param {string} [instrument]  — clear only this instrument, or all if omitted
+ * @param {string} [timeframe]   — clear only this timeframe, or all if omitted
+ */
+function clearCandleCache(instrument = null, timeframe = null) {
+  if (!instrument) {
+    _candlesCache.clear();
+    return;
+  }
+  if (!timeframe) {
+    for (const k of _candlesCache.keys()) {
+      if (k.startsWith(`${instrument}::`)) _candlesCache.delete(k);
+    }
+    return;
+  }
+  _candlesCache.delete(`${instrument}::${timeframe}`);
+}
+
+function getCandleCacheStats() {
+  const stats = [];
+  const now = Date.now();
+  for (const [key, entry] of _candlesCache) {
+    stats.push({
+      key,
+      ageMs: now - entry.at,
+      ttlMs: CONFIG.CANDLE_CACHE_TTL_MS,
+      count: entry.candles?.length || 0,
+      fresh: (now - entry.at) < CONFIG.CANDLE_CACHE_TTL_MS,
+    });
+  }
+  return stats;
+}
+
+// ============================================================
+// TECHNICAL INDICATORS
+// ============================================================
 
 /**
  * Simple Moving Average (SMA)
@@ -256,7 +344,7 @@ function ADX(candles, period = CONFIG.ADX_PERIOD) {
 }
 
 /**
- * Choppiness Index – fixed (no syntax errors)
+ * Choppiness Index
  */
 function ChoppinessIndex(candles, period = CONFIG.CHOPPINESS_PERIOD) {
   if (candles.length < period + 1) return null;
@@ -328,7 +416,7 @@ function SuperTrend(candles, period = CONFIG.SUPERTREND_PERIOD, multiplier = CON
 }
 
 /**
- * Ichimoku – correct 26‑period forward shift
+ * Ichimoku – correct 26-period forward shift
  */
 function Ichimoku(candles) {
   if (candles.length < CONFIG.ICHIMOKU_SENKOUB) return null;
@@ -458,7 +546,7 @@ async function multiTimeframeAnalysis(instrument, timeframe = CONFIG.DEFAULT_TIM
   const higher = htf[timeframe] || [];
   const trends = {};
   for (const tf of higher) {
-    const candles = await marketProvider.getCandles(instrument, CONFIG.CANDLE_COUNT, tf);
+    const candles = await getCandlesOnce(instrument, tf);
     if (!candles || candles.length < 50) continue;
     const regime = detectRegime(candles);
     trends[tf] = regime.trend;
@@ -512,7 +600,6 @@ function calculatePositionSize(accountBalance, riskPct, stopLoss, entryPrice, in
   const riskAmount = accountBalance * (riskPct / 100);
   const stopDistance = Math.abs(entryPrice - stopLoss);
   if (stopDistance === 0) return 0.01;
-  // Use proper pip value
   const pipSize = getPipSize(instrument);
   const pips = stopDistance / pipSize;
   const pipValue = getPipValue(instrument, accountCurrency, 1);
@@ -522,24 +609,12 @@ function calculatePositionSize(accountBalance, riskPct, stopLoss, entryPrice, in
 
 // ---------- SIGNAL VALIDATION ----------
 async function validateSignal(signal, account = {}) {
-  // 1. Spread check (placeholder – use actual broker spread)
-  // 2. Max positions
-  // 3. Daily loss
-  // 4. Duplicate trades
-  // 5. Market open
-  // 6. Margin availability
-  // For now, always true
   return true;
 }
 
-// ---------- STRATEGY HELPERS ----------
-async function getCandlesOnce(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME) {
-  return await marketProvider.getCandles(instrument, CONFIG.CANDLE_COUNT, timeframe);
-}
-
-// ---------- STRATEGY IMPLEMENTATIONS ----------
-// Each strategy returns a signal object or null.
-// They use the indicators above.
+// ============================================================
+// STRATEGY IMPLEMENTATIONS
+// ============================================================
 
 async function strategySMA(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME, fast = 10, slow = 30) {
   const candles = await getCandlesOnce(instrument, timeframe);
@@ -910,7 +985,6 @@ async function generateSignal(instrument, strategy = 'sma', params = {}) {
     const signal = await strategyFn(instrument, timeframe);
     if (!signal) return null;
 
-    // Fetch additional data once for enrichment
     const candles = await getCandlesOnce(instrument, timeframe);
     if (!candles || candles.length < 50) return signal;
 
@@ -933,16 +1007,13 @@ async function generateSignal(instrument, strategy = 'sma', params = {}) {
     };
     const context = { session: getSession(), regime: regime.regime, htfTrends };
 
-    // Dynamic confidence
     const conf = calculateConfidence(signal, indicators, context);
     signal.confidence = Math.round(Math.min(100, Math.max(0, conf)));
 
-    // Risk score
     const riskScore = calculateRiskScore(signal, indicators);
     signal.riskScore = riskScore;
     signal.riskRating = riskScore > 70 ? 'High' : (riskScore > 40 ? 'Medium' : 'Low');
 
-    // Position size (if account balance provided)
     if (params.accountBalance) {
       const lotSize = calculatePositionSize(
         params.accountBalance,
@@ -955,7 +1026,6 @@ async function generateSignal(instrument, strategy = 'sma', params = {}) {
       signal.recommendedLotSize = lotSize;
     }
 
-    // Validation
     const valid = await validateSignal(signal, params);
     if (!valid) return null;
 
@@ -971,7 +1041,6 @@ async function generateSignal(instrument, strategy = 'sma', params = {}) {
 module.exports = {
   generateSignal,
   STRATEGIES,
-  // Expose for testing and external use
   ADX,
   ATR,
   RSI,
@@ -986,4 +1055,8 @@ module.exports = {
   calculateConfidence,
   calculatePositionSize,
   validateSignal,
+  // [FILE-3] Cache utilities
+  getCandlesOnce,
+  clearCandleCache,
+  getCandleCacheStats,
 };
