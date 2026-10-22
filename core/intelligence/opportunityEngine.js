@@ -1,8 +1,25 @@
 // core/intelligence/opportunityEngine.js – Trade Filter
 // Uses analogues from PredictionEngine to simulate TP/SL probabilities,
-// evaluates multiple multipliers, selects best risk‑adjusted one.
-// Corrected MAE sign convention, weighted percentiles, path simulation,
-// and risk‑adjusted utility.
+// evaluates multiple multipliers, selects best risk-adjusted one.
+//
+// [FILE-6A] CANDIDATE_MULTIPLIERS now [100, 200, 300, 500, 800] to match
+//   the broker's accepted set. Old values [2..30] were rejected at execution.
+// [FILE-6B] TP/SL levels computed from expectedFavorable / expectedAdverse
+//   (price units) rather than MFE/MAE percentiles (which are R-multiples).
+//   The old code added 2.5 (R) to 1.12 (price) producing unusable levels.
+// [FILE-6C] Utility uses actual loss per SL-hit path, not stake.
+//   stake × multiplier × (slDistance/entryPrice) is the real loss; for $99
+//   at 500x with a 2-pip SL, actual loss ≈ $8.81, not $99. Old formula
+//   over-penalized by ~10x.
+// [FILE-6D] probSL and probTP are weighted by path weight.
+// [FILE-6E] MAX_WEIGHTED_DISTANCE = 2.5 (was 0.30 — unreachable).
+// [FILE-6F] MIN_EV_OVER_STAKE = 0.005 (was 0.02 — unreachable at 100x).
+// [FILE-6G] MAX_KNOCKOUT_PROBABILITY = 0.50 (was 0.30 — over-strict).
+// [FILE-6H] Every rejection gate logs a structured one-line reason.
+// [FILE-6I] MIN_EV_OVER_STAKE checked once on selected multiplier.
+// [FILE-6J] TP_MULTIPLIER and SL_MULTIPLIER scale expected moves.
+// [FILE-6K] Paths with <2 prices skipped (fallback exit bug).
+// [FILE-6L] Duration derived from timeToMaxFavorable, capped at 15 min.
 
 const riskEngine = require('../risk/riskEngine');
 const { getPipSize } = require('../../shared/helpers');
@@ -13,22 +30,24 @@ const CONFIG = {
   // Quality filters
   MIN_CONFIDENCE: 55,
   MIN_EV: 0.0,
-  MIN_EV_OVER_STAKE: 0.02,
+  MIN_EV_OVER_STAKE: 0.005,         // [FILE-6F] was 0.02
   MIN_EFFECTIVE_SAMPLE: 15,
   MIN_QUALIFIED_COUNT: 20,
-  MAX_WEIGHTED_DISTANCE: 0.30,
-  MIN_MARKET_QUALITY: 40,
-  MAX_SPREAD_PIPS: 2.0,
+  MAX_WEIGHTED_DISTANCE: 2.5,        // [FILE-6E] was 0.30
+  MIN_MARKET_QUALITY: 30,            // was 40 — realistic for current data
+  MAX_SPREAD_PIPS: 3.0,              // was 2.0
 
   // Multiplier selection
-  CANDIDATE_MULTIPLIERS: [2, 3, 5, 10, 15, 20, 30],
-  MAX_KNOCKOUT_PROBABILITY: 0.30,   // maximum acceptable probability of hitting knockout
-  TP_PERCENTILE: 0.70,              // percentile of MFE distribution for TP
-  SL_PERCENTILE: 0.30,              // percentile of MAE distribution for SL
-  RISK_AVERSION: 2.0,               // penalty factor for knockout probability in utility
-
-  // Minimum number of paths required for simulation
+  CANDIDATE_MULTIPLIERS: [100, 200, 300, 500, 800],   // [FILE-6A]
+  MAX_KNOCKOUT_PROBABILITY: 0.50,    // [FILE-6G] was 0.30
+  TP_MULTIPLIER: 1.5,                // [FILE-6J] TP = 1.5 × expected favorable move
+  SL_MULTIPLIER: 1.2,                // [FILE-6J] SL = 1.2 × expected adverse move
+  RISK_AVERSION: 2.0,
   MIN_PATHS: 10,
+
+  // [FILE-6L] Duration bounds
+  MIN_DURATION_SEC: 60,
+  MAX_DURATION_SEC: 900,             // 15 min
 };
 
 // ---- NO TRADE Reason Taxonomy ----
@@ -55,22 +74,11 @@ const NO_TRADE_REASONS = {
   INSUFFICIENT_PATHS: 'INSUFFICIENT_PATHS',
 };
 
-/**
- * Evaluate a Prediction and determine if it is tradable.
- * @param {Object} prediction - Prediction object from predictionEngine.
- * @param {Object} account - Account object (balance, currency, etc.).
- * @param {Array} openPositions - Array of open positions.
- * @param {Object} marketData - Current market data (spread, price, etc.).
- * @param {Object} riskConfig - Risk configuration (max risk per trade, etc.).
- * @returns {Promise<Object>} TradeOpportunity object.
- */
 async function evaluate(prediction, account, openPositions, marketData, riskConfig = {}) {
-  // 1. Validate inputs
   if (!prediction) {
     return createNoTradeResponse(NO_TRADE_REASONS.MODEL_UNCERTAINTY, 'No prediction provided.');
   }
 
-  // 2. Extract key values from prediction
   const {
     symbol = 'UNKNOWN',
     direction = 'NEUTRAL',
@@ -86,12 +94,12 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
     mfe = 0,
     mae = 0,
     timeToMaxFavorable = 5,
-    analogues = [], // contains futurePrices, mfe, mae, totalWeight, etc.
+    analogues = [],
   } = prediction;
 
   const { up = 0, down = 0, neutral = 0 } = probabilities;
 
-  // 3. Basic quality filters
+  // ---- Basic quality filters ----
   const reasons = [];
 
   if (calibratedConfidence < CONFIG.MIN_CONFIDENCE) {
@@ -99,7 +107,7 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
   }
 
   const maxProb = Math.max(up, down);
-  if (maxProb < 0.55) {
+  if (maxProb < 0.50) {
     reasons.push(NO_TRADE_REASONS.UNCERTAIN_DIRECTION);
   }
 
@@ -115,7 +123,6 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
     reasons.push(NO_TRADE_REASONS.LOW_MARKET_QUALITY);
   }
 
-  // Check spread if marketData provided
   if (marketData?.spread) {
     const pipSize = getPipSize(symbol);
     const spreadPips = marketData.spread / pipSize;
@@ -128,27 +135,40 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
     reasons.push(NO_TRADE_REASONS.LOW_EXPECTED_MOVE);
   }
 
-  // MAE ratio: adverse vs expected move (using directional-specific adverse)
   const maeRatio = Math.abs(expectedAdverse) / (Math.abs(expectedMove) || 0.0001);
   if (maeRatio > 0.8) {
     reasons.push(NO_TRADE_REASONS.HIGH_MAE_RATIO);
   }
 
   if (reasons.length > 0) {
+    // [FILE-6H] Structured rejection log
+    logger.info(
+      `[Opportunity] ${symbol} NO_TRADE ${reasons[0]} — ` +
+      `conf=${calibratedConfidence.toFixed(0)} ` +
+      `maxProb=${maxProb.toFixed(2)} ` +
+      `ESS=${effectiveSampleSize.toFixed(1)} ` +
+      `qual=${qualifiedCount} ` +
+      `avgDist=${weightedAverageDistance.toFixed(2)} ` +
+      `mktQ=${marketQuality.toFixed(0)} ` +
+      `expMove=${expectedMove.toFixed(6)} ` +
+      `maeRatio=${maeRatio.toFixed(2)}`
+    );
     return createNoTradeResponse(reasons[0], `Basic checks failed: ${reasons.join(', ')}`, prediction);
   }
 
-  // 4. If direction is neutral, no trade
+  // Direction must be non-neutral
   if (direction === 'NEUTRAL') {
+    logger.info(`[Opportunity] ${symbol} NO_TRADE UNCERTAIN_DIRECTION — direction=NEUTRAL`);
     return createNoTradeResponse(NO_TRADE_REASONS.UNCERTAIN_DIRECTION, 'Direction is neutral.', prediction);
   }
 
-  // 5. Extract analogue paths (futurePrices) from analogues
+  // ---- Extract path simulations ----
   const lookahead = prediction.timeframe === 'M5' ? 5 : (prediction.timeframe === 'M15' ? 15 : 5);
   const paths = analogues
     .map(a => {
       const prices = a.futurePrices?.[lookahead];
-      if (!prices || !prices.length) return null;
+      // [FILE-6K] Skip paths with <2 prices (fallback exit bug)
+      if (!prices || prices.length < 2) return null;
       return {
         prices,
         weight: a.totalWeight || 1.0,
@@ -159,40 +179,25 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
     .filter(p => p !== null);
 
   if (paths.length < CONFIG.MIN_PATHS) {
+    logger.info(`[Opportunity] ${symbol} NO_TRADE INSUFFICIENT_PATHS — only ${paths.length} valid paths (need ${CONFIG.MIN_PATHS})`);
     return createNoTradeResponse(NO_TRADE_REASONS.INSUFFICIENT_PATHS, `Only ${paths.length} valid paths.`, prediction);
   }
 
-  // 6. Compute TP and SL levels using weighted percentiles of MFE and MAE (positive distances)
-  // MFE and MAE are stored as positive distances (we ensured that in StateStore)
-  const mfeData = paths.map(p => ({ value: p.mfe, weight: p.weight })).filter(d => d.value !== null && d.value !== undefined);
-  const maeData = paths.map(p => ({ value: p.mae, weight: p.weight })).filter(d => d.value !== null && d.value !== undefined);
+  // ---- [FILE-6B] TP/SL from expectedFavorable/expectedAdverse (price units) ----
+  const favorable = Math.abs(expectedFavorable || 0);
+  const adverse = Math.abs(expectedAdverse || 0);
 
-  if (mfeData.length < 5 || maeData.length < 5) {
-    return createNoTradeResponse(NO_TRADE_REASONS.LOW_SAMPLE_SIZE, 'Insufficient MFE/MAE data.', prediction);
+  if (favorable <= 0 || adverse <= 0) {
+    logger.info(`[Opportunity] ${symbol} NO_TRADE LOW_EXPECTED_MOVE — fav=${favorable.toFixed(6)} adv=${adverse.toFixed(6)}`);
+    return createNoTradeResponse(NO_TRADE_REASONS.LOW_EXPECTED_MOVE, 'Missing favorable/adverse move estimates.', prediction);
   }
 
-  // Weighted percentile function (local)
-  function weightedPercentile(data, p) {
-    const sorted = data.slice().sort((a, b) => a.value - b.value);
-    const totalW = sorted.reduce((s, d) => s + d.weight, 0);
-    if (totalW === 0) return 0;
-    let cum = 0;
-    for (const d of sorted) {
-      cum += d.weight / totalW;
-      if (cum >= p) return d.value;
-    }
-    return sorted[sorted.length - 1].value;
-  }
+  const tpDist = favorable * CONFIG.TP_MULTIPLIER;
+  const slDist = adverse * CONFIG.SL_MULTIPLIER;
 
-  const tpDistance = weightedPercentile(mfeData, CONFIG.TP_PERCENTILE);
-  const slDistance = weightedPercentile(maeData, CONFIG.SL_PERCENTILE);
-
-  // Ensure positive
-  const tpDist = Math.abs(tpDistance);
-  const slDist = Math.abs(slDistance);
-
-  const entryPrice = marketData?.currentPrice || 0;
-  if (!entryPrice) {
+  const entryPrice = marketData?.currentPrice || prediction.entryPrice || 0;
+  if (!entryPrice || entryPrice <= 0) {
+    logger.info(`[Opportunity] ${symbol} NO_TRADE MODEL_UNCERTAINTY — no entry price`);
     return createNoTradeResponse(NO_TRADE_REASONS.MODEL_UNCERTAINTY, 'No entry price.', prediction);
   }
 
@@ -200,18 +205,18 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
   if (direction === 'BUY') {
     takeProfitLevel = entryPrice + tpDist;
     knockoutLevel = entryPrice - slDist;
-  } else { // SELL
+  } else {
     takeProfitLevel = entryPrice - tpDist;
     knockoutLevel = entryPrice + slDist;
   }
 
-  // 7. Determine stake from account
+  // ---- Stake sizing ----
   const balance = account?.balance ? parseFloat(account.balance) : 10000;
   const riskPerTrade = riskConfig.riskPerTradePct || 1.0;
-  const maxLossAmount = balance * (riskPerTrade / 100);
-  const stake = Math.min(maxLossAmount, balance * 0.05);
+  // Max loss is the stake itself (Deriv Multipliers cap loss at stake)
+  const stake = Math.max(0.5, Math.min(balance * (riskPerTrade / 100), balance * 0.05));
 
-  // 8. Evaluate candidate multipliers using path simulation
+  // ---- Evaluate candidate multipliers via path simulation ----
   let bestMultiplier = null;
   let bestUtility = -Infinity;
   let bestMetrics = null;
@@ -219,13 +224,15 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
   for (const mult of CONFIG.CANDIDATE_MULTIPLIERS) {
     let totalProfit = 0;
     let totalWeight = 0;
-    let hitsTP = 0;
-    let hitsSL = 0;
+    let weightedHitsTP = 0;
+    let weightedHitsSL = 0;
+    let weightedSLLoss = 0;
 
     for (const path of paths) {
       const w = path.weight || 1.0;
       totalWeight += w;
       const prices = path.prices;
+
       let exitPrice = null;
       let hitTP = false;
       let hitSL = false;
@@ -234,33 +241,37 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
         if (direction === 'BUY') {
           if (price >= takeProfitLevel) { hitTP = true; exitPrice = takeProfitLevel; break; }
           if (price <= knockoutLevel) { hitSL = true; exitPrice = knockoutLevel; break; }
-        } else { // SELL
+        } else {
           if (price <= takeProfitLevel) { hitTP = true; exitPrice = takeProfitLevel; break; }
           if (price >= knockoutLevel) { hitSL = true; exitPrice = knockoutLevel; break; }
         }
       }
       if (!exitPrice) exitPrice = prices[prices.length - 1];
 
-      // Compute profit: profit = stake * multiplier * (priceChange / entryPrice)
       const priceChange = (direction === 'BUY') ? (exitPrice - entryPrice) : (entryPrice - exitPrice);
       const profit = stake * mult * (priceChange / entryPrice);
       totalProfit += profit * w;
-      if (hitTP) hitsTP++;
-      if (hitSL) hitsSL++;
+
+      if (hitTP) weightedHitsTP += w;
+      if (hitSL) {
+        weightedHitsSL += w;
+        weightedSLLoss += Math.abs(profit) * w;   // [FILE-6C] actual loss magnitude
+      }
     }
 
     if (totalWeight === 0) continue;
 
     const avgProfit = totalProfit / totalWeight;
-    const probTP = hitsTP / paths.length;
-    const probSL = hitsSL / paths.length;
+    // [FILE-6D] Weighted probabilities
+    const probTP = weightedHitsTP / totalWeight;
+    const probSL = weightedHitsSL / totalWeight;
+    const avgLossOnSLHit = weightedHitsSL > 0 ? (weightedSLLoss / weightedHitsSL) : 0;
+
     const ev = avgProfit;
 
-    // Risk-adjusted utility: EV - riskAversion * (probSL * avgLoss)
-    // We approximate loss as stake (worst-case) * probSL, but can refine.
-    const utility = ev - CONFIG.RISK_AVERSION * (probSL * stake);
+    // [FILE-6C] Risk-adjusted utility: penalize tail risk using ACTUAL loss per SL hit
+    const utility = ev - CONFIG.RISK_AVERSION * probSL * avgLossOnSLHit;
 
-    // Check if EV is positive and knockout probability is acceptable
     if (ev > CONFIG.MIN_EV && probSL < CONFIG.MAX_KNOCKOUT_PROBABILITY && utility > bestUtility) {
       bestUtility = utility;
       bestMultiplier = mult;
@@ -269,24 +280,48 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
         probSL,
         probOther: 1 - probTP - probSL,
         avgProfit,
+        avgLossOnSLHit,
         ev,
         evOverStake: ev / stake,
+        utility,
       };
     }
   }
 
   if (!bestMultiplier) {
+    logger.info(
+      `[Opportunity] ${symbol} NO_TRADE NO_VALID_MULTIPLIER — ` +
+      `direction=${direction} stake=${stake.toFixed(2)} ` +
+      `tpDist=${tpDist.toFixed(6)} slDist=${slDist.toFixed(6)} ` +
+      `paths=${paths.length}`
+    );
     return createNoTradeResponse(NO_TRADE_REASONS.NO_VALID_MULTIPLIER, 'No multiplier yielded positive EV with acceptable knockout probability.', prediction);
   }
 
-  // 9. Risk engine checks (exposure, correlated positions, etc.)
+  // [FILE-6I] Check EV/stake once on selected multiplier
+  if (bestMetrics.evOverStake < CONFIG.MIN_EV_OVER_STAKE) {
+    logger.info(
+      `[Opportunity] ${symbol} NO_TRADE LOW_EV_OVER_STAKE — ` +
+      `selected=${bestMultiplier}x evOverStake=${bestMetrics.evOverStake.toFixed(5)} ` +
+      `threshold=${CONFIG.MIN_EV_OVER_STAKE}`
+    );
+    return createNoTradeResponse(NO_TRADE_REASONS.LOW_EV_OVER_STAKE, `EV/stake ${bestMetrics.evOverStake.toFixed(5)} below threshold.`, prediction);
+  }
+
+  // ---- [FILE-6L] Duration ----
+  const duration = Math.max(
+    CONFIG.MIN_DURATION_SEC,
+    Math.min(CONFIG.MAX_DURATION_SEC, Math.round((timeToMaxFavorable || 5) * 60))
+  );
+
+  // ---- Risk engine gate ----
   try {
     const riskCheck = await riskEngine.validateTrade({
       symbol,
       direction,
       stake,
       multiplier: bestMultiplier,
-      duration: Math.max(60, (timeToMaxFavorable || 5) * 60),
+      duration,
       knockoutLevel,
       takeProfitLevel,
       account,
@@ -294,20 +329,27 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
       marketData,
     });
     if (!riskCheck.approved) {
-      return createNoTradeResponse(
-        riskCheck.reason === 'EXPOSURE_LIMIT' ? NO_TRADE_REASONS.RISK_LIMIT_EXCEEDED :
-        riskCheck.reason === 'CORRELATED' ? NO_TRADE_REASONS.CORRELATED_EXPOSURE :
-        NO_TRADE_REASONS.RISK_LIMIT_EXCEEDED,
-        riskCheck.message || 'Risk validation failed',
-        prediction
-      );
+      const reason = riskCheck.reason === 'EXPOSURE_LIMIT' ? NO_TRADE_REASONS.RISK_LIMIT_EXCEEDED :
+                     riskCheck.reason === 'CORRELATED' ? NO_TRADE_REASONS.CORRELATED_EXPOSURE :
+                     NO_TRADE_REASONS.RISK_LIMIT_EXCEEDED;
+      logger.info(`[Opportunity] ${symbol} NO_TRADE ${reason} — ${riskCheck.message || riskCheck.reason || 'risk rejection'}`);
+      return createNoTradeResponse(reason, riskCheck.message || 'Risk validation failed', prediction);
     }
   } catch (err) {
-    logger.error('[OpportunityEngine] Risk engine error:', err.message);
+    logger.error(`[Opportunity] ${symbol} risk engine error: ${err.message}`);
     return createNoTradeResponse(NO_TRADE_REASONS.MODEL_UNCERTAINTY, `Risk engine error: ${err.message}`, prediction);
   }
 
-  // 10. All checks passed – return TRADE opportunity
+  // ---- All checks passed ----
+  logger.info(
+    `[Opportunity] ${symbol} TRADE ${direction} ` +
+    `${bestMultiplier}x stake=${stake.toFixed(2)} ` +
+    `probTP=${(bestMetrics.probTP*100).toFixed(0)}% probSL=${(bestMetrics.probSL*100).toFixed(0)}% ` +
+    `ev=${bestMetrics.ev.toFixed(2)} evOverStake=${(bestMetrics.evOverStake*100).toFixed(2)}% ` +
+    `entry=${entryPrice.toFixed(5)} tp=${takeProfitLevel.toFixed(5)} ko=${knockoutLevel.toFixed(5)} ` +
+    `duration=${duration}s`
+  );
+
   return {
     tradable: true,
     reason: `Selected ${bestMultiplier}x (EV: ${bestMetrics.ev.toFixed(2)}, KO prob: ${(bestMetrics.probSL*100).toFixed(1)}%)`,
@@ -315,7 +357,7 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
     direction,
     stake,
     multiplier: bestMultiplier,
-    duration: Math.max(60, (timeToMaxFavorable || 5) * 60),
+    duration,
     entryPrice,
     knockoutLevel,
     takeProfitLevel,
@@ -325,27 +367,21 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
       probSL: bestMetrics.probSL,
       probOther: bestMetrics.probOther,
       expectedProfit: bestMetrics.avgProfit,
-      expectedLoss: Math.max(0, -bestMetrics.avgProfit), // only if negative, but we only allow positive EV
+      expectedLoss: bestMetrics.avgLossOnSLHit,
       ev: bestMetrics.ev,
       evOverStake: bestMetrics.evOverStake,
+      utility: bestMetrics.utility,
     },
     riskMetrics: {
       maxLoss: stake,
-      targetProfit: bestMetrics.ev > 0 ? bestMetrics.ev : 0,
-      riskRewardRatio: bestMetrics.ev / (stake || 1),
+      targetProfit: tpDist * bestMultiplier * stake / entryPrice,
+      riskRewardRatio: (tpDist / slDist),
     },
     decision: 'TRADE',
     timestamp: new Date().toISOString(),
   };
 }
 
-/**
- * Create a NO TRADE response.
- * @param {string} reason - NO_TRADE_REASONS code.
- * @param {string} message - Human-readable message.
- * @param {Object} prediction - Prediction object (optional).
- * @returns {Object} TradeOpportunity with tradable: false.
- */
 function createNoTradeResponse(reason, message, prediction = null) {
   return {
     tradable: false,
@@ -354,7 +390,6 @@ function createNoTradeResponse(reason, message, prediction = null) {
     prediction: prediction,
     decision: 'NO_TRADE',
     timestamp: new Date().toISOString(),
-    // Defaults for fields that might be expected
     stake: 0,
     multiplier: 0,
     duration: 0,
