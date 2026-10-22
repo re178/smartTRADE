@@ -1,24 +1,20 @@
 // core/execution/orderService.js – Order Management with Multiplier Support
 //
 // [FILE-ORDERFIX-1] Robust current-price fetch before SL/TP validation.
-//   Previously, marketProvider.getCurrentPrice was called BEFORE the broker
-//   was obtained/connected. On the first trade after restart, or after any
-//   auth-WS blip, it returned null or 0. Because `knockoutLevel >= null`
-//   evaluates to `knockoutLevel >= 0` (which is true for any positive SL),
-//   EVERY valid stop loss was rejected with "Knockout must be below current
-//   price for BUY". This was the root cause of the SL-not-functioning bug.
+//   (See prior revision notes — retained unchanged.)
+// [FILE-4] Strategy attribution:
+//   • placeMarketOrder accepts { strategy, regimeCode, entryThesis }
+//   • strategy name stored on Trade.strategy
+//   • regimeCode stored on Trade.entryThesis.regime
+//   • entryThesis (optional) stored on Trade.entryThesis
+//   • Order.metadata.strategy records the same for audit
+//   • trade.closed event includes strategy so the performance recorder
+//     knows which strategy to credit without a second DB query
+//   • closeTrade reads strategy from Trade and includes in its result
 //
-//   The fix:
-//     1. Broker is obtained and connected FIRST.
-//     2. Price is fetched from broker.getPrices() (authoritative, live,
-//        from the streaming tick cache).
-//     3. Falls back to marketProvider.getCurrentPrice() only if broker fails.
-//     4. hasValidPrice guard: SL/TP validation is skipped with a clear
-//        error if BOTH sources fail — no more silent `null >= 0` rejection.
-//     5. Error messages include the actual current price and a suggested
-//        valid SL/TP (10 pips from current price).
-//     6. Half-pip tolerance on the boundary so a SL/TP that's very close to
-//        current price doesn't get rejected with a confusing message.
+// All callers that don't pass `strategy` still work — fields default to null.
+// This file does NOT wire the ranker or server; it only stores what the
+// caller passes. The pipeline integration happens in File 7.
 
 const { getBroker } = require('./brokerFactory');
 const marketProvider = require('../market/provider');
@@ -36,7 +32,7 @@ const MIN_CONFIDENCE = 60;
 const MIN_EDGE = 0.2;
 const ACCEPTED_MULTIPLIERS = [100, 200, 300, 500, 800];
 
-// ---- Pip size lookup (for SL/TP tolerance + suggested values) ----
+// ---- Pip size lookup ----
 function getPipSize(symbol) {
   if (!symbol) return 0.0001;
   const clean = symbol.replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
@@ -62,7 +58,6 @@ function validateAutoTradeSignal(signal) {
  * fallback. Returns null if neither source has a usable number.
  */
 async function fetchCurrentPrice(broker, instrument, product) {
-  // 1. Broker (live from streaming cache)
   try {
     const prices = await broker.getPrices([instrument]);
     if (prices && prices.length > 0) {
@@ -79,7 +74,6 @@ async function fetchCurrentPrice(broker, instrument, product) {
     logger.warn(`[orderService] Broker price fetch failed for ${instrument}: ${err.message}`);
   }
 
-  // 2. marketProvider
   try {
     const mp = await marketProvider.getCurrentPrice(instrument, product);
     if (Number.isFinite(mp) && mp > 0) return mp;
@@ -92,6 +86,12 @@ async function fetchCurrentPrice(broker, instrument, product) {
 
 /**
  * Place a market order – supports both CFD and Multiplier.
+ *
+ * @param {Object} options
+ * @param {string} [options.strategy]       — strategy that generated the signal (File 4)
+ * @param {string} [options.regimeCode]     — market regime at open time (File 4)
+ * @param {Object} [options.entryThesis]    — optional thesis snapshot (File 4)
+ * @returns {Promise<Object>}
  */
 async function placeMarketOrder(options) {
   const {
@@ -108,6 +108,10 @@ async function placeMarketOrder(options) {
     product = 'deriv_cfd',
     decisionId = null,
     autoTrade = false,
+    // [FILE-4]
+    strategy = null,
+    regimeCode = null,
+    entryThesis = null,
   } = options;
 
   const isMultiplier = stake !== undefined && stake !== null && stake > 0;
@@ -160,7 +164,6 @@ async function placeMarketOrder(options) {
       throw new Error(validation.message);
     }
   } else {
-    // Multiplier — non-price validation first
     const normalizedMultiplier = Math.floor(Number(multiplier));
     if (!Number.isFinite(normalizedMultiplier) || !ACCEPTED_MULTIPLIERS.includes(normalizedMultiplier)) {
       throw new Error(`Multiplier must be one of: ${ACCEPTED_MULTIPLIERS.join(', ')} (got ${multiplier})`);
@@ -168,7 +171,6 @@ async function placeMarketOrder(options) {
     if (!duration || duration < 10) throw new Error('Duration must be at least 10 seconds');
     if (stake <= 0) throw new Error('Stake must be positive');
 
-    // SL/TP validation — only if user provided one
     const hasSL = knockoutLevel != null && knockoutLevel !== '';
     const hasTP = takeProfitLevel != null && takeProfitLevel !== '';
 
@@ -250,9 +252,9 @@ async function placeMarketOrder(options) {
     if (decision) {
       const autoCheck = validateAutoTradeSignal(decision);
       if (!autoCheck.valid) {
-        logger.warn(`[orderService] Auto‑trade signal invalid: ${autoCheck.reason}`);
+        logger.warn(`[orderService] Auto-trade signal invalid: ${autoCheck.reason}`);
         eventBus.emit('order.rejected', { instrument, side, reason: autoCheck.reason });
-        throw new Error(`Auto‑trade rejected: ${autoCheck.reason}`);
+        throw new Error(`Auto-trade rejected: ${autoCheck.reason}`);
       }
     }
   }
@@ -319,6 +321,7 @@ async function placeMarketOrder(options) {
   }
 
   // ============ STEP 8: Save Order ============
+  // [FILE-4] strategy in metadata.strategy for audit
   const orderData = {
     contractId,
     instrument,
@@ -337,6 +340,10 @@ async function placeMarketOrder(options) {
     duration: isMultiplier ? duration : null,
     knockoutLevel: isMultiplier ? knockoutLevel : null,
     takeProfitLevel: isMultiplier ? takeProfitLevel : null,
+    metadata: {
+      strategy: strategy || null,
+      regimeCode: regimeCode || null,
+    },
   };
 
   let orderSaveError = null;
@@ -357,9 +364,19 @@ async function placeMarketOrder(options) {
   }
 
   // ============ STEP 9: Save Trade ============
+  // [FILE-4] strategy + regimeCode + entryThesis stored on Trade
+  // - strategy → Trade.strategy (schema field, already exists)
+  // - regimeCode → Trade.entryThesis.regime (schema field, already exists)
+  // - entryThesis → merged over Trade.entryThesis
   let trade = null;
   let tradeSaveError = null;
   try {
+    const thesisSnapshot = {
+      ...(entryThesis && typeof entryThesis === 'object' ? entryThesis : {}),
+    };
+    if (regimeCode != null) thesisSnapshot.regime = regimeCode;
+    if (Object.keys(thesisSnapshot).length === 0) thesisSnapshot.regime = null;
+
     const tradeData = {
       contractId,
       instrument,
@@ -381,10 +398,16 @@ async function placeMarketOrder(options) {
       knockoutLevel: isMultiplier ? knockoutLevel : null,
       takeProfitLevel: isMultiplier ? takeProfitLevel : null,
       purchasePrice: isMultiplier ? purchasePrice : null,
+      // [FILE-4]
+      strategy: strategy || null,
+      entryThesis: thesisSnapshot,
     };
     trade = new Trade(tradeData);
     await trade.save();
-    logger.info(`[orderService] Trade created (OPEN) for ${contractId}`);
+    logger.info(
+      `[orderService] Trade created (OPEN) for ${contractId}` +
+      (strategy ? ` [strategy=${strategy}${regimeCode ? `, regime=${regimeCode}` : ''}]` : '')
+    );
   } catch (err) {
     tradeSaveError = err;
     logger.error(
@@ -427,6 +450,9 @@ async function placeMarketOrder(options) {
     decisionId,
     timestamp: new Date().toISOString(),
     isMultiplier,
+    // [FILE-4]
+    strategy: strategy || null,
+    regimeCode: regimeCode || null,
     recording: {
       order: orderSaveError ? { ok: false, error: orderSaveError.message } : { ok: true },
       trade: tradeSaveError ? { ok: false, error: tradeSaveError.message } : { ok: true },
@@ -444,7 +470,14 @@ async function placeMarketOrder(options) {
     eventPayload.takeProfitLevel = takeProfitLevel;
   }
   eventBus.emit('order.placed', eventPayload);
-  eventBus.emit('trade.placed', { instrument, side, contractId, price: entryPrice });
+  eventBus.emit('trade.placed', {
+    instrument,
+    side,
+    contractId,
+    price: entryPrice,
+    strategy: strategy || null,   // [FILE-4]
+    regimeCode: regimeCode || null,
+  });
 
   if (decisionId) {
     try {
@@ -465,6 +498,9 @@ async function placeMarketOrder(options) {
     price: entryPrice,
     entryPrice,
     purchasePrice,
+    // [FILE-4] echo back so the caller / frontend can confirm
+    strategy: strategy || null,
+    regimeCode: regimeCode || null,
     raw: result,
     recording: {
       order: orderSaveError ? { ok: false, error: orderSaveError.message } : { ok: true },
@@ -473,7 +509,7 @@ async function placeMarketOrder(options) {
   };
 }
 
-// ---- Other functions unchanged ----
+// ---- Other functions ----
 async function cancelOrder(contractId, product) {
   if (!contractId) throw new Error('contractId is required');
   const broker = getBroker(product);
@@ -496,8 +532,16 @@ async function closeTrade(contractId, product) {
   if (!broker.isConnected()) await broker.connect();
   const result = await broker.closeTrade(contractId);
 
+  // [FILE-4] Load trade to get strategy + regime + P/L for downstream credit
+  let closedTrade = null;
   try {
-    const closedTrade = await Trade.findOne({ contractId: String(contractId) });
+    closedTrade = await Trade.findOne({ contractId: String(contractId) });
+  } catch (err) {
+    logger.warn(`[orderService] closeTrade lookup failed for ${contractId}: ${err.message}`);
+  }
+
+  // SelfLearner update (existing behaviour, preserved)
+  try {
     if (closedTrade && closedTrade.decisionId) {
       await selfLearner.updateDecisionOutcome(closedTrade.decisionId, closedTrade);
     }
@@ -512,9 +556,28 @@ async function closeTrade(contractId, product) {
     broker: product || 'default',
   });
 
-  eventBus.emit('trade.closed', { contractId, result, timestamp: new Date().toISOString() });
+  // [FILE-4] trade.closed now carries strategy + regime + profit + risk for
+  // the StrategyPerformance recorder (File 7 wires the listener)
+  const closedPayload = {
+    contractId,
+    result,
+    timestamp: new Date().toISOString(),
+    // [FILE-4]
+    strategy: closedTrade?.strategy || null,
+    regimeCode: closedTrade?.entryThesis?.regime || null,
+    realizedProfit: closedTrade?.realizedProfit ?? closedTrade?.pnl ?? null,
+    riskAmount: closedTrade?.riskAmount ?? closedTrade?.stake ?? null,
+    instrument: closedTrade?.instrument || null,
+  };
+  eventBus.emit('trade.closed', closedPayload);
   eventBus.emit('trade.closed.sound', { contractId });
-  return { ...result, pl: 0 };
+
+  return {
+    ...result,
+    pl: 0,
+    // [FILE-4] echo strategy for callers (e.g. dashboard notification)
+    strategy: closedTrade?.strategy || null,
+  };
 }
 
 async function modifyTrade(contractId, stopLoss, takeProfit, product) {
