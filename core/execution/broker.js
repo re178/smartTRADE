@@ -10,7 +10,7 @@
 // [BUGFIX-A..F] — see prior revisions.
 // [REVERT-1..2] — see prior revisions.
 // [GUARD-3]     — see prior revisions.
-// [FILE-3.1]    Startup + runtime reconcile hardening (see below).
+// [FILE-3.1]    Startup + runtime reconcile hardening.
 // [FILE-3.2]    Log knockout + take_profit on FIRST TICK for every contract.
 // [FILE-3.3]    modifySLTP() preserved but hardened.
 // [FILE-3.4]    getContractStatus() public method.
@@ -18,9 +18,11 @@
 //               style='candles' instead of the deprecated Binary.com
 //               { ohlc, interval, start, end } request which Deriv rejects
 //               with {"code":"UnknownMethod","message":"no recognized
-//               method in request"}. This was the root cause of every
-//               "candles insufficient" / blank chart / 500 /api/candles
-//               failure across the whole pipeline.
+//               method in request"}.
+// [FILE-4.1]    Removed `start: 1` and `subscribe: 0` from the ticks_history
+//               payload. When count + end='latest' + granularity are supplied,
+//               Deriv computes the time window itself. Passing start:1 on top
+//               of that creates a range conflict and Deriv rejects the request.
 
 const WebSocket = require('ws');
 const axios = require('axios');
@@ -683,7 +685,7 @@ class DerivBroker extends EventEmitter {
         handled = true;
       }
       if (msg.active_symbols !== undefined) handled = true;
-      if (msg.candles !== undefined) handled = true;   // [FILE-4.0] ticks_history candles response
+      if (msg.candles !== undefined) handled = true;
       if (!handled) logger.debug('[In Public] Unhandled:', JSON.stringify(redactSensitive(msg)));
     } catch (e) { logger.error('[In Public] Parse error:', e.message); }
   }
@@ -1512,23 +1514,28 @@ class DerivBroker extends EventEmitter {
   }
 
   // ============================================================
-  // [FILE-4.0] CANDLES — Deriv ticks_history with style='candles'
+  // [FILE-4.0 / FILE-4.1] CANDLES — Deriv ticks_history with style='candles'
   //
   // The old `{ ohlc: symbol, interval, start, end }` format was the
   // Binary.com WebSocket API and is rejected by Deriv with:
   //   {"code":"UnknownMethod","message":"no recognized method in request"}
   //
-  // The current Deriv WebSocket API uses `ticks_history` for candles:
+  // The current Deriv WebSocket API uses `ticks_history` for candles.
+  // The correct payload for a one-shot historical query is:
   //   {
   //     ticks_history: 'frxEURUSD',
   //     adjust_start_time: 1,
   //     count: 200,              // 1..5000
   //     end: 'latest',           // or a Unix timestamp
-  //     start: 1,                // 1 when end='latest' + count given
   //     style: 'candles',
   //     granularity: 300,        // seconds per candle
-  //     subscribe: 0,
   //   }
+  //
+  // NOTE: Do NOT include `start` when `end: 'latest'` and `count` are
+  // both set — Deriv computes the window from count × granularity.
+  // Passing `start: 1` (epoch 1970) on top of that creates a range
+  // conflict and Deriv rejects the request.
+  //
   // Response shape: { candles: [ { epoch, open, high, low, close } ], history: {...} }
   // ============================================================
   async getCandles(instrument, count = 100, granularity = 'M5') {
@@ -1544,10 +1551,8 @@ class DerivBroker extends EventEmitter {
       adjust_start_time: 1,
       count: safeCount,
       end: 'latest',
-      start: 1,
       style: 'candles',
       granularity: sec,
-      subscribe: 0,
     };
 
     logger.info(`[DerivBroker] getCandles(${instrument}/${granularity}) → ticks_history ${symbol} count=${safeCount} gran=${sec}s`);
