@@ -10,32 +10,17 @@
 // [BUGFIX-A..F] — see prior revisions.
 // [REVERT-1..2] — see prior revisions.
 // [GUARD-3]     — see prior revisions.
-// [FILE-3.1]    Startup + runtime reconcile hardening:
-//   - tradeReconcileMinAgeMs raised from 15s to 60s
-//   - _verifyContractStatus() queries proposal_open_contract for a
-//     specific contract ID before marking any trade CLOSED. A trade is
-//     only CLOSED if Deriv confirms it (is_sold || is_expired ||
-//     terminal status). Portfolio absence alone is no longer sufficient.
-//   - Extracted sell_price / buy_price from proposal_open_contract when
-//     reconciling so the Trade doc gets correct realizedProfit and pnl
-//     even when reconciliation closes the trade.
-//   - Log 'Contract NOT in portfolio but confirmed OPEN via
-//     proposal_open_contract' warning when the false-alarm path is hit
-//     (this was the root cause of 'positions disappearing').
-// [FILE-3.2] Log knockout + take_profit on FIRST TICK for every contract.
-//   This is what surfaces the 'OTIE destroyed my knockout' problem — if
-//   the first tick shows limitStopLoss=null after a MODIFY, we'll see it
-//   immediately in the log.
-// [FILE-3.3] modifySLTP() preserved for backward compatibility but:
-//   - Logs a WARNING that this loses multiplier and creates an orphan Trade
-//   - Preserves both SL and TP from the current contract if not explicitly
-//     overridden (no more silently null-ing out one of them)
-//   - Preserves the multiplier from the current Trade document
-//   OTIE no longer calls this (File 2 removes it) but the method remains
-//   for any external caller that needs the close+reopen primitive.
-// [FILE-3.4] getContractStatus() public method — returns
-//   { status: 'open'|'closed'|'unknown', profit, soldFor, buyPrice,
-//     limitStopLoss, limitTakeProfit } for a single contract.
+// [FILE-3.1]    Startup + runtime reconcile hardening (see below).
+// [FILE-3.2]    Log knockout + take_profit on FIRST TICK for every contract.
+// [FILE-3.3]    modifySLTP() preserved but hardened.
+// [FILE-3.4]    getContractStatus() public method.
+// [FILE-4.0]    getCandles() fixed to use Deriv ticks_history with
+//               style='candles' instead of the deprecated Binary.com
+//               { ohlc, interval, start, end } request which Deriv rejects
+//               with {"code":"UnknownMethod","message":"no recognized
+//               method in request"}. This was the root cause of every
+//               "candles insufficient" / blank chart / 500 /api/candles
+//               failure across the whole pipeline.
 
 const WebSocket = require('ws');
 const axios = require('axios');
@@ -290,10 +275,7 @@ class DerivBroker extends EventEmitter {
       contractPersistIntervalMs: parseInt(config.contractPersistIntervalMs || process.env.DERIV_CONTRACT_PERSIST_INTERVAL_MS || 3000),
       contractSubscribeTimeout: parseInt(config.contractSubscribeTimeout || process.env.DERIV_CONTRACT_SUBSCRIBE_TIMEOUT || 15000),
       tradeReconcileIntervalMs: parseInt(config.tradeReconcileIntervalMs || process.env.DERIV_TRADE_RECONCILE_INTERVAL || 30000),
-      // [FILE-3.1] 60s minimum age before any trade is eligible for reconcile-close.
       tradeReconcileMinAgeMs: parseInt(config.tradeReconcileMinAgeMs || process.env.DERIV_TRADE_RECONCILE_MIN_AGE || 60000),
-      // [FILE-3.1] Consecutive portfolio misses required before contract status is
-      // even queried. A single miss (network blip, eventual consistency) is ignored.
       tradeReconcileMissesRequired: parseInt(config.tradeReconcileMissesRequired || process.env.DERIV_TRADE_RECONCILE_MISSES || 2),
     };
 
@@ -345,7 +327,6 @@ class DerivBroker extends EventEmitter {
     this._contractPersistAt = new Map();
     this._contractPersistTimers = new Map();
     this._contractUpdateCounts = new Map();
-    // [FILE-3.1] Per-contract portfolio-miss counter for reconcile hardening.
     this._reconcileMissCounts = new Map();
 
     this._tradeReconcileTimer = null;
@@ -358,7 +339,7 @@ class DerivBroker extends EventEmitter {
       tradesReconciledClosed: 0,
       reconcileSkippedFresh: 0,
       reconcileSkippedFetchError: 0,
-      reconcileSkippedFalseAlarm: 0,     // [FILE-3.1]
+      reconcileSkippedFalseAlarm: 0,
       portfolioEmptyResponses: 0,
     };
 
@@ -613,7 +594,7 @@ class DerivBroker extends EventEmitter {
       return;
     }
     try {
-      const important = payload.active_symbols || payload.ticks || payload.ohlc;
+      const important = payload.active_symbols || payload.ticks || payload.ticks_history || payload.ohlc;
       if (important) logger.info(`[Out Public] ${payload.req_id || '-'} →`, JSON.stringify(redactSensitive(payload)));
       this._publicSocket.send(JSON.stringify(payload));
     } catch (e) {
@@ -702,6 +683,7 @@ class DerivBroker extends EventEmitter {
         handled = true;
       }
       if (msg.active_symbols !== undefined) handled = true;
+      if (msg.candles !== undefined) handled = true;   // [FILE-4.0] ticks_history candles response
       if (!handled) logger.debug('[In Public] Unhandled:', JSON.stringify(redactSensitive(msg)));
     } catch (e) { logger.error('[In Public] Parse error:', e.message); }
   }
@@ -1019,16 +1001,8 @@ class DerivBroker extends EventEmitter {
   }
 
   // ============================================================
-  // [FILE-3.1] HARDENED RECONCILE
+  // HARDENED RECONCILE
   // ============================================================
-  // A trade is only marked CLOSED when:
-  //   1. The portfolio has missed it for tradeReconcileMissesRequired consecutive cycles
-  //   2. The trade is at least tradeReconcileMinAgeMs old
-  //   3. proposal_open_contract CONFIRMS the contract is closed (is_sold ||
-  //      is_expired || terminal status)
-  //
-  // Missing from portfolio alone is NOT sufficient. This is the fix for
-  // 'positions disappearing'.
   async _reconcileTradeStatus() {
     if (this._authState !== STATE.READY) return;
 
@@ -1041,7 +1015,6 @@ class DerivBroker extends EventEmitter {
     }
     if (openTrades.length === 0) return;
 
-    // Fetch portfolio. Skip entire cycle on fetch failure.
     let portfolio;
     try {
       portfolio = await this.getOpenTrades();
@@ -1059,7 +1032,6 @@ class DerivBroker extends EventEmitter {
     for (const trade of openTrades) {
       const cid = String(trade.contractId);
 
-      // Contract is still in portfolio — clear miss count, no action.
       if (portfolioIds.has(cid)) {
         if (this._reconcileMissCounts.has(cid)) {
           logger.info(`[DerivBroker] Contract ${cid} reappeared in portfolio — clearing miss counter.`);
@@ -1068,14 +1040,12 @@ class DerivBroker extends EventEmitter {
         continue;
       }
 
-      // Missing from portfolio. Skip if fresh (eventual consistency).
       const openedAt = trade.openTime ? new Date(trade.openTime).getTime() : 0;
       if (openedAt && (now - openedAt) < minAge) {
         this.metrics.reconcileSkippedFresh++;
         continue;
       }
 
-      // Increment miss counter.
       const misses = (this._reconcileMissCounts.get(cid) || 0) + 1;
       this._reconcileMissCounts.set(cid, misses);
 
@@ -1087,12 +1057,10 @@ class DerivBroker extends EventEmitter {
         continue;
       }
 
-      // Enough misses. Verify via proposal_open_contract before closing.
       logger.info(`[DerivBroker] Contract ${cid} missed ${misses}× portfolio checks — verifying status.`);
       const verify = await this._verifyContractStatus(cid);
 
       if (verify.status === 'open') {
-        // Portfolio is behind, contract is actually open. Skip.
         this.metrics.reconcileSkippedFalseAlarm++;
         logger.warn(
           `[DerivBroker] Contract ${cid} NOT in portfolio but proposal_open_contract reports OPEN — ` +
@@ -1103,7 +1071,6 @@ class DerivBroker extends EventEmitter {
       }
 
       if (verify.status === 'closed') {
-        // Confirmed closed by Deriv. Mark closed with accurate P/L.
         try {
           await Trade.findOneAndUpdate(
             { contractId: cid },
@@ -1130,7 +1097,6 @@ class DerivBroker extends EventEmitter {
         continue;
       }
 
-      // status === 'unknown' — API failed. Skip this cycle, retry next.
       logger.warn(`[DerivBroker] Contract ${cid} verification returned UNKNOWN — skipping reconcile this cycle.`);
     }
 
@@ -1139,10 +1105,6 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // [FILE-3.1] Query a single contract's status directly. Returns:
-  //   { status: 'open'|'closed'|'unknown', profit, soldFor, buyPrice,
-  //     limitStopLoss, limitTakeProfit }
-  // 'unknown' means the API failed OR returned no data — caller must retry.
   async _verifyContractStatus(contractId) {
     const key = String(contractId);
     const numericId = Number(key);
@@ -1177,7 +1139,6 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // [FILE-3.4] Public method — safe to call from controllers or scripts.
   async getContractStatus(contractId) {
     await this._ensureAuthReady();
     return this._verifyContractStatus(contractId);
@@ -1219,7 +1180,6 @@ class DerivBroker extends EventEmitter {
     const contractId = String(poc.contract_id ?? '');
     if (!contractId) return;
 
-    // [FILE-3.2] Extract knockout / TP from the response
     const limitStopLoss = poc.limit_order?.stop_loss != null ? Number(poc.limit_order.stop_loss) : null;
     const limitTakeProfit = poc.limit_order?.take_profit != null ? Number(poc.limit_order.take_profit) : null;
 
@@ -1254,8 +1214,6 @@ class DerivBroker extends EventEmitter {
     this._contractUpdateCounts.set(contractId, count);
 
     if (count === 1) {
-      // [FILE-3.2] Log knockout/TP on FIRST TICK so we can see if OTIE
-      // destroyed the user's SL after a MODIFY.
       logger.info(
         `[DerivBroker] Contract ${contractId} FIRST TICK — status=${state.status} ` +
         `profit=${state.currentProfit} spot=${state.currentSpot} entry=${state.entrySpot} ` +
@@ -1552,18 +1510,78 @@ class DerivBroker extends EventEmitter {
     }
     return results;
   }
+
+  // ============================================================
+  // [FILE-4.0] CANDLES — Deriv ticks_history with style='candles'
+  //
+  // The old `{ ohlc: symbol, interval, start, end }` format was the
+  // Binary.com WebSocket API and is rejected by Deriv with:
+  //   {"code":"UnknownMethod","message":"no recognized method in request"}
+  //
+  // The current Deriv WebSocket API uses `ticks_history` for candles:
+  //   {
+  //     ticks_history: 'frxEURUSD',
+  //     adjust_start_time: 1,
+  //     count: 200,              // 1..5000
+  //     end: 'latest',           // or a Unix timestamp
+  //     start: 1,                // 1 when end='latest' + count given
+  //     style: 'candles',
+  //     granularity: 300,        // seconds per candle
+  //     subscribe: 0,
+  //   }
+  // Response shape: { candles: [ { epoch, open, high, low, close } ], history: {...} }
+  // ============================================================
   async getCandles(instrument, count = 100, granularity = 'M5') {
     await this._ensurePublicReady();
     const symbol = toDerivSymbol(instrument, this.symbolMap);
     if (!symbol) throw new Error(`Unknown instrument: ${instrument}`);
     const intervalMap = { M1: 60, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400, D1: 86400 };
     const sec = intervalMap[granularity] || 300;
-    const end = Math.floor(Date.now() / 1000);
-    const start = end - (count * sec + 10);
-    const resp = await this._sendPublicRequest({ ohlc: symbol, interval: sec, start, end });
-    const candles = (resp.candles || []).slice(-count);
-    return candles.map(c => ({ mid: { o: c.open, h: c.high, l: c.low, c: c.close }, time: c.epoch, complete: true }));
+    const safeCount = Math.max(1, Math.min(parseInt(count) || 100, 5000));
+
+    const reqPayload = {
+      ticks_history: symbol,
+      adjust_start_time: 1,
+      count: safeCount,
+      end: 'latest',
+      start: 1,
+      style: 'candles',
+      granularity: sec,
+      subscribe: 0,
+    };
+
+    logger.info(`[DerivBroker] getCandles(${instrument}/${granularity}) → ticks_history ${symbol} count=${safeCount} gran=${sec}s`);
+
+    let resp;
+    try {
+      resp = await this._sendPublicRequest(reqPayload, 20000);
+    } catch (err) {
+      logger.error(`[DerivBroker] getCandles(${instrument}) request failed: ${err.message}`);
+      throw err;
+    }
+
+    if (!resp || !Array.isArray(resp.candles)) {
+      logger.warn(
+        `[DerivBroker] getCandles(${instrument}) — no candles array in response. ` +
+        `Keys: ${resp ? Object.keys(resp).join(',') : 'null'}`
+      );
+      return [];
+    }
+
+    if (resp.candles.length === 0) {
+      logger.warn(`[DerivBroker] getCandles(${instrument}) — Deriv returned 0 candles`);
+      return [];
+    }
+
+    logger.info(`[DerivBroker] getCandles(${instrument}) ✓ ${resp.candles.length} candles`);
+
+    return resp.candles.slice(-safeCount).map(c => ({
+      mid: { o: c.open, h: c.high, l: c.low, c: c.close },
+      time: c.epoch,
+      complete: true,
+    }));
   }
+
   async getOpenTrades() {
     await this._ensureAuthReady();
     const resp = await this._sendAuthRequest({ portfolio: 1 });
@@ -1680,23 +1698,15 @@ class DerivBroker extends EventEmitter {
     return resp;
   }
 
-  // [FILE-3.3] modifySLTP preserved for external callers but hardened:
-  // - Preserves both SL and TP from the current contract if not overridden
-  // - Preserves multiplier from the current Trade doc
-  // - Logs a WARNING that this loses the original contract and creates an
-  //   orphan Trade for the new contract
-  // OTIE no longer calls this (File 2 removes it entirely).
   async modifySLTP(tradeId, stopLoss, takeProfit) {
     await this._ensureAuthReady();
     const positions = await this.getOpenTrades();
     const pos = positions.find(p => p.id === String(tradeId));
     if (!pos) throw new Error(`Trade ${tradeId} not open`);
 
-    // Preserve missing values from current contract
     const finalSL = (stopLoss != null) ? Number(stopLoss) : (pos.stopLoss || null);
     const finalTP = (takeProfit != null) ? Number(takeProfit) : (pos.takeProfit || null);
 
-    // Preserve multiplier from the Trade document
     let finalMultiplier = DEFAULT_MULTIPLIER;
     try {
       const tradeDoc = await Trade.findOne({ contractId: String(tradeId) }).lean();
