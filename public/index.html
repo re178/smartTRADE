@@ -651,4 +651,34 @@
 
       // Lazy-load digit view when entering digit-related sections
       if (sec === 'digits' || sec === 'risefall' || sec === 'evenodd') {
-        const sym
+        const sym = document.getElementById('digitSymbolSelect')?.value || 'EURUSD';
+        fetch(`/api/digit/${sym}`).then(r => r.json())
+          .then(d => window.onDigitUpdate && window.onDigitUpdate(d))
+          .catch(() => {});
+      }
+    });
+  });
+
+  // Export CSV (from history)
+  document.getElementById('exportCSVBtn')?.addEventListener('click', function () {
+    const h = (window.dashboardState && window.dashboardState.history) || [];
+    if (h.length === 0) { alert('No history to export.'); return; }
+    let csv = 'Pair,Side,Entry,Exit,Stake,PnL,Status,Date\n';
+    h.forEach(t => {
+      csv += `${t.pair},${t.side},${t.entryPrice ?? ''},${t.exitPrice ?? ''},${t.lotSize ?? ''},${t.pnl ?? ''},${t.status},${new Date(t.date).toISOString()}\n`;
+    });
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `history_${new Date().toISOString().slice(0,10)}.csv`;
+    a.click(); URL.revokeObjectURL(a.href);
+  });
+
+  // Report button — stub (server route /api/report exists but disabled)
+  document.getElementById('reportModalBtn')?.addEventListener('click', function () {
+    alert('Report generation: use POST /api/report with {from, to}');
+  });
+})();
+</script>
+</body>
+</html>
