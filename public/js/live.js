@@ -1,14 +1,24 @@
-// public/js/live.js – WebSocket dispatcher
+// public/js/live.js – WebSocket dispatcher (merged: v6 + v7 pipeline + bots + digits)
 // All state updates flow through window.updateDashboardState (app.js).
 // contractUpdate / otieState / price / positions / account use targeted
 // repaint hooks so live ticks don't rerender every widget.
 //
-// [FILE-3-OF-4] Handles 'otieState' from OTIE V6 — forwards to
-//   window.onOtieState so the trajectory panel and positions table update.
-//   Also handles OTIE 'RELEASED' action (contract closed by OTIE) by
-//   clearing the state entry.
-//   Handles otieStates in the init payload so the panel populates
-//   immediately on page load.
+// Preserved from prior version:
+//   • contractUpdate → targeted position update
+//   • otieState + otieV5State/otieV5Action (legacy + new)
+//   • decision → legacy displayDecision
+//   • maybeAutoExecute (Auto toggle path)
+//   • playSound dispatcher
+//
+// Added for v2 (pattern-based) pipeline:
+//   • strategyConsensus    → window.onStrategyConsensus
+//   • prediction           → window.onPredictionUpdate + window.onPredictionUpdate_tv
+//   • opportunity          → window.onOpportunityUpdate + maybeAutoExecute
+//   • digitUpdate          → window.onDigitUpdate
+//   • digitSignal          → silent
+//   • botStarted/Stopped/Entry/Result/Error/Cycle → window.onBotEvent
+//   • price                → window.onPriceTick (chart) + prices map
+//   • init merges strategyConsensus, runningBots, digitViews
 
 (function () {
   'use strict';
@@ -43,6 +53,7 @@
     const u = s.toUpperCase().trim();
     return (u.length === 6 && /^[A-Z]{6}$/.test(u)) ? u.slice(0, 3) + '_' + u.slice(3) : u;
   }
+
   function formatPrice(p) {
     if (p === undefined || p === null) return 'N/A';
     return parseFloat(p).toFixed(5);
@@ -93,7 +104,7 @@
   }
 
   // ============================================================
-  //  [FILE-3-OF-4] Per-contract live tick
+  //  Per-contract live tick (unchanged from your version)
   // ============================================================
   function handleContractUpdate(cu) {
     const s = state();
@@ -139,11 +150,8 @@
         isValidToSell: cu.isValidToSell,
         lastUpdate: cu.receivedAt,
       });
-    } else {
-      // Closed contract we never saw open — nothing to do except clear OTIE
     }
 
-    // If contract closed, also clear any OTIE state for it
     if (isClosed && s.otieStates && s.otieStates[contractId]) {
       delete s.otieStates[contractId];
       if (typeof window.renderOTIEPanel === 'function') window.renderOTIEPanel();
@@ -156,27 +164,18 @@
   }
 
   // ============================================================
-  //  [FILE-3-OF-4] OTIE V6 trajectory update
+  //  OTIE state
   // ============================================================
   function handleOtieState(payload) {
     if (!payload || !payload.tradeId) return;
-
-    // Forward to app.js handler (defines window.onOtieState).
-    // That function is responsible for storing into dashboardState.otieStates
-    // and repainting the OTIE panel + positions table.
     if (typeof window.onOtieState === 'function') {
       window.onOtieState(payload);
     } else {
-      // Fallback: store directly so the panel can still render if File 4
-      // wasn't fully deployed. Not ideal — but avoids silent drop.
       const s = state();
       if (!s) return;
       if (!s.otieStates) s.otieStates = {};
-      if (payload.action === 'RELEASED') {
-        delete s.otieStates[payload.tradeId];
-      } else {
-        s.otieStates[payload.tradeId] = payload;
-      }
+      if (payload.action === 'RELEASED') delete s.otieStates[payload.tradeId];
+      else s.otieStates[payload.tradeId] = payload;
       if (typeof window.renderOTIEPanel === 'function') window.renderOTIEPanel();
       if (typeof window.renderPositionsWidget === 'function') window.renderPositionsWidget();
     }
@@ -196,15 +195,44 @@
         handleOtieState(msg.data);
         break;
 
+      // ---- Strategy consensus (v2 pipeline) ----
+      case 'strategyConsensus':
+        if (typeof window.onStrategyConsensus === 'function') window.onStrategyConsensus(msg.data);
+        break;
+
+      // ---- Prediction: fires both legacy + new handlers ----
       case 'prediction':
+        if (typeof window.onPredictionUpdate === 'function') window.onPredictionUpdate(msg.data);
+        if (typeof window.onPredictionUpdate_tv === 'function') window.onPredictionUpdate_tv(msg.data);
         if (window.updateDashboardState) window.updateDashboardState({ prediction: msg.data });
         break;
 
+      // ---- Opportunity: triggers auto-execute + opportunity panel ----
       case 'opportunity':
+        if (typeof window.onOpportunityUpdate === 'function') window.onOpportunityUpdate(msg.data);
         if (window.updateDashboardState) window.updateDashboardState({ opportunity: msg.data });
         maybeAutoExecute(msg.data);
         break;
 
+      // ---- Digit stream ----
+      case 'digitUpdate':
+        if (typeof window.onDigitUpdate === 'function') window.onDigitUpdate(msg.data);
+        break;
+      case 'digitSignal':
+        // Silent — digit bots read their own state
+        break;
+
+      // ---- Bot events ----
+      case 'botStarted':
+      case 'botStopped':
+      case 'botEntry':
+      case 'botResult':
+      case 'botError':
+      case 'botCycle':
+        if (typeof window.onBotEvent === 'function') window.onBotEvent(msg.type, msg.data);
+        break;
+
+      // ---- Market state ----
       case 'marketAwareness':
         if (window.updateDashboardState) window.updateDashboardState({ awareness: msg.data });
         break;
@@ -222,6 +250,7 @@
         if (window.updateDashboardState) window.updateDashboardState({ liveSignal: msg.data });
         break;
 
+      // ---- OTIE legacy alert-based displays (v6 events) ----
       case 'otieV5State':
         displayOTIEState(msg.data);
         break;
@@ -229,16 +258,13 @@
         displayOTIEAction(msg.data);
         break;
 
+      // ---- Trade lifecycle ----
       case 'tradeClosed': {
         const s = state();
         if (s) {
           const cid = String(msg.data?.contractId || '');
-          if (s.positions) {
-            s.positions = s.positions.filter(p => String(p.id ?? p.contractId) !== cid);
-          }
-          if (s.otieStates && s.otieStates[cid]) {
-            delete s.otieStates[cid];
-          }
+          if (s.positions) s.positions = s.positions.filter(p => String(p.id ?? p.contractId) !== cid);
+          if (s.otieStates && s.otieStates[cid]) delete s.otieStates[cid];
           if (typeof window.renderPositionsWidget === 'function') window.renderPositionsWidget();
           if (typeof window.renderOTIEPanel === 'function') window.renderOTIEPanel();
         }
@@ -249,26 +275,35 @@
         playSound('tradeOpen');
         break;
 
+      // ---- Init payload ----
       case 'init': {
         const s = state();
         if (!s) break;
         s.account = msg.data.account || s.account;
         if (Array.isArray(msg.data.positions)) s.positions = msg.data.positions;
 
-        // [FILE-3-OF-4] Merge otieStates from init payload
         if (msg.data.otieStates && typeof msg.data.otieStates === 'object') {
           if (!s.otieStates) s.otieStates = {};
-          for (const [cid, st] of Object.entries(msg.data.otieStates)) {
-            s.otieStates[cid] = st;
-          }
+          for (const [cid, st] of Object.entries(msg.data.otieStates)) s.otieStates[cid] = st;
+        }
+        if (msg.data.strategyConsensus && typeof msg.data.strategyConsensus === 'object') {
+          if (!s.strategyConsensus) s.strategyConsensus = {};
+          Object.assign(s.strategyConsensus, msg.data.strategyConsensus);
+        }
+        if (Array.isArray(msg.data.runningBots)) s.runningBots = msg.data.runningBots;
+        if (msg.data.digitViews && typeof msg.data.digitViews === 'object') {
+          if (!s.digitViews) s.digitViews = {};
+          Object.assign(s.digitViews, msg.data.digitViews);
         }
 
         if (typeof window.renderAccountWidget === 'function') window.renderAccountWidget();
         if (typeof window.renderPositionsWidget === 'function') window.renderPositionsWidget();
         if (typeof window.renderOTIEPanel === 'function') window.renderOTIEPanel();
+        if (typeof window.renderLiveSignalPanel === 'function') window.renderLiveSignalPanel();
         break;
       }
 
+      // ---- Positions / account / price / history ----
       case 'positions': {
         const s = state();
         if (!s) break;
@@ -291,6 +326,7 @@
         if (!s.prices) s.prices = {};
         s.prices[msg.data.symbol] = msg.data;
         if (typeof window.renderPriceWidgets === 'function') window.renderPriceWidgets();
+        if (typeof window.onPriceTick === 'function') window.onPriceTick(msg.data);
         break;
       }
 
@@ -318,7 +354,7 @@
   }
 
   // ============================================================
-  //  Auto-execute — status-aware, never retries on error
+  //  Auto-execute — preserved from your version
   // ============================================================
   function maybeAutoExecute(opp) {
     if (!opp || !opp.tradable) return;
@@ -341,6 +377,8 @@
         knockoutLevel: opp.knockoutLevel,
         takeProfitLevel: opp.takeProfitLevel,
         product: 'deriv_cfd',
+        strategy: opp.strategyInfo?.anchorStrategy || null,
+        regimeCode: opp.prediction?.regime || null,
       }),
     })
       .then(r => r.json().then(b => ({ status: r.status, body: b })).catch(() => ({ status: r.status, body: {} })))
@@ -365,7 +403,7 @@
   }
 
   // ============================================================
-  //  Legacy display functions
+  //  Legacy display functions — preserved
   // ============================================================
   function displayDecision(d) {
     const panel = document.getElementById('liveSignalPanel');
