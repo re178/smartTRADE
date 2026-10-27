@@ -613,4 +613,126 @@ function _renderOtieCard(s) {
       <div class="col-3"><div class="small text-muted">DD</div>
         <div style="font-size:1.2em; font-weight:700;">${ddPct}%</div></div>
       <div class="col-3"><div class="small text-muted">REVS</div>
-        <div style="font-size:1.2em
+        <div style="font-size:1.2em; font-weight:700;">${s.reversals||0}</div></div>
+    </div>
+    ${isClose && s.reason ? `<div class="alert alert-danger mt-2 mb-0 py-1 small"><strong>CLOSE:</strong> ${s.reason}</div>` : ''}
+  </div>`;
+}
+
+// ================================================================
+// Refresh
+// ================================================================
+async function refreshAllData() {
+  try {
+    const [account, positions, history] = await Promise.all([
+      fetchJson('/api/account').catch(() => null),
+      fetchJson('/api/trades').catch(() => []),
+      fetchJson('/api/trade-history').catch(() => []),
+    ]);
+    if (account) dashboardState.account = account;
+    if (Array.isArray(positions)) dashboardState.positions = positions;
+    if (Array.isArray(history)) dashboardState.history = history;
+    renderAllWidgets();
+  } catch (e) { console.error('Refresh error:', e); }
+}
+
+async function refreshSignals() {
+  if (_activeSignalFetchInFlight) return;
+  _activeSignalFetchInFlight = true;
+  try {
+    const data = await fetchJson('/api/signal/active');
+    if (data && data.signals) {
+      for (const [sym, payload] of Object.entries(data.signals)) {
+        if (payload.consensus) dashboardState.strategyConsensus[sym] = payload.consensus;
+        if (payload.opportunity) dashboardState.signalOpportunities[sym] = payload.opportunity;
+        if (payload.prediction) dashboardState.signalPredictions[sym] = payload.prediction;
+      }
+      renderLiveSignalPanel();
+    }
+  } catch (e) { console.warn('[App] refreshSignals failed:', e.message); }
+  finally { _activeSignalFetchInFlight = false; }
+}
+
+// ================================================================
+// Actions
+// ================================================================
+async function closeTrade(tradeId) {
+  if (!confirm(`Close contract ${tradeId}?`)) return;
+  try {
+    await fetchJson(`/api/close/${tradeId}`, { method: 'PUT' });
+    SoundManager.tradeClose();
+  } catch (e) { alert('Error: ' + e.message); SoundManager.reject(); }
+}
+
+window.closeTrade = closeTrade;
+
+// ================================================================
+// Exports
+// ================================================================
+window.dashboardState = dashboardState;
+window.updateDashboardState = updateDashboardState;
+window.renderAllWidgets = renderAllWidgets;
+window.renderPositionsWidget = renderPositionsWidget;
+window.renderOTIEPanel = renderOTIEPanel;
+window.renderLiveSignalPanel = renderLiveSignalPanel;
+window.SoundManager = SoundManager;
+window.refreshDashboard = refreshAllData;
+window.refreshSignals = refreshSignals;
+
+window.updatePositionBadge = function (count) {
+  const b = document.getElementById('positionCount');
+  if (b) b.textContent = count || 0;
+};
+window.updateApiStatus = function (connected) {
+  const dot = document.getElementById('apiStatusDot');
+  const text = document.getElementById('apiStatusText');
+  if (dot) dot.className = 'dot ' + (connected ? 'connected' : 'disconnected');
+  if (text) text.textContent = connected ? 'Connected' : 'Disconnected';
+};
+window.updateAccountBadge = function (acc) {
+  if (!acc) return;
+  const idEl = document.getElementById('accountId');
+  const curEl = document.getElementById('accountCurrency');
+  const typeEl = document.getElementById('accountTypeLabel');
+  if (idEl) idEl.textContent = acc.id || acc.login || '—';
+  if (curEl) curEl.textContent = acc.currency || 'USD';
+  if (typeEl) {
+    const srv = String(acc.server || '').toLowerCase();
+    const type = srv.includes('demo') ? 'demo' : 'real';
+    typeEl.textContent = type.toUpperCase();
+    typeEl.className = 'account-type ' + type;
+  }
+};
+
+// ================================================================
+// DOM wiring
+// ================================================================
+document.addEventListener('DOMContentLoaded', async function () {
+  await refreshAllData();
+  await refreshSignals();
+
+  setInterval(() => {
+    if (document.visibilityState === 'visible') refreshSignals();
+  }, 30000);
+
+  document.getElementById('refreshTrades')?.addEventListener('click', refreshAllData);
+  document.getElementById('refreshHistory')?.addEventListener('click', refreshAllData);
+  document.getElementById('refreshLiveSignals')?.addEventListener('click', refreshSignals);
+  document.getElementById('applyHistoryFilter')?.addEventListener('click', applyHistoryFilters);
+  document.getElementById('prevPage')?.addEventListener('click', function () {
+    if (historyPage > 1) { historyPage--; renderHistoryTable(); }
+  });
+  document.getElementById('nextPage')?.addEventListener('click', function () {
+    if (historyPage < historyTotalPages) { historyPage++; renderHistoryTable(); }
+  });
+  document.getElementById('resetHistoryFilter')?.addEventListener('click', function () {
+    ['historyFrom','historyTo','historySymbol','historySide','historyStatus'].forEach(id => {
+      const el = document.getElementById(id); if (el) el.value = '';
+    });
+    applyHistoryFilters();
+  });
+
+  renderLiveSignalPanel();
+});
+
+console.log('✅ app.js loaded');
