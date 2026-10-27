@@ -1,22 +1,15 @@
-// server.js – RTS Entry Point (Deriv-only)
-// INTEGRATED: StrategyRanker + PredictionEngine + OpportunityEngine +
-//             RiskEngine + OTIE V6 + StrategyPerformance feedback loop.
+// server.js – RTS Entry Point (Deriv-only, pattern-based)
+// Integrated: StrategyRanker + PatternPredictor + OpportunityEngine +
+//             RiskEngine + OTIE + Bot Runner + Digit Analyzer + BotRoutes.
 //
-// [FILE-7] Strategy ranking pipeline integration:
-//   • runPredictionPipeline calls ranker.rank(state, symbol) FIRST
-//   • Consensus broadcast as 'strategyConsensus' WS event
-//   • Consensus passed to predictionEngine.predict() and to
-//     opportunityEngine.evaluate() so strategy-only and combined
-//     modes are evaluated end-to-end
-//   • Per-symbol prediction/opportunity caches power /api/signal/active
-//   • New route /api/signal/active → current consensus + prediction +
-//     opportunity per symbol (used by frontend Live Signal panel)
-//   • New route /debug/strategies → top strategies, cache stats, per-symbol
-//     consensus (for diagnosis)
-//   • trade.closed handler updates StrategyPerformance.recordOutcome()
-//     so each closed trade credits the strategy that generated it
-//   • Existing pipeline, OTIE, /health/pipeline, /debug/pipeline all
-//     preserved and extended
+// CHANGE from prior version:
+//   • Removed stateStore + outcomeLabeler + predictionEngine
+//   • Added pattern-based predictor (core/intelligence/patterns/predictor)
+//   • Added bot runner (core/bots/runner) with lifecycle + WS events
+//   • Added digit analyzer (core/intelligence/digit/analyzer)
+//   • Mounted /api bot routes
+//   • Removed /api/research mounting (research routes still exist but not used)
+//   • All existing endpoints preserved
 
 require('dotenv').config();
 
@@ -28,7 +21,7 @@ const WebSocket = require('ws');
 const http = require('http');
 
 // ============================================================
-// [WIRE-1] Broadcast helpers before any require that uses them
+// Broadcast helpers — must exist before any require uses them
 // ============================================================
 const dashboardClients = new Set();
 
@@ -52,16 +45,14 @@ module.exports.broadcastToDashboards = broadcastToDashboards;
 module.exports.broadcast = broadcast;
 
 // ============================================================
-// Require route tree AFTER exports
+// Requires AFTER exports
 // ============================================================
 const connectDB = require('./config/db');
 const apiRoutes = require('./api/routes');
-const researchRoutes = require('./api/routes/research');
+const botRoutes = require('./api/botRoutes');
 const User = require('./models/User');
 
 // ---------- MODELS ----------
-const Price = require('./models/Price');
-const Account = require('./models/Account');
 const Trade = require('./models/Trade');
 const StrategyPerformance = require('./models/StrategyPerformance');
 
@@ -74,21 +65,17 @@ const deepRegime = require('./core/intelligence/deep/regime');
 const decisionEngine = require('./core/decision/engine');
 const eventBus = require('./infrastructure/eventBus');
 
-// ---------- DATA ORCHESTRATOR & STATE STORE ----------
+// ---------- DATA ORCHESTRATOR ----------
 const { dataOrchestrator } = require('./core/data/dataOrchestrator');
-const stateStore = require('./core/intelligence/lab/stateStore');
 
-// ---------- STRATEGY ENGINE + RANKER [FILE-7] ----------
+// ---------- STRATEGY ENGINE + RANKER ----------
 const strategyEngine = require('./core/strategy/engine');
 const ranker = require('./core/strategy/ranker');
 
-// ---------- PREDICTION / OPPORTUNITY / RISK ----------
-const predictionEngine = require('./core/intelligence/predictionEngine');
+// ---------- PATTERN PREDICTOR + OPPORTUNITY + RISK ----------
+const predictor = require('./core/intelligence/patterns/predictor');
 const opportunityEngine = require('./core/intelligence/opportunityEngine');
 const riskEngine = require('./core/risk/riskEngine');
-
-// ---------- OUTCOME LABELER ----------
-const outcomeLabeler = require('./core/intelligence/lab/outcomeLabeler');
 
 // ---------- ANALYTICS DASHBOARD ----------
 const analyticsDashboard = require('./core/analytics/dashboard');
@@ -101,6 +88,10 @@ const otie = require('./core/intelligence/openTradeIntelligenceV5');
 
 // ---------- PERFORMANCE MONITOR ----------
 const performanceMonitor = require('./core/performance/performanceMonitor');
+
+// ---------- BOT RUNNER + DIGIT ANALYZER ----------
+const botRunner = require('./core/bots/runner');
+const digitAnalyzer = require('./core/intelligence/digit/analyzer');
 
 // ---------- BROKER ----------
 const { getBroker } = require('./core/execution/brokerFactory');
@@ -117,16 +108,12 @@ const PORT = process.env.PORT || 5000;
 connectDB();
 
 // ============================================================
-// Per-symbol caches for /api/signal/active [FILE-7]
+// Per-symbol caches
 // ============================================================
-const _consensusCache = new Map();     // symbol -> latest ranker output
-const _predictionCache = new Map();    // symbol -> latest prediction
-const _opportunityCache = new Map();   // symbol -> latest opportunity
+const _consensusCache = new Map();
+const _predictionCache = new Map();
+const _opportunityCache = new Map();
 
-/**
- * Flatten the ranker's full consensus into a lightweight payload
- * suitable for WebSocket broadcast and dashboard rendering.
- */
 function flattenConsensus(consensus) {
   if (!consensus || !consensus.consensus) return null;
   const c = consensus.consensus;
@@ -178,7 +165,7 @@ async function ensureAdmin() {
   }
 }
 
-// ---------- JSON Repair Helper ----------
+// ---------- JSON repair helper ----------
 function repairJson(raw) {
   let repaired = raw.trim();
   if (repaired.endsWith(',')) repaired = repaired.slice(0, -1);
@@ -214,39 +201,23 @@ app.use((req, res, next) => {
     const contentType = req.headers['content-type'] || '';
     if (contentType.includes('application/json') && trimmed.length > 0) {
       let parsed = null;
-      try {
-        parsed = JSON.parse(trimmed);
-        req.body = parsed;
-      } catch (err) {
+      try { parsed = JSON.parse(trimmed); req.body = parsed; }
+      catch (err) {
         if (err instanceof SyntaxError) {
           const repaired = repairJson(trimmed);
-          try {
-            parsed = JSON.parse(repaired);
-            req.body = parsed;
-            req.repairedRawBody = repaired;
-          } catch (err2) {
-            console.error('[BodyParser] JSON repair failed:', err2.message);
-            req.body = {};
-            req.parseError = err2;
-          }
-        } else {
-          throw err;
-        }
+          try { parsed = JSON.parse(repaired); req.body = parsed; req.repairedRawBody = repaired; }
+          catch (err2) { req.body = {}; req.parseError = err2; }
+        } else { throw err; }
       }
-    } else {
-      req.body = {};
-    }
+    } else { req.body = {}; }
     next();
   });
-  req.on('error', (err) => {
-    console.error('[BodyParser] Request body error:', err.message);
-    next(err);
-  });
+  req.on('error', (err) => { next(err); });
 });
 
 app.use(express.static('public'));
 
-// ---------- Admin User Middleware ----------
+// ---------- Admin user middleware ----------
 app.use(async (req, res, next) => {
   try {
     let admin = await User.findOne({ userId: 'admin' });
@@ -258,7 +229,6 @@ app.use(async (req, res, next) => {
     req.user = { id: 'admin', tradingProduct: admin.tradingProduct };
     next();
   } catch (err) {
-    console.error('[AdminMiddleware] Error:', err.message);
     req.user = { id: 'admin', tradingProduct: process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd' };
     next();
   }
@@ -266,10 +236,10 @@ app.use(async (req, res, next) => {
 
 // ---------- API Routes ----------
 app.use('/api', apiRoutes);
-app.use('/api/research', researchRoutes);
+app.use('/api', botRoutes);
 
 // ============================================================
-// Health + debug routes
+// Health + debug
 // ============================================================
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'OK', message: 'RTS is running with Deriv broker' });
@@ -282,25 +252,14 @@ app.get('/health/pipeline', async (req, res) => {
     const cache = marketStateCache._cache || new Map();
     const hasMarketData = cache.size > 0;
     const hasConsensus = _consensusCache.size > 0;
-
-    let labelStale = true;
-    try {
-      const HistoricalState = require('./models/HistoricalState');
-      const recent = await HistoricalState.findOne({ outcome5: { $exists: true } })
-        .sort({ labeledAt: -1 }).select('labeledAt').lean();
-      if (recent?.labeledAt) {
-        const ageMin = (Date.now() - new Date(recent.labeledAt).getTime()) / 60000;
-        labelStale = ageMin > 30;
-      }
-    } catch (_) {}
-
-    const healthy = connected && hasMarketData && hasConsensus && !labelStale;
+    const hasBots = botRunner.list().length > 0;
+    const healthy = connected && hasMarketData && hasConsensus;
     res.status(healthy ? 200 : 503).json({
       healthy,
       brokerConnected: connected,
       marketCachePopulated: hasMarketData,
       strategyConsensusActive: hasConsensus,
-      labelerActive: !labelStale,
+      runningBots: hasBots,
       timestamp: new Date().toISOString(),
     });
   } catch (err) {
@@ -317,14 +276,6 @@ app.get('/debug/pipeline', async (req, res) => {
     let deepBuffers = 0;
     try {
       deepBuffers = require('./core/intelligence/deep/marketState')._buffers?.size || 0;
-    } catch (_) {}
-
-    let lastLabel = null;
-    try {
-      const HistoricalState = require('./models/HistoricalState');
-      const last = await HistoricalState.findOne({ outcome5: { $exists: true } })
-        .sort({ labeledAt: -1 }).select('labeledAt symbol').lean();
-      if (last) lastLabel = { symbol: last.symbol, at: last.labeledAt };
     } catch (_) {}
 
     let dashboardMetrics = {};
@@ -349,7 +300,6 @@ app.get('/debug/pipeline', async (req, res) => {
       marketCache: { symbolCount: cache.size, symbols: Array.from(cache.keys()) },
       deepState: { bufferCount: deepBuffers },
       pipeline: { timerRunning: !!pipelineTimer },
-      outcomeLabeler: { lastLabel },
       analyticsDashboard: {
         hasMetrics: Object.keys(dashboardMetrics).length > 0,
         totalTrades: dashboardMetrics.totalTrades || 0,
@@ -362,6 +312,7 @@ app.get('/debug/pipeline', async (req, res) => {
         symbolsWithOpportunity: Array.from(_opportunityCache.keys()),
         candleCacheStats: strategyEngine.getCandleCacheStats ? strategyEngine.getCandleCacheStats() : [],
       },
+      runningBots: botRunner.list(),
       watchedSymbols: WATCHED_SYMBOLS,
     });
   } catch (err) {
@@ -370,10 +321,8 @@ app.get('/debug/pipeline', async (req, res) => {
 });
 
 // ============================================================
-// [FILE-7] Live signal endpoint
+// /api/signal/active
 // ============================================================
-// Returns the current consensus + prediction + opportunity per symbol.
-// Frontend Live Signal panel polls this on load and after each WS event.
 app.get('/api/signal/active', async (req, res) => {
   try {
     const broker = getBroker('deriv_cfd');
@@ -395,6 +344,9 @@ app.get('/api/signal/active', async (req, res) => {
           confidence: prediction.calibratedConfidence,
           probabilities: prediction.probabilities,
           expectedMove: prediction.expectedMove,
+          pattern: prediction.pattern,
+          momentum: prediction.momentum,
+          volatility: prediction.volatility,
           strategyConsensus: prediction.strategyConsensus,
           strategyLevels: prediction.strategyLevels,
           qualifiedCount: prediction.qualifiedCount,
@@ -434,7 +386,7 @@ app.get('/api/signal/active', async (req, res) => {
 });
 
 // ============================================================
-// [FILE-7] Strategy diagnostics endpoint
+// /debug/strategies
 // ============================================================
 app.get('/debug/strategies', async (req, res) => {
   try {
@@ -494,6 +446,8 @@ app.get('/debug/status', (req, res) => {
       decisionEngine: decisionEngine ? 'running' : 'not loaded',
       otieV5: otie ? 'running' : 'not loaded',
       strategyRanker: ranker ? 'running' : 'not loaded',
+      botRunner: botRunner ? 'running' : 'not loaded',
+      digitAnalyzer: digitAnalyzer ? 'running' : 'not loaded',
     },
     lastCandle: candleStore.getHistory('EURUSD', 'M5', 1)[0] || null,
     lastMarketState: lastState,
@@ -503,7 +457,7 @@ app.get('/debug/status', (req, res) => {
   });
 });
 
-// ---------- SPA Fallback ----------
+// ---------- SPA fallback ----------
 app.get('*', (req, res) => {
   if (!req.path.startsWith('/api')) {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
@@ -575,6 +529,9 @@ async function sendDashboardInitialState(ws) {
       }
     } catch (_) {}
 
+    let digitViews = {};
+    try { digitViews = digitAnalyzer.getAllViews(); } catch (_) {}
+
     ws.send(JSON.stringify({
       type: 'init',
       data: {
@@ -583,6 +540,8 @@ async function sendDashboardInitialState(ws) {
         positions,
         otieStates: otieState,
         strategyConsensus,
+        digitViews,
+        runningBots: botRunner.list(),
       }
     }));
   } catch (err) {
@@ -603,11 +562,8 @@ otie.on('otieV5Action', (action) => broadcast('otieV5Action', action));
 otie.on('otieState', (state) => broadcast('otieState', state));
 
 // ============================================================
-// [FILE-7] StrategyPerformance feedback loop
+// StrategyPerformance feedback loop
 // ============================================================
-// Every closed trade attributed to a strategy updates its performance
-// record. This closes the loop: ranker uses these records to weight
-// strategies on the next cycle.
 eventBus.on('trade.closed', async (data) => {
   const contractId = data?.contractId;
   const strategy = data?.strategy;
@@ -616,12 +572,6 @@ eventBus.on('trade.closed', async (data) => {
   const riskAmount = Number(data?.riskAmount);
 
   if (!strategy || !instrument || !Number.isFinite(realizedProfit)) {
-    if (contractId) {
-      console.debug(
-        `[StrategyPerformance] Skip ${contractId}: ` +
-        `strategy=${strategy || 'none'} instrument=${instrument || 'none'} pnl=${realizedProfit}`
-      );
-    }
     return;
   }
 
@@ -631,26 +581,21 @@ eventBus.on('trade.closed', async (data) => {
     const regimeCode = data?.regimeCode || 'NEUTRAL';
 
     const updated = await StrategyPerformance.recordOutcome(
-      strategy,
-      symbol,
-      realizedProfit,
-      risk,
-      regimeCode
+      strategy, symbol, realizedProfit, risk, regimeCode
     );
 
-    logger.info(
+    console.log(
       `[StrategyPerformance] ${strategy}/${symbol} (${regimeCode}): ` +
       `pnl=${realizedProfit.toFixed(2)}$ R=${(realizedProfit/risk).toFixed(2)} ` +
       `trades=${updated.trades} wr=${(updated.winRate*100).toFixed(0)}% ` +
-      `recentWR=${(updated.recentWinRate*100).toFixed(0)}% ` +
-      `flagged=${updated.flagged}`
+      `recentWR=${(updated.recentWinRate*100).toFixed(0)}% flagged=${updated.flagged}`
     );
   } catch (err) {
     console.error(`[StrategyPerformance] Failed for ${contractId}: ${err.message}`);
   }
 });
 
-// Performance monitor (existing)
+// Performance monitor
 eventBus.on('trade.closed', async (data) => {
   try {
     const trade = await Trade.findOne({ contractId: String(data.contractId) });
@@ -666,30 +611,27 @@ performanceMonitor.on('thresholdsUpdated', (thresholds) => {
 });
 
 // ============================================================
-// PREDICTION / OPPORTUNITY PIPELINE with StrategyRanker [FILE-7]
+// PREDICTION PIPELINE
 // ============================================================
 const WATCHED_SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD'];
 
 async function runPredictionPipeline(symbol) {
   try {
-    // 1. Compute deep state
     const state = await require('./core/intelligence/deep/marketState').compute(symbol, 'M5', 200);
     if (!state) {
       console.log(`[Pipeline] ${symbol}: no state (candles insufficient)`);
       return false;
     }
 
-    // 2. Rank strategies — produces consensus even when strategies disagree
     let strategyConsensus = null;
     try {
       strategyConsensus = await ranker.rank(state, symbol, { timeframe: 'M5' });
       _consensusCache.set(symbol, strategyConsensus);
       broadcastToDashboards('strategyConsensus', flattenConsensus(strategyConsensus));
     } catch (rankErr) {
-      logger.warn(`[Pipeline] Ranker failed for ${symbol}: ${rankErr.message}`);
+      console.warn(`[Pipeline] Ranker failed for ${symbol}: ${rankErr.message}`);
     }
 
-    // 3. Broker context
     const broker = getBroker('deriv_cfd');
     const account = await broker.getAccount();
     const positions = await broker.getOpenTrades();
@@ -700,8 +642,7 @@ async function runPredictionPipeline(symbol) {
       timestamp: new Date().toISOString(),
     };
 
-    // 4. Prediction — now consumes strategy consensus
-    const prediction = await predictionEngine.predict(state, symbol, { strategyConsensus });
+    const prediction = await predictor.predict(symbol, state, strategyConsensus, { timeframe: 'M5' });
     if (!prediction) {
       console.log(`[Pipeline] ${symbol}: no prediction`);
       return false;
@@ -709,18 +650,13 @@ async function runPredictionPipeline(symbol) {
     _predictionCache.set(symbol, prediction);
     broadcastToDashboards('prediction', prediction);
 
-    // 5. Opportunity — now uses prediction.strategyConsensus internally
     const opportunity = await opportunityEngine.evaluate(
-      prediction,
-      account,
-      positions,
-      marketData,
+      prediction, account, positions, marketData,
       { riskPerTradePct: parseFloat(process.env.RISK_PER_TRADE_PCT) || 1.0 }
     );
     _opportunityCache.set(symbol, opportunity);
     broadcastToDashboards('opportunity', opportunity);
 
-    // 6. Log summary
     const src = opportunity.source || prediction.source || 'unknown';
     console.log(
       `[Pipeline] ${symbol}: ${opportunity.decision || 'NO_TRADE'} ` +
@@ -746,14 +682,12 @@ async function runPredictionPipelineAll() {
   }
 }
 
-// Trigger on candle close
 candleStore.on('candleClosed', async (candle) => {
   if (candle.timeframe === 'M5' && WATCHED_SYMBOLS.includes(candle.symbol)) {
     await runPredictionPipeline(candle.symbol);
   }
 });
 
-// Timer trigger
 let pipelineTimer = null;
 function startPipelineTimer() {
   if (pipelineTimer) clearInterval(pipelineTimer);
@@ -768,7 +702,7 @@ function startPipelineTimer() {
 
 async function startCognitiveEngines() {
   try {
-    console.log('[CTOS] Cognitive engines active: Awareness, Regime, Decision, OTIE V6, StrategyRanker, PerformanceMonitor.');
+    console.log('[CTOS] Cognitive engines active: Awareness, Regime, Decision, OTIE, StrategyRanker, BotRunner, DigitAnalyzer.');
   } catch (err) {
     console.error('[CTOS] Initialization error:', err.message);
   }
@@ -803,23 +737,46 @@ async function startServer() {
     console.log(`📊 Dashboard:      http://localhost:${PORT}`);
     console.log(`🔌 API base:       http://localhost:${PORT}/api`);
     console.log(`🎯 Signals:        http://localhost:${PORT}/api/signal/active`);
+    console.log(`🤖 Bots:           http://localhost:${PORT}/api/bots`);
+    console.log(`🔢 Digits:         http://localhost:${PORT}/api/digit`);
     console.log(`📈 Strategies:     http://localhost:${PORT}/debug/strategies`);
     console.log(`🩺 Health:         http://localhost:${PORT}/health/pipeline`);
     console.log(`🔧 Debug:          http://localhost:${PORT}/debug/pipeline`);
-    console.log('🧠 CTOS + StrategyRanker: enabled');
+    console.log('🧠 CTOS + StrategyRanker + PatternPredictor: enabled');
+    console.log('🤖 Bot runner: ready');
     console.log('📦 Deriv broker: active');
     console.log('==============================================');
 
     startWSPing();
 
-    Promise.all([dataOrchestrator.recover(), stateStore.init()])
-      .then(() => console.log('✅ Data Orchestrator and State Store initialised.'))
-      .catch(err => console.warn('⚠️ Failed to initialise:', err.message));
+    dataOrchestrator.recover()
+      .then(() => console.log('✅ Data Orchestrator initialised.'))
+      .catch(err => console.warn('⚠️ Data Orchestrator recover failed:', err.message));
 
     setTimeout(startCognitiveEngines, 2000);
 
-    try { outcomeLabeler.startScheduler(); console.log('✅ Outcome labeler scheduler started.'); }
-    catch (err) { console.error('❌ Outcome labeler failed:', err.message); }
+    // Start digit analyzer
+    try {
+      digitAnalyzer.start();
+      digitAnalyzer.on('digitUpdate', (view) => broadcastToDashboards('digitUpdate', view));
+      digitAnalyzer.on('digitSignal', (sig) => broadcastToDashboards('digitSignal', sig));
+      console.log('✅ Digit analyzer started.');
+    } catch (err) {
+      console.error('❌ Digit analyzer failed:', err.message);
+    }
+
+    // Wire bot runner events
+    try {
+      botRunner.on('botStarted', (d) => broadcastToDashboards('botStarted', d));
+      botRunner.on('botStopped', (d) => broadcastToDashboards('botStopped', d));
+      botRunner.on('botEntry', (d) => broadcastToDashboards('botEntry', d));
+      botRunner.on('botResult', (d) => broadcastToDashboards('botResult', d));
+      botRunner.on('botCycle', (d) => broadcastToDashboards('botCycle', d));
+      botRunner.on('botError', (d) => broadcastToDashboards('botError', d));
+      console.log('✅ Bot runner wired to dashboards.');
+    } catch (err) {
+      console.error('❌ Bot runner wiring failed:', err.message);
+    }
 
     try { analyticsDashboard.start(); console.log('✅ Analytics dashboard started.'); }
     catch (err) { console.error('❌ Analytics dashboard failed:', err.message); }
@@ -866,6 +823,7 @@ async function startServer() {
       console.log(`   StrategyRanker:    ${_consensusCache.size > 0 ? '🟢 ' + _consensusCache.size + ' symbol(s)' : '🟡 waiting'}`);
       console.log(`   Predictions:       ${_predictionCache.size} symbol(s)`);
       console.log(`   Opportunities:     ${_opportunityCache.size} symbol(s)`);
+      console.log(`   Running bots:      ${botRunner.list().length}`);
       console.log(`   OTIE observers:    ${otie.observerCount || 0} contract(s)`);
       try { console.log(`   Market cache:      ${marketStateCache._cache.size} symbols`); } catch (_) {}
       console.log('==============================================');
@@ -876,11 +834,11 @@ async function startServer() {
     console.log(`\n🛑 Received ${signal}, shutting down gracefully...`);
     if (wsPingTimer) clearInterval(wsPingTimer);
     if (pipelineTimer) clearInterval(pipelineTimer);
+    try { botRunner.stopAll(); } catch (_) {}
     try {
       await dataOrchestrator.shutdown();
       if (otie && typeof otie.stop === 'function') otie.stop();
     } catch (err) { console.error('Shutdown error:', err.message); }
-    try { if (outcomeLabeler.stopScheduler) outcomeLabeler.stopScheduler(); } catch (_) {}
     try { if (analyticsDashboard.stop) analyticsDashboard.stop(); } catch (_) {}
     try { if (ranker.clearCache) ranker.clearCache(); } catch (_) {}
     try {
