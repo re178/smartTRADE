@@ -1,5 +1,6 @@
 // public/js/bots.js
 // Bot catalog, config form, running list, run receipts.
+// Event-driven (via window.onBotEvent from live.js) + 8s polling fallback.
 
 'use strict';
 
@@ -9,37 +10,57 @@
   let _running = [];
 
   async function fetchBots() {
+    const container = document.getElementById('botListContainer');
+    if (container) container.innerHTML = '<p class="text-muted">Loading bots...</p>';
+    console.log('[Bots] Fetching /api/bots...');
     try {
-      _bots = await (await fetch('/api/bots')).json();
+      const res = await fetch('/api/bots');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      _bots = await res.json();
+      if (!Array.isArray(_bots)) throw new Error('Expected array from /api/bots');
+      console.log('[Bots] ✓ Loaded ' + _bots.length + ' bots');
       renderBotList();
-    } catch (err) { console.warn('[Bots] fetch failed:', err.message); }
+    } catch (err) {
+      if (container) container.innerHTML = `<div class="alert alert-danger">Error loading bots: ${err.message}</div>`;
+      console.error('[Bots] fetch failed:', err);
+    }
   }
 
   async function fetchRunning() {
     try {
-      _running = await (await fetch('/api/bots/running')).json();
+      const res = await fetch('/api/bots/running');
+      if (!res.ok) return;
+      _running = await res.json();
+      if (!Array.isArray(_running)) _running = [];
       renderRunningBots();
       const el = document.getElementById('runningBotCount');
       if (el) el.textContent = _running.length;
-    } catch (err) { console.warn('[Bots] running failed:', err.message); }
+    } catch (err) {
+      console.warn('[Bots] running failed:', err.message);
+    }
   }
 
   async function fetchRuns() {
+    if (_bots.length === 0) return;
     try {
       const all = [];
       for (const bot of _bots) {
-        const runs = await (await fetch(`/api/bots/${bot.id}/runs?limit=10`)).json();
-        if (Array.isArray(runs)) all.push(...runs);
+        try {
+          const runs = await (await fetch(`/api/bots/${bot.id}/runs?limit=10`)).json();
+          if (Array.isArray(runs)) all.push(...runs);
+        } catch (_) {}
       }
       all.sort((a, b) => new Date(b.openedAt) - new Date(a.openedAt));
       renderRuns(all.slice(0, 50));
-    } catch (err) { console.warn('[Bots] runs failed:', err.message); }
+    } catch (err) {
+      console.warn('[Bots] runs failed:', err.message);
+    }
   }
 
   function renderBotList() {
     const container = document.getElementById('botListContainer');
     if (!container) return;
-    if (_bots.length === 0) { container.innerHTML = '<p class="text-muted">No bots</p>'; return; }
+    if (_bots.length === 0) { container.innerHTML = '<p class="text-muted">No bots available</p>'; return; }
 
     const groups = {
       fx: { label: 'FX Multiplier Bots', color: '#1a73e8', bots: [] },
@@ -79,16 +100,18 @@
 
   function selectBot(botId) {
     _selectedBot = _bots.find(b => b.id === botId);
-    if (!_selectedBot) return;
+    if (!_selectedBot) { alert('Bot not found'); return; }
+    
     const form = document.getElementById('botStartForm');
     const name = document.getElementById('botStartName');
     const fields = document.getElementById('botConfigFields');
+    
     if (name) name.textContent = `${_selectedBot.name} (${_selectedBot.assetClass})`;
 
     if (fields) {
-      fields.innerHTML = Object.entries(_selectedBot.defaultConfig).map(([key, val]) => {
+      fields.innerHTML = Object.entries(_selectedBot.defaultConfig || {}).map(([key, val]) => {
         const isNum = typeof val === 'number';
-        return `<div class="col-md-4">
+        return `<div class="col-6 col-md-4">
           <label class="form-label small">${key}</label>
           <input class="form-control form-control-sm" name="${key}"
                  value="${val}" type="${isNum ? 'number' : 'text'}"
@@ -103,9 +126,11 @@
     const container = document.getElementById('runningBotsContainer');
     if (!container) return;
     if (_running.length === 0) { container.innerHTML = '<p class="text-muted">No bots running.</p>'; return; }
+    
     container.innerHTML = _running.map(inst => {
-      const s = inst.stats;
+      const s = inst.stats || { runs: 0, entries: 0, wins: 0, losses: 0, pnl: 0 };
       const pnlClass = s.pnl >= 0 ? 'text-success' : 'text-danger';
+      
       return `<div class="card mb-2" style="border-left:3px solid #00b894;">
         <div class="card-body p-3">
           <div class="d-flex justify-content-between align-items-start">
@@ -126,6 +151,7 @@
         </div>
       </div>`;
     }).join('');
+    
     container.querySelectorAll('button[data-stop]').forEach(btn => {
       btn.addEventListener('click', async () => {
         if (!confirm('Stop this bot? Open positions remain under OTIE management.')) return;
@@ -138,12 +164,14 @@
   function renderRuns(runs) {
     const container = document.getElementById('botRunsContainer');
     if (!container) return;
-    if (!runs || runs.length === 0) { container.innerHTML = '<p class="text-muted">No runs yet.</p>'; return; }
+    if (!runs || runs.length === 0) { container.innerHTML = '<p class="text-muted p-3">No runs yet.</p>'; return; }
+    
     const rows = runs.map(r => {
       const pnlClass = r.pnl >= 0 ? 'text-success' : 'text-danger';
       const badge = r.result === 'WIN' ? '<span class="badge bg-success">WIN</span>'
                   : r.result === 'LOSS' ? '<span class="badge bg-danger">LOSS</span>'
                   : `<span class="badge bg-warning">${r.status || 'OPEN'}</span>`;
+                  
       return `<tr>
         <td>${new Date(r.openedAt).toLocaleString()}</td>
         <td><strong>${r.botId}</strong></td>
@@ -156,6 +184,8 @@
         <td>${badge}</td>
       </tr>`;
     }).join('');
+    
+    // Wrapped in table-responsive for mobile scrolling
     container.innerHTML = `<div class="table-responsive" style="max-height:400px;">
       <table class="table table-sm table-striped mb-0">
         <thead style="position:sticky; top:0; background:#fff;">
@@ -171,15 +201,18 @@
     if (!_selectedBot) return;
     const form = document.getElementById('botConfigForm');
     const config = {};
+    
     form.querySelectorAll('input[name]').forEach(f => {
       config[f.name] = isNaN(Number(f.value)) || f.value === '' ? f.value : Number(f.value);
     });
+    
     const res = await fetch(`/api/bots/${_selectedBot.id}/start`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(config),
     });
     const data = await res.json();
+    
     if (data.success) {
       document.getElementById('botStartForm').style.display = 'none';
       _selectedBot = null;
@@ -196,6 +229,7 @@
     fetchBots();
     fetchRunning();
     fetchRuns();
+    
     setInterval(() => {
       if (document.getElementById('section-bots')?.style.display !== 'none') fetchRunning();
     }, 8000);
@@ -204,10 +238,12 @@
       e.preventDefault();
       startSelectedBot();
     });
+    
     document.getElementById('cancelBotStart')?.addEventListener('click', () => {
       document.getElementById('botStartForm').style.display = 'none';
       _selectedBot = null;
     });
+    
     document.getElementById('stopAllBots')?.addEventListener('click', async () => {
       if (!confirm('Stop all running bots?')) return;
       await fetch('/api/bots/stop-all', { method: 'POST' });
