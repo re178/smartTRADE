@@ -1,5 +1,6 @@
 // public/js/digits.js
 // Renders: big number + arrow, digit frequency bars, Even/Odd, Rise/Fall.
+// Handles the dedicated analysis panels and fetches initial state.
 
 'use strict';
 
@@ -9,6 +10,7 @@
   window.onDigitUpdate = function (data) {
     if (!data) return;
 
+    // ---- Main Digit Panel (Big Number, Arrow, Bars) ----
     if (data.symbol === currentDigitSymbol) {
       const cur = document.getElementById('digitCurrent');
       const prev = document.getElementById('digitPrevious');
@@ -25,20 +27,22 @@
         else { arrow.textContent = '·'; arrow.style.color = '#94a3b8'; }
       }
 
+      // Digit Frequency Bars
       const bars = document.getElementById('digitFrequencyBars');
       if (bars && data.digitFreqPct) {
         const max = Math.max.apply(null, data.digitFreqPct.concat([1]));
         bars.innerHTML = data.digitFreqPct.map((pct, digit) => {
-          const height = Math.round((pct / max) * 140);
+          const height = Math.round((pct / max) * 100); // Max height 100px
           const color = digit % 2 === 0 ? '#00b894' : '#e74c5e';
           return `<div style="flex:1; display:flex; flex-direction:column; align-items:center;">
-            <div style="background:${color}; width:100%; height:${height}px; border-radius:3px 3px 0 0;"></div>
-            <div style="font-weight:700; margin-top:4px;">${digit}</div>
-            <div class="text-muted" style="font-size:0.7em;">${pct.toFixed(1)}%</div>
+            <div style="background:${color}; width:100%; height:${height}px; border-radius:3px 3px 0 0; min-height:2px;"></div>
+            <div style="font-weight:700; margin-top:4px; font-size:0.7rem;">${digit}</div>
+            <div class="text-muted" style="font-size:0.6rem;">${pct.toFixed(0)}%</div>
           </div>`;
         }).join('');
       }
 
+      // Mini Even/Odd panel (inside Digit Stream section)
       const eo = document.getElementById('digitEvenOdd');
       if (eo) {
         const ePct = data.evenPct || 0;
@@ -53,6 +57,7 @@
           <div class="small text-muted mt-2">Streak: ${data.currentParity || '—'} (${data.evenStreak || data.oddStreak || 0})</div>`;
       }
 
+      // Mini Rise/Fall panel (inside Digit Stream section)
       const rf = document.getElementById('digitRiseFall');
       if (rf) {
         const rPct = data.risePct || 0;
@@ -68,39 +73,50 @@
       }
     }
 
+    // ---- Dedicated Rise/Fall Analysis Section ----
     const rfSym = document.getElementById('rfSymbolSelect')?.value;
     if (rfSym && data.symbol === rfSym) {
       const panel = document.getElementById('riseFallPanel');
-      if (panel) panel.innerHTML = `
-        <div class="row text-center">
-          <div class="col-4"><div class="stat-value text-success">${(data.risePct||0).toFixed(1)}%</div><div class="small">Rise</div></div>
-          <div class="col-4"><div class="stat-value text-danger">${(data.fallPct||0).toFixed(1)}%</div><div class="small">Fall</div></div>
-          <div class="col-4"><div class="stat-value text-muted">${(data.flatPct||0).toFixed(1)}%</div><div class="small">Flat</div></div>
-        </div>
-        <div class="mt-3 small text-muted">Samples: ${data.sampleSize || 0}</div>`;
+      if (panel) {
+        panel.innerHTML = `
+          <div class="row text-center">
+            <div class="col-4"><div class="stat-value text-success">${(data.risePct||0).toFixed(1)}%</div><div class="small">Rise</div></div>
+            <div class="col-4"><div class="stat-value text-danger">${(data.fallPct||0).toFixed(1)}%</div><div class="small">Fall</div></div>
+            <div class="col-4"><div class="stat-value text-muted">${(data.flatPct||0).toFixed(1)}%</div><div class="small">Flat</div></div>
+          </div>
+          <div class="mt-3 small text-muted text-center">Samples: ${data.sampleSize || 0}</div>`;
+      }
     }
 
+    // ---- Dedicated Even/Odd Analysis Section ----
     const eoSym = document.getElementById('eoSymbolSelect')?.value;
     if (eoSym && data.symbol === eoSym) {
       const panel = document.getElementById('evenOddPanel');
-      if (panel) panel.innerHTML = `
-        <div class="row text-center">
-          <div class="col-6"><div class="stat-value text-success">${(data.evenPct||0).toFixed(1)}%</div><div class="small">Even</div></div>
-          <div class="col-6"><div class="stat-value text-danger">${(data.oddPct||0).toFixed(1)}%</div><div class="small">Odd</div></div>
-        </div>
-        <div class="mt-3 small text-muted">Samples: ${data.sampleSize || 0}</div>`;
+      if (panel) {
+        panel.innerHTML = `
+          <div class="row text-center">
+            <div class="col-6"><div class="stat-value text-success">${(data.evenPct||0).toFixed(1)}%</div><div class="small">Even</div></div>
+            <div class="col-6"><div class="stat-value text-danger">${(data.oddPct||0).toFixed(1)}%</div><div class="small">Odd</div></div>
+          </div>
+          <div class="mt-3 small text-muted text-center">Samples: ${data.sampleSize || 0}</div>`;
+      }
     }
   };
 
   document.addEventListener('DOMContentLoaded', function () {
+    // Handle dropdown change in the Digit Stream section
     const sel = document.getElementById('digitSymbolSelect');
-    if (sel) sel.addEventListener('change', e => {
-      currentDigitSymbol = e.target.value;
-      fetch(`/api/digit/${currentDigitSymbol}`)
-        .then(r => r.json())
-        .then(d => window.onDigitUpdate(d))
-        .catch(() => {});
-    });
+    if (sel) {
+      sel.addEventListener('change', e => {
+        currentDigitSymbol = e.target.value;
+        fetch(`/api/digit/${currentDigitSymbol}`)
+          .then(r => r.json())
+          .then(d => window.onDigitUpdate(d))
+          .catch(() => {});
+      });
+    }
+    
+    // Initial fetch on page load
     fetch(`/api/digit/${currentDigitSymbol}`)
       .then(r => r.json())
       .then(d => window.onDigitUpdate(d))
