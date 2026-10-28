@@ -1,6 +1,5 @@
-// public/js/app.js
-// Core dashboard state + render functions for positions, account, history,
-// OTIE panel, and the Live Signal Engine.
+// public/js/app.js – Dashboard logic
+// Renders all widgets. Live updates come from live.js.
 
 'use strict';
 
@@ -11,9 +10,7 @@ let historyPage = 1;
 let historyTotalPages = 1;
 let _activeSignalFetchInFlight = false;
 
-// ================================================================
-// Sound
-// ================================================================
+// ---- Sound Manager ----
 const SoundManager = {
   _ctx: null,
   _init() { if (!this._ctx) this._ctx = new (window.AudioContext || window.webkitAudioContext)(); },
@@ -30,19 +27,34 @@ const SoundManager = {
   signal() { this._playTone(800, 0.2, 'sine', 0.4); },
   tradeOpen() { this._playTone(600, 0.15, 'sine', 0.4); setTimeout(() => this._playTone(900, 0.2, 'sine', 0.4), 150); },
   tradeClose() { this._playTone(900, 0.15, 'sine', 0.4); setTimeout(() => this._playTone(600, 0.2, 'sine', 0.4), 150); },
-  danger() { this._playTone(150, 0.3, 'sawtooth', 0.3); setTimeout(() => this._playTone(150, 0.3, 'sawtooth', 0.3), 300); },
+  danger() { this._playTone(150, 0.3, 'sawtooth', 0.3); setTimeout(() => this._playTone(150, 0.3, 'sawtooth', 0.3), 300); setTimeout(() => this._playTone(150, 0.3, 'sawtooth', 0.3), 600); },
   reject() { this._playTone(300, 0.3, 'square', 0.2); setTimeout(() => this._playTone(200, 0.4, 'square', 0.2), 350); }
 };
 
-// ================================================================
-// Helpers
-// ================================================================
+// ---- API helpers ----
 async function fetchJson(url, options = {}) {
   const res = await fetch((CONFIG.API_BASE || '') + url, {
-    headers: { 'Content-Type': 'application/json' }, ...options
+    headers: { 'Content-Type': 'application/json' },
+    ...options
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
   return res.json();
+}
+
+async function placeOrderFetch(url, body) {
+  let res;
+  try {
+    res = await fetch((CONFIG.API_BASE || '') + url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } catch (networkErr) {
+    return { httpStatus: 0, body: { success: false, status: 'NETWORK_ERROR', error: networkErr.message, canRetry: false } };
+  }
+  let payload = {};
+  try { payload = await res.json(); } catch (_) { payload = {}; }
+  return { httpStatus: res.status, body: payload };
 }
 
 function formatPrice(p) {
@@ -63,7 +75,7 @@ function symbolToDisplay(sym) {
 }
 
 // ================================================================
-// State
+// 1. STATE STORE
 // ================================================================
 const dashboardState = {
   account: null,
@@ -71,18 +83,22 @@ const dashboardState = {
   prices: {},
   history: [],
   pendingOrders: [],
+  liveSignal: null,
   regime: null,
   awareness: null,
   metrics: null,
   fusion: null,
+  otieDecisions: [],
+  otieActions: [],
   otieStates: {},
+  belief: null,
+  prediction: null,
+  opportunity: null,
   contractStates: {},
   lastContractUpdateAt: null,
   strategyConsensus: {},
   signalOpportunities: {},
   signalPredictions: {},
-  runningBots: [],
-  digitViews: {},
 };
 
 function updateDashboardState(newState) {
@@ -96,17 +112,38 @@ function renderAllWidgets() {
   renderPriceWidgets();
   renderStatsWidget();
   renderHistoryWidget();
+  renderPendingOrdersWidget();
   renderRegimeWidget();
   renderAwarenessWidget();
   renderMetricsWidget();
+  renderFusionWidget();
+  renderBeliefWidget();
+  renderPredictionWidget();
+  renderOpportunityWidget();
   renderLiveMonitorStatus();
   renderOTIEPanel();
   renderLiveSignalPanel();
 }
 
-// ================================================================
-// Account
-// ================================================================
+function renderLiveMonitorStatus() {
+  const el = document.getElementById('liveMonitorStatus');
+  if (!el) return;
+  const now = Date.now();
+  const last = dashboardState.lastContractUpdateAt;
+  const count = Object.keys(dashboardState.contractStates || {}).length;
+  if (!last) {
+    el.textContent = count > 0 ? `${count} contract(s) tracked — waiting for first live tick` : 'Live monitoring idle (no open contracts)';
+    el.className = 'small text-muted';
+    return;
+  }
+  const ageSec = Math.round((now - last) / 1000);
+  const label = `${count} contract(s) · last live tick ${ageSec}s ago`;
+  if (ageSec < 10) { el.textContent = label; el.className = 'small text-success'; }
+  else if (ageSec < 60) { el.textContent = label; el.className = 'small text-warning'; }
+  else { el.textContent = `${label} — stream may have stalled`; el.className = 'small text-danger'; }
+}
+setInterval(renderLiveMonitorStatus, 5000);
+
 function renderAccountWidget() {
   const acc = dashboardState.account;
   if (!acc) return;
@@ -120,9 +157,6 @@ function renderAccountWidget() {
   if (window.updateAccountBadge) window.updateAccountBadge(acc);
 }
 
-// ================================================================
-// Positions — close button always shown unless CLOSED
-// ================================================================
 function renderPositionsWidget() {
   const positions = dashboardState.positions || [];
   const badge = document.getElementById('positionCount');
@@ -134,15 +168,17 @@ function renderPositionsWidget() {
   const stPL = document.getElementById('statOpenPL');
 
   if (positions.length === 0) {
-    container.innerHTML = '<p class="text-muted">No open trades.</p>';
+    container.innerHTML = '<p class="text-muted p-3">No open trades.</p>';
     if (stOpen) stOpen.textContent = '0';
     if (stPL) stPL.textContent = '—';
     return;
   }
 
-  let html = `<table class="table table-striped"><thead><tr>
-    <th>ID</th><th>Pair</th><th>Side</th><th>Entry</th><th>Current</th>
-    <th>Stake</th><th>P/L</th><th>OTIE</th><th>Status</th><th>Action</th>
+  // RESPONSIVE FIX: wrapped in table-responsive so it scrolls on mobile
+  let html = `<div class="table-responsive"><table class="table table-striped mb-0"><thead><tr>
+    <th>ID</th><th>Pair</th><th>Side</th><th>Entry</th><th>Paid</th>
+    <th>Current</th><th>Units</th><th>P/L</th>
+    <th>OTIE</th><th>Status</th><th>Action</th>
   </tr></thead><tbody>`;
   let totalPL = 0;
 
@@ -153,7 +189,7 @@ function renderPositionsWidget() {
     const live = dashboardState.contractStates[cid];
     const otie = dashboardState.otieStates[cid];
     const status = live?.status || t.status || 'OPEN';
-    const canClose = status !== 'CLOSED';
+    const canClose = status !== 'CLOSED'; // Always show close button unless explicitly CLOSED
     const plClass = pl > 0 ? 'text-success' : pl < 0 ? 'text-danger' : 'text-muted';
 
     let otieCell = '<span class="text-muted small">—</span>';
@@ -161,27 +197,34 @@ function renderPositionsWidget() {
       const actionBadge = otie.action === 'CLOSE'
         ? '<span class="badge bg-danger">CLOSE</span>'
         : '<span class="badge bg-success">HOLD</span>';
-      otieCell = `${actionBadge} <div class="small text-muted">peak ${Number(otie.peak||0).toFixed(2)}$</div>`;
+      const peakStr = Number(otie.peak || 0).toFixed(2);
+      const ddStr = (Number(otie.drawdownPct || 0) * 100).toFixed(0);
+      const ddClass = Number(otie.drawdownPct) > 0.30 ? 'text-danger' : 'text-muted';
+      otieCell = `${actionBadge}
+        <div class="${ddClass}" style="font-size:0.7em; line-height:1.1; margin-top:2px;">
+          peak ${peakStr}$<br>dd ${ddStr}%
+        </div>`;
     }
 
     html += `<tr>
-      <td style="font-family:monospace; font-size:0.85em;">${cid}</td>
+      <td style="font-family:monospace; font-size:0.85em;">${t.id ?? t.contractId ?? '—'}</td>
       <td>${t.instrument ?? '—'}</td>
       <td><span class="badge ${t.side === 'BUY' ? 'bg-success' : t.side === 'SELL' ? 'bg-danger' : 'bg-secondary'}">${t.side ?? '—'}</span></td>
       <td>${formatPrice(t.entryPrice ?? t.price)}</td>
+      <td>${formatPrice(t.purchasePrice)}</td>
       <td>${formatPrice(t.currentPrice)}</td>
-      <td>$${Number(t.units || t.stake || 0).toFixed(2)}</td>
-      <td class="${plClass}">${pl.toFixed(2)}</td>
+      <td>${t.units ?? '—'}</td>
+      <td class="${plClass} fw-bold">${pl.toFixed(2)}</td>
       <td>${otieCell}</td>
       <td><span class="badge ${status === 'OPEN' ? 'bg-primary' : 'bg-secondary'}">${status}</span></td>
       <td>${canClose
-        ? `<button class="btn btn-sm btn-danger" onclick="window.closeTrade('${cid}')"><i class="fas fa-times"></i></button>`
-        : '<span class="small text-muted">—</span>'}</td>
+        ? `<button class="btn btn-sm btn-danger" onclick="window.closeTrade('${cid}')"><i class="fas fa-times"></i> Close</button>`
+        : '<span class="small text-muted">settling…</span>'}</td>
     </tr>`;
   }
-  html += `<tr><td colspan="6"><strong>Total Unrealized P&L</strong></td>
-           <td class="${totalPL > 0 ? 'text-success' : totalPL < 0 ? 'text-danger' : ''}"><strong>${totalPL.toFixed(2)}</strong></td>
-           <td colspan="3"></td></tr></tbody></table>`;
+  html += `<tr><td colspan="7"><strong>Total Unrealized P&L</strong></td>
+           <td class="${totalPL > 0 ? 'text-success' : totalPL < 0 ? 'text-danger' : ''} fw-bold"><strong>${totalPL.toFixed(2)}</strong></td>
+           <td colspan="3"></td></tr></tbody></table></div>`;
   container.innerHTML = html;
 
   if (stOpen) stOpen.textContent = positions.length;
@@ -189,11 +232,9 @@ function renderPositionsWidget() {
     stPL.textContent = (totalPL >= 0 ? '+' : '') + totalPL.toFixed(2);
     stPL.className = `stat-change ${totalPL >= 0 ? 'positive' : 'negative'}`;
   }
+  if (window.updatePositionBadge) window.updatePositionBadge(positions.length);
 }
 
-// ================================================================
-// Prices
-// ================================================================
 function renderPriceWidgets() {
   const priceInfo = document.getElementById('priceInfo');
   if (!priceInfo) return;
@@ -205,17 +246,12 @@ function renderPriceWidgets() {
   }
   let html = '';
   for (const [symbol, d] of Object.entries(prices)) {
-    const bid = d.bid || 0, ask = d.ask || 0;
-    let mid = d.mid;
-    if (!mid || mid <= 0) mid = (bid + ask) / 2;
-    html += `<div class="d-flex justify-content-between"><span>${symbolToDisplay(symbol)}</span><span><strong>${formatPrice(mid)}</strong> (B:${formatPrice(bid)} A:${formatPrice(ask)})</span></div>`;
+    const bid = d.bid || 0, ask = d.ask || 0, mid = (bid + ask) / 2;
+    html += `<div class="d-flex justify-content-between mb-2"><span>${symbolToDisplay(symbol)}</span><span><strong>${formatPrice(mid)}</strong> <small class="text-muted">(Bid ${formatPrice(bid)} / Ask ${formatPrice(ask)})</small></span></div>`;
   }
   priceInfo.innerHTML = html;
 }
 
-// ================================================================
-// Stats
-// ================================================================
 function renderStatsWidget() {
   const history = dashboardState.history || [];
   const wr = document.getElementById('statWinRate');
@@ -226,17 +262,364 @@ function renderStatsWidget() {
     return;
   }
   const wins = history.filter(t => t.pnl > 0).length;
-  if (wr) wr.textContent = ((wins / history.length) * 100).toFixed(1) + '%';
+  const winRate = (wins / history.length) * 100;
+  if (wr) wr.textContent = winRate.toFixed(1) + '%';
   const tw = history.filter(t => t.pnl > 0).reduce((s, t) => s + t.pnl, 0);
   const tl = history.filter(t => t.pnl < 0).reduce((s, t) => s + Math.abs(t.pnl), 0);
   const factor = tl > 0 ? tw / tl : (tw > 0 ? Infinity : 0);
   if (pf) pf.textContent = `PF: ${factor === Infinity ? '∞' : factor.toFixed(2)}`;
 }
 
-// ================================================================
-// History
-// ================================================================
 function renderHistoryWidget() { renderHistoryTable(); }
+
+function renderPendingOrdersWidget() {
+  const orders = dashboardState.pendingOrders || [];
+  const container = document.getElementById('pendingOrdersContainer');
+  if (!container) return;
+  if (orders.length === 0) { container.innerHTML = '<p class="text-muted">No pending orders.</p>'; return; }
+  let html = `<div class="table-responsive"><table class="table table-striped mb-0"><thead><tr>
+    <th>ID</th><th>Pair</th><th>Side</th><th>Entry</th><th>Lot</th><th>Status</th><th>Action</th>
+  </tr></thead><tbody>`;
+  orders.forEach(o => {
+    html += `<tr>
+      <td>${o.contractId || o.clientOrderId || 'N/A'}</td>
+      <td>${o.instrument}</td>
+      <td><span class="badge ${o.side === 'BUY' ? 'bg-success' : 'bg-danger'}">${o.side}</span></td>
+      <td>${o.entryPrice || '-'}</td>
+      <td>${o.units}</td>
+      <td><span class="badge bg-warning">${o.status}</span></td>
+      <td><button class="btn btn-sm btn-danger" onclick="window.cancelPending('${o.contractId || o.clientOrderId}')">Cancel</button></td>
+    </tr>`;
+  });
+  html += '</tbody></table></div>';
+  container.innerHTML = html;
+}
+
+function renderRegimeWidget() {
+  const r = dashboardState.regime;
+  const panel = document.getElementById('regimePanel');
+  if (!panel) return;
+  if (!r) { panel.innerHTML = '<p class="text-muted">Waiting for regime data...</p>'; return; }
+  panel.innerHTML = `<h6 class="card-title mb-2">Current Regime</h6>
+    <p class="card-text mb-1"><strong>${r.name}</strong> (${r.confidence}%)</p>
+    <p class="small mb-1">${r.description || ''}</p>
+    <p class="small text-muted mb-0">${r.symbol} | ${new Date(r.timestamp).toLocaleString()}</p>`;
+}
+
+function renderAwarenessWidget() {
+  const a = dashboardState.awareness;
+  const panel = document.getElementById('awarenessPanel');
+  if (!panel) return;
+  if (!a) { panel.innerHTML = '<p class="text-muted">Waiting for market awareness...</p>'; return; }
+  panel.innerHTML = `<h6 class="card-title mb-2">Market Awareness (${a.symbol})</h6>
+    <p class="small mb-1">Spread: ${(a.spread || 0).toFixed(5)} | Velocity: ${(a.velocity || 0).toFixed(6)}</p>
+    <p class="small mb-1">Acceleration: ${(a.acceleration || 0).toFixed(6)} | Liquidity: ${((a.liquidity || 0) * 100).toFixed(0)}%</p>
+    <p class="small mb-1">Unusual: ${a.unusualEvents ? a.unusualEvents.join(', ') : (a.unusual ? a.unusual.join(', ') : 'None')}</p>
+    <p class="small text-muted mb-0">${new Date(a.lastUpdated).toLocaleString()}</p>`;
+}
+
+function renderMetricsWidget() {
+  const m = dashboardState.metrics;
+  const panel = document.getElementById('metricsPanel');
+  if (!panel) return;
+  if (!m) { panel.innerHTML = '<p class="text-muted">Waiting for metrics...</p>'; return; }
+  panel.innerHTML = `<h6 class="card-title mb-2">Live Performance</h6>
+    <div class="row small">
+      <div class="col-6 mb-1">Win Rate: ${((m.winRate || 0) * 100).toFixed(1)}%</div>
+      <div class="col-6 mb-1">Profit Factor: ${(m.profitFactor || 0).toFixed(2)}</div>
+      <div class="col-6 mb-1">Sharpe: ${(m.sharpe || 0).toFixed(2)}</div>
+      <div class="col-6 mb-1">Max DD: ${((m.maxDrawdown || 0) * 100).toFixed(1)}%</div>
+      <div class="col-6 mb-1">Expectancy: ${(m.expectancy || 0).toFixed(2)}</div>
+      <div class="col-6 mb-1">Trades: ${m.totalTrades || 0}</div>
+      <div class="col-6 mb-1">Daily P&L: ${(m.dailyPnL || 0).toFixed(2)}</div>
+      <div class="col-6 mb-1">Current DD: ${((m.currentDrawdown || 0) * 100).toFixed(1)}%</div>
+    </div>
+    <p class="small text-muted mt-2 mb-0">${m.timestamp ? new Date(m.timestamp).toLocaleString() : ''}</p>`;
+}
+
+function renderFusionWidget() {
+  const f = dashboardState.fusion;
+  const panel = document.getElementById('fusionPanel');
+  if (!panel) return;
+  if (!f) { panel.innerHTML = '<p class="text-muted">Waiting for timeframe assessments...</p>'; return; }
+  const vc = f.verdict === 'bullish' ? 'success' : (f.verdict === 'bearish' ? 'danger' : 'secondary');
+  const icon = f.verdict === 'bullish' ? '📈' : (f.verdict === 'bearish' ? '📉' : '➖');
+  panel.innerHTML = `<div class="row">
+    <div class="col-md-6">
+      <h6>${icon} ${f.symbol} – <span class="text-${vc}">${f.verdict.toUpperCase()}</span> (${f.confidence}%)</h6>
+      <p class="small mb-1">Agreement: ${f.agreement}% across ${f.timeframeCount} timeframes</p>
+      <ul class="list-inline small">
+        <li class="list-inline-item"><span class="badge bg-success">Bull ${f.timeframeBreakdown.bullish}</span></li>
+        <li class="list-inline-item"><span class="badge bg-danger">Bear ${f.timeframeBreakdown.bearish}</span></li>
+        <li class="list-inline-item"><span class="badge bg-secondary">Neutral ${f.timeframeBreakdown.neutral}</span></li>
+      </ul>
+      <p class="small mb-0">Session: ${f.session.name} (×${f.session.liquidityMultiplier})</p>
+    </div>
+    <div class="col-md-6">
+      <p class="small mb-1"><strong>Reasons</strong></p>
+      <ul class="small mb-0" style="padding-left: 1rem;">${f.reasons.map(r => `<li>${r}</li>`).join('') || '<li>No detailed reasons</li>'}</ul>
+    </div>
+  </div>`;
+}
+
+function renderBeliefWidget() {
+  const b = dashboardState.belief;
+  const panel = document.getElementById('beliefPanel');
+  if (!panel) return;
+  if (!b) { panel.innerHTML = '<p class="text-muted">No belief data.</p>'; return; }
+  const tc = b.belief === 'bullish' ? 'text-success' : b.belief === 'bearish' ? 'text-danger' : 'text-secondary';
+  panel.innerHTML = `<h6 class="card-title mb-2">Market Belief</h6>
+    <p class="${tc} mb-1" style="font-size:1.1rem; font-weight:bold;">${b.belief.toUpperCase()} (${b.beliefConfidence || 50}%)</p>
+    <p class="small mb-1">Edge: ${b.edge?.toFixed(3) || 0} R | P(win): ${(b.winProbability * 100).toFixed(1)}%</p>
+    <p class="small mb-0">Similarity: ${b.similarityCount || 0} | Quality: ${b.marketQuality || 50}/100</p>`;
+}
+
+function renderPredictionWidget() {
+  const p = dashboardState.prediction;
+  const panel = document.getElementById('predictionPanel');
+  if (!panel) return;
+  if (!p) { panel.innerHTML = '<p class="text-muted">Waiting for prediction data...</p>'; return; }
+  const up = (p.probabilities?.up || 0) * 100;
+  const down = (p.probabilities?.down || 0) * 100;
+  const neu = (p.probabilities?.neutral || 0) * 100;
+  const srcBadge = p.source ? `<span class="badge bg-${p.source === 'combined' ? 'success' : p.source === 'strategy' ? 'info' : 'secondary'} ms-2">${p.source}</span>` : '';
+  panel.innerHTML = `<div class="row">
+    <div class="col-md-8">
+      <div class="prediction-bar mb-2" style="display:flex; gap:16px;">
+        <div class="prob-block prob-up"><div class="value text-success" style="font-size:1.3rem;font-weight:bold;">${up.toFixed(0)}%</div><div class="label small text-muted">UP</div></div>
+        <div class="prob-block prob-down"><div class="value text-danger" style="font-size:1.3rem;font-weight:bold;">${down.toFixed(0)}%</div><div class="label small text-muted">DOWN</div></div>
+        <div class="prob-block prob-neutral"><div class="value text-warning" style="font-size:1.3rem;font-weight:bold;">${neu.toFixed(0)}%</div><div class="label small text-muted">NEUTRAL</div></div>
+        <div style="margin-left:auto; text-align:right;">
+          <div class="small">Confidence: <strong>${p.calibratedConfidence || 0}%</strong>${srcBadge}</div>
+          <div class="small">Direction: <strong>${p.direction || '—'}</strong></div>
+        </div>
+      </div>
+      <div class="small mb-1">Expected: <strong>${((p.expectedMove || 0) * 10000).toFixed(1)} pips</strong> | Fav: ${((p.expectedFavorable || 0) * 10000).toFixed(1)} | Adv: ${((p.expectedAdverse || 0) * 10000).toFixed(1)}</div>
+      <div class="small text-muted">Sample: ${p.sampleSize || 0} · Effective: ${(p.effectiveSampleSize || 0).toFixed(1)} · Mode: ${p.modeLabel || '—'}</div>
+    </div>
+  </div>`;
+}
+
+function renderOpportunityWidget() {
+  const o = dashboardState.opportunity;
+  const panel = document.getElementById('opportunityPanel');
+  if (!panel) return;
+  if (!o) { panel.innerHTML = '<p class="text-muted">Waiting for opportunity data...</p>'; return; }
+  if (!o.tradable) {
+    panel.innerHTML = `<div class="alert alert-danger mb-0">
+      <h6 class="mb-1"><i class="fas fa-times-circle"></i> NO TRADE</h6>
+      <p class="mb-0 small">${o.reason || 'Does not meet criteria'}</p>
+    </div>`;
+    return;
+  }
+  panel.innerHTML = `<div class="alert alert-success mb-0">
+    <h6 class="mb-1"><i class="fas fa-check-circle"></i> TRADE OPPORTUNITY (${o.source || 'analogue'})</h6>
+    <p class="mb-1 small"><strong>${o.direction}</strong> | Stake: $${(o.stake || 0).toFixed(2)} | Mult: ${o.multiplier}x | Dur: ${o.duration}s</p>
+    <p class="mb-1 small">Entry: ${formatPrice(o.entryPrice)} | KO: ${formatPrice(o.knockoutLevel)} | TP: ${formatPrice(o.takeProfitLevel)}</p>
+    <p class="mb-0 small">EV: $${(o.tradeEconomics?.ev || 0).toFixed(2)} | P(TP): ${((o.tradeEconomics?.probTP || 0) * 100).toFixed(0)}% | P(SL): ${((o.tradeEconomics?.probSL || 0) * 100).toFixed(0)}%</p>
+  </div>`;
+}
+
+// ================================================================
+// Live Signal Engine panel
+// ================================================================
+window.onStrategyConsensus = function (payload) {
+  if (!payload || !payload.symbol) return;
+  const sym = formatSymbol(payload.symbol);
+  if (!dashboardState.strategyConsensus) dashboardState.strategyConsensus = {};
+  dashboardState.strategyConsensus[sym] = payload;
+  renderLiveSignalPanel();
+};
+
+window.onOpportunityUpdate = function (payload) {
+  if (!payload || !payload.prediction?.symbol) return;
+  const sym = formatSymbol(payload.prediction.symbol);
+  if (!dashboardState.signalOpportunities) dashboardState.signalOpportunities = {};
+  dashboardState.signalOpportunities[sym] = payload;
+  if (payload.prediction) {
+    if (!dashboardState.signalPredictions) dashboardState.signalPredictions = {};
+    dashboardState.signalPredictions[sym] = payload.prediction;
+  }
+  renderLiveSignalPanel();
+};
+
+window.onPredictionUpdate = function (payload) {
+  if (!payload || !payload.symbol) return;
+  const sym = formatSymbol(payload.symbol);
+  if (!dashboardState.signalPredictions) dashboardState.signalPredictions = {};
+  dashboardState.signalPredictions[sym] = payload;
+};
+
+function buildSignalView(symbol) {
+  const sym = formatSymbol(symbol);
+  const consensus = dashboardState.strategyConsensus[sym] || null;
+  const prediction = dashboardState.signalPredictions[sym] || null;
+  const opportunity = dashboardState.signalOpportunities[sym] || null;
+  return { sym, consensus, prediction, opportunity };
+}
+
+function renderLiveSignalPanel() {
+  const container = document.getElementById('liveSignalEngineContent');
+  if (!container) return;
+
+  const symbols = (window.WATCHED_SYMBOLS || ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD']).map(s => formatSymbol(s));
+
+  const headerBadge = document.getElementById('liveSignalEngineBadge');
+  if (headerBadge) {
+    const ready = symbols.filter(s => { const c = dashboardState.strategyConsensus[s]; const o = dashboardState.signalOpportunities[s]; return c && o && o.tradable; }).length;
+    const active = symbols.filter(s => dashboardState.strategyConsensus[s]).length;
+    if (ready > 0) { headerBadge.textContent = `${ready} actionable`; headerBadge.className = 'badge bg-success'; }
+    else if (active > 0) { headerBadge.textContent = `${active} evaluated`; headerBadge.className = 'badge bg-info'; }
+    else { headerBadge.textContent = 'Waiting...'; headerBadge.className = 'badge bg-secondary'; }
+  }
+
+  container.innerHTML = symbols.map(sym => {
+    const { consensus, prediction, opportunity } = buildSignalView(sym);
+    if (!consensus && !prediction && !opportunity) return `<div class="card mb-2"><div class="card-body p-3 text-muted small"><strong>${symbolToDisplay(sym)}</strong> — awaiting first pipeline cycle (runs every 30s)</div></div>`;
+    return renderSignalCard(sym, consensus, prediction, opportunity);
+  }).join('');
+}
+
+function renderSignalCard(sym, consensus, prediction, opportunity) {
+  const c = consensus || {}, o = opportunity || null, p = prediction || {};
+  const isTradable = o && o.tradable === true;
+  const isConflict = c.action === 'CONFLICT';
+  const isNeutral = c.action === 'NEUTRAL';
+  const isSignal = c.action === 'SIGNAL';
+
+  const borderColor = isTradable ? '#00b894' : isConflict ? '#e74c5e' : isNeutral ? '#cbd5e1' : isSignal ? '#3b82f6' : '#e2e8f0';
+  const bgColor = isTradable ? '#f0fdf4' : isConflict ? '#fef2f2' : '#ffffff';
+
+  let consensusLine = '';
+  if (isSignal && c.direction) {
+    const dirClass = c.direction === 'BUY' ? 'success' : 'danger';
+    consensusLine = `<span class="badge bg-${dirClass} fs-6">${c.direction}</span><span class="ms-2 small">confidence <strong>${c.confidence}%</strong></span><span class="ms-2 text-muted small">${(c.agreeing || []).length}/${(c.strategies || []).length} strategies agree</span>${c.anchorStrategy ? `<span class="ms-2 small">anchor: <strong>${c.anchorStrategy}</strong></span>` : ''}`;
+  } else if (isConflict) { consensusLine = `<span class="badge bg-danger fs-6">CONFLICT</span><span class="ms-2 text-muted small">strategies disagree — no trade</span>`; }
+  else if (isNeutral) { consensusLine = `<span class="badge bg-secondary fs-6">NEUTRAL</span><span class="ms-2 text-muted small">insufficient weight — no trade</span>`; }
+  else { consensusLine = `<span class="badge bg-secondary fs-6">—</span><span class="ms-2 text-muted small">no consensus yet</span>`; }
+
+  const rows = (c.strategies || []).map(r => {
+    let statusIcon = '', statusClass = 'text-muted';
+    if (r.status === 'AGREE') { statusIcon = '✓'; statusClass = 'text-success fw-bold'; }
+    else if (r.status === 'CONFLICT') { statusIcon = '✗'; statusClass = 'text-danger fw-bold'; }
+    else if (r.status === 'FLAGGED') { statusIcon = '⊘'; statusClass = 'text-warning'; }
+    else if (r.status === 'BELOW_THRESHOLD') { statusIcon = '·'; statusClass = 'text-muted'; }
+    const sideBadge = r.signalSide ? `<span class="badge bg-${r.signalSide === 'BUY' ? 'success' : 'danger'}" style="font-size:0.7em;">${r.signalSide}</span>` : `<span class="badge bg-light text-muted" style="font-size:0.7em;">—</span>`;
+    const wr = Number(r.effectiveWinRate || 0) * 100;
+    const wrClass = wr >= 60 ? 'text-success' : (wr >= 50 ? 'text-muted' : 'text-danger');
+    return `<div class="d-flex justify-content-between align-items-center py-1" style="font-size:0.8em; border-bottom:1px solid #f1f5f9;">
+      <div class="d-flex align-items-center gap-2"><span class="${statusClass}" style="width:14px; display:inline-block; text-align:center;">${statusIcon}</span><span style="min-width:80px;"><strong>${r.name}</strong></span>${sideBadge}</div>
+      <div class="d-flex align-items-center gap-3"><span class="${wrClass}" title="effective win rate">${wr.toFixed(0)}%<span class="text-muted"> (${r.trades || 0})</span></span><span class="text-muted" title="weight">w=${(r.weight || 0).toFixed(2)}</span></div>
+    </div>`;
+  }).join('');
+
+  let opportunityBlock = '';
+  if (isTradable) {
+    const eco = o.tradeEconomics || {};
+    opportunityBlock = `<div class="mt-3 p-3 rounded" style="background:rgba(255,255,255,0.7); border:1px solid #bbf7d0;">
+      <div class="row small">
+        <div class="col-md-6"><div><strong>Trade:</strong> ${o.direction} ${symbolToDisplay(sym)}</div><div><strong>Entry:</strong> ${formatPrice(o.entryPrice)}</div><div><strong>Stop:</strong> ${formatPrice(o.knockoutLevel)}</div><div><strong>Target:</strong> ${formatPrice(o.takeProfitLevel)}</div></div>
+        <div class="col-md-6"><div><strong>Stake:</strong> $${(o.stake || 0).toFixed(2)}</div><div><strong>Multiplier:</strong> ${o.multiplier}x</div><div><strong>Duration:</strong> ${o.duration}s</div><div><strong>Source:</strong> <span class="badge bg-info">${o.source || 'analogue'}</span></div></div>
+      </div>
+      <div class="row small mt-2"><div class="col-4">P(TP): <strong>${((eco.probTP || 0) * 100).toFixed(0)}%</strong></div><div class="col-4">P(SL): <strong>${((eco.probSL || 0) * 100).toFixed(0)}%</strong></div><div class="col-4">EV: <strong>$${(eco.ev || 0).toFixed(2)}</strong></div></div>
+      <div class="mt-2"><button class="btn btn-sm btn-success" onclick="window.executeLiveSignal('${sym}')"><i class="fas fa-play"></i> Execute Trade</button><button class="btn btn-sm btn-outline-secondary ms-2" onclick="window.dismissSignal('${sym}')">Dismiss</button></div>
+    </div>`;
+  } else if (o && !o.tradable) { opportunityBlock = `<div class="mt-2 small text-muted"><i class="fas fa-ban"></i> ${o.reason || 'Not tradable'}</div>`; }
+
+  let predictionLine = '';
+  if (p && p.modeLabel) { predictionLine = `<div class="small text-muted mt-1">Prediction: ${p.direction || '—'} · ${p.calibratedConfidence || 0}% · mode ${p.modeLabel}</div>`; }
+
+  return `<div class="card mb-3" style="border-left: 4px solid ${borderColor}; background: ${bgColor};">
+    <div class="card-body p-3">
+      <div class="d-flex justify-content-between align-items-start mb-2"><div><h6 class="mb-1">${symbolToDisplay(sym)} <span class="text-muted small ms-2">${c.regime || ''}</span></h6><div>${consensusLine}</div></div><div class="text-end small text-muted">${c.evaluatedAt ? new Date(c.evaluatedAt).toLocaleTimeString() : ''}</div></div>
+      ${predictionLine}
+      ${rows ? `<div class="mt-2">${rows}</div>` : ''}
+      ${opportunityBlock}
+    </div>
+  </div>`;
+}
+
+window.executeLiveSignal = async function (symbol) {
+  const sym = formatSymbol(symbol);
+  const opportunity = dashboardState.signalOpportunities[sym];
+  const consensus = dashboardState.strategyConsensus[sym];
+  if (!opportunity || !opportunity.tradable) { alert('No tradable opportunity for ' + symbol); return; }
+  const stratInfo = opportunity.strategyInfo || {};
+  const strategy = stratInfo.anchorStrategy || opportunity.prediction?.strategyConsensus?.anchorStrategy || consensus?.anchorStrategy || null;
+  const regimeCode = opportunity.prediction?.regime || consensus?.regime || null;
+  const confirmMsg = `Execute ${opportunity.direction} ${symbolToDisplay(sym)}?\n\nEntry: ${formatPrice(opportunity.entryPrice)}\nStop: ${formatPrice(opportunity.knockoutLevel)}\nTarget: ${formatPrice(opportunity.takeProfitLevel)}\nStake: $${(opportunity.stake || 0).toFixed(2)}\nMult: ${opportunity.multiplier}x\nDur: ${opportunity.duration}s\nSource: ${opportunity.source || 'analogue'}\n${strategy ? `Strategy: ${strategy}\n` : ''}${regimeCode ? `Regime: ${regimeCode}\n` : ''}`;
+  if (!confirm(confirmMsg)) return;
+
+  const body = { pair: symbol.replace(/_/g, '/'), side: opportunity.direction, stake: opportunity.stake, multiplier: opportunity.multiplier, duration: opportunity.duration, knockoutLevel: opportunity.knockoutLevel, takeProfitLevel: opportunity.takeProfitLevel, product: 'deriv_cfd', strategy, regimeCode };
+  const result = await placeOrderFetch('/api/trade', body);
+  showOrderOutcome(result);
+  if (result.body?.success && (result.body?.status === 'FILLED' || result.body?.status === 'CONFIRMED_RECORD_FAILED')) { delete dashboardState.signalOpportunities[sym]; renderLiveSignalPanel(); }
+};
+
+window.dismissSignal = function (symbol) { delete dashboardState.signalOpportunities[formatSymbol(symbol)]; renderLiveSignalPanel(); };
+
+// ================================================================
+// OTIE panel
+// ================================================================
+window.onOtieState = function (state) {
+  if (!state || !state.tradeId) return;
+  if (!dashboardState.otieStates) dashboardState.otieStates = {};
+  if (state.action === 'RELEASED') delete dashboardState.otieStates[state.tradeId];
+  else dashboardState.otieStates[state.tradeId] = state;
+  if (typeof window.renderOTIEPanel === 'function') window.renderOTIEPanel();
+  if (typeof window.renderPositionsWidget === 'function') window.renderPositionsWidget();
+};
+
+function renderOTIEPanel() {
+  const container = document.getElementById('otieContent');
+  if (!container) return;
+  const states = dashboardState.otieStates || {};
+  const ids = Object.keys(states).sort();
+  const placeholder = document.querySelector('#otiePanel > p.text-muted');
+  if (placeholder) placeholder.style.display = ids.length > 0 ? 'none' : 'block';
+  const headerBadge = document.querySelector('#section-trademanagement .card-header .badge');
+  if (headerBadge) {
+    const pendingClose = ids.filter(id => states[id].action === 'CLOSE').length;
+    if (pendingClose > 0) { headerBadge.textContent = `${ids.length} monitored · ${pendingClose} closing`; headerBadge.className = 'badge bg-danger'; }
+    else if (ids.length > 0) { headerBadge.textContent = `${ids.length} monitored`; headerBadge.className = 'badge bg-success'; }
+    else { headerBadge.textContent = 'Idle'; headerBadge.className = 'badge bg-secondary'; }
+  }
+  if (ids.length === 0) { container.innerHTML = '<p class="text-muted p-3">No open contracts to monitor.</p>'; return; }
+  let html = '';
+  for (const id of ids) html += _renderOtieCard(states[id]);
+  container.innerHTML = html;
+}
+
+function _renderOtieCard(s) {
+  const isClose = s.action === 'CLOSE';
+  const borderColor = isClose ? '#e74c5e' : '#00b894';
+  const bgColor = isClose ? '#fef2f2' : '#f0fdf4';
+  const statusColor = isClose ? 'bg-danger' : 'bg-success';
+  const profitColor = Number(s.profit) >= 0 ? '#00b894' : '#e74c5e';
+  const t = s.thresholds || {};
+  const ddPct = (Number(s.drawdownPct || 0) * 100).toFixed(0);
+  const ddThreshold = t.drawdownClosePct ? (t.drawdownClosePct * 100).toFixed(0) : '40';
+  const ddWarn = parseFloat(ddPct) > parseFloat(ddThreshold) * 0.75;
+  const ddColor = ddWarn ? '#e74c5e' : '#6b7a8f';
+  const revThreshold = t.chopMaxReversals || 8;
+  const revWarn = Number(s.reversals) >= revThreshold * 0.75;
+  const revColor = revWarn ? '#e74c5e' : '#6b7a8f';
+
+  return `<div style="border-left: 4px solid ${borderColor}; background: ${bgColor}; border-radius: 8px; padding: 16px; margin-bottom: 12px;">
+      <div class="d-flex justify-content-between align-items-center mb-2"><div><strong style="font-size: 1.05em;">${s.symbol}</strong><span class="badge ${s.side === 'BUY' ? 'bg-success' : 'bg-danger'} ms-2">${s.side}</span><span class="badge bg-primary ms-1">${s.multiplier}x</span><span class="text-muted ms-2 small">$${Number(s.stake).toFixed(2)} stake</span></div><div><span class="badge ${statusColor}">${s.action}</span><span class="text-muted ms-2" style="font-size:0.75em;">${(Number(s.age) / 1000).toFixed(0)}s · ${s.tickCount || 0} ticks</span></div></div>
+      <div class="row text-center mb-2">
+        <div class="col-3"><div class="small text-muted" style="font-size:0.7em; text-transform:uppercase;">Profit</div><div style="font-size: 1.3em; font-weight: 700; color: ${profitColor};">${Number(s.profit) >= 0 ? '+' : ''}$${Number(s.profit).toFixed(2)}</div></div>
+        <div class="col-3"><div class="small text-muted" style="font-size:0.7em; text-transform:uppercase;">Peak</div><div style="font-size: 1.3em; font-weight: 700; color: #00b894;">+$${Number(s.peak).toFixed(2)}</div></div>
+        <div class="col-3"><div class="small text-muted" style="font-size:0.7em; text-transform:uppercase;">Drawdown</div><div style="font-size: 1.3em; font-weight: 700; color: ${ddColor};">${ddPct}%</div></div>
+        <div class="col-3"><div class="small text-muted" style="font-size:0.7em; text-transform:uppercase;">Reversals</div><div style="font-size: 1.3em; font-weight: 700; color: ${revColor};">${s.reversals || 0}</div></div>
+      </div>
+      ${isClose && s.reason ? `<div class="alert alert-danger mt-2 mb-0 py-2 small"><strong>CLOSE TRIGGER:</strong> ${s.reason}</div>` : ''}
+    </div>`;
+}
+
+// ================================================================
+// History table (with pagination)
+// ================================================================
 function applyHistoryFilters() { historyPage = 1; renderHistoryTable(); }
 
 function renderHistoryTable() {
@@ -250,13 +633,13 @@ function renderHistoryTable() {
   const filtered = all.filter(t => {
     if (from && new Date(t.date) < new Date(from)) return false;
     if (to && new Date(t.date) > new Date(to)) return false;
-    if (symbol && !String(t.pair || '').toUpperCase().includes(symbol.toUpperCase())) return false;
+    if (symbol && !t.pair?.toUpperCase().includes(symbol.toUpperCase())) return false;
     if (side && t.side !== side) return false;
     if (status && t.status !== status) return false;
     return true;
   });
-  filtered.sort((a, b) => new Date(b.date) - new Date(a.date));
 
+  filtered.sort((a, b) => new Date(b.date) - new Date(a.date));
   const cnt = document.getElementById('historyCount');
   if (cnt) cnt.textContent = filtered.length;
 
@@ -269,368 +652,52 @@ function renderHistoryTable() {
   const pageItems = filtered.slice(start, end);
 
   const setTxt = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+  const setDisabled = (id, val) => { const el = document.getElementById(id); if (el) el.disabled = val; };
   setTxt('pageStart', filtered.length > 0 ? start + 1 : 0);
   setTxt('pageEnd', end);
   setTxt('pageTotal', filtered.length);
   setTxt('pageInfo', `Page ${historyPage} of ${historyTotalPages}`);
+  setDisabled('prevPage', historyPage <= 1);
+  setDisabled('nextPage', historyPage >= historyTotalPages);
 
   const container = document.getElementById('historyContainer');
   if (!container) return;
-  if (pageItems.length === 0) { container.innerHTML = '<p class="text-muted">No matching records.</p>'; return; }
+  if (pageItems.length === 0) { container.innerHTML = '<p class="text-muted p-3">No matching records.</p>'; return; }
 
-  let html = `<div class="table-responsive"><table class="table table-striped table-sm">
-    <thead><tr><th>Pair</th><th>Side</th><th>Entry</th><th>Exit</th><th>Stake</th><th>P/L</th><th>Status</th><th>Date</th></tr></thead><tbody>`;
+  let html = `<table class="table table-striped table-sm mb-0"><thead><tr><th>Pair</th><th>Side</th><th>Entry</th><th>Exit</th><th>Lot</th><th>P/L</th><th>Status</th><th>Date</th></tr></thead><tbody>`;
   pageItems.forEach(t => {
     const pl = t.pnl ? parseFloat(t.pnl).toFixed(2) : '0.00';
+    const sc = t.status === 'OPEN' ? 'bg-primary' : (t.pnl >= 0 ? 'bg-success' : 'bg-danger');
     html += `<tr>
       <td>${t.pair}</td>
       <td><span class="badge ${t.side === 'BUY' ? 'bg-success' : 'bg-danger'}">${t.side}</span></td>
       <td>${t.entryPrice !== null ? formatPrice(t.entryPrice) : '-'}</td>
       <td>${t.exitPrice !== null ? formatPrice(t.exitPrice) : '-'}</td>
       <td>${t.lotSize}</td>
-      <td class="${pl >= 0 ? 'text-success' : 'text-danger'}">${pl}</td>
-      <td><span class="badge bg-secondary">${t.status}</span></td>
+      <td class="${pl >= 0 ? 'text-success' : 'text-danger'} fw-bold">${pl}</td>
+      <td><span class="badge ${sc}">${t.status}</span></td>
       <td>${new Date(t.date).toLocaleString()}</td>
     </tr>`;
   });
-  html += '</tbody></table></div>';
+  html += '</tbody></table>';
   container.innerHTML = html;
 }
 
 // ================================================================
-// Regime / Awareness / Metrics
-// ================================================================
-function renderRegimeWidget() {
-  const r = dashboardState.regime;
-  const panel = document.getElementById('regimePanel');
-  if (!panel) return;
-  if (!r) { panel.innerHTML = '<p class="text-muted">Waiting for regime data...</p>'; return; }
-  panel.innerHTML = `<div class="card"><div class="card-body">
-    <h6 class="card-title">Current Regime</h6>
-    <p class="card-text"><strong>${r.name}</strong> (${r.confidence}%)</p>
-    <p class="small">${r.description || ''}</p>
-    <p class="small text-muted">${r.symbol} | ${new Date(r.timestamp).toLocaleString()}</p>
-  </div></div>`;
-}
-
-function renderAwarenessWidget() {
-  const a = dashboardState.awareness;
-  const panel = document.getElementById('awarenessPanel');
-  if (!panel) return;
-  if (!a) { panel.innerHTML = '<p class="text-muted">Waiting for market awareness...</p>'; return; }
-  panel.innerHTML = `<div class="card"><div class="card-body">
-    <h6 class="card-title">Awareness (${a.symbol})</h6>
-    <p>Spread: ${(a.spread || 0).toFixed(5)} | Velocity: ${(a.velocity || 0).toFixed(6)}</p>
-    <p>Accel: ${(a.acceleration || 0).toFixed(6)} | Liquidity: ${((a.liquidity || 0) * 100).toFixed(0)}%</p>
-    <p>Unusual: ${a.unusual ? a.unusual.join(', ') : 'None'}</p>
-    <p class="small text-muted">${new Date(a.lastUpdated).toLocaleString()}</p>
-  </div></div>`;
-}
-
-function renderMetricsWidget() {
-  const m = dashboardState.metrics;
-  const panel = document.getElementById('metricsPanel');
-  if (!panel) return;
-  if (!m) { panel.innerHTML = '<p class="text-muted">Waiting for metrics...</p>'; return; }
-  panel.innerHTML = `<div class="card"><div class="card-body">
-    <h6 class="card-title">Performance</h6>
-    <div class="row small">
-      <div class="col-6">Win Rate: ${((m.winRate || 0) * 100).toFixed(1)}%</div>
-      <div class="col-6">PF: ${(m.profitFactor || 0).toFixed(2)}</div>
-      <div class="col-6">Sharpe: ${(m.sharpe || 0).toFixed(2)}</div>
-      <div class="col-6">Max DD: ${((m.maxDrawdown || 0) * 100).toFixed(1)}%</div>
-      <div class="col-6">Expectancy: ${(m.expectancy || 0).toFixed(2)}</div>
-      <div class="col-6">Trades: ${m.totalTrades || 0}</div>
-      <div class="col-6">Daily P&L: ${(m.dailyPnL || 0).toFixed(2)}</div>
-      <div class="col-6">Belief: ${m.belief || '—'} (${m.beliefConfidence || 0}%)</div>
-    </div>
-  </div></div>`;
-}
-
-// ================================================================
-// Live monitoring status
-// ================================================================
-function renderLiveMonitorStatus() {
-  const el = document.getElementById('liveMonitorStatus');
-  if (!el) return;
-  const now = Date.now();
-  const last = dashboardState.lastContractUpdateAt;
-  const count = Object.keys(dashboardState.contractStates || {}).length;
-  if (!last) {
-    el.textContent = count > 0 ? `${count} contract(s) — waiting for first tick` : 'Live monitoring idle';
-    el.className = 'small text-muted';
-    return;
-  }
-  const ageSec = Math.round((now - last) / 1000);
-  const label = `${count} contract(s) · last tick ${ageSec}s ago`;
-  if (ageSec < 10) { el.textContent = label; el.className = 'small text-success'; }
-  else if (ageSec < 60) { el.textContent = label; el.className = 'small text-warning'; }
-  else { el.textContent = `${label} — stalled`; el.className = 'small text-danger'; }
-}
-setInterval(renderLiveMonitorStatus, 5000);
-
-// ================================================================
-// Live Signal Engine
-// ================================================================
-window.onStrategyConsensus = function (payload) {
-  if (!payload || !payload.symbol) return;
-  const sym = formatSymbol(payload.symbol);
-  dashboardState.strategyConsensus[sym] = payload;
-  renderLiveSignalPanel();
-};
-
-window.onOpportunityUpdate = function (payload) {
-  if (!payload || !payload.prediction?.symbol) return;
-  const sym = formatSymbol(payload.prediction.symbol);
-  dashboardState.signalOpportunities[sym] = payload;
-  if (payload.prediction) dashboardState.signalPredictions[sym] = payload.prediction;
-  renderLiveSignalPanel();
-};
-
-window.onPredictionUpdate = function (payload) {
-  if (!payload || !payload.symbol) return;
-  const sym = formatSymbol(payload.symbol);
-  dashboardState.signalPredictions[sym] = payload;
-};
-
-function renderLiveSignalPanel() {
-  const container = document.getElementById('liveSignalEngineContent');
-  if (!container) return;
-
-  const symbols = (window.WATCHED_SYMBOLS || ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD'])
-    .map(s => formatSymbol(s));
-
-  const headerBadge = document.getElementById('liveSignalEngineBadge');
-  if (headerBadge) {
-    const ready = symbols.filter(s => dashboardState.signalOpportunities[s]?.tradable).length;
-    const active = symbols.filter(s => dashboardState.strategyConsensus[s]).length;
-    if (ready > 0) { headerBadge.textContent = `${ready} actionable`; headerBadge.className = 'badge bg-success'; }
-    else if (active > 0) { headerBadge.textContent = `${active} evaluated`; headerBadge.className = 'badge bg-info'; }
-    else { headerBadge.textContent = 'Waiting...'; headerBadge.className = 'badge bg-secondary'; }
-  }
-
-  const cards = symbols.map(sym => {
-    const consensus = dashboardState.strategyConsensus[sym];
-    const prediction = dashboardState.signalPredictions[sym];
-    const opportunity = dashboardState.signalOpportunities[sym];
-    if (!consensus && !prediction && !opportunity) return renderWaitingSignalCard(sym);
-    return renderSignalCard(sym, consensus, prediction, opportunity);
-  });
-
-  container.innerHTML = cards.join('');
-}
-
-function renderWaitingSignalCard(sym) {
-  return `<div class="card mb-3"><div class="card-body text-muted small">
-    <strong>${symbolToDisplay(sym)}</strong> — awaiting pipeline cycle (every 30s)
-  </div></div>`;
-}
-
-function renderSignalCard(sym, consensus, prediction, opportunity) {
-  const c = consensus || {};
-  const p = prediction || {};
-  const o = opportunity || null;
-  const isTradable = o && o.tradable === true;
-  const isConflict = c.action === 'CONFLICT';
-  const isNeutral = c.action === 'NEUTRAL';
-  const isSignal = c.action === 'SIGNAL';
-
-  const borderColor = isTradable ? '#00b894' : isConflict ? '#e74c5e' : isNeutral ? '#cbd5e1' : isSignal ? '#3b82f6' : '#e2e8f0';
-  const bgColor = isTradable ? '#f0fdf4' : isConflict ? '#fef2f2' : '#ffffff';
-
-  let consensusLine = '';
-  if (isSignal && c.direction) {
-    const dirClass = c.direction === 'BUY' ? 'success' : 'danger';
-    consensusLine = `<span class="badge bg-${dirClass} fs-6">${c.direction}</span>
-      <span class="ms-2">conf <strong>${c.confidence}%</strong></span>
-      <span class="ms-2 small text-muted">${(c.agreeing || []).length}/${(c.strategies || []).length} agree</span>
-      ${c.anchorStrategy ? `<span class="ms-2 small">anchor: <strong>${c.anchorStrategy}</strong></span>` : ''}`;
-  } else if (isConflict) {
-    consensusLine = `<span class="badge bg-danger fs-6">CONFLICT</span>`;
-  } else if (isNeutral) {
-    consensusLine = `<span class="badge bg-secondary fs-6">NEUTRAL</span>`;
-  } else {
-    consensusLine = `<span class="badge bg-secondary fs-6">—</span>`;
-  }
-
-  const rows = (c.strategies || []).map(r => {
-    let statusIcon = '', statusClass = 'text-muted';
-    if (r.status === 'AGREE') { statusIcon = '✓'; statusClass = 'text-success fw-bold'; }
-    else if (r.status === 'CONFLICT') { statusIcon = '✗'; statusClass = 'text-danger'; }
-    else if (r.status === 'FLAGGED') { statusIcon = '⊘'; statusClass = 'text-warning'; }
-    const sideBadge = r.signalSide
-      ? `<span class="badge bg-${r.signalSide === 'BUY' ? 'success' : 'danger'}" style="font-size:0.7em;">${r.signalSide}</span>`
-      : `<span class="badge bg-light text-muted" style="font-size:0.7em;">—</span>`;
-    const wr = Number(r.effectiveWinRate || 0) * 100;
-    return `<div class="d-flex justify-content-between py-1" style="font-size:0.8em; border-bottom:1px solid #f1f5f9;">
-      <div><span class="${statusClass}" style="width:14px; display:inline-block;">${statusIcon}</span>
-        <strong>${r.name}</strong> ${sideBadge}</div>
-      <div><span class="${wr >= 55 ? 'text-success' : wr >= 45 ? 'text-muted' : 'text-danger'}">${wr.toFixed(0)}%</span>
-        <span class="text-muted"> (${r.trades || 0}) w=${(r.weight || 0).toFixed(2)}</span></div>
-    </div>`;
-  }).join('');
-
-  let opportunityBlock = '';
-  if (isTradable) {
-    const eco = o.tradeEconomics || {};
-    opportunityBlock = `<div class="mt-3 p-3 rounded" style="background:rgba(255,255,255,0.7); border:1px solid #bbf7d0;">
-      <div class="row small">
-        <div class="col-md-6">
-          <div><strong>${o.direction}</strong> ${symbolToDisplay(sym)}</div>
-          <div>Entry ${formatPrice(o.entryPrice)}</div>
-          <div>KO ${formatPrice(o.knockoutLevel)} / TP ${formatPrice(o.takeProfitLevel)}</div>
-        </div>
-        <div class="col-md-6">
-          <div>Stake $${(o.stake || 0).toFixed(2)} · ${o.multiplier}x · ${o.duration}s</div>
-          <div>P(TP) ${((eco.probTP||0)*100).toFixed(0)}% · P(SL) ${((eco.probSL||0)*100).toFixed(0)}%</div>
-          <div>EV $${(eco.ev||0).toFixed(2)} (${((eco.evOverStake||0)*100).toFixed(1)}%)</div>
-        </div>
-      </div>
-      <div class="mt-2">
-        <button class="btn btn-sm btn-success" onclick="window.executeLiveSignal('${sym}')">
-          <i class="fas fa-play"></i> Execute
-        </button>
-        <button class="btn btn-sm btn-outline-secondary ms-2" onclick="window.dismissSignal('${sym}')">Dismiss</button>
-      </div>
-    </div>`;
-  } else if (o && !o.tradable) {
-    opportunityBlock = `<div class="mt-2 small text-muted"><i class="fas fa-ban"></i> ${o.reason || 'Not tradable'}</div>`;
-  }
-
-  let predictionLine = '';
-  if (p && p.modeLabel) {
-    predictionLine = `<div class="small text-muted mt-1">
-      ${p.direction || '—'} · ${p.calibratedConfidence || 0}% · mode ${p.modeLabel}
-      ${p.pattern ? ` · pattern ${p.pattern.bias} (${p.pattern.confidence}%)` : ''}
-      ${p.momentum ? ` · mom ${p.momentum.direction}` : ''}
-    </div>`;
-  }
-
-  return `<div class="card mb-3" style="border-left: 4px solid ${borderColor}; background: ${bgColor};">
-    <div class="card-body">
-      <div class="d-flex justify-content-between align-items-start mb-2">
-        <div>
-          <h6 class="mb-1">${symbolToDisplay(sym)} <span class="small text-muted ms-2">${c.regime || ''}</span></h6>
-          <div>${consensusLine}</div>
-        </div>
-        <div class="text-end small text-muted">${c.evaluatedAt ? new Date(c.evaluatedAt).toLocaleTimeString() : ''}</div>
-      </div>
-      ${predictionLine}
-      ${rows ? `<div class="mt-2">${rows}</div>` : ''}
-      ${opportunityBlock}
-    </div>
-  </div>`;
-}
-
-window.executeLiveSignal = async function (symbol) {
-  const sym = formatSymbol(symbol);
-  const opportunity = dashboardState.signalOpportunities[sym];
-  if (!opportunity || !opportunity.tradable) { alert('No tradable opportunity'); return; }
-
-  const stratInfo = opportunity.strategyInfo || {};
-  const strategy = stratInfo.anchorStrategy || opportunity.prediction?.strategyConsensus?.anchorStrategy || null;
-  const regimeCode = opportunity.prediction?.regime || null;
-
-  const msg = `Execute ${opportunity.direction} ${symbolToDisplay(sym)}?\n` +
-    `Entry: ${formatPrice(opportunity.entryPrice)}\nKO: ${formatPrice(opportunity.knockoutLevel)}\nTP: ${formatPrice(opportunity.takeProfitLevel)}\n` +
-    `Stake: $${(opportunity.stake || 0).toFixed(2)}\nMult: ${opportunity.multiplier}x\nDur: ${opportunity.duration}s\n` +
-    (strategy ? `Strategy: ${strategy}\n` : '') + (regimeCode ? `Regime: ${regimeCode}` : '');
-  if (!confirm(msg)) return;
-
-  const res = await fetch('/api/trade', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      pair: symbol, side: opportunity.direction, stake: opportunity.stake,
-      multiplier: opportunity.multiplier, duration: opportunity.duration,
-      knockoutLevel: opportunity.knockoutLevel, takeProfitLevel: opportunity.takeProfitLevel,
-      product: 'deriv_cfd', strategy, regimeCode,
-    }),
-  });
-  const body = await res.json().catch(() => ({}));
-  if (body.success) {
-    SoundManager.tradeOpen();
-    alert(`Trade placed: ${body.contractId || '?'}`);
-    delete dashboardState.signalOpportunities[sym];
-    renderLiveSignalPanel();
-    refreshAllData();
-  } else {
-    SoundManager.reject();
-    alert(`${body.status || 'Error'}: ${body.error || 'unknown'}`);
-  }
-};
-
-window.dismissSignal = function (symbol) {
-  delete dashboardState.signalOpportunities[formatSymbol(symbol)];
-  renderLiveSignalPanel();
-};
-
-// ================================================================
-// OTIE
-// ================================================================
-window.onOtieState = function (state) {
-  if (!state || !state.tradeId) return;
-  if (state.action === 'RELEASED') delete dashboardState.otieStates[state.tradeId];
-  else dashboardState.otieStates[state.tradeId] = state;
-  renderOTIEPanel();
-  renderPositionsWidget();
-};
-
-function renderOTIEPanel() {
-  const container = document.getElementById('otieContent');
-  if (!container) return;
-  const states = dashboardState.otieStates || {};
-  const ids = Object.keys(states).sort();
-  const headerBadge = document.querySelector('#section-trademanagement .card-header .badge');
-  if (headerBadge) {
-    if (ids.length > 0) { headerBadge.textContent = `${ids.length} monitored`; headerBadge.className = 'badge bg-success'; }
-    else { headerBadge.textContent = 'Idle'; headerBadge.className = 'badge bg-secondary'; }
-  }
-  if (ids.length === 0) { container.innerHTML = '<p class="text-muted">No open contracts.</p>'; return; }
-  container.innerHTML = ids.map(id => _renderOtieCard(states[id])).join('');
-}
-
-function _renderOtieCard(s) {
-  const isClose = s.action === 'CLOSE';
-  const borderColor = isClose ? '#e74c5e' : '#00b894';
-  const bgColor = isClose ? '#fef2f2' : '#f0fdf4';
-  const profitColor = Number(s.profit) >= 0 ? '#00b894' : '#e74c5e';
-  const ddPct = (Number(s.drawdownPct || 0) * 100).toFixed(0);
-  return `<div style="border-left:4px solid ${borderColor}; background:${bgColor}; border-radius:8px; padding:16px; margin-bottom:12px;">
-    <div class="d-flex justify-content-between mb-2">
-      <div><strong>${s.symbol}</strong>
-        <span class="badge ${s.side === 'BUY' ? 'bg-success' : 'bg-danger'} ms-2">${s.side}</span>
-        <span class="badge bg-primary ms-1">${s.multiplier}x</span>
-        <span class="small text-muted ms-2">$${Number(s.stake).toFixed(2)}</span></div>
-      <div><span class="badge ${isClose ? 'bg-danger' : 'bg-success'}">${s.action}</span></div>
-    </div>
-    <div class="row text-center">
-      <div class="col-3"><div class="small text-muted">PROFIT</div>
-        <div style="font-size:1.2em; font-weight:700; color:${profitColor};">${Number(s.profit)>=0?'+':''}$${Number(s.profit).toFixed(2)}</div></div>
-      <div class="col-3"><div class="small text-muted">PEAK</div>
-        <div style="font-size:1.2em; font-weight:700; color:#00b894;">+$${Number(s.peak||0).toFixed(2)}</div></div>
-      <div class="col-3"><div class="small text-muted">DD</div>
-        <div style="font-size:1.2em; font-weight:700;">${ddPct}%</div></div>
-      <div class="col-3"><div class="small text-muted">REVS</div>
-        <div style="font-size:1.2em; font-weight:700;">${s.reversals||0}</div></div>
-    </div>
-    ${isClose && s.reason ? `<div class="alert alert-danger mt-2 mb-0 py-1 small"><strong>CLOSE:</strong> ${s.reason}</div>` : ''}
-  </div>`;
-}
-
-// ================================================================
-// Refresh
+// Manual refresh
 // ================================================================
 async function refreshAllData() {
   try {
-    const [account, positions, history] = await Promise.all([
+    const [account, positions, history, pending] = await Promise.all([
       fetchJson('/api/account').catch(() => null),
       fetchJson('/api/trades').catch(() => []),
       fetchJson('/api/trade-history').catch(() => []),
+      fetchJson('/api/pending-orders').catch(() => []),
     ]);
     if (account) dashboardState.account = account;
     if (Array.isArray(positions)) dashboardState.positions = positions;
     if (Array.isArray(history)) dashboardState.history = history;
+    if (Array.isArray(pending)) dashboardState.pendingOrders = pending;
     renderAllWidgets();
   } catch (e) { console.error('Refresh error:', e); }
 }
@@ -641,11 +708,15 @@ async function refreshSignals() {
   try {
     const data = await fetchJson('/api/signal/active');
     if (data && data.signals) {
+      const consensus = {}, opportunities = {}, predictions = {};
       for (const [sym, payload] of Object.entries(data.signals)) {
-        if (payload.consensus) dashboardState.strategyConsensus[sym] = payload.consensus;
-        if (payload.opportunity) dashboardState.signalOpportunities[sym] = payload.opportunity;
-        if (payload.prediction) dashboardState.signalPredictions[sym] = payload.prediction;
+        if (payload.consensus) consensus[sym] = payload.consensus;
+        if (payload.opportunity) opportunities[sym] = payload.opportunity;
+        if (payload.prediction) predictions[sym] = payload.prediction;
       }
+      dashboardState.strategyConsensus = { ...dashboardState.strategyConsensus, ...consensus };
+      dashboardState.signalOpportunities = { ...dashboardState.signalOpportunities, ...opportunities };
+      dashboardState.signalPredictions = { ...dashboardState.signalPredictions, ...predictions };
       renderLiveSignalPanel();
     }
   } catch (e) { console.warn('[App] refreshSignals failed:', e.message); }
@@ -653,36 +724,68 @@ async function refreshSignals() {
 }
 
 // ================================================================
-// Actions
+// User actions
 // ================================================================
 async function closeTrade(tradeId) {
   if (!confirm(`Close contract ${tradeId}?`)) return;
   try {
-    await fetchJson(`/api/close/${tradeId}`, { method: 'PUT' });
+    const res = await fetchJson(`/api/close/${tradeId}`, { method: 'PUT' });
     SoundManager.tradeClose();
-    refreshAllData();
-  } catch (e) { alert('Error: ' + e.message); SoundManager.reject(); }
+    console.log('[App] Close confirmed:', res);
+  } catch (e) { alert('Error closing trade: ' + e.message); SoundManager.reject(); }
 }
 
-window.closeTrade = closeTrade;
+async function cancelPending(orderId) {
+  if (!confirm(`Cancel order ${orderId}?`)) return;
+  try { await fetchJson(`/api/order/${orderId}`, { method: 'DELETE' }); }
+  catch (e) { alert('Error cancelling: ' + e.message); }
+}
 
 // ================================================================
-// Exports
+// Trade form — status-aware
+// ================================================================
+function showOrderOutcome(result) {
+  const status = result.body?.status;
+  const contractId = result.body?.contractId ? String(result.body.contractId) : null;
+
+  if (status === 'FILLED' || (result.body?.success && status !== 'CONFIRMED_RECORD_FAILED')) {
+    SoundManager.tradeOpen();
+    alert(`✅ Trade placed\n\nContract: ${contractId || '?'}\nEntry: ${result.body?.entryPrice ?? '—'}\nPurchase: ${result.body?.purchasePrice ?? '—'}\nStrategy: ${result.body?.strategy ?? '(none)'}\n\nLive P/L will appear in Open Positions.`);
+    refreshAllData();
+  } else if (status === 'CONFIRMED_RECORD_FAILED') {
+    SoundManager.danger();
+    alert(`⚠️ Purchase CONFIRMED but record save failed.\n\nContract: ${contractId}\n\nDO NOT RETRY — the contract is live at Deriv and will be picked up by reconciliation.`);
+    refreshAllData();
+  } else if (status === 'REJECTED') {
+    SoundManager.reject();
+    alert(`❌ Order rejected\n\n${result.body?.error || 'No reason'}\n\nSafe to retry after correcting the input.`);
+  } else if (status === 'BROKER_ERROR' || result.httpStatus >= 500) {
+    SoundManager.danger();
+    alert(`❗ Broker error — purchase may have completed.\n\n${result.body?.error || ''}\n\nDO NOT click Place Trade again without first checking Open Positions.`);
+  } else {
+    SoundManager.danger();
+    alert(`❓ Unexpected response (HTTP ${result.httpStatus}):\n${JSON.stringify(result.body)}\n\nCheck Open Positions before retrying.`);
+  }
+}
+
+// ================================================================
+// Expose to live.js
 // ================================================================
 window.dashboardState = dashboardState;
 window.updateDashboardState = updateDashboardState;
-window.renderAllWidgets = renderAllWidgets;
 window.renderPositionsWidget = renderPositionsWidget;
+window.renderLiveMonitorStatus = renderLiveMonitorStatus;
+window.renderPriceWidgets = renderPriceWidgets;
+window.renderAccountWidget = renderAccountWidget;
+window.renderHistoryWidget = renderHistoryWidget;
 window.renderOTIEPanel = renderOTIEPanel;
-window.renderLiveSignalPanel = renderLiveSignalPanel;
 window.SoundManager = SoundManager;
+window.closeTrade = closeTrade;
+window.cancelPending = cancelPending;
 window.refreshDashboard = refreshAllData;
 window.refreshSignals = refreshSignals;
 
-window.updatePositionBadge = function (count) {
-  const b = document.getElementById('positionCount');
-  if (b) b.textContent = count || 0;
-};
+window.updatePositionBadge = function (count) { const b = document.getElementById('positionCount'); if (b) b.textContent = count || 0; };
 window.updateApiStatus = function (connected) {
   const dot = document.getElementById('apiStatusDot');
   const text = document.getElementById('apiStatusText');
@@ -692,47 +795,128 @@ window.updateApiStatus = function (connected) {
 window.updateAccountBadge = function (acc) {
   if (!acc) return;
   const idEl = document.getElementById('accountId');
-  const curEl = document.getElementById('accountCurrency');
   const typeEl = document.getElementById('accountTypeLabel');
+  const curEl = document.getElementById('accountCurrency');
   if (idEl) idEl.textContent = acc.id || acc.login || '—';
   if (curEl) curEl.textContent = acc.currency || 'USD';
   if (typeEl) {
-    const srv = String(acc.server || '').toLowerCase();
+    const srv = (acc.server || '').toLowerCase();
     const type = srv.includes('demo') ? 'demo' : 'real';
     typeEl.textContent = type.toUpperCase();
     typeEl.className = 'account-type ' + type;
   }
 };
 
+window.executeSignalFromCard = function (btn) {
+  const card = btn.closest('.live-signal-card');
+  if (!card) return;
+  let sym = (card.dataset.symbol || '').toUpperCase().replace(/^FRX/, '');
+  if (sym.length === 6) sym = sym.slice(0, 3) + '_' + sym.slice(3);
+  const side = (card.dataset.side || '').toUpperCase();
+  const pair = document.getElementById('tradePair');
+  const sideSel = document.getElementById('tradeSide');
+  const stakeIn = document.getElementById('tradeStake');
+  if (!pair || !sideSel) { alert('Trade form not available.'); return; }
+  pair.value = sym;
+  sideSel.value = side === 'SELL' ? 'SELL' : 'BUY';
+  if (stakeIn && !stakeIn.value) stakeIn.value = '10';
+  const tab = document.querySelector('.sidebar-nav .nav-item[data-section="trading"]');
+  if (tab) tab.click();
+};
+
+window.exportHistoryCSV = function () {
+  const h = dashboardState.history || [];
+  if (h.length === 0) { alert('No history to export.'); return; }
+  let csv = 'Pair,Side,Entry,Exit,Lot,P/L,Status,Date\n';
+  h.forEach(t => { csv += `${t.pair},${t.side},${t.entryPrice},${t.exitPrice},${t.lotSize},${t.pnl},${t.status},${new Date(t.date).toISOString()}\n`; });
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `trade_history_${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+
 // ================================================================
 // DOM wiring
 // ================================================================
 document.addEventListener('DOMContentLoaded', async function () {
-  await refreshAllData();
-  await refreshSignals();
+  await Promise.all([refreshAllData().catch(() => {}), refreshSignals().catch(() => {})]);
+  setInterval(() => { if (document.visibilityState === 'visible') refreshSignals(); }, 30000);
 
-  setInterval(() => {
-    if (document.visibilityState === 'visible') refreshSignals();
-  }, 30000);
+  document.getElementById('getSignalBtn')?.addEventListener('click', async function () {
+    const pair = document.getElementById('signalPair').value.trim();
+    const strategy = document.getElementById('signalStrategy').value;
+    if (!pair) { alert('Enter a pair.'); return; }
+    try {
+      const result = await fetchJson(`/api/signal?symbol=${encodeURIComponent(pair)}&strategy=${encodeURIComponent(strategy)}`);
+      const c = document.getElementById('signalResult');
+      if (result.signal) { c.innerHTML = `<div class="alert alert-${result.signal === 'BUY' ? 'success' : result.signal === 'SELL' ? 'danger' : 'secondary'}"><strong>${result.signal}</strong> (${result.confidence || 0}%)<br><small>${result.reason || ''}</small></div>`; }
+      else { c.innerHTML = `<div class="alert alert-info">${result.message || 'No signal'}</div>`; }
+    } catch (e) { alert('Error: ' + e.message); }
+  });
+
+  document.getElementById('tradeForm')?.addEventListener('submit', async function (e) {
+    e.preventDefault();
+    if (isSubmitting) return;
+    isSubmitting = true;
+    const pair = document.getElementById('tradePair').value.trim();
+    const side = document.getElementById('tradeSide').value;
+    const stake = parseFloat(document.getElementById('tradeStake').value);
+    const multiplier = parseFloat(document.getElementById('tradeMultiplier').value);
+    const duration = parseInt(document.getElementById('tradeDuration').value);
+    const ko = parseFloat(document.getElementById('tradeKnockout').value) || null;
+    const tp = parseFloat(document.getElementById('tradeTP').value) || null;
+    if (!pair || !stake || stake <= 0 || !multiplier || !duration) { alert('Fill in all required fields.'); isSubmitting = false; return; }
+    const result = await placeOrderFetch('/api/trade', { pair, side, stake, multiplier, duration, knockoutLevel: ko, takeProfitLevel: tp, product: document.getElementById('currentProduct')?.textContent || 'deriv_cfd' });
+    showOrderOutcome(result);
+    isSubmitting = false;
+  });
+
+  document.getElementById('autoTradeForm')?.addEventListener('submit', async function (e) {
+    e.preventDefault();
+    if (isAutoSubmitting) return;
+    isAutoSubmitting = true;
+    const pair = document.getElementById('autoPair').value.trim();
+    const risk = parseFloat(document.getElementById('autoRisk').value);
+    const strategy = document.getElementById('autoStrategy').value;
+    if (!pair || !risk || risk <= 0) { alert('Fill all fields.'); isAutoSubmitting = false; return; }
+    const result = await placeOrderFetch('/api/auto-trade', { pair, riskPercent: risk, strategy });
+    const status = result.body?.status;
+    if (status === 'FILLED' || (result.body?.success && status !== 'CONFIRMED_RECORD_FAILED')) { SoundManager.tradeOpen(); alert(`✅ Auto-trade placed\nContract: ${result.body?.contractId || '?'}`); refreshAllData(); }
+    else if (status === 'CONFIRMED_RECORD_FAILED') { SoundManager.danger(); alert(`⚠️ Confirmed ${result.body?.contractId} but record failed. DO NOT retry.`); }
+    else if (status === 'REJECTED' || status === 'NO_SIGNAL') { SoundManager.reject(); alert(`Not placed: ${result.body?.message || result.body?.error || 'No signal'}`); }
+    else { SoundManager.danger(); alert(`❗ Broker error — check positions before retrying.\n${result.body?.error || ''}`); }
+    isAutoSubmitting = false;
+  });
+
+  document.getElementById('applyHistoryFilter')?.addEventListener('click', applyHistoryFilters);
+  document.getElementById('resetHistoryFilter')?.addEventListener('click', function () {
+    ['historyFrom', 'historyTo', 'historySymbol', 'historySide', 'historyStatus'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+    applyHistoryFilters();
+  });
+  document.getElementById('prevPage')?.addEventListener('click', function () { if (historyPage > 1) { historyPage--; renderHistoryTable(); } });
+  document.getElementById('nextPage')?.addEventListener('click', function () { if (historyPage < historyTotalPages) { historyPage++; renderHistoryTable(); } });
 
   document.getElementById('refreshTrades')?.addEventListener('click', refreshAllData);
   document.getElementById('refreshHistory')?.addEventListener('click', refreshAllData);
+  document.getElementById('refreshPending')?.addEventListener('click', refreshAllData);
   document.getElementById('refreshLiveSignals')?.addEventListener('click', refreshSignals);
-  document.getElementById('applyHistoryFilter')?.addEventListener('click', applyHistoryFilters);
-  document.getElementById('prevPage')?.addEventListener('click', function () {
-    if (historyPage > 1) { historyPage--; renderHistoryTable(); }
+
+  document.getElementById('deleteHistoryBtn')?.addEventListener('click', async function () {
+    if (!confirm('Delete all closed trades? This cannot be undone.')) return;
+    try { const r = await fetchJson('/api/history', { method: 'DELETE' }); alert(`Deleted ${r.deletedCount} trades.`); refreshAllData(); }
+    catch (e) { alert('Error: ' + e.message); }
   });
-  document.getElementById('nextPage')?.addEventListener('click', function () {
-    if (historyPage < historyTotalPages) { historyPage++; renderHistoryTable(); }
-  });
-  document.getElementById('resetHistoryFilter')?.addEventListener('click', function () {
-    ['historyFrom','historyTo','historySymbol','historySide','historyStatus'].forEach(id => {
-      const el = document.getElementById(id); if (el) el.value = '';
-    });
-    applyHistoryFilters();
+
+  document.getElementById('exportCSVBtn')?.addEventListener('click', function () { if (typeof window.exportHistoryCSV === 'function') window.exportHistoryCSV(); });
+  document.getElementById('generateReportBtn')?.addEventListener('click', function () {
+    const modal = bootstrap.Modal.getInstance(document.getElementById('reportModal'));
+    if (modal) modal.hide();
+    alert('Report generation endpoint not yet implemented on the server.');
   });
 
   renderLiveSignalPanel();
 });
 
-console.log('app.js loaded');
+console.log('✅ app.js loaded — Live Signal Engine + OTIE V6 trajectory panel active.');
