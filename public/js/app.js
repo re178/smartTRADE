@@ -1,8 +1,6 @@
 // public/js/app.js
 // Core dashboard state + render functions for positions, account, history,
 // OTIE panel, and the Live Signal Engine.
-// Module-specific files (tradingview.js, bots.js, digits.js) attach their own
-// handlers to window.on* hooks.
 
 'use strict';
 
@@ -123,7 +121,7 @@ function renderAccountWidget() {
 }
 
 // ================================================================
-// Positions
+// Positions — close button always shown unless CLOSED
 // ================================================================
 function renderPositionsWidget() {
   const positions = dashboardState.positions || [];
@@ -155,9 +153,7 @@ function renderPositionsWidget() {
     const live = dashboardState.contractStates[cid];
     const otie = dashboardState.otieStates[cid];
     const status = live?.status || t.status || 'OPEN';
-    const canClose = live
-      ? (live.isValidToSell !== false && !live.isSold && !live.isExpired)
-      : status === 'OPEN';
+    const canClose = status !== 'CLOSED';
     const plClass = pl > 0 ? 'text-success' : pl < 0 ? 'text-danger' : 'text-muted';
 
     let otieCell = '<span class="text-muted small">—</span>';
@@ -180,7 +176,7 @@ function renderPositionsWidget() {
       <td><span class="badge ${status === 'OPEN' ? 'bg-primary' : 'bg-secondary'}">${status}</span></td>
       <td>${canClose
         ? `<button class="btn btn-sm btn-danger" onclick="window.closeTrade('${cid}')"><i class="fas fa-times"></i></button>`
-        : '<span class="small text-muted">settling…</span>'}</td>
+        : '<span class="small text-muted">—</span>'}</td>
     </tr>`;
   }
   html += `<tr><td colspan="6"><strong>Total Unrealized P&L</strong></td>
@@ -209,7 +205,9 @@ function renderPriceWidgets() {
   }
   let html = '';
   for (const [symbol, d] of Object.entries(prices)) {
-    const bid = d.bid || 0, ask = d.ask || 0, mid = (bid + ask) / 2;
+    const bid = d.bid || 0, ask = d.ask || 0;
+    let mid = d.mid;
+    if (!mid || mid <= 0) mid = (bid + ask) / 2;
     html += `<div class="d-flex justify-content-between"><span>${symbolToDisplay(symbol)}</span><span><strong>${formatPrice(mid)}</strong> (B:${formatPrice(bid)} A:${formatPrice(ask)})</span></div>`;
   }
   priceInfo.innerHTML = html;
@@ -528,6 +526,7 @@ window.executeLiveSignal = async function (symbol) {
   const sym = formatSymbol(symbol);
   const opportunity = dashboardState.signalOpportunities[sym];
   if (!opportunity || !opportunity.tradable) { alert('No tradable opportunity'); return; }
+
   const stratInfo = opportunity.strategyInfo || {};
   const strategy = stratInfo.anchorStrategy || opportunity.prediction?.strategyConsensus?.anchorStrategy || null;
   const regimeCode = opportunity.prediction?.regime || null;
@@ -551,13 +550,13 @@ window.executeLiveSignal = async function (symbol) {
   const body = await res.json().catch(() => ({}));
   if (body.success) {
     SoundManager.tradeOpen();
-    alert(`✅ Trade placed: ${body.contractId || '?'}`);
+    alert(`Trade placed: ${body.contractId || '?'}`);
     delete dashboardState.signalOpportunities[sym];
     renderLiveSignalPanel();
     refreshAllData();
   } else {
     SoundManager.reject();
-    alert(`❌ ${body.status || 'Error'}: ${body.error || 'unknown'}`);
+    alert(`${body.status || 'Error'}: ${body.error || 'unknown'}`);
   }
 };
 
@@ -661,6 +660,7 @@ async function closeTrade(tradeId) {
   try {
     await fetchJson(`/api/close/${tradeId}`, { method: 'PUT' });
     SoundManager.tradeClose();
+    refreshAllData();
   } catch (e) { alert('Error: ' + e.message); SoundManager.reject(); }
 }
 
@@ -735,4 +735,4 @@ document.addEventListener('DOMContentLoaded', async function () {
   renderLiveSignalPanel();
 });
 
-console.log('✅ app.js loaded');
+console.log('app.js loaded');
