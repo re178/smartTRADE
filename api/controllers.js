@@ -1,4 +1,4 @@
-// api/controllers.js – Complete Request Handlers (with defensive candles)
+// api/controllers.js – Complete Request Handlers (with defensive candles + resilient close)
 
 const Trade = require('../models/Trade');
 const Order = require('../models/Order');
@@ -165,27 +165,23 @@ exports.getPrices = async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 };
 
-// ---------- CANDLES — DEFENSIVE ----------
+// ---------- CANDLES ----------
 exports.getCandles = async (req, res) => {
   const { pair, count = 100, granularity = 'M5' } = req.query;
   if (!pair) return res.status(400).json({ error: 'pair query param required' });
 
   try {
     const product = getProduct(req);
-
-    // Build every plausible symbol format the broker might accept.
-    const clean = String(pair).toUpperCase().replace(/[/\-_]/g, '');  // EURUSD
+    const clean = String(pair).toUpperCase().replace(/[/\-_]/g, '');
     const formats = [clean];
     if (clean.length === 6) {
-      formats.push(clean.slice(0, 3) + '_' + clean.slice(3));           // EUR_USD
-      formats.push('frx' + clean);                                      // frxEURUSD
-      formats.push('frx' + clean.slice(0, 3) + '_' + clean.slice(3));   // frxEUR_USD
+      formats.push(clean.slice(0, 3) + '_' + clean.slice(3));
+      formats.push('frx' + clean);
+      formats.push('frx' + clean.slice(0, 3) + '_' + clean.slice(3));
     } else {
-      // Synthetic indices like R_100, 1HZ100V
       formats.push(pair);
     }
 
-    // Wait for broker if it's still connecting (Render cold start).
     try {
       const broker = getBroker(product);
       if (!broker.isConnected || !broker.isConnected()) {
@@ -199,7 +195,6 @@ exports.getCandles = async (req, res) => {
 
     let lastErr = null;
     const attempts = [];
-
     for (const fmt of formats) {
       try {
         const candles = await marketProvider.getCandles(fmt, parseInt(count), granularity, product);
@@ -223,7 +218,7 @@ exports.getCandles = async (req, res) => {
       pair, attempts,
       lastError: lastErr ? lastErr.message : 'All formats returned empty',
       brokerConnected,
-      hint: brokerConnected ? 'Broker connected but candle endpoint failed.' : 'Broker not connected — wait 30s on Render cold start and retry.',
+      hint: brokerConnected ? 'Broker connected but candle endpoint failed.' : 'Broker not connected — wait 30s and retry.',
     });
   } catch (error) {
     logger.error('[getCandles] Fatal:', error.message);
@@ -401,36 +396,108 @@ exports.placeOrder = async (req, res) => {
   }
 };
 
-// ---------- Close ----------
+// ---------- Close (resilient) ----------
 exports.closeTrade = async (req, res) => {
   const { tradeId } = req.params;
   if (!tradeId) return res.status(400).json({ error: 'tradeId required' });
+
+  const cid = String(tradeId);
+  const product = getProduct(req);
+  const broker = getBroker(product);
+
+  let brokerClosed = false;
+  let closeResult = null;
+  let brokerError = null;
+
   try {
-    const product = getProduct(req);
-    const result = await orderService.closeTrade(tradeId, product);
+    closeResult = await orderService.closeTrade(cid, product);
+    brokerClosed = true;
+  } catch (err) {
+    brokerError = err;
+    logger.warn(`[closeTrade] Broker close failed for ${cid}: ${err.message} — attempting verification`);
+  }
+
+  if (!brokerClosed) {
+    let verify = { status: 'unknown' };
     try {
-      const openTrades = await orderService.getOpenTrades(product);
-      broadcastToDashboards('positions', openTrades);
-    } catch (_) {}
+      verify = await broker.getContractStatus(cid);
+    } catch (vErr) {
+      logger.warn(`[closeTrade] verify failed for ${cid}: ${vErr.message}`);
+    }
+
+    if (verify.status === 'closed') {
+      try {
+        await Trade.findOneAndUpdate(
+          { contractId: cid },
+          {
+            $set: {
+              status: 'CLOSED',
+              closeTime: new Date(),
+              closePrice: verify.soldFor || null,
+              realizedProfit: verify.profit || 0,
+              pnl: verify.profit || 0,
+              floatingProfit: 0,
+            },
+          }
+        );
+        logger.info(`[closeTrade] ${cid} already settled at Deriv — Trade marked CLOSED (pnl=${verify.profit || 0})`);
+        brokerClosed = true;
+      } catch (dbErr) {
+        return res.status(500).json({ error: `Settlement verified but DB update failed: ${dbErr.message}` });
+      }
+    } else if (verify.status === 'unknown') {
+      try {
+        await Trade.findOneAndUpdate(
+          { contractId: cid, status: 'OPEN' },
+          {
+            $set: {
+              status: 'CLOSED',
+              closeTime: new Date(),
+              floatingProfit: 0,
+              closeReason: 'force-closed-stale',
+            },
+          }
+        );
+        logger.warn(`[closeTrade] ${cid} not found at Deriv — force-closed as stale`);
+        brokerClosed = true;
+      } catch (dbErr) {
+        return res.status(500).json({ error: `Force-close failed: ${dbErr.message}` });
+      }
+    } else {
+      return res.status(500).json({
+        error: brokerError ? brokerError.message : 'Close failed',
+        contractStatus: verify.status,
+        hint: 'Contract still open at Deriv but sell failed. Retry or check broker logs.',
+      });
+    }
+  }
+
+  try {
+    const openTrades = await orderService.getOpenTrades(product);
+    broadcastToDashboards('positions', openTrades);
+  } catch (_) {}
+
+  try {
+    const account = await accountService.getAccount(product);
+    broadcastToDashboards('account', enhanceAccount(account, broker));
+  } catch (_) {}
+
+  await broadcastHistoryUpdate();
+  portfolioManager.updateDailyPnL(closeResult?.pl || 0);
+
+  const updated = await Trade.findOne({ contractId: cid });
+  if (updated) {
     try {
-      const account = await accountService.getAccount(product);
-      const broker = getBroker(product);
-      broadcastToDashboards('account', enhanceAccount(account, broker));
-    } catch (_) {}
-    await broadcastHistoryUpdate();
-    portfolioManager.updateDailyPnL(result.pl || 0);
-    const updated = await Trade.findOne({ contractId: String(tradeId) });
-    if (updated) {
-      const broker = getBroker(product);
       const account = await broker.getAccount();
       notifyTrade('CLOSED', updated, account).catch(() => {});
-      try { const learner = await getPerformanceLearner(); learner.recordTrade(updated); } catch (_) {}
-    }
-    res.json({ success: true, contractId: String(tradeId), result });
-  } catch (error) {
-    logger.error('[closeTrade] Error:', error.message);
-    res.status(500).json({ error: error.message });
+    } catch (_) {}
+    try {
+      const learner = await getPerformanceLearner();
+      learner.recordTrade(updated);
+    } catch (_) {}
   }
+
+  res.json({ success: true, contractId: cid, result: closeResult || { forced: true } });
 };
 
 exports.cancelOrder = async (req, res) => {
