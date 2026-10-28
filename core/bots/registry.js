@@ -1,11 +1,8 @@
 // core/bots/registry.js
 // 17 bots across 4 categories. Each has its own entry rule.
-//   FX Multiplier   (7): trend_rider, range_scalper, breakout_hunter,
-//                        momentum_burst, pattern_reversal, pullback_trader, squeeze_breaker
-//   Synthetic Digit (5): even_odd_trader, over_under_trader,
-//                        matches_differs_trader, digit_streak_fade, digit_hot_cold
-//   Synthetic Binary(3): rise_fall_momentum, rise_fall_streak, rise_fall_breakout
-//   Volatility      (2): vol_high_low, vol_scalper
+// [FIX-2] FX bots now expose knockoutLevel / takeProfitLevel overrides.
+//   null = use ATR-derived levels (bot's own logic decides).
+//   number = use exactly that price as the KO/TP.
 
 'use strict';
 
@@ -15,13 +12,18 @@ function normalizeSymbol(s) {
   return String(s || '').replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
 }
 
-// ---------------- Helpers ----------------
-
 function wait(reason) {
   return { action: 'WAIT', reasons: Array.isArray(reason) ? reason : [reason] };
 }
 
 function enterMultiplier(direction, config, overrides, reasons) {
+  const finalKnockout = (config.knockoutLevel != null && config.knockoutLevel !== '')
+    ? Number(config.knockoutLevel)
+    : (overrides.knockoutLevel != null ? Number(overrides.knockoutLevel) : null);
+  const finalTakeProfit = (config.takeProfitLevel != null && config.takeProfitLevel !== '')
+    ? Number(config.takeProfitLevel)
+    : (overrides.takeProfitLevel != null ? Number(overrides.takeProfitLevel) : null);
+
   return {
     action: 'ENTER',
     direction,
@@ -33,8 +35,8 @@ function enterMultiplier(direction, config, overrides, reasons) {
       multiplier: config.multiplier,
       duration: overrides.durationSec || config.durationSec,
       durationUnit: 's',
-      knockoutLevel: overrides.knockoutLevel,
-      takeProfitLevel: overrides.takeProfitLevel,
+      knockoutLevel: finalKnockout,
+      takeProfitLevel: finalTakeProfit,
       contractClass: 'multiplier',
     },
   };
@@ -89,15 +91,11 @@ function enterBinary(contractType, config, reason) {
   };
 }
 
-// ================================================================
-//  BOT REGISTRY
-// ================================================================
-
 const BOTS = {
 
-  // --------------------------------------------------------------
+  // ============================================================
   // CATEGORY A — FX MULTIPLIER BOTS (7)
-  // --------------------------------------------------------------
+  // ============================================================
 
   trend_rider: {
     id: 'trend_rider', name: 'Trend Rider',
@@ -106,6 +104,7 @@ const BOTS = {
     defaultConfig: {
       symbol: 'EURUSD', timeframe: 'M5', stake: 10, multiplier: 200,
       durationSec: 900, minConfidence: 65, stopAfterLosses: 3,
+      knockoutLevel: null, takeProfitLevel: null,
     },
     evaluate(ctx) {
       const { state, prediction, consensus, config } = ctx;
@@ -137,6 +136,7 @@ const BOTS = {
     assetClass: 'fx', contractClass: 'multiplier',
     defaultConfig: {
       symbol: 'EURUSD', timeframe: 'M5', stake: 5, multiplier: 100, durationSec: 600,
+      knockoutLevel: null, takeProfitLevel: null,
     },
     evaluate(ctx) {
       const { state, config } = ctx;
@@ -165,6 +165,7 @@ const BOTS = {
     defaultConfig: {
       symbol: 'EURUSD', timeframe: 'M5', stake: 10, multiplier: 200,
       durationSec: 900, minAtrRatio: 1.2,
+      knockoutLevel: null, takeProfitLevel: null,
     },
     evaluate(ctx) {
       const { prediction, state, config } = ctx;
@@ -194,6 +195,7 @@ const BOTS = {
     defaultConfig: {
       symbol: 'EURUSD', timeframe: 'M1', stake: 5, multiplier: 300,
       durationSec: 300, velocityThreshold: 0.00005,
+      knockoutLevel: null, takeProfitLevel: null,
     },
     evaluate(ctx) {
       const { state, config } = ctx;
@@ -223,6 +225,7 @@ const BOTS = {
     assetClass: 'fx', contractClass: 'multiplier',
     defaultConfig: {
       symbol: 'EURUSD', timeframe: 'M5', stake: 8, multiplier: 150, durationSec: 900,
+      knockoutLevel: null, takeProfitLevel: null,
     },
     evaluate(ctx) {
       const { prediction, state, config } = ctx;
@@ -255,6 +258,7 @@ const BOTS = {
     assetClass: 'fx', contractClass: 'multiplier',
     defaultConfig: {
       symbol: 'EURUSD', timeframe: 'M5', stake: 10, multiplier: 200, durationSec: 900,
+      knockoutLevel: null, takeProfitLevel: null,
     },
     evaluate(ctx) {
       const { state, config, candles } = ctx;
@@ -287,6 +291,7 @@ const BOTS = {
     assetClass: 'fx', contractClass: 'multiplier',
     defaultConfig: {
       symbol: 'EURUSD', timeframe: 'M5', stake: 10, multiplier: 200, durationSec: 900,
+      knockoutLevel: null, takeProfitLevel: null,
     },
     evaluate(ctx) {
       const { state, config, candles } = ctx;
@@ -313,17 +318,15 @@ const BOTS = {
     },
   },
 
-  // --------------------------------------------------------------
+  // ============================================================
   // CATEGORY B — SYNTHETIC DIGIT BOTS (5)
-  // --------------------------------------------------------------
+  // ============================================================
 
   even_odd_trader: {
     id: 'even_odd_trader', name: 'Even/Odd Trader',
     description: 'Synthetic digit. Trades EVEN or ODD when frequency edge ≥ threshold.',
     assetClass: 'synthetic_digit', contractClass: 'digit',
-    defaultConfig: {
-      symbol: 'R_100', stake: 1, durationTicks: 5, minEdge: 0.08, minSamples: 50,
-    },
+    defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, minEdge: 0.08, minSamples: 50 },
     evaluate(ctx) {
       const { digitView, config } = ctx;
       if (!digitView) return wait('No digit data');
@@ -332,12 +335,8 @@ const BOTS = {
       }
       const even = digitView.evenPct;
       const odd = digitView.oddPct;
-      if (even >= 50 + config.minEdge * 100) {
-        return enterDigit('DIGITEVEN', config, `Even ${even.toFixed(1)}%`);
-      }
-      if (odd >= 50 + config.minEdge * 100) {
-        return enterDigit('DIGITODD', config, `Odd ${odd.toFixed(1)}%`);
-      }
+      if (even >= 50 + config.minEdge * 100) return enterDigit('DIGITEVEN', config, `Even ${even.toFixed(1)}%`);
+      if (odd >= 50 + config.minEdge * 100) return enterDigit('DIGITODD', config, `Odd ${odd.toFixed(1)}%`);
       return wait(`Even ${even.toFixed(1)}% / Odd ${odd.toFixed(1)}%`);
     },
   },
@@ -346,15 +345,11 @@ const BOTS = {
     id: 'over_under_trader', name: 'Over/Under Trader',
     description: 'Synthetic digit. Trades OVER or UNDER a digit threshold.',
     assetClass: 'synthetic_digit', contractClass: 'digit',
-    defaultConfig: {
-      symbol: 'R_100', stake: 1, durationTicks: 5, threshold: 5, minEdge: 0.10, minSamples: 100,
-    },
+    defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, threshold: 5, minEdge: 0.10, minSamples: 100 },
     evaluate(ctx) {
       const { digitView, config } = ctx;
       if (!digitView) return wait('No digit data');
-      if (digitView.sampleSize < config.minSamples) {
-        return wait(`Samples ${digitView.sampleSize} < ${config.minSamples}`);
-      }
+      if (digitView.sampleSize < config.minSamples) return wait(`Samples ${digitView.sampleSize} < ${config.minSamples}`);
       const freq = digitView.digitFreq;
       const th = config.threshold;
       const overCount = freq.slice(th + 1).reduce((a, b) => a + b, 0);
@@ -362,12 +357,8 @@ const BOTS = {
       const total = digitView.sampleSize;
       const overPct = (overCount / total) * 100;
       const underPct = (underCount / total) * 100;
-      if (overPct >= 50 + config.minEdge * 100) {
-        return enterDigitBarrier('DIGITOVER', th, config, `Over ${th}: ${overPct.toFixed(1)}%`);
-      }
-      if (underPct >= 50 + config.minEdge * 100) {
-        return enterDigitBarrier('DIGITUNDER', th, config, `Under ${th}: ${underPct.toFixed(1)}%`);
-      }
+      if (overPct >= 50 + config.minEdge * 100) return enterDigitBarrier('DIGITOVER', th, config, `Over ${th}: ${overPct.toFixed(1)}%`);
+      if (underPct >= 50 + config.minEdge * 100) return enterDigitBarrier('DIGITUNDER', th, config, `Under ${th}: ${underPct.toFixed(1)}%`);
       return wait(`Over ${th}: ${overPct.toFixed(1)}% / Under ${th}: ${underPct.toFixed(1)}%`);
     },
   },
@@ -376,25 +367,17 @@ const BOTS = {
     id: 'matches_differs_trader', name: 'Matches/Differs Trader',
     description: 'Synthetic digit. Trades MATCHES or DIFFERS on a specific digit.',
     assetClass: 'synthetic_digit', contractClass: 'digit',
-    defaultConfig: {
-      symbol: 'R_100', stake: 1, durationTicks: 5, targetDigit: 5, minSamples: 100,
-    },
+    defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, targetDigit: 5, minSamples: 100 },
     evaluate(ctx) {
       const { digitView, config } = ctx;
       if (!digitView) return wait('No digit data');
-      if (digitView.sampleSize < config.minSamples) {
-        return wait(`Samples ${digitView.sampleSize} < ${config.minSamples}`);
-      }
+      if (digitView.sampleSize < config.minSamples) return wait(`Samples ${digitView.sampleSize} < ${config.minSamples}`);
       const freq = digitView.digitFreq;
       const total = digitView.sampleSize;
       const target = config.targetDigit;
       const targetPct = (freq[target] / total) * 100;
-      if (targetPct >= 13) {
-        return enterDigitBarrier('DIGITMATCH', target, config, `Digit ${target} hot: ${targetPct.toFixed(1)}%`);
-      }
-      if (targetPct <= 7) {
-        return enterDigitBarrier('DIGITDIFF', target, config, `Digit ${target} cold: ${targetPct.toFixed(1)}%`);
-      }
+      if (targetPct >= 13) return enterDigitBarrier('DIGITMATCH', target, config, `Digit ${target} hot: ${targetPct.toFixed(1)}%`);
+      if (targetPct <= 7) return enterDigitBarrier('DIGITDIFF', target, config, `Digit ${target} cold: ${targetPct.toFixed(1)}%`);
       return wait(`Digit ${target} at ${targetPct.toFixed(1)}% (need <7 or >13)`);
     },
   },
@@ -403,20 +386,14 @@ const BOTS = {
     id: 'digit_streak_fade', name: 'Digit Streak Fade',
     description: 'Synthetic digit. Fades long even/odd streaks (mean reversion).',
     assetClass: 'synthetic_digit', contractClass: 'digit',
-    defaultConfig: {
-      symbol: 'R_100', stake: 1, durationTicks: 5, minStreak: 4,
-    },
+    defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, minStreak: 4 },
     evaluate(ctx) {
       const { digitView, config } = ctx;
       if (!digitView) return wait('No digit data');
       const evenStreak = digitView.evenStreak || 0;
       const oddStreak = digitView.oddStreak || 0;
-      if (evenStreak >= config.minStreak) {
-        return enterDigit('DIGITODD', config, `${evenStreak}-streak of even, fading to ODD`);
-      }
-      if (oddStreak >= config.minStreak) {
-        return enterDigit('DIGITEVEN', config, `${oddStreak}-streak of odd, fading to EVEN`);
-      }
+      if (evenStreak >= config.minStreak) return enterDigit('DIGITODD', config, `${evenStreak}-streak of even, fading to ODD`);
+      if (oddStreak >= config.minStreak) return enterDigit('DIGITEVEN', config, `${oddStreak}-streak of odd, fading to EVEN`);
       return wait(`Streak: even=${evenStreak} odd=${oddStreak}`);
     },
   },
@@ -425,15 +402,11 @@ const BOTS = {
     id: 'digit_hot_cold', name: 'Digit Hot/Cold',
     description: 'Synthetic digit. Trades OVER/UNDER the best-edge threshold.',
     assetClass: 'synthetic_digit', contractClass: 'digit',
-    defaultConfig: {
-      symbol: 'R_100', stake: 1, durationTicks: 5, minSamples: 100,
-    },
+    defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, minSamples: 100 },
     evaluate(ctx) {
       const { digitView, config } = ctx;
       if (!digitView) return wait('No digit data');
-      if (digitView.sampleSize < config.minSamples) {
-        return wait(`Samples < ${config.minSamples}`);
-      }
+      if (digitView.sampleSize < config.minSamples) return wait(`Samples < ${config.minSamples}`);
       const freq = digitView.digitFreq;
       const total = digitView.sampleSize;
       let bestOver = null, bestUnder = null;
@@ -443,41 +416,29 @@ const BOTS = {
         if (overPct > 55 && (!bestOver || overPct > bestOver.pct)) bestOver = { th, pct: overPct };
         if (underPct > 55 && (!bestUnder || underPct > bestUnder.pct)) bestUnder = { th, pct: underPct };
       }
-      if (bestOver && bestOver.pct >= (bestUnder ? bestUnder.pct : 0)) {
-        return enterDigitBarrier('DIGITOVER', bestOver.th, config, `Over ${bestOver.th}: ${bestOver.pct.toFixed(1)}%`);
-      }
-      if (bestUnder) {
-        return enterDigitBarrier('DIGITUNDER', bestUnder.th, config, `Under ${bestUnder.th}: ${bestUnder.pct.toFixed(1)}%`);
-      }
+      if (bestOver && bestOver.pct >= (bestUnder ? bestUnder.pct : 0)) return enterDigitBarrier('DIGITOVER', bestOver.th, config, `Over ${bestOver.th}: ${bestOver.pct.toFixed(1)}%`);
+      if (bestUnder) return enterDigitBarrier('DIGITUNDER', bestUnder.th, config, `Under ${bestUnder.th}: ${bestUnder.pct.toFixed(1)}%`);
       return wait('No strong over/under edge');
     },
   },
 
-  // --------------------------------------------------------------
+  // ============================================================
   // CATEGORY C — SYNTHETIC RISE/FALL BOTS (3)
-  // --------------------------------------------------------------
+  // ============================================================
 
   rise_fall_momentum: {
     id: 'rise_fall_momentum', name: 'Rise/Fall Momentum',
     description: 'Synthetic CALL/PUT based on tick direction bias > threshold.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
-    defaultConfig: {
-      symbol: 'R_100', stake: 1, durationTicks: 5, minBias: 0.56, minSamples: 100,
-    },
+    defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, minBias: 0.56, minSamples: 100 },
     evaluate(ctx) {
       const { digitView, config } = ctx;
       if (!digitView) return wait('No data');
-      if (digitView.sampleSize < config.minSamples) {
-        return wait(`Samples < ${config.minSamples}`);
-      }
+      if (digitView.sampleSize < config.minSamples) return wait(`Samples < ${config.minSamples}`);
       const risePct = digitView.risePct / 100;
       const fallPct = digitView.fallPct / 100;
-      if (risePct >= config.minBias) {
-        return enterBinary('CALL', config, `Rise bias ${(risePct * 100).toFixed(1)}%`);
-      }
-      if (fallPct >= config.minBias) {
-        return enterBinary('PUT', config, `Fall bias ${(fallPct * 100).toFixed(1)}%`);
-      }
+      if (risePct >= config.minBias) return enterBinary('CALL', config, `Rise bias ${(risePct * 100).toFixed(1)}%`);
+      if (fallPct >= config.minBias) return enterBinary('PUT', config, `Fall bias ${(fallPct * 100).toFixed(1)}%`);
       return wait(`Rise ${(risePct * 100).toFixed(1)}% / Fall ${(fallPct * 100).toFixed(1)}%`);
     },
   },
@@ -486,9 +447,7 @@ const BOTS = {
     id: 'rise_fall_streak', name: 'Rise/Fall Streak Fade',
     description: 'Synthetic CALL/PUT. Fades N consecutive rises or falls.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
-    defaultConfig: {
-      symbol: 'R_100', stake: 1, durationTicks: 5, minStreak: 4,
-    },
+    defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, minStreak: 4 },
     evaluate(ctx) {
       const { digitView, config } = ctx;
       if (!digitView) return wait('No data');
@@ -513,9 +472,7 @@ const BOTS = {
     id: 'rise_fall_breakout', name: 'Rise/Fall Breakout',
     description: 'Synthetic CALL/PUT on sharp directional tick burst.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
-    defaultConfig: {
-      symbol: 'R_100', stake: 1, durationTicks: 5, lookbackTicks: 10, minMovePct: 0.05,
-    },
+    defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, lookbackTicks: 10, minMovePct: 0.05 },
     evaluate(ctx) {
       const { digitView, config } = ctx;
       if (!digitView) return wait('No data');
@@ -523,25 +480,21 @@ const BOTS = {
       if (prices.length < 5) return wait('Not enough prices');
       const first = prices[0], last = prices[prices.length - 1];
       const movePct = ((last - first) / first) * 100;
-      if (Math.abs(movePct) < config.minMovePct) {
-        return wait(`Move ${movePct.toFixed(3)}% < ${config.minMovePct}%`);
-      }
+      if (Math.abs(movePct) < config.minMovePct) return wait(`Move ${movePct.toFixed(3)}% < ${config.minMovePct}%`);
       const dir = movePct > 0 ? 'CALL' : 'PUT';
       return enterBinary(dir, config, `Move ${movePct.toFixed(3)}% in ${config.lookbackTicks} ticks`);
     },
   },
 
-  // --------------------------------------------------------------
+  // ============================================================
   // CATEGORY D — SYNTHETIC VOLATILITY BOTS (2)
-  // --------------------------------------------------------------
+  // ============================================================
 
   vol_high_low: {
     id: 'vol_high_low', name: 'Volatility High/Low',
     description: 'Synthetic ONETOUCH/NOTOUCH on momentum bias.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
-    defaultConfig: {
-      symbol: 'R_100', stake: 1, durationTicks: 5, barrierPips: 10,
-    },
+    defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, barrierPips: 10 },
     evaluate(ctx) {
       const { digitView, config } = ctx;
       if (!digitView) return wait('No data');
@@ -551,12 +504,8 @@ const BOTS = {
       const total = up + down;
       if (total === 0) return wait('Not enough direction data');
       const bias = Math.max(up, down) / total;
-      if (bias > 0.65) {
-        return enterBinary('ONETOUCH', config, `Strong directional bias ${(bias * 100).toFixed(1)}%`);
-      }
-      if (bias < 0.55) {
-        return enterBinary('NOTOUCH', config, `Balanced movement, expect no touch`);
-      }
+      if (bias > 0.65) return enterBinary('ONETOUCH', config, `Strong directional bias ${(bias * 100).toFixed(1)}%`);
+      if (bias < 0.55) return enterBinary('NOTOUCH', config, `Balanced movement, expect no touch`);
       return wait(`Bias ${(bias * 100).toFixed(1)}%`);
     },
   },
@@ -565,9 +514,7 @@ const BOTS = {
     id: 'vol_scalper', name: 'Volatility Scalper',
     description: 'Synthetic CALL/PUT. Quick 5-tick scalps on strong short-term momentum.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
-    defaultConfig: {
-      symbol: 'R_100', stake: 1, durationTicks: 5,
-    },
+    defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5 },
     evaluate(ctx) {
       const { digitView, config } = ctx;
       if (!digitView) return wait('No data');
