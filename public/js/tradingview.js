@@ -1,8 +1,5 @@
 // public/js/tradingview.js
-// Defensive chart loader. Handles v4 AND v5 API, missing data, fetch errors.
-// [FILE-4.3] onPriceTick now computes `mid` from bid/ask when the broker's
-// tick event doesn't include it. Broker broadcasts {symbol, bid, ask, time}
-// — no mid. Previous version read data.mid → 0 → displayed "0.00000".
+// Chart loader with v4/v5 support + drawing tools integration.
 
 'use strict';
 
@@ -47,17 +44,13 @@
   function initChart() {
     const container = document.getElementById('tradingChart');
     if (!container) {
-      setStatus('❌ <b>Error:</b> #tradingChart container not found in DOM', '#e74c5e');
+      setStatus('Error: #tradingChart container not found in DOM', '#e74c5e');
       return false;
     }
 
     const lib = chartLibAvailable();
     if (!lib.ok) {
-      setStatus(
-        `❌ <b>Chart library not loaded.</b><br>${lib.reason}<br>` +
-        `<small>Check the script tag for lightweight-charts in index.html</small>`,
-        '#e74c5e'
-      );
+      setStatus('Chart library not loaded. ' + lib.reason, '#e74c5e');
       return false;
     }
 
@@ -73,7 +66,7 @@
         timeScale: { timeVisible: true, secondsVisible: false },
       });
     } catch (err) {
-      setStatus('❌ <b>createChart failed:</b> ' + err.message, '#e74c5e');
+      setStatus('createChart failed: ' + err.message, '#e74c5e');
       return false;
     }
 
@@ -87,7 +80,7 @@
       try {
         candleSeries = chart.addCandlestickSeries(candleOpts);
         _chartApi = 'v4';
-        console.log('[TV] ✓ Using v4 API (chart.addCandlestickSeries)');
+        console.log('[TV] Using v4 API (chart.addCandlestickSeries)');
       } catch (err) {
         console.warn('[TV] v4 addCandlestickSeries threw:', err.message);
       }
@@ -102,35 +95,15 @@
         try {
           candleSeries = chart.addSeries(CandleCtor, candleOpts);
           _chartApi = 'v5';
-          console.log('[TV] ✓ Using v5 API (chart.addSeries(CandlestickSeries))');
+          console.log('[TV] Using v5 API (chart.addSeries(CandlestickSeries))');
         } catch (err) {
           console.warn('[TV] v5 addSeries threw:', err.message);
-        }
-      }
-      if (!candleSeries) {
-        const alt =
-          window.LightweightCharts.candlestickSeries ||
-          window.LightweightCharts.SeriesCandlestick ||
-          null;
-        if (alt) {
-          try {
-            candleSeries = chart.addSeries(alt, candleOpts);
-            _chartApi = 'v5-alt';
-            console.log('[TV] ✓ Using v5-alt API');
-          } catch (err) {
-            console.warn('[TV] v5-alt threw:', err.message);
-          }
         }
       }
     }
 
     if (!candleSeries) {
-      setStatus(
-        `❌ <b>Unsupported chart API.</b> Version: ${version}<br>` +
-        `Chart: addCandlestickSeries=${typeof chart.addCandlestickSeries}, addSeries=${typeof chart.addSeries}<br>` +
-        `<small>Try a fresh hard refresh (Ctrl+Shift+R).</small>`,
-        '#e74c5e'
-      );
+      setStatus('Unsupported chart API. Version: ' + version, '#e74c5e');
       return false;
     }
 
@@ -138,7 +111,23 @@
       if (chart && container) chart.applyOptions({ width: container.clientWidth || 800 });
     });
 
-    console.log('[TV] Chart initialized ✓ (API:', _chartApi, ')');
+    // Attach drawing tools
+    try {
+      if (window.ChartTools && typeof window.ChartTools.attach === 'function') {
+        window.ChartTools.attach({
+          chart,
+          series: candleSeries,
+          container,
+          getSymbol: () => currentSymbol,
+          getTimeframe: () => currentTF,
+        });
+        console.log('[TV] Chart tools attached');
+      }
+    } catch (err) {
+      console.warn('[TV] Chart tools attach failed:', err.message);
+    }
+
+    console.log('[TV] Chart initialized (API:', _chartApi, ')');
     return true;
   }
 
@@ -163,10 +152,10 @@
   async function loadCandles() {
     console.log(`[TV] loadCandles() — ${currentSymbol} ${currentTF}`);
     if (!candleSeries) {
-      setStatus('❌ Chart not initialized. Click <b>Reload</b> after checking Debug panel.', '#e74c5e');
+      setStatus('Chart not initialized. Click Reload after checking Debug panel.', '#e74c5e');
       return;
     }
-    setStatus('⏳ Loading candles...', '#f39c12');
+    setStatus('Loading candles...', '#f39c12');
 
     const url = `/api/candles?pair=${encodeURIComponent(currentSymbol)}&count=200&granularity=${currentTF}`;
     let res, text, data;
@@ -174,28 +163,28 @@
       res = await fetch(url);
       text = await res.text();
     } catch (err) {
-      setStatus('❌ <b>Network error:</b> ' + err.message, '#e74c5e');
+      setStatus('Network error: ' + err.message, '#e74c5e');
       return;
     }
 
     if (!res.ok) {
-      setStatus(`❌ <b>/api/candles returned HTTP ${res.status}.</b><br><small>${text.slice(0, 200).replace(/</g, '&lt;')}</small>`, '#e74c5e');
+      setStatus(`/api/candles returned HTTP ${res.status}.`, '#e74c5e');
       return;
     }
 
     try { data = JSON.parse(text); }
     catch (err) {
-      setStatus(`❌ <b>Invalid JSON:</b><br><small>${text.slice(0, 200)}</small>`, '#e74c5e');
+      setStatus('Invalid JSON from /api/candles', '#e74c5e');
       return;
     }
 
     if (!Array.isArray(data)) {
-      setStatus(`❌ <b>Expected array, got ${typeof data}.</b><br><small>${JSON.stringify(data).slice(0, 200)}</small>`, '#e74c5e');
+      setStatus(`Expected array, got ${typeof data}.`, '#e74c5e');
       return;
     }
 
     if (data.length === 0) {
-      setStatus('⚠️ <b>No candles returned.</b><br><small>Broker has no history yet for this pair/timeframe.</small>', '#f39c12');
+      setStatus('No candles returned. Broker has no history yet.', '#f39c12');
       return;
     }
 
@@ -206,7 +195,7 @@
     }
 
     if (_candles.length === 0) {
-      setStatus('❌ <b>All candles failed validation.</b><br><small>First raw: ' + JSON.stringify(data[0]).slice(0, 300) + '</small>', '#e74c5e');
+      setStatus('All candles failed validation.', '#e74c5e');
       return;
     }
 
@@ -218,9 +207,9 @@
       chart.timeScale().fitContent();
       setStatus('');
       renderCandleTable();
-      console.log('[TV] ✓ Chart rendered');
+      console.log('[TV] Chart rendered');
     } catch (err) {
-      setStatus('❌ <b>setData failed:</b> ' + err.message, '#e74c5e');
+      setStatus('setData failed: ' + err.message, '#e74c5e');
     }
   }
 
@@ -247,8 +236,6 @@
     }).join('');
   }
 
-  // [FILE-4.3] Fix: broker emits { symbol, bid, ask, time } — no mid.
-  // Compute mid from bid/ask so the price display works.
   window.onPriceTick = function (data) {
     if (!data) return;
     const sym = String(data.symbol || '').replace(/^frx/i, '').replace(/[_/]/g, '').toUpperCase();
@@ -296,10 +283,16 @@
       currentSymbol = e.target.value;
       const el = document.getElementById('tvSymbol');
       if (el) el.textContent = currentSymbol;
+      if (window.ChartTools && window.ChartTools.reloadForNewSymbol) {
+        window.ChartTools.reloadForNewSymbol();
+      }
       loadCandles();
     });
     document.getElementById('tvTimeframeSelect')?.addEventListener('change', e => {
       currentTF = e.target.value;
+      if (window.ChartTools && window.ChartTools.reloadForNewSymbol) {
+        window.ChartTools.reloadForNewSymbol();
+      }
       loadCandles();
     });
     document.getElementById('tvReloadChart')?.addEventListener('click', () => {
@@ -315,6 +308,41 @@
       a.href = URL.createObjectURL(blob);
       a.download = `${currentSymbol}_${currentTF}_candles.csv`;
       a.click(); URL.revokeObjectURL(a.href);
+    });
+
+    ['hline', 'vline', 'box'].forEach(tool => {
+      document.getElementById('tool_' + tool)?.addEventListener('click', () => {
+        if (!window.ChartTools) return;
+        const current = window.ChartTools.tool;
+        window.ChartTools.setTool(current === tool ? null : tool);
+        window.ChartTools._updateToolButtons();
+      });
+    });
+    document.getElementById('tool_undo')?.addEventListener('click', () => {
+      if (window.ChartTools) window.ChartTools.undo();
+    });
+    document.getElementById('tool_clear')?.addEventListener('click', () => {
+      if (window.ChartTools) window.ChartTools.clear();
+    });
+
+    document.getElementById('tvFullscreen')?.addEventListener('click', () => {
+      const body = document.getElementById('tvChartBody');
+      if (!body) return;
+      if (!document.fullscreenElement) {
+        body.requestFullscreen().then(() => {
+          setTimeout(() => {
+            if (chart) chart.applyOptions({ width: body.clientWidth, height: window.innerHeight - 80 });
+            if (window.ChartTools && window.ChartTools._resize) window.ChartTools._resize();
+          }, 100);
+        }).catch(err => alert('Fullscreen failed: ' + err.message));
+      } else {
+        document.exitFullscreen().then(() => {
+          setTimeout(() => {
+            if (chart) chart.applyOptions({ width: body.clientWidth, height: 500 });
+            if (window.ChartTools && window.ChartTools._resize) window.ChartTools._resize();
+          }, 100);
+        });
+      }
     });
   }
 
