@@ -1,15 +1,4 @@
-// server.js – RTS Entry Point (Deriv-only, pattern-based)
-// Integrated: StrategyRanker + PatternPredictor + OpportunityEngine +
-//             RiskEngine + OTIE + Bot Runner + Digit Analyzer + BotRoutes.
-//
-// CHANGE from prior version:
-//   • Removed stateStore + outcomeLabeler + predictionEngine
-//   • Added pattern-based predictor (core/intelligence/patterns/predictor)
-//   • Added bot runner (core/bots/runner) with lifecycle + WS events
-//   • Added digit analyzer (core/intelligence/digit/analyzer)
-//   • Mounted /api bot routes
-//   • Removed /api/research mounting (research routes still exist but not used)
-//   • All existing endpoints preserved
+// server.js – RTS Entry Point (Deriv-only, pattern-based, with balance guard)
 
 require('dotenv').config();
 
@@ -20,9 +9,6 @@ const mongoose = require('mongoose');
 const WebSocket = require('ws');
 const http = require('http');
 
-// ============================================================
-// Broadcast helpers — must exist before any require uses them
-// ============================================================
 const dashboardClients = new Set();
 
 function broadcastToDashboards(type, data) {
@@ -44,19 +30,14 @@ function broadcast(type, data) { broadcastToDashboards(type, data); }
 module.exports.broadcastToDashboards = broadcastToDashboards;
 module.exports.broadcast = broadcast;
 
-// ============================================================
-// Requires AFTER exports
-// ============================================================
 const connectDB = require('./config/db');
 const apiRoutes = require('./api/routes');
 const botRoutes = require('./api/botRoutes');
 const User = require('./models/User');
 
-// ---------- MODELS ----------
 const Trade = require('./models/Trade');
 const StrategyPerformance = require('./models/StrategyPerformance');
 
-// ---------- COGNITIVE MODULES ----------
 const priceBuffer = require('./core/data/priceBuffer');
 const candleStore = require('./core/data/candleStore');
 const marketStateCache = require('./core/data/marketStateCache');
@@ -65,38 +46,26 @@ const deepRegime = require('./core/intelligence/deep/regime');
 const decisionEngine = require('./core/decision/engine');
 const eventBus = require('./infrastructure/eventBus');
 
-// ---------- DATA ORCHESTRATOR ----------
 const { dataOrchestrator } = require('./core/data/dataOrchestrator');
 
-// ---------- STRATEGY ENGINE + RANKER ----------
 const strategyEngine = require('./core/strategy/engine');
 const ranker = require('./core/strategy/ranker');
 
-// ---------- PATTERN PREDICTOR + OPPORTUNITY + RISK ----------
 const predictor = require('./core/intelligence/patterns/predictor');
 const opportunityEngine = require('./core/intelligence/opportunityEngine');
 const riskEngine = require('./core/risk/riskEngine');
 
-// ---------- ANALYTICS DASHBOARD ----------
 const analyticsDashboard = require('./core/analytics/dashboard');
-
-// ---------- CANDLE BOOTSTRAPPER ----------
 const candleBootstrapper = require('./core/data/candleBootstrapper');
-
-// ---------- OTIE ----------
 const otie = require('./core/intelligence/openTradeIntelligenceV5');
-
-// ---------- PERFORMANCE MONITOR ----------
 const performanceMonitor = require('./core/performance/performanceMonitor');
 
-// ---------- BOT RUNNER + DIGIT ANALYZER ----------
 const botRunner = require('./core/bots/runner');
 const digitAnalyzer = require('./core/intelligence/digit/analyzer');
+const balanceGuard = require('./core/risk/balanceGuard');
 
-// ---------- BROKER ----------
 const { getBroker } = require('./core/execution/brokerFactory');
 
-// ---------- HELPERS ----------
 function normalizeSymbol(symbol) {
   if (!symbol) return '';
   return symbol.replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
@@ -107,9 +76,6 @@ const PORT = process.env.PORT || 5000;
 
 connectDB();
 
-// ============================================================
-// Per-symbol caches
-// ============================================================
 const _consensusCache = new Map();
 const _predictionCache = new Map();
 const _opportunityCache = new Map();
@@ -146,9 +112,6 @@ function flattenConsensus(consensus) {
   };
 }
 
-// ============================================================
-// Admin helper
-// ============================================================
 async function ensureAdmin() {
   try {
     const adminId = 'admin';
@@ -165,7 +128,6 @@ async function ensureAdmin() {
   }
 }
 
-// ---------- JSON repair helper ----------
 function repairJson(raw) {
   let repaired = raw.trim();
   if (repaired.endsWith(',')) repaired = repaired.slice(0, -1);
@@ -186,7 +148,6 @@ function repairJson(raw) {
   return repaired;
 }
 
-// ---------- Middleware ----------
 app.use(cors());
 
 app.use((req, res, next) => {
@@ -217,7 +178,6 @@ app.use((req, res, next) => {
 
 app.use(express.static('public'));
 
-// ---------- Admin user middleware ----------
 app.use(async (req, res, next) => {
   try {
     let admin = await User.findOne({ userId: 'admin' });
@@ -234,13 +194,9 @@ app.use(async (req, res, next) => {
   }
 });
 
-// ---------- API Routes ----------
 app.use('/api', apiRoutes);
 app.use('/api', botRoutes);
 
-// ============================================================
-// Health + debug
-// ============================================================
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'OK', message: 'RTS is running with Deriv broker' });
 });
@@ -264,6 +220,23 @@ app.get('/health/pipeline', async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: err.message, healthy: false });
+  }
+});
+
+app.get('/api/balance-guard', (req, res) => {
+  try {
+    res.json(balanceGuard.getState());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/balance-guard/reset', (req, res) => {
+  try {
+    balanceGuard.reset();
+    res.json({ success: true, state: balanceGuard.getState() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -312,6 +285,7 @@ app.get('/debug/pipeline', async (req, res) => {
         symbolsWithOpportunity: Array.from(_opportunityCache.keys()),
         candleCacheStats: strategyEngine.getCandleCacheStats ? strategyEngine.getCandleCacheStats() : [],
       },
+      balanceGuard: balanceGuard.getState(),
       runningBots: botRunner.list(),
       watchedSymbols: WATCHED_SYMBOLS,
     });
@@ -320,9 +294,6 @@ app.get('/debug/pipeline', async (req, res) => {
   }
 });
 
-// ============================================================
-// /api/signal/active
-// ============================================================
 app.get('/api/signal/active', async (req, res) => {
   try {
     const broker = getBroker('deriv_cfd');
@@ -385,9 +356,6 @@ app.get('/api/signal/active', async (req, res) => {
   }
 });
 
-// ============================================================
-// /debug/strategies
-// ============================================================
 app.get('/debug/strategies', async (req, res) => {
   try {
     const top = await StrategyPerformance.topStrategies(20);
@@ -433,7 +401,6 @@ app.get('/debug/strategies', async (req, res) => {
   }
 });
 
-// ---------- Existing debug route ----------
 app.get('/debug/status', (req, res) => {
   const lastState = marketStateCache.get('EURUSD') || null;
   const lastRegime = deepRegime.getLatestRegime('EURUSD') || null;
@@ -448,6 +415,7 @@ app.get('/debug/status', (req, res) => {
       strategyRanker: ranker ? 'running' : 'not loaded',
       botRunner: botRunner ? 'running' : 'not loaded',
       digitAnalyzer: digitAnalyzer ? 'running' : 'not loaded',
+      balanceGuard: balanceGuard ? 'running' : 'not loaded',
     },
     lastCandle: candleStore.getHistory('EURUSD', 'M5', 1)[0] || null,
     lastMarketState: lastState,
@@ -457,7 +425,6 @@ app.get('/debug/status', (req, res) => {
   });
 });
 
-// ---------- SPA fallback ----------
 app.get('*', (req, res) => {
   if (!req.path.startsWith('/api')) {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
@@ -466,9 +433,6 @@ app.get('*', (req, res) => {
   }
 });
 
-// ============================================================
-// HTTP + WebSocket server
-// ============================================================
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
@@ -542,6 +506,7 @@ async function sendDashboardInitialState(ws) {
         strategyConsensus,
         digitViews,
         runningBots: botRunner.list(),
+        balanceGuard: balanceGuard.getState(),
       }
     }));
   } catch (err) {
@@ -549,7 +514,6 @@ async function sendDashboardInitialState(ws) {
   }
 }
 
-// ---------- Legacy event bindings ----------
 awarenessEngine.on('marketAwareness', (data) => broadcast('marketAwareness', data));
 deepRegime.on('regime', (regime) => broadcast('regime', regime));
 decisionEngine.on('decision', (decision) => broadcast('decision', decision));
@@ -561,9 +525,6 @@ otie.on('otieV5State', (state) => broadcast('otieV5State', state));
 otie.on('otieV5Action', (action) => broadcast('otieV5Action', action));
 otie.on('otieState', (state) => broadcast('otieState', state));
 
-// ============================================================
-// StrategyPerformance feedback loop
-// ============================================================
 eventBus.on('trade.closed', async (data) => {
   const contractId = data?.contractId;
   const strategy = data?.strategy;
@@ -595,7 +556,6 @@ eventBus.on('trade.closed', async (data) => {
   }
 });
 
-// Performance monitor
 eventBus.on('trade.closed', async (data) => {
   try {
     const trade = await Trade.findOne({ contractId: String(data.contractId) });
@@ -610,9 +570,6 @@ performanceMonitor.on('thresholdsUpdated', (thresholds) => {
   }
 });
 
-// ============================================================
-// PREDICTION PIPELINE
-// ============================================================
 const WATCHED_SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD'];
 
 async function runPredictionPipeline(symbol) {
@@ -702,7 +659,7 @@ function startPipelineTimer() {
 
 async function startCognitiveEngines() {
   try {
-    console.log('[CTOS] Cognitive engines active: Awareness, Regime, Decision, OTIE, StrategyRanker, BotRunner, DigitAnalyzer.');
+    console.log('[CTOS] Cognitive engines active: Awareness, Regime, Decision, OTIE, StrategyRanker, BotRunner, DigitAnalyzer, BalanceGuard.');
   } catch (err) {
     console.error('[CTOS] Initialization error:', err.message);
   }
@@ -733,39 +690,43 @@ async function startServer() {
 
   server.listen(PORT, () => {
     console.log('==============================================');
-    console.log(`✅ RTS server running on http://localhost:${PORT}`);
-    console.log(`📊 Dashboard:      http://localhost:${PORT}`);
-    console.log(`🔌 API base:       http://localhost:${PORT}/api`);
-    console.log(`🎯 Signals:        http://localhost:${PORT}/api/signal/active`);
-    console.log(`🤖 Bots:           http://localhost:${PORT}/api/bots`);
-    console.log(`🔢 Digits:         http://localhost:${PORT}/api/digit`);
-    console.log(`📈 Strategies:     http://localhost:${PORT}/debug/strategies`);
-    console.log(`🩺 Health:         http://localhost:${PORT}/health/pipeline`);
-    console.log(`🔧 Debug:          http://localhost:${PORT}/debug/pipeline`);
-    console.log('🧠 CTOS + StrategyRanker + PatternPredictor: enabled');
-    console.log('🤖 Bot runner: ready');
-    console.log('📦 Deriv broker: active');
+    console.log(`RTS server running on http://localhost:${PORT}`);
+    console.log(`Dashboard:      http://localhost:${PORT}`);
+    console.log(`API base:       http://localhost:${PORT}/api`);
+    console.log(`Signals:        http://localhost:${PORT}/api/signal/active`);
+    console.log(`Bots:           http://localhost:${PORT}/api/bots`);
+    console.log(`Digits:         http://localhost:${PORT}/api/digit`);
+    console.log(`Balance guard:  http://localhost:${PORT}/api/balance-guard`);
+    console.log(`Strategies:     http://localhost:${PORT}/debug/strategies`);
+    console.log(`Health:         http://localhost:${PORT}/health/pipeline`);
+    console.log(`Debug:          http://localhost:${PORT}/debug/pipeline`);
     console.log('==============================================');
 
     startWSPing();
 
     dataOrchestrator.recover()
-      .then(() => console.log('✅ Data Orchestrator initialised.'))
-      .catch(err => console.warn('⚠️ Data Orchestrator recover failed:', err.message));
+      .then(() => console.log('Data Orchestrator initialised.'))
+      .catch(err => console.warn('Data Orchestrator recover failed:', err.message));
 
     setTimeout(startCognitiveEngines, 2000);
 
-    // Start digit analyzer
     try {
       digitAnalyzer.start();
       digitAnalyzer.on('digitUpdate', (view) => broadcastToDashboards('digitUpdate', view));
       digitAnalyzer.on('digitSignal', (sig) => broadcastToDashboards('digitSignal', sig));
-      console.log('✅ Digit analyzer started.');
+      console.log('Digit analyzer started.');
     } catch (err) {
-      console.error('❌ Digit analyzer failed:', err.message);
+      console.error('Digit analyzer failed:', err.message);
     }
 
-    // Wire bot runner events
+    try {
+      balanceGuard.start();
+      balanceGuard.on && balanceGuard.on('triggered', () => {});
+      console.log('Balance guard started.');
+    } catch (err) {
+      console.error('Balance guard failed:', err.message);
+    }
+
     try {
       botRunner.on('botStarted', (d) => broadcastToDashboards('botStarted', d));
       botRunner.on('botStopped', (d) => broadcastToDashboards('botStopped', d));
@@ -773,27 +734,27 @@ async function startServer() {
       botRunner.on('botResult', (d) => broadcastToDashboards('botResult', d));
       botRunner.on('botCycle', (d) => broadcastToDashboards('botCycle', d));
       botRunner.on('botError', (d) => broadcastToDashboards('botError', d));
-      console.log('✅ Bot runner wired to dashboards.');
+      console.log('Bot runner wired to dashboards.');
     } catch (err) {
-      console.error('❌ Bot runner wiring failed:', err.message);
+      console.error('Bot runner wiring failed:', err.message);
     }
 
-    try { analyticsDashboard.start(); console.log('✅ Analytics dashboard started.'); }
-    catch (err) { console.error('❌ Analytics dashboard failed:', err.message); }
+    try { analyticsDashboard.start(); console.log('Analytics dashboard started.'); }
+    catch (err) { console.error('Analytics dashboard failed:', err.message); }
 
     try {
       candleBootstrapper.bootstrap()
-        .then(() => console.log('✅ Candle bootstrap complete.'))
-        .catch(err => console.warn('⚠️ Candle bootstrap failed (non-fatal):', err.message));
+        .then(() => console.log('Candle bootstrap complete.'))
+        .catch(err => console.warn('Candle bootstrap failed (non-fatal):', err.message));
     } catch (err) {
-      console.warn('⚠️ Candle bootstrap threw (non-fatal):', err.message);
+      console.warn('Candle bootstrap threw (non-fatal):', err.message);
     }
 
     setTimeout(() => {
       startDerivBroker().then(() => {
         const broker = getBroker('deriv_cfd');
         if (broker.isConnected()) {
-          console.log('✅ Broker ready — starting pipeline timer.');
+          console.log('Broker ready — starting pipeline timer.');
           startPipelineTimer();
           setTimeout(() => {
             runPredictionPipelineAll().catch(err => {
@@ -802,36 +763,37 @@ async function startServer() {
           }, 2000);
         } else {
           broker.once('ready', () => {
-            console.log('✅ Broker ready (delayed) — starting pipeline timer.');
+            console.log('Broker ready (delayed) — starting pipeline timer.');
             startPipelineTimer();
           });
         }
       }).catch(err => {
-        console.error('❌ startDerivBroker failed:', err.message);
+        console.error('startDerivBroker failed:', err.message);
         startPipelineTimer();
       });
     }, 3000);
 
     setTimeout(() => {
       console.log('==============================================');
-      console.log('📊 RTS Subsystem Status:');
+      console.log('RTS Subsystem Status:');
       try {
         const broker = getBroker('deriv_cfd');
-        console.log(`   Broker:            ${broker.isConnected() ? '🟢 connected' : '🔴 disconnected'}`);
-      } catch (_) { console.log('   Broker:            🔴 not initialized'); }
-      console.log(`   Pipeline timer:    ${pipelineTimer ? '🟢 running' : '🔴 stopped'}`);
-      console.log(`   StrategyRanker:    ${_consensusCache.size > 0 ? '🟢 ' + _consensusCache.size + ' symbol(s)' : '🟡 waiting'}`);
+        console.log(`   Broker:            ${broker.isConnected() ? 'connected' : 'disconnected'}`);
+      } catch (_) { console.log('   Broker:            not initialized'); }
+      console.log(`   Pipeline timer:    ${pipelineTimer ? 'running' : 'stopped'}`);
+      console.log(`   StrategyRanker:    ${_consensusCache.size > 0 ? _consensusCache.size + ' symbol(s)' : 'waiting'}`);
       console.log(`   Predictions:       ${_predictionCache.size} symbol(s)`);
       console.log(`   Opportunities:     ${_opportunityCache.size} symbol(s)`);
       console.log(`   Running bots:      ${botRunner.list().length}`);
       console.log(`   OTIE observers:    ${otie.observerCount || 0} contract(s)`);
       try { console.log(`   Market cache:      ${marketStateCache._cache.size} symbols`); } catch (_) {}
+      console.log(`   Balance guard:     ${balanceGuard.getState().enabled ? 'active' : 'disabled'}`);
       console.log('==============================================');
     }, 20000);
   });
 
   async function shutdown(signal) {
-    console.log(`\n🛑 Received ${signal}, shutting down gracefully...`);
+    console.log(`\nReceived ${signal}, shutting down gracefully...`);
     if (wsPingTimer) clearInterval(wsPingTimer);
     if (pipelineTimer) clearInterval(pipelineTimer);
     try { botRunner.stopAll(); } catch (_) {}
@@ -853,6 +815,6 @@ async function startServer() {
 }
 
 startServer().catch(err => {
-  console.error('❌ Server start error:', err);
+  console.error('Server start error:', err);
   process.exit(1);
 });
