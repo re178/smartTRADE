@@ -1,9 +1,7 @@
 // core/execution/broker.js – Stable Dual-WebSocket Deriv Broker
-// ... (header omitted for brevity — everything below is the same file)
-// [FILE-4.4] Three changes on top of FILE-4.1:
-//   • tick emit includes mid (was missing — caused price display "0.00000")
-//   • _buildSymbolMaps accepts synthetic indices (R_100, 1HZ100V, etc.)
-//   • WATCHLIST includes synthetics so digit analyzer receives ticks
+// [FIX-1] Emits trade.closed when a contract settles — fixes BotRun P/L.
+// [FILE-4.4] tick event includes mid. Synthetics in symbol map + watchlist.
+// [FILE-4.1] getCandles uses ticks_history with style='candles' (no start:1).
 
 const WebSocket = require('ws');
 const axios = require('axios');
@@ -15,10 +13,10 @@ const Trade = require('../../models/Trade');
 const priceBuffer = require('../../core/data/priceBuffer');
 const Price = require('../../models/Price');
 const Account = require('../../models/Account');
+const eventBus = require('../../infrastructure/eventBus');
 
 EventEmitter.defaultMaxListeners = 20;
 
-// [FILE-4.4] Include synthetics so digit bots get tick data
 const WATCHLIST = [
   'frxEURUSD', 'frxGBPUSD', 'frxUSDJPY', 'frxAUDUSD',
   'R_100', 'R_75', 'R_50', 'R_25', 'R_10',
@@ -291,6 +289,7 @@ class DerivBroker extends EventEmitter {
     this._contractPersistTimers = new Map();
     this._contractUpdateCounts = new Map();
     this._reconcileMissCounts = new Map();
+    this._closedEmitted = new Set();
     this._tradeReconcileTimer = null;
 
     this.metrics = {
@@ -625,7 +624,6 @@ class DerivBroker extends EventEmitter {
         if (bid !== null && ask !== null) {
           priceBuffer.update(tick.symbol, bid, ask, time);
           Price.upsertPrice(tick.symbol, bid, ask, time, 'deriv').catch(() => {});
-          // [FILE-4.4] Include mid in broadcast so consumers don't have to derive it
           const mid = (bid + ask) / 2;
           this.emit('tick', { symbol: tick.symbol, bid, ask, mid, time });
         }
@@ -1026,11 +1024,13 @@ class DerivBroker extends EventEmitter {
     const key = String(contractId);
     const state = this._contractStates.get(key);
     if (!state) return;
+
     const now = Date.now();
     const last = this._contractPersistAt.get(key) || 0;
-    if (!force && (now - last) < this.config.contractPersistIntervalMs) {
+    const interval = this.config.contractPersistIntervalMs;
+    if (!force && (now - last) < interval) {
       if (!this._contractPersistTimers.has(key)) {
-        const delay = this.config.contractPersistIntervalMs - (now - last);
+        const delay = interval - (now - last);
         const timer = setTimeout(() => {
           this._contractPersistTimers.delete(key);
           this._persistContractState(key, true).catch(() => {});
@@ -1043,6 +1043,7 @@ class DerivBroker extends EventEmitter {
     const pending = this._contractPersistTimers.get(key);
     if (pending) { clearTimeout(pending); this._contractPersistTimers.delete(key); }
     this._contractPersistAt.set(key, now);
+
     const finalStatuses = ['sold', 'won', 'lost', 'cancelled', 'expired'];
     const isFinal = state.isSold || state.isExpired || finalStatuses.includes(String(state.status || '').toLowerCase());
     const update = {
@@ -1057,10 +1058,50 @@ class DerivBroker extends EventEmitter {
       update.closeTime = state.sellTime || new Date();
       update.floatingProfit = 0;
     }
+
     try {
-      await Trade.findOneAndUpdate({ contractId: String(key) }, { $set: update }, { new: false });
-      this.metrics.contractUpdatesPersisted++;
-    } catch (_) {}
+      const res = await Trade.findOneAndUpdate({ contractId: String(key) }, { $set: update }, { new: false });
+      if (res) this.metrics.contractUpdatesPersisted++;
+
+      // [FIX-1] Emit trade.closed the first time we see this contract settle.
+      // BotRunner listens to this and updates BotRun.pnl + instance stats.
+      if (isFinal && !this._closedEmitted.has(key)) {
+        this._closedEmitted.add(key);
+
+        let tradeDoc = null;
+        try { tradeDoc = await Trade.findOne({ contractId: String(key) }).lean(); } catch (_) {}
+
+        const realizedProfit = Number(state.currentProfit ?? 0);
+        const riskAmount = Number(tradeDoc?.stake || tradeDoc?.lotSize || 1) || 1;
+
+        const closedPayload = {
+          contractId: String(key),
+          strategy: tradeDoc?.strategy || null,
+          instrument: tradeDoc?.instrument || state.symbol || null,
+          regimeCode: (tradeDoc?.entryThesis && tradeDoc.entryThesis.regime) || null,
+          realizedProfit,
+          riskAmount,
+          result: {
+            closePrice: state.exitTick ?? state.sellPrice ?? state.currentSpot ?? null,
+            buyPrice: state.buyPrice ?? null,
+          },
+          source: 'broker_settlement',
+          timestamp: new Date().toISOString(),
+        };
+
+        try {
+          eventBus.emit('trade.closed', closedPayload);
+          logger.info(
+            `[DerivBroker] Emitted trade.closed for ${key} — ` +
+            `pnl=${realizedProfit.toFixed(2)} strategy=${tradeDoc?.strategy || 'unknown'}`
+          );
+        } catch (emitErr) {
+          logger.warn(`[DerivBroker] trade.closed emit failed for ${key}: ${emitErr.message}`);
+        }
+      }
+    } catch (err) {
+      logger.warn(`[DerivBroker] Trade persist failed for ${key}: ${err.message}`);
+    }
   }
 
   async _loadSymbolsWithTimeout() {
@@ -1097,8 +1138,6 @@ class DerivBroker extends EventEmitter {
     }
     this._symbolsDiscovered = true; this._symbolsLoaded = true;
   }
-
-  // [FILE-4.4] Also include synthetic indices (R_100, 1HZ100V, etc.)
   _buildSymbolMaps(symbols) {
     let count = 0;
     this.symbolMap = {}; this.reverseMap = {}; this.spreadMap = {};
@@ -1108,7 +1147,6 @@ class DerivBroker extends EventEmitter {
       const pip = Number(sym.pip_size ?? sym.pip ?? 0.0001);
       if (!derivSymbol) continue;
 
-      // FX pairs: EUR/USD → EUR_USD
       const fxMatch = display.match(/([A-Z]{3})\/([A-Z]{3})/);
       if (fxMatch) {
         const ourPair = fxMatch[1] + '_' + fxMatch[2];
@@ -1119,7 +1157,6 @@ class DerivBroker extends EventEmitter {
         continue;
       }
 
-      // Synthetic indices: R_100, R_50, 1HZ100V, etc.
       if (/^(R_|1HZ)/i.test(derivSymbol)) {
         this.symbolMap[derivSymbol] = derivSymbol;
         this.reverseMap[derivSymbol] = derivSymbol;
@@ -1131,7 +1168,6 @@ class DerivBroker extends EventEmitter {
     logger.info(`[DerivBroker] Symbol map built: ${count} (FX + synthetics)`);
     return count;
   }
-
   async _subscribeDefaultSymbols() {
     const valid = new Set(Object.values(this.symbolMap));
     const toSub = WATCHLIST.filter(s => valid.has(s));
@@ -1477,6 +1513,7 @@ class DerivBroker extends EventEmitter {
     this._contractPersistTimers.clear();
     if (this._tradeReconcileTimer) { clearInterval(this._tradeReconcileTimer); this._tradeReconcileTimer = null; }
     this._reconcileMissCounts.clear();
+    this._closedEmitted.clear();
   }
   _getReconnectDelay(attempt) {
     const base = this.config.reconnectBaseDelay;
