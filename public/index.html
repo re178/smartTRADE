@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>RTS Trading Dashboard v2 — Live Market</title>
+  <title>RTS Trading Dashboard v2</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet" />
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
@@ -143,19 +143,21 @@
     ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 8px; }
 
-    /* Trading view chart area */
     #tradingChart { height: 500px; background: #0b1a2e; border-radius: 8px; }
 
-    /* Digit display */
     .digit-display { font-size: 4rem; font-weight: 800; line-height: 1; }
     .digit-arrow { font-size: 2.5rem; color: #94a3b8; }
+
+    .tool-btn.active { background: #1a73e8 !important; color: #fff !important; border-color: #1a73e8 !important; }
+
+    .debug-btn { position: fixed; bottom: 16px; right: 16px; z-index: 99998;
+      background: #1a73e8; color: #fff; border: none; padding: 10px 18px; border-radius: 50px;
+      box-shadow: 0 4px 16px rgba(26,115,232,0.4); cursor: pointer; font-weight: 600; }
+    .debug-btn:hover { background: #1557b0; }
   </style>
 </head>
 <body>
 
-<!-- ============================================================ -->
-<!-- SIDEBAR -->
-<!-- ============================================================ -->
 <nav class="sidebar" id="sidebar">
   <div class="sidebar-brand">
     <i class="fas fa-chart-line"></i>
@@ -188,9 +190,10 @@
   </div>
 </nav>
 
-<!-- ============================================================ -->
-<!-- MAIN CONTENT -->
-<!-- ============================================================ -->
+<button class="debug-btn" onclick="window.__rtsDebug && window.__rtsDebug.show()">
+  <i class="fas fa-bug"></i> Debug
+</button>
+
 <div class="main-content">
 
   <header class="top-header">
@@ -224,7 +227,7 @@
   </header>
 
   <!-- ============================================================ -->
-  <!-- SECTION: TRADING VIEW (default) -->
+  <!-- SECTION: TRADING VIEW -->
   <!-- ============================================================ -->
   <div id="section-tradingview" class="section-content">
     <div class="row g-3 mb-3">
@@ -259,9 +262,9 @@
     </div>
 
     <div class="card mb-3">
-      <div class="card-header">
+      <div class="card-header" style="flex-wrap:wrap;">
         <span class="card-title"><i class="fas fa-chart-area"></i> Live Chart — <span id="tvSymbol">EURUSD</span></span>
-        <div class="d-flex gap-2">
+        <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
           <select id="tvSymbolSelect" class="form-select form-select-sm" style="width:auto;">
             <option value="EURUSD">EUR/USD</option>
             <option value="GBPUSD">GBP/USD</option>
@@ -275,10 +278,36 @@
             <option value="H1">H1</option>
             <option value="H4">H4</option>
           </select>
+
+          <div class="btn-group btn-group-sm" role="group" style="margin-left:8px;">
+            <button class="btn btn-outline-secondary tool-btn" id="tool_hline" title="Horizontal Line (click chart to place)">
+              <i class="fas fa-minus"></i>
+            </button>
+            <button class="btn btn-outline-secondary tool-btn" id="tool_vline" title="Vertical Line (click chart to place)">
+              <i class="fas fa-grip-lines-vertical"></i>
+            </button>
+            <button class="btn btn-outline-secondary tool-btn" id="tool_box" title="Box (click-drag on chart)">
+              <i class="far fa-square"></i>
+            </button>
+            <button class="btn btn-outline-secondary" id="tool_undo" title="Undo last drawing">
+              <i class="fas fa-undo"></i>
+            </button>
+            <button class="btn btn-outline-secondary" id="tool_clear" title="Clear all drawings">
+              <i class="fas fa-trash"></i>
+            </button>
+          </div>
+
+          <button class="btn btn-sm btn-primary" id="tvReloadChart" title="Reload candles">
+            <i class="fas fa-sync-alt"></i>
+          </button>
+          <button class="btn btn-sm btn-outline-secondary" id="tvFullscreen" title="Fullscreen chart">
+            <i class="fas fa-expand"></i>
+          </button>
         </div>
       </div>
-      <div class="card-body p-2">
-        <div id="tradingChart"></div>
+      <div class="card-body p-2" id="tvChartBody">
+        <div id="tvChartStatus" class="text-center small text-muted p-3" style="display:none;"></div>
+        <div id="tradingChart" style="position:relative;"></div>
       </div>
     </div>
 
@@ -288,7 +317,7 @@
         <div class="stat-value" id="tvPrice">—</div>
       </div></div>
       <div class="col-md-3"><div class="stat-card">
-        <div class="stat-label">Pattern Bias</div>
+        <div class="stat-label">Pattern</div>
         <div class="stat-value" id="tvPatternBias" style="font-size:1.1rem;">—</div>
       </div></div>
       <div class="col-md-3"><div class="stat-card">
@@ -314,10 +343,10 @@
             <thead style="position:sticky; top:0; background:#fff; z-index:2;">
               <tr>
                 <th>Time</th><th>Open</th><th>High</th><th>Low</th><th>Close</th>
-                <th>Volume</th><th>Body</th><th>Pattern</th>
+                <th>Volume</th><th>Body</th>
               </tr>
             </thead>
-            <tbody id="tvCandleTable"><tr><td colspan="8" class="text-muted">Loading...</td></tr></tbody>
+            <tbody id="tvCandleTable"><tr><td colspan="7" class="text-muted">Loading...</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -333,7 +362,10 @@
   <!-- ============================================================ -->
   <div id="section-bots" class="section-content" style="display:none;">
     <div class="card mb-3">
-      <div class="card-header"><span class="card-title"><i class="fas fa-robot"></i> Available Bots</span></div>
+      <div class="card-header">
+        <span class="card-title"><i class="fas fa-robot"></i> Available Bots</span>
+        <button class="btn btn-sm btn-outline-primary" id="botsReload"><i class="fas fa-sync-alt"></i> Reload</button>
+      </div>
       <div class="card-body" id="botListContainer">
         <p class="text-muted">Loading bots...</p>
       </div>
@@ -538,7 +570,7 @@
   </div>
 
   <!-- ============================================================ -->
-  <!-- SECTION: MARKET REGIME -->
+  <!-- SECTION: REGIME -->
   <!-- ============================================================ -->
   <div id="section-regime" class="section-content" style="display:none;">
     <div class="row">
@@ -589,19 +621,21 @@
 </div><!-- /.main-content -->
 
 <!-- ============================================================ -->
-<!-- SCRIPTS -->
+<!-- SCRIPTS (order matters — config first, live.js last) -->
 <!-- ============================================================ -->
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-<script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <script src="js/config.js"></script>
+<script src="js/debug.js"></script>
 <script src="js/app.js"></script>
 <script src="js/tradingview.js"></script>
+<script src="js/chart-tools.js"></script>
 <script src="js/bots.js"></script>
 <script src="js/digits.js"></script>
 <script src="js/live.js"></script>
 
 <!-- ============================================================ -->
-<!-- INLINE: NAVIGATION + UI HELPERS -->
+<!-- INLINE: NAVIGATION -->
 <!-- ============================================================ -->
 <script>
 (function () {
@@ -649,8 +683,7 @@
       if (window.innerWidth <= 992) sidebar.classList.remove('open');
       window.scrollTo({ top: 0, behavior: 'smooth' });
 
-      // Lazy-load digit view when entering digit-related sections
-      if (sec === 'digits' || sec === 'risefall' || sec === 'evenodd') {
+      if ((sec === 'digits' || sec === 'risefall' || sec === 'evenodd')) {
         const sym = document.getElementById('digitSymbolSelect')?.value || 'EURUSD';
         fetch(`/api/digit/${sym}`).then(r => r.json())
           .then(d => window.onDigitUpdate && window.onDigitUpdate(d))
@@ -659,7 +692,6 @@
     });
   });
 
-  // Export CSV (from history)
   document.getElementById('exportCSVBtn')?.addEventListener('click', function () {
     const h = (window.dashboardState && window.dashboardState.history) || [];
     if (h.length === 0) { alert('No history to export.'); return; }
@@ -674,7 +706,6 @@
     a.click(); URL.revokeObjectURL(a.href);
   });
 
-  // Report button — stub (server route /api/report exists but disabled)
   document.getElementById('reportModalBtn')?.addEventListener('click', function () {
     alert('Report generation: use POST /api/report with {from, to}');
   });
