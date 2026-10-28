@@ -116,12 +116,15 @@
         return Number.isFinite(p) ? p : null;
       } catch (_) { return null; }
     }
+    
     _pixelToTime(x) {
       try { return this.chart.timeScale().coordinateToTime(x); } catch (_) { return null; }
     }
+    
     _priceToPixel(price) {
       try { return this.series.priceToCoordinate(price); } catch (_) { return null; }
     }
+    
     _timeToPixel(time) {
       try { return this.chart.timeScale().timeToCoordinate(time); } catch (_) { return null; }
     }
@@ -144,6 +147,7 @@
         this._updateToolButtons();
         return;
       }
+      
       if (this.tool === 'vline') {
         if (time != null) {
           this.drawings.push({ type: 'vline', time, color: '#3498db' });
@@ -154,6 +158,7 @@
         this._updateToolButtons();
         return;
       }
+      
       if (this.tool === 'box') {
         if (price != null && time != null) {
           this._dragStart = { time, price };
@@ -176,6 +181,7 @@
       const x2 = this._timeToPixel(time);
       const y1 = this._priceToPixel(this._dragStart.price);
       const y2 = this._priceToPixel(price);
+      
       if (x1 == null || x2 == null || y1 == null || y2 == null) return;
       this._drawBoxPixels(x1, y1, x2, y2, 'rgba(0, 184, 148, 0.15)', '#00b894', 2, true);
     }
@@ -187,6 +193,7 @@
       const y = ev.clientY - rect.top;
       const price = this._pixelToPrice(y);
       const time = this._pixelToTime(x);
+      
       if (price != null && time != null) {
         this.drawings.push({
           type: 'box',
@@ -207,12 +214,15 @@
       const right = Math.max(x1, x2);
       const top = Math.min(y1, y2);
       const bottom = Math.max(y1, y2);
+      
       this.ctx.save();
       this.ctx.fillStyle = fillColor;
       this.ctx.fillRect(left, top, right - left, bottom - top);
+      
       this.ctx.strokeStyle = strokeColor;
       this.ctx.lineWidth = lineWidth;
       if (dashed) this.ctx.setLineDash([4, 4]);
+      
       this.ctx.strokeRect(left, top, right - left, bottom - top);
       this.ctx.restore();
     }
