@@ -34,7 +34,7 @@ class BotRunner extends EventEmitter {
     const instance = {
       instanceId, botId, name: bot.name, assetClass: bot.assetClass, contractClass: bot.contractClass,
       symbol, config: finalConfig, status: 'RUNNING', startedAt: new Date(), lastRunAt: null, lastReason: null,
-      timer: null, _running: false,
+      timer: null, _running: false, _lastEntryTime: 0,
       stats: { runs: 0, entries: 0, wins: 0, losses: 0, pnl: 0, consecutiveLosses: 0 },
     };
 
@@ -78,6 +78,13 @@ class BotRunner extends EventEmitter {
     instance._running = true;
 
     try {
+      // 1. SETTLEMENT COOLDOWN: Prevent firing before the last trade settles
+      if (instance._lastEntryTime && Date.now() - instance._lastEntryTime < 15000) {
+        instance.lastReason = 'Awaiting trade settlement...';
+        return;
+      }
+
+      // 2. Circuit breaker
       const maxLosses = instance.config.stopAfterLosses || 0;
       if (maxLosses > 0 && instance.stats.consecutiveLosses >= maxLosses) {
         logger.warn(`[BotRunner] ${instance.instanceId} — max consecutive losses hit. Stopping.`);
@@ -98,7 +105,7 @@ class BotRunner extends EventEmitter {
       const bot = getBot(instance.botId);
       const timeframe = instance.config.timeframe || 'M5';
       
-      // Pass stats so bot can adapt thresholds
+      // Pass stats so bot can adapt thresholds based on consecutive losses
       const ctx = { config: instance.config, stats: instance.stats };
 
       if (bot.assetClass === 'fx') {
@@ -160,7 +167,9 @@ class BotRunner extends EventEmitter {
         throw new Error(`Unknown contractClass: ${tradeParams.contractClass}`);
       }
 
+      // Only mark as entered if the contract actually went through
       instance.stats.entries++;
+      instance._lastEntryTime = Date.now(); // Triggers 15-second cooldown
       instance.lastReason = 'TRADE PLACED';
 
       await BotRun.create({
@@ -176,6 +185,7 @@ class BotRunner extends EventEmitter {
 
       this.emit('botEntry', { instanceId: instance.instanceId, botId: instance.botId, contractId: String(result.contractId), symbol: instance.config.symbol, side: tradeParams.contractType || direction, entryPrice: result.entryPrice, stake: tradeParams.stake, reasons, timestamp: new Date().toISOString() });
     } catch (err) {
+      // If it fails, print the actual error, not "ENTERED"
       logger.error(`[BotRunner] ${instance.botId}/${instance.instanceId} entry failed: ${err.message}`);
       instance.lastReason = `Execution failed: ${err.message}`;
       this.emit('botError', { instanceId: instance.instanceId, botId: instance.botId, error: err.message });
