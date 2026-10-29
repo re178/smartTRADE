@@ -222,6 +222,7 @@
     <button class="nav-item" data-section="history"><i class="fas fa-history"></i> History</button>
 
     <div class="nav-label">Analysis</div>
+    <button class="nav-item" data-section="analytics"><i class="fas fa-chart-pie"></i> Analytics & Rankings</button>
     <button class="nav-item" data-section="signals"><i class="fas fa-crosshairs"></i> Signals & Opportunities</button>
     <button class="nav-item" data-section="risefall"><i class="fas fa-arrow-up-wide-short"></i> Rise / Fall</button>
     <button class="nav-item" data-section="evenodd"><i class="fas fa-scale-balanced"></i> Even / Odd</button>
@@ -443,9 +444,84 @@
     </div>
 
     <div class="card">
-      <div class="card-header"><span class="card-title"><i class="fas fa-receipt"></i> Recent Runs</span></div>
+      <div class="card-header">
+        <span class="card-title"><i class="fas fa-receipt"></i> Recent Runs</span>
+        <div class="d-flex gap-2">
+          <button class="btn btn-sm btn-outline-success" id="exportRunsBtn" title="Download all runs as CSV"><i class="fas fa-download"></i> Export</button>
+          <button class="btn btn-sm btn-outline-danger" id="clearRunsBtn" title="Delete all runs"><i class="fas fa-trash"></i> Clear</button>
+        </div>
+      </div>
       <div class="card-body p-0">
         <div id="botRunsContainer" class="table-responsive"><p class="text-muted p-3">No runs yet.</p></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- SECTION: ANALYTICS (NEW) -->
+  <!-- ============================================================ -->
+  <div id="section-analytics" class="section-content" style="display:none;">
+    <div class="row g-3 mb-3">
+      <div class="col-6 col-md-4">
+        <div class="stat-card">
+          <div class="stat-label">Total Trades</div>
+          <div class="stat-value" id="anaTotalTrades">0</div>
+        </div>
+      </div>
+      <div class="col-6 col-md-4">
+        <div class="stat-card">
+          <div class="stat-label">Global Win Rate</div>
+          <div class="stat-value" id="anaWinRate">0%</div>
+        </div>
+      </div>
+      <div class="col-12 col-md-4">
+        <div class="stat-card">
+          <div class="stat-label">Total PnL</div>
+          <div class="stat-value" id="anaTotalPnL" style="font-size: 1.8rem;">$0.00</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header">
+        <span class="card-title"><i class="fas fa-trophy text-warning"></i> Bot Rankings (by PnL)</span>
+        <button class="btn btn-sm btn-outline-primary" id="refreshAnalyticsBtn"><i class="fas fa-sync-alt"></i> Refresh</button>
+      </div>
+      <div class="card-body p-0">
+        <div class="table-responsive">
+          <table class="table table-sm table-striped mb-0">
+            <thead><tr><th>Bot</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Total PnL</th></tr></thead>
+            <tbody id="anaBotRankingsBody"><tr><td colspan="6" class="text-muted p-3">Loading...</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header">
+        <span class="card-title"><i class="fas fa-calendar-day"></i> Daily Breakdown (Last 30 Days)</span>
+      </div>
+      <div class="card-body p-0">
+        <div class="table-responsive">
+          <table class="table table-sm table-striped mb-0">
+            <thead><tr><th>Date</th><th>Trades</th><th>Wins</th><th>Losses</th><th>PnL</th></tr></thead>
+            <tbody id="anaDailyBody"><tr><td colspan="5" class="text-muted p-3">Loading...</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header">
+        <span class="card-title"><i class="fas fa-calendar-alt"></i> Monthly Breakdown</span>
+      </div>
+      <div class="card-body p-0">
+        <div class="table-responsive">
+          <table class="table table-sm table-striped mb-0">
+            <thead><tr><th>Month</th><th>Trades</th><th>Wins</th><th>Losses</th><th>PnL</th></tr></thead>
+            <tbody id="anaMonthlyBody"><tr><td colspan="5" class="text-muted p-3">Loading...</td></tr></tbody>
+          </table>
+        </div>
       </div>
     </div>
   </div>
@@ -679,6 +755,7 @@
 <script src="js/bots.js"></script>
 <script src="js/digits.js"></script>
 <script src="js/live.js"></script>
+<script src="js/analytics.js"></script>
 
 <!-- ============================================================ -->
 <!-- INLINE: NAVIGATION & MOBILE SIDEBAR LOGIC                     -->
@@ -707,6 +784,7 @@
   const sections = {
     tradingview: document.getElementById('section-tradingview'),
     bots: document.getElementById('section-bots'),
+    analytics: document.getElementById('section-analytics'),
     positions: document.getElementById('section-positions'),
     history: document.getElementById('section-history'),
     signals: document.getElementById('section-signals'),
@@ -718,8 +796,8 @@
   };
   const pageTitle = document.getElementById('pageTitle');
   const titles = {
-    tradingview: 'Trading View', bots: 'Bots', positions: 'Positions',
-    history: 'Trade History', signals: 'Signals & Opportunities',
+    tradingview: 'Trading View', bots: 'Bots', analytics: 'Analytics & Rankings',
+    positions: 'Positions', history: 'Trade History', signals: 'Signals & Opportunities',
     risefall: 'Rise / Fall', evenodd: 'Even / Odd', digits: 'Digit Stream',
     regime: 'Market Regime', trademanagement: 'OTIE',
   };
@@ -747,6 +825,11 @@
         fetch(`/api/digit/${sym}`).then(r => r.json())
           .then(d => window.onDigitUpdate && window.onDigitUpdate(d))
           .catch(() => {});
+      }
+
+      // Lazy-load Analytics if entering that section
+      if (sec === 'analytics' && window.loadAnalytics) {
+        window.loadAnalytics();
       }
     });
   });
