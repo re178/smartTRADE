@@ -35,7 +35,7 @@ class BotRunner extends EventEmitter {
       instanceId, botId, name: bot.name, assetClass: bot.assetClass, contractClass: bot.contractClass,
       symbol, config: finalConfig, status: 'RUNNING', startedAt: new Date(), lastRunAt: null, lastReason: null,
       timer: null, _running: false, _lastEntryTime: 0,
-      stats: { runs: 0, entries: 0, wins: 0, losses: 0, pnl: 0, consecutiveLosses: 0 },
+      stats: { runs: 0, entries: 0, wins: 0, losses: 0, pnl: 0, peakPnl: 0, consecutiveLosses: 0 },
     };
 
     const intervalMs = bot.assetClass === 'fx' ? 15000 : 5000;
@@ -84,12 +84,44 @@ class BotRunner extends EventEmitter {
         return;
       }
 
-      // 2. Circuit breaker
-      const maxLosses = instance.config.stopAfterLosses || 0;
+      // 2a. Consecutive-loss circuit breaker
+      const maxLosses = Number(instance.config.stopAfterLosses) || 0;
       if (maxLosses > 0 && instance.stats.consecutiveLosses >= maxLosses) {
-        logger.warn(`[BotRunner] ${instance.instanceId} — max consecutive losses hit. Stopping.`);
+        instance.lastReason = `Stopped: ${instance.stats.consecutiveLosses} consecutive losses (limit ${maxLosses})`;
+        logger.warn(`[BotRunner] ${instance.instanceId} — ${instance.lastReason}`);
         this.stop(instance.instanceId);
         return;
+      }
+
+      // 2b. Session PnL rules — take-profit / stop-loss / trailing drawdown
+      const s = instance.stats;
+      const tp = Number(instance.config.botTakeProfit) || 0;
+      const slAmt = Math.abs(Number(instance.config.botStopLoss) || 0);
+      const trailPct = Number(instance.config.trailingDrawdownPct) || 0;
+
+      if (s.pnl > s.peakPnl) s.peakPnl = s.pnl;
+
+      if (tp > 0 && s.pnl >= tp) {
+        instance.lastReason = `Stopped: Take profit hit (+$${s.pnl.toFixed(2)} >= +$${tp})`;
+        logger.info(`[BotRunner] ${instance.instanceId} — ${instance.lastReason}`);
+        this.stop(instance.instanceId);
+        return;
+      }
+      if (slAmt > 0 && s.pnl <= -slAmt) {
+        instance.lastReason = `Stopped: Stop loss hit (${s.pnl.toFixed(2)} <= -$${slAmt})`;
+        logger.info(`[BotRunner] ${instance.instanceId} — ${instance.lastReason}`);
+        this.stop(instance.instanceId);
+        return;
+      }
+      if (trailPct > 0 && s.peakPnl > 0) {
+        const trailFloor = s.peakPnl * (1 - trailPct / 100);
+        if (s.pnl <= trailFloor) {
+          instance.lastReason =
+            `Stopped: Trailing drawdown (${s.pnl.toFixed(2)} <= ${trailFloor.toFixed(2)}, peak +$${s.peakPnl.toFixed(2)})`;
+          logger.info(`[BotRunner] ${instance.instanceId} — ${instance.lastReason}`);
+          this.stop(instance.instanceId);
+          return;
+        }
       }
 
       instance.lastRunAt = new Date();
@@ -124,7 +156,7 @@ class BotRunner extends EventEmitter {
       instance.stats.runs++;
 
       let result;
-      try { result = bot.evaluate(ctx); } 
+      try { result = await bot.evaluate(ctx); } 
       catch (evalErr) { instance.lastReason = `evaluate error: ${evalErr.message}`; return; }
 
       if (!result || result.action === 'WAIT') {
