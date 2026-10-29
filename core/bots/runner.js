@@ -78,7 +78,6 @@ class BotRunner extends EventEmitter {
     instance._running = true;
 
     try {
-      // Circuit breaker
       const maxLosses = instance.config.stopAfterLosses || 0;
       if (maxLosses > 0 && instance.stats.consecutiveLosses >= maxLosses) {
         logger.warn(`[BotRunner] ${instance.instanceId} — max consecutive losses hit. Stopping.`);
@@ -99,7 +98,7 @@ class BotRunner extends EventEmitter {
       const bot = getBot(instance.botId);
       const timeframe = instance.config.timeframe || 'M5';
       
-      // Pass instance stats into context so the bot knows if it's losing
+      // Pass stats so bot can adapt thresholds
       const ctx = { config: instance.config, stats: instance.stats };
 
       if (bot.assetClass === 'fx') {
