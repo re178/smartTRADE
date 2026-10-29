@@ -34,7 +34,7 @@ class BotRunner extends EventEmitter {
     const instance = {
       instanceId, botId, name: bot.name, assetClass: bot.assetClass, contractClass: bot.contractClass,
       symbol, config: finalConfig, status: 'RUNNING', startedAt: new Date(), lastRunAt: null, lastReason: null,
-      timer: null, _running: false, _lastLossTime: 0,
+      timer: null, _running: false,
       stats: { runs: 0, entries: 0, wins: 0, losses: 0, pnl: 0, consecutiveLosses: 0 },
     };
 
@@ -78,17 +78,7 @@ class BotRunner extends EventEmitter {
     instance._running = true;
 
     try {
-      // 1. Loss Cooldown Check (Smart re-evaluation)
-      const pauseSec = instance.config.pauseOnLossSec || 0;
-      if (pauseSec > 0 && instance._lastLossTime > 0) {
-        const elapsed = (Date.now() - instance._lastLossTime) / 1000;
-        if (elapsed < pauseSec) {
-          instance.lastReason = `Loss cooldown (${Math.round(pauseSec - elapsed)}s)`;
-          return;
-        }
-      }
-
-      // 2. Circuit breaker
+      // Circuit breaker
       const maxLosses = instance.config.stopAfterLosses || 0;
       if (maxLosses > 0 && instance.stats.consecutiveLosses >= maxLosses) {
         logger.warn(`[BotRunner] ${instance.instanceId} — max consecutive losses hit. Stopping.`);
@@ -108,7 +98,9 @@ class BotRunner extends EventEmitter {
 
       const bot = getBot(instance.botId);
       const timeframe = instance.config.timeframe || 'M5';
-      const ctx = { config: instance.config };
+      
+      // Pass instance stats into context so the bot knows if it's losing
+      const ctx = { config: instance.config, stats: instance.stats };
 
       if (bot.assetClass === 'fx') {
         const state = await deepMarketState.compute(instance.symbol, timeframe, 200).catch(() => null);
@@ -169,7 +161,6 @@ class BotRunner extends EventEmitter {
         throw new Error(`Unknown contractClass: ${tradeParams.contractClass}`);
       }
 
-      // THE FIX: Only mark as entered if the contract actually went through
       instance.stats.entries++;
       instance.lastReason = 'TRADE PLACED';
 
@@ -186,7 +177,6 @@ class BotRunner extends EventEmitter {
 
       this.emit('botEntry', { instanceId: instance.instanceId, botId: instance.botId, contractId: String(result.contractId), symbol: instance.config.symbol, side: tradeParams.contractType || direction, entryPrice: result.entryPrice, stake: tradeParams.stake, reasons, timestamp: new Date().toISOString() });
     } catch (err) {
-      // THE FIX: If it fails, it prints the actual error, not "ENTERED"
       logger.error(`[BotRunner] ${instance.botId}/${instance.instanceId} entry failed: ${err.message}`);
       instance.lastReason = `Execution failed: ${err.message}`;
       this.emit('botError', { instanceId: instance.instanceId, botId: instance.botId, error: err.message });
@@ -210,10 +200,12 @@ class BotRunner extends EventEmitter {
       const instance = this._instances.get(run.instanceId);
       if (instance) {
         instance.stats.pnl += realizedProfit;
-        if (run.result === 'WIN') { instance.stats.wins++; instance.stats.consecutiveLosses = 0; }
-        else if (run.result === 'LOSS') {
-          instance.stats.losses++; instance.stats.consecutiveLosses++;
-          instance._lastLossTime = Date.now(); // Trigger loss cooldown
+        if (run.result === 'WIN') { 
+          instance.stats.wins++; 
+          instance.stats.consecutiveLosses = 0; 
+        } else if (run.result === 'LOSS') {
+          instance.stats.losses++; 
+          instance.stats.consecutiveLosses++;
         }
         this.emit('botResult', { instanceId: run.instanceId, botId: run.botId, contractId, result: run.result, pnl: realizedProfit, totalPnl: instance.stats.pnl, timestamp: new Date().toISOString() });
       }
