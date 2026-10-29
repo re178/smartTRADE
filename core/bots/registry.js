@@ -2,6 +2,7 @@
 // 17 bots. Optimized for BIG WINS and SMALL LOSSES.
 // FX bots use tight Knockouts (1x ATR) and wide Take Profits (4x+ ATR).
 // Digit bots focus on high-payout contracts (MATCH, OVER 8, UNDER 1).
+// [INTELLIGENT RECOVERY] Bots dynamically tighten thresholds after a loss.
 
 'use strict';
 
@@ -347,18 +348,23 @@ const BOTS = {
     assetClass: 'synthetic_digit', contractClass: 'digit',
     defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, minEdge: 0.12, minSamples: 50 },
     evaluate(ctx) {
-      const { digitView, config } = ctx;
+      const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No digit data');
       if (digitView.sampleSize < config.minSamples) return wait('Not enough samples');
       
+      // INTELLIGENT RECOVERY: Demand a stronger edge if we are losing
+      const losses = stats?.consecutiveLosses || 0;
+      let requiredEdge = 62; // Base 62%
+      if (losses === 1) requiredEdge = 65;
+      if (losses >= 2) requiredEdge = 68;
+
       const even = digitView.evenPct;
       const odd = digitView.oddPct;
       
-      // Requires a massive 62% edge to fire. Payout is ~1:1.
-      if (even >= 62) return enterDigit('DIGITEVEN', config, `Even ${even.toFixed(1)}%`);
-      if (odd >= 62) return enterDigit('DIGITODD', config, `Odd ${odd.toFixed(1)}%`);
+      if (even >= requiredEdge) return enterDigit('DIGITEVEN', config, `Even ${even.toFixed(1)}% (Need >=${requiredEdge}%)`);
+      if (odd >= requiredEdge) return enterDigit('DIGITODD', config, `Odd ${odd.toFixed(1)}% (Need >=${requiredEdge}%)`);
       
-      return wait(`Even ${even.toFixed(1)}% / Odd ${odd.toFixed(1)}%`);
+      return wait(`Even ${even.toFixed(1)}% / Odd ${odd.toFixed(1)}% (Need ${requiredEdge}%)`);
     },
   },
 
@@ -368,27 +374,30 @@ const BOTS = {
     assetClass: 'synthetic_digit', contractClass: 'digit',
     defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, threshold: 8, minSamples: 100 },
     evaluate(ctx) {
-      const { digitView, config } = ctx;
+      const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No digit data');
       if (digitView.sampleSize < config.minSamples) return wait('Not enough samples');
       
+      // INTELLIGENT RECOVERY: Demand a colder digit if we are losing
+      const losses = stats?.consecutiveLosses || 0;
+      let requiredPct = 5.0; // Base 5%
+      if (losses === 1) requiredPct = 3.5;
+      if (losses >= 2) requiredPct = 2.0;
+
       const freq = digitView.digitFreq;
       const total = digitView.sampleSize;
       const th = config.threshold; // Default 8
       
-      // Calculate how often digit is strictly greater than 8 (i.e., 9)
       const overCount = freq.slice(th + 1).reduce((a, b) => a + b, 0);
       const overPct = (overCount / total) * 100;
       
-      // Calculate how often digit is strictly less than 1 (i.e., 0)
       const underCount = freq.slice(0, 1).reduce((a, b) => a + b, 0);
       const underPct = (underCount / total) * 100;
       
-      // If it hasn't happened in a while (dropped below 5%), bet on it happening
-      if (overPct <= 5.0) return enterDigitBarrier('DIGITOVER', th, config, `Over ${th} is cold (${overPct.toFixed(1)}%). Expected payout ~9x.`);
-      if (underPct <= 5.0) return enterDigitBarrier('DIGITUNDER', 0, config, `Under 1 is cold (${underPct.toFixed(1)}%). Expected payout ~9x.`);
+      if (overPct <= requiredPct) return enterDigitBarrier('DIGITOVER', th, config, `Over ${th} cold (${overPct.toFixed(1)}%). Need <=${requiredPct}%.`);
+      if (underPct <= requiredPct) return enterDigitBarrier('DIGITUNDER', 0, config, `Under 1 cold (${underPct.toFixed(1)}%). Need <=${requiredPct}%.`);
       
-      return wait(`Over ${th}: ${overPct.toFixed(1)}% / Under 1: ${underPct.toFixed(1)}%`);
+      return wait(`Over ${th}: ${overPct.toFixed(1)}% / Under 1: ${underPct.toFixed(1)}% (Need <=${requiredPct}%)`);
     },
   },
 
@@ -398,21 +407,26 @@ const BOTS = {
     assetClass: 'synthetic_digit', contractClass: 'digit',
     defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, targetDigit: 5, minSamples: 100 },
     evaluate(ctx) {
-      const { digitView, config } = ctx;
+      const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No digit data');
       if (digitView.sampleSize < config.minSamples) return wait('Not enough samples');
       
+      // INTELLIGENT RECOVERY: If we lose, wait for an even colder digit
+      const losses = stats?.consecutiveLosses || 0;
+      let requiredPct = 4.0; // Base 4%
+      if (losses === 1) requiredPct = 3.0;
+      if (losses >= 2) requiredPct = 2.0;
+
       const freq = digitView.digitFreq;
       const total = digitView.sampleSize;
       const target = config.targetDigit;
       const targetPct = (freq[target] / total) * 100;
       
-      // If digit is colder than 5%, bet on MATCH (pays ~$9.00 on $1.00)
-      if (targetPct <= 5) {
+      if (targetPct <= requiredPct) {
         return enterDigitBarrier('DIGITMATCH', target, config, `Digit ${target} extremely cold (${targetPct.toFixed(1)}%). Expecting MATCH.`);
       }
       
-      return wait(`Digit ${target} at ${targetPct.toFixed(1)}% (need <5% to fire)`);
+      return wait(`Digit ${target} at ${targetPct.toFixed(1)}% (Need <=${requiredPct}% to fire)`);
     },
   },
 
@@ -422,16 +436,22 @@ const BOTS = {
     assetClass: 'synthetic_digit', contractClass: 'digit',
     defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, minStreak: 6 },
     evaluate(ctx) {
-      const { digitView, config } = ctx;
+      const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No digit data');
+      
+      // INTELLIGENT RECOVERY: Demand a longer streak if we are losing
+      const losses = stats?.consecutiveLosses || 0;
+      let requiredStreak = config.minStreak;
+      if (losses === 1) requiredStreak += 1;
+      if (losses >= 2) requiredStreak += 2;
+
       const evenStreak = digitView.evenStreak || 0;
       const oddStreak = digitView.oddStreak || 0;
       
-      // Require a 6-streak before fading
-      if (evenStreak >= config.minStreak) return enterDigit('DIGITODD', config, `${evenStreak}-streak even. Fading to ODD.`);
-      if (oddStreak >= config.minStreak) return enterDigit('DIGITEVEN', config, `${oddStreak}-streak odd. Fading to EVEN.`);
+      if (evenStreak >= requiredStreak) return enterDigit('DIGITODD', config, `${evenStreak}-streak even. Fading to ODD.`);
+      if (oddStreak >= requiredStreak) return enterDigit('DIGITEVEN', config, `${oddStreak}-streak odd. Fading to EVEN.`);
       
-      return wait(`Streak: even=${evenStreak} odd=${oddStreak}`);
+      return wait(`Streak: even=${evenStreak} odd=${oddStreak} (Need ${requiredStreak})`);
     },
   },
 
@@ -441,21 +461,26 @@ const BOTS = {
     assetClass: 'synthetic_digit', contractClass: 'digit',
     defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, minSamples: 100 },
     evaluate(ctx) {
-      const { digitView, config } = ctx;
+      const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No digit data');
       if (digitView.sampleSize < config.minSamples) return wait('Not enough samples');
       
+      // INTELLIGENT RECOVERY: Demand an even colder digit after a loss
+      const losses = stats?.consecutiveLosses || 0;
+      let requiredPct = 4.0; // Base 4%
+      if (losses === 1) requiredPct = 2.5;
+      if (losses >= 2) requiredPct = 1.0;
+
       const freq = digitView.digitFreq;
       const total = digitView.sampleSize;
       
-      // Only look for extreme Over 8 or Under 1 setups
       const over8 = (freq.slice(9).reduce((a, b) => a + b, 0) / total) * 100;
       const under1 = (freq.slice(0, 1).reduce((a, b) => a + b, 0) / total) * 100;
       
-      if (over8 <= 4) return enterDigitBarrier('DIGITOVER', 8, config, `Over 8 is only ${over8.toFixed(1)}%. Betting OVER 8 (pays ~9x).`);
-      if (under1 <= 4) return enterDigitBarrier('DIGITUNDER', 0, config, `Under 1 is only ${under1.toFixed(1)}%. Betting UNDER 1 (pays ~9x).`);
+      if (over8 <= requiredPct) return enterDigitBarrier('DIGITOVER', 8, config, `Over 8 is only ${over8.toFixed(1)}%. (Need <=${requiredPct}%)`);
+      if (under1 <= requiredPct) return enterDigitBarrier('DIGITUNDER', 0, config, `Under 1 is only ${under1.toFixed(1)}%. (Need <=${requiredPct}%)`);
       
-      return wait('No extreme edge yet');
+      return wait(`No extreme edge yet (Need <=${requiredPct}%)`);
     },
   },
 
@@ -469,17 +494,23 @@ const BOTS = {
     assetClass: 'synthetic_binary', contractClass: 'binary',
     defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, minBias: 0.62, minSamples: 100 },
     evaluate(ctx) {
-      const { digitView, config } = ctx;
+      const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No data');
       if (digitView.sampleSize < config.minSamples) return wait('Not enough samples');
       
+      // INTELLIGENT RECOVERY
+      const losses = stats?.consecutiveLosses || 0;
+      let requiredBias = config.minBias;
+      if (losses === 1) requiredBias += 0.03;
+      if (losses >= 2) requiredBias += 0.06;
+
       const risePct = digitView.risePct / 100;
       const fallPct = digitView.fallPct / 100;
       
-      if (risePct >= config.minBias) return enterBinary('CALL', config, `Rise bias ${(risePct * 100).toFixed(1)}%`);
-      if (fallPct >= config.minBias) return enterBinary('PUT', config, `Fall bias ${(fallPct * 100).toFixed(1)}%`);
+      if (risePct >= requiredBias) return enterBinary('CALL', config, `Rise bias ${(risePct * 100).toFixed(1)}%`);
+      if (fallPct >= requiredBias) return enterBinary('PUT', config, `Fall bias ${(fallPct * 100).toFixed(1)}%`);
       
-      return wait(`Rise ${(risePct * 100).toFixed(1)}% / Fall ${(fallPct * 100).toFixed(1)}%`);
+      return wait(`Rise ${(risePct * 100).toFixed(1)}% / Fall ${(fallPct * 100).toFixed(1)}% (Need >=${(requiredBias * 100).toFixed(0)}%)`);
     },
   },
 
@@ -489,10 +520,17 @@ const BOTS = {
     assetClass: 'synthetic_binary', contractClass: 'binary',
     defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, minStreak: 5 },
     evaluate(ctx) {
-      const { digitView, config } = ctx;
+      const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No data');
+      
+      // INTELLIGENT RECOVERY
+      const losses = stats?.consecutiveLosses || 0;
+      let requiredStreak = config.minStreak;
+      if (losses === 1) requiredStreak += 1;
+      if (losses >= 2) requiredStreak += 2;
+
       const dirs = (digitView.directions || []).slice(-20);
-      if (dirs.length < config.minStreak) return wait('Not enough ticks');
+      if (dirs.length < requiredStreak) return wait('Not enough ticks');
       
       let streak = 0, lastDir = null;
       for (let i = dirs.length - 1; i >= 0; i--) {
@@ -502,11 +540,11 @@ const BOTS = {
         else break;
       }
       
-      if (streak >= config.minStreak) {
+      if (streak >= requiredStreak) {
         const dir = lastDir === 'up' ? 'PUT' : 'CALL';
         return enterBinary(dir, config, `${streak}-tick ${lastDir}-streak → fade to ${dir}`);
       }
-      return wait(`Streak: ${streak} ${lastDir || '-'}`);
+      return wait(`Streak: ${streak} ${lastDir || '-'} (Need ${requiredStreak})`);
     },
   },
 
@@ -516,15 +554,22 @@ const BOTS = {
     assetClass: 'synthetic_binary', contractClass: 'binary',
     defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, lookbackTicks: 10, minMovePct: 0.08 },
     evaluate(ctx) {
-      const { digitView, config } = ctx;
+      const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No data');
+      
+      // INTELLIGENT RECOVERY
+      const losses = stats?.consecutiveLosses || 0;
+      let requiredMove = config.minMovePct;
+      if (losses === 1) requiredMove += 0.02;
+      if (losses >= 2) requiredMove += 0.04;
+
       const prices = (digitView.recentPrices || []).slice(-config.lookbackTicks);
       if (prices.length < 5) return wait('Not enough prices');
       
       const first = prices[0], last = prices[prices.length - 1];
       const movePct = ((last - first) / first) * 100;
       
-      if (Math.abs(movePct) < config.minMovePct) return wait(`Move ${movePct.toFixed(3)}% too small`);
+      if (Math.abs(movePct) < requiredMove) return wait(`Move ${movePct.toFixed(3)}% too small (Need ${requiredMove.toFixed(3)}%)`);
       
       const dir = movePct > 0 ? 'CALL' : 'PUT';
       return enterBinary(dir, config, `Move ${movePct.toFixed(3)}% in ${config.lookbackTicks} ticks`);
@@ -541,8 +586,15 @@ const BOTS = {
     assetClass: 'synthetic_binary', contractClass: 'binary',
     defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, barrierPips: 10 },
     evaluate(ctx) {
-      const { digitView, config } = ctx;
+      const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No data');
+      
+      // INTELLIGENT RECOVERY
+      const losses = stats?.consecutiveLosses || 0;
+      let upperBias = 0.70, lowerBias = 0.50;
+      if (losses === 1) { upperBias = 0.75; lowerBias = 0.45; }
+      if (losses >= 2) { upperBias = 0.80; lowerBias = 0.40; }
+
       const dirs = (digitView.directions || []).slice(-20);
       const up = dirs.filter(d => d === 'up').length;
       const down = dirs.filter(d => d === 'down').length;
@@ -550,8 +602,8 @@ const BOTS = {
       if (total === 0) return wait('Not enough direction data');
       
       const bias = Math.max(up, down) / total;
-      if (bias > 0.70) return enterBinary('ONETOUCH', config, `Strong directional bias ${(bias * 100).toFixed(1)}%`);
-      if (bias < 0.50) return enterBinary('NOTOUCH', config, `Balanced movement`);
+      if (bias > upperBias) return enterBinary('ONETOUCH', config, `Strong directional bias ${(bias * 100).toFixed(1)}%`);
+      if (bias < lowerBias) return enterBinary('NOTOUCH', config, `Balanced movement`);
       
       return wait(`Bias ${(bias * 100).toFixed(1)}%`);
     },
@@ -565,6 +617,8 @@ const BOTS = {
     evaluate(ctx) {
       const { digitView, config } = ctx;
       if (!digitView) return wait('No data');
+      
+      // EXACT ORIGINAL LOGIC (User requested this remains stable)
       const dirs = (digitView.directions || []).slice(-5);
       if (dirs.length < 5) return wait('Not enough ticks');
       
