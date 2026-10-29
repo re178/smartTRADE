@@ -1,6 +1,7 @@
 // core/bots/registry.js
 // 17 bots. Optimized for BIG WINS and SMALL LOSSES.
-// Includes ADAPTIVE RECOVERY and pip-size validation for Deriv.
+// Includes ADAPTIVE RECOVERY, pip-size validation, price-precision rounding,
+// and session-level risk limits (take-profit / stop-loss / trailing / consecutive).
 
 'use strict';
 
@@ -18,6 +19,25 @@ function getPipSize(symbol) {
     XAUUSD: 0.01, XAGUSD: 0.001, BTCUSD: 0.1, ETHUSD: 0.01,
   };
   return map[clean] || 0.0001;
+}
+
+// Deriv rejects floating-point noise like 157.78000000000003 on JPY pairs.
+// Every multiplier-level price that leaves the bot must pass through roundPrice().
+function getPricePrecision(symbol) {
+  const clean = normalizeSymbol(symbol);
+  const map = {
+    EURUSD: 5, GBPUSD: 5, AUDUSD: 5, NZDUSD: 5, USDCHF: 5, USDCAD: 5,
+    USDJPY: 3, EURJPY: 3, GBPJPY: 3, AUDJPY: 3,
+    XAUUSD: 2, XAGUSD: 3, BTCUSD: 2, ETHUSD: 2,
+  };
+  return map[clean] != null ? map[clean] : 5;
+}
+
+function roundPrice(symbol, price) {
+  if (price == null || !Number.isFinite(Number(price))) return null;
+  const p = getPricePrecision(symbol);
+  const f = Math.pow(10, p);
+  return Math.round(Number(price) * f) / f;
 }
 
 function wait(reason) {
@@ -43,8 +63,8 @@ function enterMultiplier(direction, config, overrides, reasons) {
       multiplier: config.multiplier,
       duration: overrides.durationSec || config.durationSec,
       durationUnit: 's',
-      knockoutLevel: finalKnockout,
-      takeProfitLevel: finalTakeProfit,
+      knockoutLevel: roundPrice(config.symbol, finalKnockout),
+      takeProfitLevel: roundPrice(config.symbol, finalTakeProfit),
       contractClass: 'multiplier',
     },
   };
@@ -657,6 +677,21 @@ const BOTS = {
     },
   },
 };
+
+// ── Session-level risk defaults ───────────────────────────────
+// Applied to every bot. Individual bot defaultConfig still wins on
+// Object.assign, so any bot that sets its own values keeps them.
+// botStopLoss is stored as a POSITIVE number ("max loss $10").
+const RISK_DEFAULTS = {
+  botTakeProfit: 20,          // stop when session PnL >= +$20
+  botStopLoss: 10,            // stop when session PnL <= -$10
+  trailingDrawdownPct: 25,    // once in profit, stop if PnL gives back 25% of peak
+  stopAfterLosses: 3,         // hard stop after N consecutive losses
+};
+
+for (const id in BOTS) {
+  BOTS[id].defaultConfig = Object.assign({}, RISK_DEFAULTS, BOTS[id].defaultConfig);
+}
 
 function getBot(id) { return BOTS[id] || null; }
 function listBots() { return Object.values(BOTS); }
