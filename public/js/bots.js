@@ -2,6 +2,7 @@
 // Bot catalog, config form, running list, run receipts.
 // Event-driven (via window.onBotEvent from live.js) + 8s polling fallback.
 // Includes EXPORT and CLEAR functionality for recent runs.
+// Also shows live risk state (TP/SL/trail/consecutive) on each running bot.
 
 'use strict';
 
@@ -118,15 +119,21 @@
     if (name) name.textContent = `${_selectedBot.name} (${_selectedBot.assetClass})`;
 
     if (fields) {
-      fields.innerHTML = Object.entries(_selectedBot.defaultConfig || {}).map(([key, val]) => {
-        const isNum = typeof val === 'number';
-        return `<div class="col-6 col-md-4">
-          <label class="form-label small text-muted mb-1">${key}</label>
-          <input class="form-control form-control-sm" name="${key}"
-                 value="${val}" type="${isNum ? 'number' : 'text'}"
-                 ${isNum ? 'step="any"' : ''} />
-        </div>`;
-      }).join('');
+      // Skip null/undefined so optional fields (e.g. knockoutLevel,
+      // takeProfitLevel on FX bots) don't render as text inputs containing
+      // the literal string "null" — which used to get sent to the backend
+      // and turn into NaN via Number('null').
+      fields.innerHTML = Object.entries(_selectedBot.defaultConfig || {})
+        .filter(([, val]) => val !== null && val !== undefined)
+        .map(([key, val]) => {
+          const isNum = typeof val === 'number';
+          return `<div class="col-6 col-md-4">
+            <label class="form-label small text-muted mb-1">${key}</label>
+            <input class="form-control form-control-sm" name="${key}"
+                   value="${val}" type="${isNum ? 'number' : 'text'}"
+                   ${isNum ? 'step="any"' : ''} />
+          </div>`;
+        }).join('');
     }
     if (form) { form.style.display = 'block'; form.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
   }
@@ -137,8 +144,23 @@
     if (_running.length === 0) { container.innerHTML = '<p class="text-muted p-3">No bots running.</p>'; return; }
     
     container.innerHTML = _running.map(inst => {
-      const s = inst.stats || { runs: 0, entries: 0, wins: 0, losses: 0, pnl: 0 };
+      const s = inst.stats || { runs: 0, entries: 0, wins: 0, losses: 0, pnl: 0, peakPnl: 0 };
       const pnlClass = s.pnl >= 0 ? 'text-success' : 'text-danger';
+
+      // Build the live risk-limit readout from the running instance's config.
+      const cfg = inst.config || {};
+      const tp = Number(cfg.botTakeProfit) || 0;
+      const sl = Math.abs(Number(cfg.botStopLoss) || 0);
+      const trail = Number(cfg.trailingDrawdownPct) || 0;
+      const maxLoss = Number(cfg.stopAfterLosses) || 0;
+      const peak = Number(s.peakPnl) || 0;
+      const riskLine = [
+        tp > 0 ? `TP +$${tp}` : null,
+        sl > 0 ? `SL -$${sl}` : null,
+        trail > 0 ? `Trail ${trail}%` : null,
+        maxLoss > 0 ? `Stop@${maxLoss}L` : null,
+        peak > 0 ? `Peak +$${peak.toFixed(2)}` : null,
+      ].filter(Boolean).join(' · ');
       
       return `<div class="card mb-2" style="border-left:3px solid #00b894;">
         <div class="card-body p-3">
@@ -150,6 +172,9 @@
                 Runs <strong>${s.runs}</strong> · Entries <strong>${s.entries}</strong> ·
                 <span class="text-success">${s.wins}W</span>/<span class="text-danger">${s.losses}L</span> ·
                 P/L <strong class="${pnlClass}">${s.pnl >= 0 ? '+' : ''}${s.pnl.toFixed(2)}</strong>
+              </div>
+              <div class="small text-muted mt-1" style="font-size:0.72rem;">
+                <i class="fas fa-shield-halved me-1"></i>${riskLine || 'no risk limits'}
               </div>
               <div class="small text-muted mt-1 fw-bold" style="font-size:0.75rem;">${inst.lastReason || ''}</div>
             </div>
@@ -213,8 +238,14 @@
     const form = document.getElementById('botConfigForm');
     const config = {};
     
+    // Skip empty inputs entirely so the bot's defaultConfig wins on
+    // Object.assign() in the runner. Coerce only when the string is a
+    // finite number, otherwise keep the raw string.
     form.querySelectorAll('input[name]').forEach(f => {
-      config[f.name] = isNaN(Number(f.value)) || f.value === '' ? f.value : Number(f.value);
+      const raw = f.value.trim();
+      if (raw === '') return;
+      const n = Number(raw);
+      config[f.name] = Number.isFinite(n) ? n : raw;
     });
     
     const res = await fetch(`/api/bots/${_selectedBot.id}/start`, {
