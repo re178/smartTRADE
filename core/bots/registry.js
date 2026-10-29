@@ -1,8 +1,6 @@
 // core/bots/registry.js
 // 17 bots. Optimized for BIG WINS and SMALL LOSSES.
-// FX bots use tight Knockouts (1x ATR) and wide Take Profits (4x+ ATR).
-// Digit bots focus on high-payout contracts (MATCH, OVER 8, UNDER 1).
-// [INTELLIGENT RECOVERY] Bots dynamically tighten thresholds after a loss.
+// Includes ADAPTIVE RECOVERY and pip-size validation for Deriv.
 
 'use strict';
 
@@ -10,6 +8,16 @@ const { EMA, BollingerBands } = require('../strategy/engine');
 
 function normalizeSymbol(s) {
   return String(s || '').replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
+}
+
+function getPipSize(symbol) {
+  const clean = normalizeSymbol(symbol);
+  const map = {
+    EURUSD: 0.0001, GBPUSD: 0.0001, AUDUSD: 0.0001, NZDUSD: 0.0001, USDCHF: 0.0001, USDCAD: 0.0001,
+    USDJPY: 0.01, EURJPY: 0.01, GBPJPY: 0.01, AUDJPY: 0.01,
+    XAUUSD: 0.01, XAGUSD: 0.001, BTCUSD: 0.1, ETHUSD: 0.01,
+  };
+  return map[clean] || 0.0001;
 }
 
 function wait(reason) {
@@ -95,7 +103,6 @@ const BOTS = {
 
   // ============================================================
   // CATEGORY A — FX MULTIPLIER BOTS (7)
-  // Risking 1.0 ATR to make 4.0+ ATR.
   // ============================================================
 
   trend_rider: {
@@ -119,17 +126,21 @@ const BOTS = {
       }
       const atr = state.volatility && state.volatility.atr;
       if (!atr || atr <= 0) return wait('No ATR');
+      
       const dir = prediction.direction;
       const entry = state.price.current;
+      const pip = getPipSize(config.symbol);
       
-      // BIG WIN, SMALL LOSS: KO is 1.0 ATR, TP is 4.0 ATR
-      const ko = dir === 'BUY' ? entry - atr * 1.0 : entry + atr * 1.0;
-      const tp = dir === 'BUY' ? entry + atr * 4.0 : entry - atr * 4.0;
+      // Ensure min 5 pips for SL, 15 pips for TP to satisfy Deriv API
+      const koDist = Math.max(atr * 1.0, pip * 5); 
+      const tpDist = Math.max(atr * 4.0, pip * 15); 
+      
+      const ko = dir === 'BUY' ? entry - koDist : entry + koDist;
+      const tp = dir === 'BUY' ? entry + tpDist : entry - tpDist;
       
       return enterMultiplier(dir, config,
         { durationSec: config.durationSec, knockoutLevel: ko, takeProfitLevel: tp },
-        [`Pattern ${prediction.pattern.bias} (${prediction.pattern.confidence}%)`,
-         `Momentum ${prediction.momentum.direction}`]);
+        [`Pattern ${prediction.pattern.bias} (${prediction.pattern.confidence}%)`]);
     },
   },
 
@@ -148,12 +159,17 @@ const BOTS = {
       const atS = state.structure && state.structure.isAtSupport;
       const atR = state.structure && state.structure.isAtResistance;
       if (!atS && !atR) return wait('Not at S/R');
+      
       const dir = atS ? 'BUY' : 'SELL';
       const atr = state.volatility.atr;
       const entry = state.price.current;
+      const pip = getPipSize(config.symbol);
       
-      const ko = dir === 'BUY' ? entry - atr * 0.8 : entry + atr * 0.8;
-      const tp = dir === 'BUY' ? entry + atr * 3.0 : entry - atr * 3.0;
+      const koDist = Math.max(atr * 0.8, pip * 5);
+      const tpDist = Math.max(atr * 3.0, pip * 10);
+      
+      const ko = dir === 'BUY' ? entry - koDist : entry + koDist;
+      const tp = dir === 'BUY' ? entry + tpDist : entry - tpDist;
       
       return enterMultiplier(dir, config,
         { durationSec: config.durationSec, knockoutLevel: ko, takeProfitLevel: tp },
@@ -182,9 +198,13 @@ const BOTS = {
       const dir = isUp ? 'BUY' : 'SELL';
       const atr = state.volatility.atr;
       const entry = state.price.current;
+      const pip = getPipSize(config.symbol);
       
-      const ko = dir === 'BUY' ? entry - atr * 1.0 : entry + atr * 1.0;
-      const tp = dir === 'BUY' ? entry + atr * 4.5 : entry - atr * 4.5;
+      const koDist = Math.max(atr * 1.0, pip * 5);
+      const tpDist = Math.max(atr * 4.5, pip * 15);
+      
+      const ko = dir === 'BUY' ? entry - koDist : entry + koDist;
+      const tp = dir === 'BUY' ? entry + tpDist : entry - tpDist;
       
       return enterMultiplier(dir, config,
         { durationSec: config.durationSec, knockoutLevel: ko, takeProfitLevel: tp },
@@ -212,9 +232,13 @@ const BOTS = {
       const dir = v > 0 ? 'BUY' : 'SELL';
       const atr = state.volatility.atr;
       const entry = state.price.current;
+      const pip = getPipSize(config.symbol);
       
-      const ko = dir === 'BUY' ? entry - atr * 0.8 : entry + atr * 0.8;
-      const tp = dir === 'BUY' ? entry + atr * 3.0 : entry - atr * 3.0;
+      const koDist = Math.max(atr * 0.8, pip * 4);
+      const tpDist = Math.max(atr * 3.0, pip * 12);
+      
+      const ko = dir === 'BUY' ? entry - koDist : entry + koDist;
+      const tp = dir === 'BUY' ? entry + tpDist : entry - tpDist;
       
       return enterMultiplier(dir, config,
         { durationSec: config.durationSec, knockoutLevel: ko, takeProfitLevel: tp },
@@ -251,9 +275,13 @@ const BOTS = {
       
       const atr = state.volatility.atr;
       const entry = state.price.current;
+      const pip = getPipSize(config.symbol);
       
-      const ko = dir === 'BUY' ? entry - atr * 1.0 : entry + atr * 1.0;
-      const tp = dir === 'BUY' ? entry + atr * 4.0 : entry - atr * 4.0;
+      const koDist = Math.max(atr * 1.0, pip * 5);
+      const tpDist = Math.max(atr * 4.0, pip * 15);
+      
+      const ko = dir === 'BUY' ? entry - koDist : entry + koDist;
+      const tp = dir === 'BUY' ? entry + tpDist : entry - tpDist;
       
       return enterMultiplier(dir, config,
         { durationSec: config.durationSec, knockoutLevel: ko, takeProfitLevel: tp },
@@ -287,9 +315,13 @@ const BOTS = {
       
       const dir = state.trend && state.trend.direction === 'bullish' ? 'BUY' : 'SELL';
       const atr = state.volatility.atr;
+      const pip = getPipSize(config.symbol);
       
-      const ko = dir === 'BUY' ? ema - atr * 1.0 : ema + atr * 1.0;
-      const tp = dir === 'BUY' ? price + atr * 4.0 : price - atr * 4.0;
+      const koDist = Math.max(atr * 1.0, pip * 5);
+      const tpDist = Math.max(atr * 4.0, pip * 15);
+      
+      const ko = dir === 'BUY' ? ema - koDist : ema + koDist;
+      const tp = dir === 'BUY' ? price + tpDist : price - tpDist;
       
       return enterMultiplier(dir, config,
         { durationSec: config.durationSec, knockoutLevel: ko, takeProfitLevel: tp },
@@ -327,9 +359,13 @@ const BOTS = {
       if (dir === 'NEUTRAL') return wait('No breakout');
       
       const atr = state.volatility.atr;
+      const pip = getPipSize(config.symbol);
       
-      const ko = dir === 'BUY' ? price - atr * 1.0 : price + atr * 1.0;
-      const tp = dir === 'BUY' ? price + atr * 4.0 : price - atr * 4.0;
+      const koDist = Math.max(atr * 1.0, pip * 5);
+      const tpDist = Math.max(atr * 4.0, pip * 15);
+      
+      const ko = dir === 'BUY' ? price - koDist : price + koDist;
+      const tp = dir === 'BUY' ? price + tpDist : price - tpDist;
       
       return enterMultiplier(dir, config,
         { durationSec: config.durationSec, knockoutLevel: ko, takeProfitLevel: tp },
@@ -339,7 +375,6 @@ const BOTS = {
 
   // ============================================================
   // CATEGORY B — SYNTHETIC DIGIT BOTS (5)
-  // Changed to high-payout contracts (MATCH, EXTREME OVER/UNDER).
   // ============================================================
 
   even_odd_trader: {
@@ -352,9 +387,8 @@ const BOTS = {
       if (!digitView) return wait('No digit data');
       if (digitView.sampleSize < config.minSamples) return wait('Not enough samples');
       
-      // INTELLIGENT RECOVERY: Demand a stronger edge if we are losing
       const losses = stats?.consecutiveLosses || 0;
-      let requiredEdge = 62; // Base 62%
+      let requiredEdge = 62;
       if (losses === 1) requiredEdge = 65;
       if (losses >= 2) requiredEdge = 68;
 
@@ -378,15 +412,14 @@ const BOTS = {
       if (!digitView) return wait('No digit data');
       if (digitView.sampleSize < config.minSamples) return wait('Not enough samples');
       
-      // INTELLIGENT RECOVERY: Demand a colder digit if we are losing
       const losses = stats?.consecutiveLosses || 0;
-      let requiredPct = 5.0; // Base 5%
+      let requiredPct = 5.0;
       if (losses === 1) requiredPct = 3.5;
       if (losses >= 2) requiredPct = 2.0;
 
       const freq = digitView.digitFreq;
       const total = digitView.sampleSize;
-      const th = config.threshold; // Default 8
+      const th = config.threshold;
       
       const overCount = freq.slice(th + 1).reduce((a, b) => a + b, 0);
       const overPct = (overCount / total) * 100;
@@ -411,9 +444,8 @@ const BOTS = {
       if (!digitView) return wait('No digit data');
       if (digitView.sampleSize < config.minSamples) return wait('Not enough samples');
       
-      // INTELLIGENT RECOVERY: If we lose, wait for an even colder digit
       const losses = stats?.consecutiveLosses || 0;
-      let requiredPct = 4.0; // Base 4%
+      let requiredPct = 4.0;
       if (losses === 1) requiredPct = 3.0;
       if (losses >= 2) requiredPct = 2.0;
 
@@ -439,7 +471,6 @@ const BOTS = {
       const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No digit data');
       
-      // INTELLIGENT RECOVERY: Demand a longer streak if we are losing
       const losses = stats?.consecutiveLosses || 0;
       let requiredStreak = config.minStreak;
       if (losses === 1) requiredStreak += 1;
@@ -465,9 +496,8 @@ const BOTS = {
       if (!digitView) return wait('No digit data');
       if (digitView.sampleSize < config.minSamples) return wait('Not enough samples');
       
-      // INTELLIGENT RECOVERY: Demand an even colder digit after a loss
       const losses = stats?.consecutiveLosses || 0;
-      let requiredPct = 4.0; // Base 4%
+      let requiredPct = 4.0;
       if (losses === 1) requiredPct = 2.5;
       if (losses >= 2) requiredPct = 1.0;
 
@@ -498,7 +528,6 @@ const BOTS = {
       if (!digitView) return wait('No data');
       if (digitView.sampleSize < config.minSamples) return wait('Not enough samples');
       
-      // INTELLIGENT RECOVERY
       const losses = stats?.consecutiveLosses || 0;
       let requiredBias = config.minBias;
       if (losses === 1) requiredBias += 0.03;
@@ -523,7 +552,6 @@ const BOTS = {
       const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No data');
       
-      // INTELLIGENT RECOVERY
       const losses = stats?.consecutiveLosses || 0;
       let requiredStreak = config.minStreak;
       if (losses === 1) requiredStreak += 1;
@@ -557,7 +585,6 @@ const BOTS = {
       const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No data');
       
-      // INTELLIGENT RECOVERY
       const losses = stats?.consecutiveLosses || 0;
       let requiredMove = config.minMovePct;
       if (losses === 1) requiredMove += 0.02;
@@ -589,7 +616,6 @@ const BOTS = {
       const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No data');
       
-      // INTELLIGENT RECOVERY
       const losses = stats?.consecutiveLosses || 0;
       let upperBias = 0.70, lowerBias = 0.50;
       if (losses === 1) { upperBias = 0.75; lowerBias = 0.45; }
@@ -618,7 +644,6 @@ const BOTS = {
       const { digitView, config } = ctx;
       if (!digitView) return wait('No data');
       
-      // EXACT ORIGINAL LOGIC (User requested this remains stable)
       const dirs = (digitView.directions || []).slice(-5);
       if (dirs.length < 5) return wait('Not enough ticks');
       
