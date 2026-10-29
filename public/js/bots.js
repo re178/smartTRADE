@@ -1,6 +1,7 @@
 // public/js/bots.js
 // Bot catalog, config form, running list, run receipts.
 // Event-driven (via window.onBotEvent from live.js) + 8s polling fallback.
+// Includes EXPORT and CLEAR functionality for recent runs.
 
 'use strict';
 
@@ -8,6 +9,10 @@
   let _bots = [];
   let _selectedBot = null;
   let _running = [];
+
+  // ============================================================
+  // 1. FETCHERS
+  // ============================================================
 
   async function fetchBots() {
     const container = document.getElementById('botListContainer');
@@ -21,7 +26,7 @@
       console.log('[Bots] ✓ Loaded ' + _bots.length + ' bots');
       renderBotList();
     } catch (err) {
-      if (container) container.innerHTML = `<div class="alert alert-danger">Error loading bots: ${err.message}</div>`;
+      if (container) container.innerHTML = `<div class="alert alert-danger m-3">Error loading bots: ${err.message}</div>`;
       console.error('[Bots] fetch failed:', err);
     }
   }
@@ -56,6 +61,10 @@
       console.warn('[Bots] runs failed:', err.message);
     }
   }
+
+  // ============================================================
+  // 2. RENDERERS
+  // ============================================================
 
   function renderBotList() {
     const container = document.getElementById('botListContainer');
@@ -112,7 +121,7 @@
       fields.innerHTML = Object.entries(_selectedBot.defaultConfig || {}).map(([key, val]) => {
         const isNum = typeof val === 'number';
         return `<div class="col-6 col-md-4">
-          <label class="form-label small">${key}</label>
+          <label class="form-label small text-muted mb-1">${key}</label>
           <input class="form-control form-control-sm" name="${key}"
                  value="${val}" type="${isNum ? 'number' : 'text'}"
                  ${isNum ? 'step="any"' : ''} />
@@ -125,7 +134,7 @@
   function renderRunningBots() {
     const container = document.getElementById('runningBotsContainer');
     if (!container) return;
-    if (_running.length === 0) { container.innerHTML = '<p class="text-muted">No bots running.</p>'; return; }
+    if (_running.length === 0) { container.innerHTML = '<p class="text-muted p-3">No bots running.</p>'; return; }
     
     container.innerHTML = _running.map(inst => {
       const s = inst.stats || { runs: 0, entries: 0, wins: 0, losses: 0, pnl: 0 };
@@ -142,7 +151,7 @@
                 <span class="text-success">${s.wins}W</span>/<span class="text-danger">${s.losses}L</span> ·
                 P/L <strong class="${pnlClass}">${s.pnl >= 0 ? '+' : ''}${s.pnl.toFixed(2)}</strong>
               </div>
-              <div class="small text-muted mt-1">${inst.lastReason || ''}</div>
+              <div class="small text-muted mt-1 fw-bold" style="font-size:0.75rem;">${inst.lastReason || ''}</div>
             </div>
             <button class="btn btn-sm btn-danger" data-stop="${inst.instanceId}">
               <i class="fas fa-stop"></i> Stop
@@ -167,7 +176,7 @@
     if (!runs || runs.length === 0) { container.innerHTML = '<p class="text-muted p-3">No runs yet.</p>'; return; }
     
     const rows = runs.map(r => {
-      const pnlClass = r.pnl >= 0 ? 'text-success' : 'text-danger';
+      const pnlClass = r.pnl >= 0 ? 'text-success fw-bold' : 'text-danger fw-bold';
       const badge = r.result === 'WIN' ? '<span class="badge bg-success">WIN</span>'
                   : r.result === 'LOSS' ? '<span class="badge bg-danger">LOSS</span>'
                   : `<span class="badge bg-warning">${r.status || 'OPEN'}</span>`;
@@ -186,16 +195,18 @@
     }).join('');
     
     // Wrapped in table-responsive for mobile scrolling
-    container.innerHTML = `<div class="table-responsive" style="max-height:400px;">
-      <table class="table table-sm table-striped mb-0">
-        <thead style="position:sticky; top:0; background:#fff;">
-          <tr><th>Opened</th><th>Bot</th><th>Symbol</th><th>Type</th>
-              <th>Stake</th><th>Mult</th><th>Entry</th><th>P/L</th><th>Result</th></tr>
-        </thead>
-        <tbody>${rows}</tbody>
-      </table>
-    </div>`;
+    container.innerHTML = `<table class="table table-sm table-striped mb-0">
+      <thead style="position:sticky; top:0; background:#fff; z-index:2;">
+        <tr><th>Opened</th><th>Bot</th><th>Symbol</th><th>Type</th>
+            <th>Stake</th><th>Mult</th><th>Entry</th><th>P/L</th><th>Result</th></tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>`;
   }
+
+  // ============================================================
+  // 3. ACTIONS
+  // ============================================================
 
   async function startSelectedBot() {
     if (!_selectedBot) return;
@@ -223,6 +234,39 @@
     }
   }
 
+  async function exportRunsToCSV() {
+    try {
+      const res = await fetch('/api/bots/runs/export');
+      const runs = await res.json();
+      if (!runs || runs.length === 0) { alert('No runs to export.'); return; }
+      
+      let csv = 'Date,Bot,Symbol,Type,Stake,Entry,PnL,Result,Reason\n';
+      runs.forEach(r => {
+        const reason = (r.reasons || []).join(' | ').replace(/,/g, ';');
+        csv += `${new Date(r.openedAt).toISOString()},${r.botId},${r.symbol},${r.side},${r.stake},${r.entryPrice || ''},${r.pnl || 0},${r.result || 'OPEN'},"${reason}"\n`;
+      });
+      
+      const blob = new Blob([csv], { type: 'text/csv' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `bot_runs_${new Date().toISOString().slice(0,10)}.csv`;
+      a.click(); URL.revokeObjectURL(a.href);
+    } catch (e) { alert('Export failed: ' + e.message); }
+  }
+
+  async function clearRuns() {
+    if (!confirm('Are you sure you want to delete ALL bot runs? This cannot be undone.')) return;
+    try {
+      const res = await fetch('/api/bots/runs', { method: 'DELETE' });
+      if (res.ok) { alert('All runs cleared.'); fetchRuns(); }
+      else alert('Failed to clear runs.');
+    } catch (e) { alert('Clear failed: ' + e.message); }
+  }
+
+  // ============================================================
+  // 4. EVENT WIRING
+  // ============================================================
+
   window.onBotEvent = function () { fetchRunning(); fetchRuns(); };
 
   document.addEventListener('DOMContentLoaded', function () {
@@ -230,6 +274,7 @@
     fetchRunning();
     fetchRuns();
     
+    // Poll running bots every 8 seconds if on the bots page
     setInterval(() => {
       if (document.getElementById('section-bots')?.style.display !== 'none') fetchRunning();
     }, 8000);
@@ -244,10 +289,17 @@
       _selectedBot = null;
     });
     
+    document.getElementById('botsReload')?.addEventListener('click', () => {
+      fetchBots(); fetchRunning(); fetchRuns();
+    });
+
     document.getElementById('stopAllBots')?.addEventListener('click', async () => {
       if (!confirm('Stop all running bots?')) return;
       await fetch('/api/bots/stop-all', { method: 'POST' });
       fetchRunning();
     });
+
+    document.getElementById('exportRunsBtn')?.addEventListener('click', exportRunsToCSV);
+    document.getElementById('clearRunsBtn')?.addEventListener('click', clearRuns);
   });
 })();
