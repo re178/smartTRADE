@@ -16,6 +16,24 @@ const logger = require('../../infrastructure/logger') || console;
 
 function normalizeSymbol(s) { return String(s || '').replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase(); }
 
+// Trading session detection by UTC hour. Used by allowedSessions gate
+// and as a tag on every BotRun for regime × session edge analysis.
+const SESSION_RANGES = [
+  { code: 'ASIAN',               start: 0,  end: 7  },
+  { code: 'LONDON',              start: 7,  end: 12 },
+  { code: 'LONDON_NY_OVERLAP',   start: 12, end: 16 },
+  { code: 'NEW_YORK',            start: 16, end: 21 },
+  { code: 'AFTER_HOURS',         start: 21, end: 24 },
+];
+
+function detectSession(date = new Date()) {
+  const h = date.getUTCHours();
+  for (const s of SESSION_RANGES) {
+    if (h >= s.start && h < s.end) return s.code;
+  }
+  return 'AFTER_HOURS';
+}
+
 class BotRunner extends EventEmitter {
   constructor() {
     super();
@@ -43,7 +61,7 @@ class BotRunner extends EventEmitter {
     if (typeof instance.timer.unref === 'function') instance.timer.unref();
 
     this._instances.set(instanceId, instance);
-    logger.info(`[BotRunner] Started ${bot.name} (${instanceId}) on ${symbol}`);
+    logger.info(`[BotRunner] Started ${bot.name} (${instanceId}) on ${symbol}${finalConfig._edgeTest ? ' [EDGE TEST]' : ''}`);
     const summary = this._summarize(instance);
     this.emit('botStarted', summary);
     setTimeout(() => { this._runCycle(instance).catch(() => {}); }, 1000);
@@ -124,6 +142,16 @@ class BotRunner extends EventEmitter {
         }
       }
 
+      // 2c. Session gate — skip if current session not in allowedSessions
+      const allowedSessions = instance.config.allowedSessions;
+      if (Array.isArray(allowedSessions) && allowedSessions.length > 0) {
+        const currentSession = detectSession();
+        if (allowedSessions.indexOf(currentSession) < 0) {
+          instance.lastReason = `Waiting: session ${currentSession} not in [${allowedSessions.join(',')}]`;
+          return;
+        }
+      }
+
       instance.lastRunAt = new Date();
       const broker = getBroker('deriv_cfd');
       if (!broker.isConnected()) { instance.lastReason = 'broker disconnected'; return; }
@@ -144,6 +172,17 @@ class BotRunner extends EventEmitter {
         const state = await deepMarketState.compute(instance.symbol, timeframe, 200).catch(() => null);
         if (!state) { instance.lastReason = 'no deep state'; return; }
         ctx.state = state;
+
+        // 2d. Regime gate — FX only (synthetics don't have regime)
+        const allowedRegimes = instance.config.allowedRegimes;
+        if (Array.isArray(allowedRegimes) && allowedRegimes.length > 0) {
+          const currentRegime = state.regime && state.regime.code;
+          if (currentRegime && allowedRegimes.indexOf(currentRegime) < 0) {
+            instance.lastReason = `Waiting: regime ${currentRegime} not in [${allowedRegimes.join(',')}]`;
+            return;
+          }
+        }
+
         ctx.consensus = await ranker.rank(state, instance.symbol, { timeframe }).catch(() => null);
         ctx.prediction = await predictor.predict(instance.symbol, state, ctx.consensus, { timeframe }).catch(() => null);
         ctx.candles = await candleHistory.getHistory(instance.symbol, timeframe, 100).catch(() => []) || [];
@@ -166,7 +205,7 @@ class BotRunner extends EventEmitter {
       }
 
       if (result.action === 'ENTER') {
-        await this._execute(instance, result);
+        await this._execute(instance, result, ctx);
       }
     } catch (err) {
       logger.error(`[BotRunner] ${instance.instanceId} cycle exception: ${err.message}`);
@@ -176,24 +215,145 @@ class BotRunner extends EventEmitter {
     }
   }
 
-  async _execute(instance, signal) {
+  _validateStake(instance, stake) {
+    const requested = Number(stake);
+    if (!Number.isFinite(requested) || requested <= 0) {
+      return { ok: false, reason: `Invalid stake: ${stake}` };
+    }
+    const rawMax = instance.config.maxStake;
+    if (rawMax != null && rawMax !== '' && Number(rawMax) !== 0) {
+      const cap = Number(rawMax);
+      if (!Number.isFinite(cap) || cap <= 0) {
+        return { ok: false, reason: `Invalid maxStake config: ${rawMax}` };
+      }
+      if (requested > cap) {
+        return { ok: false, reason: `Stake ${requested} exceeds maxStake ${cap}` };
+      }
+    }
+    return { ok: true, stake: requested };
+  }
+
+  _validateRiskReward(instance, tradeParams, ctx) {
+    const minRR = Number(instance.config.minRiskReward) || 0;
+    if (minRR <= 0) return { ok: true };
+    if (tradeParams.contractClass !== 'multiplier') return { ok: true };
+
+    const entryPrice = ctx && ctx.state && ctx.state.price && ctx.state.price.current;
+    const ko = Number(tradeParams.knockoutLevel);
+    const tp = Number(tradeParams.takeProfitLevel);
+
+    if (!Number.isFinite(entryPrice) || entryPrice <= 0) return { ok: true };
+    if (!Number.isFinite(ko) || !Number.isFinite(tp)) return { ok: true };
+
+    const slDist = Math.abs(entryPrice - ko);
+    const tpDist = Math.abs(tp - entryPrice);
+
+    if (slDist <= 0) {
+      return { ok: false, reason: 'SL distance is zero (invalid levels)' };
+    }
+
+    const rr = tpDist / slDist;
+    if (rr < minRR) {
+      return { ok: false, reason: `RR ${rr.toFixed(2)} < minRiskReward ${minRR}`, rr };
+    }
+    return { ok: true, rr };
+  }
+
+  _buildEntryThesis(instance, reasons, ctx) {
+    const isEdgeTest = !!instance.config._edgeTest;
+    const session = detectSession();
+
+    if (instance.assetClass === 'fx') {
+      const pred = ctx && ctx.prediction;
+      const st = ctx && ctx.state;
+      const cons = ctx && ctx.consensus && ctx.consensus.consensus;
+      return {
+        botId: instance.botId,
+        instanceId: instance.instanceId,
+        reasons: reasons || [],
+        edgeTest: isEdgeTest,
+        session,
+        confidence: pred ? pred.calibratedConfidence : null,
+        direction: pred ? pred.direction : null,
+        pattern: pred && pred.pattern ? {
+          bias: pred.pattern.bias,
+          confidence: pred.pattern.confidence,
+          patterns: pred.pattern.patterns,
+        } : null,
+        momentum: pred ? pred.momentum : null,
+        volatility: pred ? pred.volatility : null,
+        regime: st && st.regime ? st.regime.code : null,
+        regimeConfidence: st && st.regime ? st.regime.confidence : null,
+        strategyConsensus: cons ? {
+          action: cons.action,
+          direction: cons.direction,
+          confidence: cons.confidence,
+          agreeing: cons.agreeing,
+        } : null,
+      };
+    }
+
+    const dv = ctx && ctx.digitView;
+    return {
+      botId: instance.botId,
+      instanceId: instance.instanceId,
+      reasons: reasons || [],
+      edgeTest: isEdgeTest,
+      session,
+      digitView: dv ? {
+        sampleSize: dv.sampleSize,
+        evenPct: dv.evenPct,
+        oddPct: dv.oddPct,
+        risePct: dv.risePct,
+        fallPct: dv.fallPct,
+        evenStreak: dv.evenStreak,
+        oddStreak: dv.oddStreak,
+      } : null,
+    };
+  }
+
+  async _execute(instance, signal, ctx) {
     const { tradeParams, direction, reasons } = signal;
+
+    // ── Stake validation (reject, do not clamp) ─────────────
+    const stakeCheck = this._validateStake(instance, tradeParams.stake);
+    if (!stakeCheck.ok) {
+      instance.lastReason = `Execution blocked: ${stakeCheck.reason}`;
+      logger.warn(`[BotRunner] ${instance.instanceId} — ${instance.lastReason}`);
+      this.emit('botError', { instanceId: instance.instanceId, botId: instance.botId, error: stakeCheck.reason });
+      return;
+    }
+
+    // ── Risk-reward gate (FX multiplier only) ───────────────
+    const rrCheck = this._validateRiskReward(instance, tradeParams, ctx);
+    if (!rrCheck.ok) {
+      instance.lastReason = `Execution blocked: ${rrCheck.reason}`;
+      logger.warn(`[BotRunner] ${instance.instanceId} — ${instance.lastReason}`);
+      this.emit('botError', { instanceId: instance.instanceId, botId: instance.botId, error: rrCheck.reason });
+      return;
+    }
+
+    const entryThesis = this._buildEntryThesis(instance, reasons, ctx);
+    const isEdgeTest = !!instance.config._edgeTest;
+    const currentSession = detectSession();
+    const currentRegime = ctx && ctx.state && ctx.state.regime ? ctx.state.regime.code : null;
+
     try {
       let result;
       if (tradeParams.contractClass === 'multiplier') {
         result = await contractService.placeContract({
-          symbol: tradeParams.symbol, direction: tradeParams.direction || direction, stake: tradeParams.stake,
+          symbol: tradeParams.symbol, direction: tradeParams.direction || direction, stake: stakeCheck.stake,
           multiplier: tradeParams.multiplier, duration: tradeParams.duration, durationUnit: tradeParams.durationUnit || 's',
           knockoutLevel: tradeParams.knockoutLevel, takeProfitLevel: tradeParams.takeProfitLevel,
           strategy: instance.botId, regimeCode: instance.config.regimeCode || 'NEUTRAL',
-          entryThesis: { botId: instance.botId, instanceId: instance.instanceId, reasons: reasons || [] },
+          entryThesis,
         });
       } else if (tradeParams.contractClass === 'digit' || tradeParams.contractClass === 'binary') {
         result = await contractService.placeContract({
           symbol: tradeParams.symbol, contractType: tradeParams.contractType, barrier: tradeParams.barrier,
-          stake: tradeParams.stake, duration: tradeParams.duration, durationUnit: tradeParams.durationUnit || 't',
+          stake: stakeCheck.stake, duration: tradeParams.duration, durationUnit: tradeParams.durationUnit || 't',
           strategy: instance.botId, regimeCode: instance.config.regimeCode || 'NEUTRAL',
-          entryThesis: { botId: instance.botId, instanceId: instance.instanceId, reasons: reasons || [] },
+          entryThesis,
         });
       } else {
         throw new Error(`Unknown contractClass: ${tradeParams.contractClass}`);
@@ -207,15 +367,19 @@ class BotRunner extends EventEmitter {
       await BotRun.create({
         botId: instance.botId, instanceId: instance.instanceId, contractId: String(result.contractId),
         symbol: normalizeSymbol(instance.config.symbol), side: tradeParams.contractType || direction,
-        contractType: tradeParams.contractType || null, stake: Number(tradeParams.stake),
+        contractType: tradeParams.contractType || null, stake: Number(stakeCheck.stake),
         multiplier: tradeParams.multiplier || null, duration: tradeParams.duration || null,
         durationUnit: tradeParams.durationUnit || null, barrier: tradeParams.barrier != null ? String(tradeParams.barrier) : null,
         entryPrice: result.entryPrice, takeProfitLevel: tradeParams.takeProfitLevel != null ? Number(tradeParams.takeProfitLevel) : null,
         knockoutLevel: tradeParams.knockoutLevel != null ? Number(tradeParams.knockoutLevel) : null,
         reasons: reasons || [], openedAt: new Date(), status: 'OPEN',
+        // New fields for edge analytics (schema must accept these — see note above)
+        isEdgeTest,
+        regimeCode: currentRegime,
+        session: currentSession,
       }).catch(err => logger.error(`[BotRunner] BotRun persist failed: ${err.message}`));
 
-      this.emit('botEntry', { instanceId: instance.instanceId, botId: instance.botId, contractId: String(result.contractId), symbol: instance.config.symbol, side: tradeParams.contractType || direction, entryPrice: result.entryPrice, stake: tradeParams.stake, reasons, timestamp: new Date().toISOString() });
+      this.emit('botEntry', { instanceId: instance.instanceId, botId: instance.botId, contractId: String(result.contractId), symbol: instance.config.symbol, side: tradeParams.contractType || direction, entryPrice: result.entryPrice, stake: stakeCheck.stake, reasons, timestamp: new Date().toISOString() });
     } catch (err) {
       // If it fails, print the actual error, not "ENTERED"
       logger.error(`[BotRunner] ${instance.botId}/${instance.instanceId} entry failed: ${err.message}`);
