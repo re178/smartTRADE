@@ -5,7 +5,19 @@
 //   • Binary (CALL/PUT/ONETOUCH/NOTOUCH)     — Synthetic indices
 //
 // Uses broker._sendAuthRequest — does NOT modify broker.js.
-// Callers: bots/runner.js, api/controllers.js (for manual orders).
+// Callers: bots/runner.js (bot entries), api/controllers.js (manual orders).
+//
+// [FIX-1] Multiplier contracts on Deriv do NOT accept duration_unit: 's'.
+//         They exit on limit_order barrier hit (or manual close).
+//         Sending duration/duration_unit caused InvalidExpiry on every
+//         FX bot entry — all FX bots have been blocked until this fix.
+//
+// [FIX-2] Deriv deprecated multipliers 100, 300, 500. Only [200, 400, 600, 800]
+//         are accepted now. Any attempt with an invalid multiplier is rejected.
+//
+// [FIX-3] roundPrice() applies per-symbol decimal precision to
+//         knockoutLevel / takeProfitLevel before they hit Deriv's proposal API.
+//         Prevents USDJPY InputValidationFailed on float noise.
 
 'use strict';
 
@@ -30,9 +42,32 @@ const CONTRACT_TYPES = {
   NOTOUCH: 'NOTOUCH',
 };
 
+// Deriv's current allowed multiplier set. Any value outside this is rejected
+// by the proposal API. Update here if Deriv changes their policy again.
+const ACCEPTED_MULTIPLIERS = [200, 400, 600, 800];
+const DEFAULT_MULTIPLIER = 200;
+
 function normalizeSymbol(s) {
   if (!s) return '';
   return String(s).replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
+}
+
+// ── Per-symbol price precision (mirrors core/bots/registry.js) ──
+function getPricePrecision(symbol) {
+  const clean = normalizeSymbol(symbol);
+  const map = {
+    EURUSD: 5, GBPUSD: 5, AUDUSD: 5, NZDUSD: 5, USDCHF: 5, USDCAD: 5,
+    USDJPY: 3, EURJPY: 3, GBPJPY: 3, AUDJPY: 3,
+    XAUUSD: 2, XAGUSD: 3, BTCUSD: 2, ETHUSD: 2,
+  };
+  return map[clean] != null ? map[clean] : 5;
+}
+
+function roundPrice(symbol, price) {
+  if (price == null || !Number.isFinite(Number(price))) return null;
+  const p = getPricePrecision(symbol);
+  const f = Math.pow(10, p);
+  return Math.round(Number(price) * f) / f;
 }
 
 /**
@@ -41,7 +76,6 @@ function normalizeSymbol(s) {
  */
 function toDerivSymbol(symbol, broker) {
   if (!symbol) return '';
-  // Synthetics: R_*, 1HZ* — keep as-is
   if (/^(R_|1HZ)/i.test(symbol)) return symbol;
   const clean = normalizeSymbol(symbol);
   const map = broker.symbolMap || {};
@@ -148,12 +182,17 @@ async function _persist(params) {
 /**
  * Place a Multiplier contract (MULTUP / MULTDOWN).
  * FX trades use this.
+ *
+ * IMPORTANT: Do NOT send duration / duration_unit. Deriv multiplier contracts
+ * exit on limit_order barrier hit (knockout / takeProfit) or manual close.
+ * Sending duration_unit: 's' triggers InvalidExpiry — this was blocking every
+ * FX bot entry since the system started.
  */
 async function placeMultiplier(params) {
   const {
     symbol, direction, stake, multiplier,
     knockoutLevel = null, takeProfitLevel = null,
-    duration = null, durationUnit = 's',
+    // duration, durationUnit are INTENTIONALLY ignored for multipliers — see above
     strategy = null, regimeCode = null, entryThesis = null,
   } = params;
 
@@ -164,8 +203,10 @@ async function placeMultiplier(params) {
   const stakeNum = Number(stake);
   const multNum = Math.floor(Number(multiplier));
   if (!Number.isFinite(stakeNum) || stakeNum <= 0) throw new Error('stake must be positive');
-  if (![100, 200, 300, 500, 800].includes(multNum)) {
-    throw new Error(`multiplier must be one of 100,200,300,500,800 (got ${multiplier})`);
+  if (!ACCEPTED_MULTIPLIERS.includes(multNum)) {
+    throw new Error(
+      `multiplier must be one of ${ACCEPTED_MULTIPLIERS.join(',')} (got ${multiplier})`
+    );
   }
 
   const broker = getBroker('deriv_cfd');
@@ -174,6 +215,10 @@ async function placeMultiplier(params) {
   const derivSymbol = toDerivSymbol(symbol, broker);
   const contractType = direction === 'BUY' ? 'MULTUP' : 'MULTDOWN';
 
+  const koRounded = roundPrice(symbol, knockoutLevel);
+  const tpRounded = roundPrice(symbol, takeProfitLevel);
+
+  // No duration / duration_unit — multiplier contracts do not use them.
   const proposalParams = {
     amount: stakeNum,
     basis: 'stake',
@@ -183,15 +228,10 @@ async function placeMultiplier(params) {
     multiplier: multNum,
   };
 
-  if (duration != null) {
-    proposalParams.duration = parseInt(duration, 10);
-    proposalParams.duration_unit = durationUnit;
-  }
-
-  if (knockoutLevel != null || takeProfitLevel != null) {
+  if (koRounded != null || tpRounded != null) {
     proposalParams.limit_order = {};
-    if (knockoutLevel != null) proposalParams.limit_order.stop_loss = Number(knockoutLevel);
-    if (takeProfitLevel != null) proposalParams.limit_order.take_profit = Number(takeProfitLevel);
+    if (koRounded != null) proposalParams.limit_order.stop_loss = koRounded;
+    if (tpRounded != null) proposalParams.limit_order.take_profit = tpRounded;
   }
 
   const proposal = await _fetchProposal(broker, proposalParams);
@@ -207,8 +247,9 @@ async function placeMultiplier(params) {
 
   const persisted = await _persist({
     contractId, symbol, side: direction, stake: stakeNum, multiplier: multNum,
-    duration, durationUnit, entryPrice, purchasePrice,
-    knockoutLevel, takeProfitLevel,
+    duration: null, durationUnit: null,
+    entryPrice, purchasePrice,
+    knockoutLevel: koRounded, takeProfitLevel: tpRounded,
     contractType, product: 'deriv_multiplier',
     strategy, regimeCode, entryThesis,
   });
@@ -228,7 +269,7 @@ async function placeMultiplier(params) {
 
 /**
  * Place a Digital or Rise/Fall or Touch contract.
- * Synthetics only.
+ * Synthetics only. These DO use duration (in ticks or seconds).
  */
 async function placeDigitOrBinary(params) {
   const {
@@ -306,9 +347,12 @@ async function placeContract(params) {
 
 module.exports = {
   CONTRACT_TYPES,
+  ACCEPTED_MULTIPLIERS,
+  DEFAULT_MULTIPLIER,
   placeContract,
   placeMultiplier,
   placeDigitOrBinary,
+  roundPrice,
   _fetchProposal,
   _buyProposal,
 };
