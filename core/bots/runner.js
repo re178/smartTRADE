@@ -373,10 +373,10 @@ class BotRunner extends EventEmitter {
         entryPrice: result.entryPrice, takeProfitLevel: tradeParams.takeProfitLevel != null ? Number(tradeParams.takeProfitLevel) : null,
         knockoutLevel: tradeParams.knockoutLevel != null ? Number(tradeParams.knockoutLevel) : null,
         reasons: reasons || [], openedAt: new Date(), status: 'OPEN',
-        // New fields for edge analytics (schema must accept these — see note above)
         isEdgeTest,
         regimeCode: currentRegime,
         session: currentSession,
+        entryThesis,
       }).catch(err => logger.error(`[BotRunner] BotRun persist failed: ${err.message}`));
 
       this.emit('botEntry', { instanceId: instance.instanceId, botId: instance.botId, contractId: String(result.contractId), symbol: instance.config.symbol, side: tradeParams.contractType || direction, entryPrice: result.entryPrice, stake: stakeCheck.stake, reasons, timestamp: new Date().toISOString() });
