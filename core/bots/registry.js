@@ -2,13 +2,15 @@
 // 17 bots. Multi-signal, adaptive, risk-enforced.
 //
 // v3 changes:
-//   • Multipliers: 100/300/500 removed (deprecated by Deriv).
-//     Only [200, 400, 600, 800] accepted now.
+//   • Multipliers: only [200, 400, 600, 800] accepted (Deriv deprecated
+//     100/300/500).
 //   • All FX bots require strategy consensus to AGREE (not just "not conflict").
 //   • All FX bots enforce minRiskReward >= 2.0 on every entry.
-//   • Digit/binary bots can adaptively flip direction after 40 trades
-//     if win rate is below break-even — exploits any detected bias
-//     without guaranteeing loss like a static hedge would.
+//   • Digit/binary bots can adaptively flip direction after 40 trades if
+//     win rate is below break-even — exploits any detected bias without
+//     guaranteeing loss like a static hedge would.
+//   • shouldFlip() defers to stats.flipped (set by runner's hysteresis
+//     logic) so there is a single source of truth for flip state.
 //   • Nothing disabled. Every bot is enabled and testable.
 
 'use strict';
@@ -50,19 +52,14 @@ function wait(reason) {
   return { action: 'WAIT', reasons: Array.isArray(reason) ? reason : [reason] };
 }
 
-// ── Adaptive flip helpers ────────────────────────────────────────
-// A bot with flipConfig can query its own recent win rate (via
-// ctx.stats.recentWinRate, populated by the runner) and choose a
-// flipped direction if below break-even.
-function shouldFlip(config, stats, breakEvenRate) {
+// ── Adaptive flip helper ────────────────────────────────────────
+// Flip state is owned by runner._updateFlipState() with hysteresis.
+// Registry simply reads stats.flipped — a single source of truth.
+// The breakEvenRate arg is kept for API compatibility but unused.
+function shouldFlip(config, stats) {
   const fc = config.flipConfig;
   if (!fc || !fc.enabled) return false;
-  const trades = stats && stats.closedTrades;
-  if (!trades || trades < (fc.minTrades || 40)) return false;
-  const wr = stats.recentWinRate;
-  if (wr == null) return false;
-  const threshold = (fc.flipBelow != null ? fc.flipBelow : breakEvenRate - 0.02);
-  return wr < threshold;
+  return !!(stats && stats.flipped);
 }
 
 // Consensus helper: for FX bots that require agreement.
@@ -467,8 +464,7 @@ const BOTS = {
 
   // ============================================================
   // SYNTHETIC DIGIT BOTS (5)
-  // All use adaptive flip: after 40 trades, if win rate is below
-  // break-even, flip entry direction. Exploits actual bias if any.
+  // All use adaptive flip via stats.flipped (owned by runner).
   // ============================================================
 
   even_odd_trader: {
@@ -488,14 +484,12 @@ const BOTS = {
       const even = digitView.evenPct;
       const odd = digitView.oddPct;
       
-      // Signal: one side is clearly dominant
       let normalDir = null;
       if (even >= 62) normalDir = 'DIGITEVEN';
       else if (odd >= 62) normalDir = 'DIGITODD';
       if (!normalDir) return wait(`Even ${even.toFixed(1)}% / Odd ${odd.toFixed(1)}% (Need >=62%)`);
       
-      // Adaptive flip: if we're losing on this signal pattern, take the opposite
-      const flip = shouldFlip(config, stats, 0.521);
+      const flip = shouldFlip(config, stats);
       const finalDir = flip
         ? (normalDir === 'DIGITEVEN' ? 'DIGITODD' : 'DIGITEVEN')
         : normalDir;
@@ -532,14 +526,12 @@ const BOTS = {
       const underCount = freq.slice(0, 1).reduce((a, b) => a + b, 0);
       const underPct = (underCount / total) * 100;
       
-      // Signal: one side is clearly cold
       let normalDir = null, barrier = null;
       if (overPct <= 5.0) { normalDir = 'DIGITOVER'; barrier = th; }
       else if (underPct <= 5.0) { normalDir = 'DIGITUNDER'; barrier = 0; }
       if (!normalDir) return wait(`Over ${th}: ${overPct.toFixed(1)}% / Under 1: ${underPct.toFixed(1)}% (Need <=5%)`);
       
-      // Adaptive flip: reverse to the opposite side
-      const flip = shouldFlip(config, stats, 0.12);
+      const flip = shouldFlip(config, stats);
       let finalDir = normalDir;
       if (flip) {
         finalDir = normalDir === 'DIGITOVER' ? 'DIGITUNDER' : 'DIGITOVER';
@@ -547,7 +539,7 @@ const BOTS = {
       }
       
       const reason = flip
-        ? `${normalDir} signal FLIPPED → ${finalDir} (recent WR < 8%)`
+        ? `${normalDir} signal FLIPPED → ${finalDir} (recent WR below 8%)`
         : `Over ${th} cold (${overPct.toFixed(1)}%) or Under 1 cold (${underPct.toFixed(1)}%)`;
       
       return enterDigitBarrier(finalDir, barrier, config, reason);
@@ -573,9 +565,6 @@ const BOTS = {
       const target = config.targetDigit;
       const targetPct = (freq[target] / total) * 100;
       
-      // TWO-ANGLE filter: require target digit to be extremely cold (< 3%)
-      // AND its immediate neighbor digit to also be below-average.
-      // This filters single-digit noise from real distribution bias.
       const neighbor = (target + 1) % 10;
       const neighborPct = (freq[neighbor] / total) * 100;
       const targetCold = targetPct <= 3.0;
@@ -583,11 +572,10 @@ const BOTS = {
       if (!targetCold) return wait(`Digit ${target} at ${targetPct.toFixed(1)}% (Need <=3%)`);
       if (!neighborCold) return wait(`Digit ${target} cold but neighbor ${neighbor} at ${neighborPct.toFixed(1)}% — distribution noise`);
       
-      // Adaptive flip
-      const flip = shouldFlip(config, stats, 0.12);
+      const flip = shouldFlip(config, stats);
       const finalDir = flip ? 'DIGITDIFF' : 'DIGITMATCH';
       const reason = flip
-        ? `Digits ${target}/${neighbor} cold FLIPPED → DIGITDIFF (recent MATCH WR < 8%)`
+        ? `Digits ${target}/${neighbor} cold FLIPPED → DIGITDIFF (recent MATCH WR below 8%)`
         : `Digits ${target}(${targetPct.toFixed(1)}%) & ${neighbor}(${neighborPct.toFixed(1)}%) both cold — MATCH`;
       
       return enterDigitBarrier(finalDir, target, config, reason);
@@ -616,13 +604,13 @@ const BOTS = {
       else if (oddStreak >= required) normalDir = 'DIGITEVEN';
       if (!normalDir) return wait(`Streak: even=${evenStreak} odd=${oddStreak} (Need ${required})`);
       
-      const flip = shouldFlip(config, stats, 0.521);
+      const flip = shouldFlip(config, stats);
       const finalDir = flip
         ? (normalDir === 'DIGITEVEN' ? 'DIGITODD' : 'DIGITEVEN')
         : normalDir;
       
       const reason = flip
-        ? `${normalDir} fade FLIPPED → ${finalDir} (recent WR < 48%)`
+        ? `${normalDir} fade FLIPPED → ${finalDir} (recent WR below 48%)`
         : `${Math.max(evenStreak, oddStreak)}-streak ${evenStreak > oddStreak ? 'even' : 'odd'} — fade to ${finalDir.replace('DIGIT','')}`;
       
       return enterDigit(finalDir, config, reason);
@@ -649,20 +637,19 @@ const BOTS = {
       const over8 = (freq.slice(9).reduce((a, b) => a + b, 0) / total) * 100;
       const under1 = (freq.slice(0, 1).reduce((a, b) => a + b, 0) / total) * 100;
       
-      // Very tight: require < 3% (rare)
       let normalDir = null;
       if (over8 <= 3.0) normalDir = 'DIGITOVER';
       else if (under1 <= 3.0) normalDir = 'DIGITUNDER';
       if (!normalDir) return wait(`Over 8: ${over8.toFixed(1)}% / Under 1: ${under1.toFixed(1)}% (Need <=3%)`);
       
-      const flip = shouldFlip(config, stats, 0.12);
+      const flip = shouldFlip(config, stats);
       const finalDir = flip
         ? (normalDir === 'DIGITOVER' ? 'DIGITUNDER' : 'DIGITOVER')
         : normalDir;
       const barrier = finalDir === 'DIGITOVER' ? 8 : 0;
       
       const reason = flip
-        ? `${normalDir} FLIPPED → ${finalDir} (recent WR < 8%)`
+        ? `${normalDir} FLIPPED → ${finalDir} (recent WR below 8%)`
         : `Over 8=${over8.toFixed(1)}% / Under 1=${under1.toFixed(1)}%`;
       
       return enterDigitBarrier(finalDir, barrier, config, reason);
@@ -671,7 +658,6 @@ const BOTS = {
 
   // ============================================================
   // SYNTHETIC BINARY BOTS (3)
-  // All use adaptive flip: same mechanism as digit bots.
   // ============================================================
 
   rise_fall_momentum: {
@@ -696,13 +682,13 @@ const BOTS = {
       else if (fallPct >= config.minBias) normalDir = 'PUT';
       if (!normalDir) return wait(`Rise ${(risePct*100).toFixed(1)}% / Fall ${(fallPct*100).toFixed(1)}% (Need >=${config.minBias*100}%)`);
       
-      const flip = shouldFlip(config, stats, 0.521);
+      const flip = shouldFlip(config, stats);
       const finalDir = flip
         ? (normalDir === 'CALL' ? 'PUT' : 'CALL')
         : normalDir;
       
       const reason = flip
-        ? `${normalDir} FLIPPED → ${finalDir} (recent WR < 48%)`
+        ? `${normalDir} FLIPPED → ${finalDir} (recent WR below 48%)`
         : `Bias ${((normalDir === 'CALL' ? risePct : fallPct) * 100).toFixed(1)}%`;
       
       return enterBinary(finalDir, config, reason);
@@ -736,11 +722,11 @@ const BOTS = {
       if (streak < config.minStreak) return wait(`Streak: ${streak} ${lastDir || '-'} (Need ${config.minStreak})`);
       
       const normalDir = lastDir === 'up' ? 'PUT' : 'CALL';
-      const flip = shouldFlip(config, stats, 0.521);
+      const flip = shouldFlip(config, stats);
       const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
       
       const reason = flip
-        ? `${streak}-tick ${lastDir}-streak FLIPPED → ${finalDir} (recent WR < 48%)`
+        ? `${streak}-tick ${lastDir}-streak FLIPPED → ${finalDir} (recent WR below 48%)`
         : `${streak}-tick ${lastDir}-streak → fade to ${finalDir}`;
       
       return enterBinary(finalDir, config, reason);
@@ -771,11 +757,11 @@ const BOTS = {
       }
       
       const normalDir = movePct > 0 ? 'CALL' : 'PUT';
-      const flip = shouldFlip(config, stats, 0.521);
+      const flip = shouldFlip(config, stats);
       const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
       
       const reason = flip
-        ? `Move ${movePct.toFixed(3)}% FLIPPED → ${finalDir} (recent WR < 48%)`
+        ? `Move ${movePct.toFixed(3)}% FLIPPED → ${finalDir} (recent WR below 48%)`
         : `Move ${movePct.toFixed(3)}% in ${config.lookbackTicks} ticks`;
       
       return enterBinary(finalDir, config, reason);
@@ -812,13 +798,13 @@ const BOTS = {
       else if (bias < 0.45) normalDir = 'NOTOUCH';
       if (!normalDir) return wait(`Bias ${(bias * 100).toFixed(1)}%`);
       
-      const flip = shouldFlip(config, stats, 0.32);
+      const flip = shouldFlip(config, stats);
       const finalDir = flip
         ? (normalDir === 'ONETOUCH' ? 'NOTOUCH' : 'ONETOUCH')
         : normalDir;
       
       const reason = flip
-        ? `${normalDir} FLIPPED → ${finalDir} (recent WR < 28%)`
+        ? `${normalDir} FLIPPED → ${finalDir} (recent WR below 28%)`
         : `${normalDir === 'ONETOUCH' ? 'Strong' : 'Balanced'} directional bias ${(bias * 100).toFixed(1)}%`;
       
       return enterBinary(finalDir, config, reason);
@@ -849,11 +835,11 @@ const BOTS = {
       else if (downs === 5) normalDir = 'PUT';
       if (!normalDir) return wait(`ups=${ups} downs=${downs}`);
       
-      const flip = shouldFlip(config, stats, 0.521);
+      const flip = shouldFlip(config, stats);
       const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
       
       const reason = flip
-        ? `5/5 ticks FLIPPED → ${finalDir} (recent WR < 48%)`
+        ? `5/5 ticks FLIPPED → ${finalDir} (recent WR below 48%)`
         : `5/5 ticks ${normalDir === 'CALL' ? 'up' : 'down'}`;
       
       return enterBinary(finalDir, config, reason);
@@ -864,15 +850,15 @@ const BOTS = {
 // ── Session-level risk defaults ─────────────────────────────────
 // Applied to every bot. Individual bot defaultConfig wins on Object.assign.
 const RISK_DEFAULTS = {
-  botTakeProfit: 20,          // stop when session PnL >= +$20
-  botStopLoss: 10,            // stop when session PnL <= -$10
-  trailingDrawdownPct: 25,    // once in profit, stop if PnL gives back 25% of peak
-  stopAfterLosses: 3,         // hard stop after N consecutive losses
-  maxStake: 50,               // hard cap on stake per trade
-  minRiskReward: 0,           // 0 = disabled; FX bots override to 2.0
-  requireConsensus: false,    // FX bots override to true
-  allowedRegimes: [],         // [] = all regimes
-  allowedSessions: [],        // [] = all sessions
+  botTakeProfit: 20,
+  botStopLoss: 10,
+  trailingDrawdownPct: 25,
+  stopAfterLosses: 3,
+  maxStake: 50,
+  minRiskReward: 0,
+  requireConsensus: false,
+  allowedRegimes: [],
+  allowedSessions: [],
 };
 
 for (const id in BOTS) {
@@ -881,7 +867,7 @@ for (const id in BOTS) {
 
 function getBot(id) { return BOTS[id] || null; }
 function listBots() { return Object.values(BOTS); }
-function listEnabledBots() { return Object.values(BOTS); }  // nothing disabled — kept for API compatibility
+function listEnabledBots() { return Object.values(BOTS); }
 
 module.exports = {
   BOTS,
