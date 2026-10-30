@@ -12,7 +12,13 @@
 // not, so a restart mid-test leaves the bots stopped and the test flagged
 // as paused. Clicking Start again resumes from where it left off.
 //
-// Default: real demo trades (paper mode not yet implemented).
+// v2 additions:
+//   • deleteBot(botId)  — delete one bot's edge history (used by per-row
+//                         delete buttons in the dashboard)
+//   • resetAll()        — stop the test (if running) + delete all edge
+//                         history (used by "Reset & Restart" button)
+//   • exportCSV now emits a Flip column (NORMAL / FLIPPED) so the CSV
+//     shows which trades were made by a flipped bot instance.
 
 'use strict';
 
@@ -288,6 +294,8 @@ class EdgeTest {
         stopped: this.stoppedBots.has(bot.id),
         lastReason: instance ? instance.lastReason : null,
         pnl: instance && instance.stats ? instance.stats.pnl : null,
+        flipped: instance && instance.stats ? !!instance.stats.flipped : false,
+        recentWinRate: instance && instance.stats ? instance.stats.recentWinRate : null,
       });
     }
 
@@ -392,13 +400,14 @@ class EdgeTest {
       'Stake', 'Multiplier', 'Duration', 'DurationUnit',
       'EntryPrice', 'ExitPrice', 'TakeProfit', 'Knockout',
       'PnL', 'Result', 'Status',
-      'Session', 'RegimeCode', 'RegimeConfidence',
+      'Session', 'Flip', 'RegimeCode', 'RegimeConfidence',
       'Confidence', 'PredictedDirection',
       'PatternBias', 'PatternConfidence', 'Patterns',
       'MomentumRoc', 'MomentumDir', 'MomentumConsecutive',
       'VolatilityRegime', 'VolatilityRatio',
       'StrategyAction', 'StrategyDirection', 'StrategyConfidence', 'StrategyAgreeing',
       'DigitSampleSize', 'DigitEvenPct', 'DigitOddPct', 'DigitRisePct', 'DigitFallPct',
+      'RecentWinRateAtEntry',
       'Reasons',
     ];
 
@@ -431,6 +440,7 @@ class EdgeTest {
         this._csv(d.result),
         this._csv(d.status),
         this._csv(d.session),
+        this._csv(thesis.flip || 'NORMAL'),
         this._csv(d.regimeCode),
         this._num(thesis.regimeConfidence),
         this._num(thesis.confidence),
@@ -452,6 +462,7 @@ class EdgeTest {
         this._num(dv.oddPct),
         this._num(dv.risePct),
         this._num(dv.fallPct),
+        this._num(thesis.recentWinRate),
         this._csv((d.reasons || []).join(' | ')),
       ];
 
@@ -462,7 +473,7 @@ class EdgeTest {
   }
 
   // ──────────────────────────────────────────────────────────
-  // RESET — delete all edge test BotRun docs
+  // RESET — delete all edge test BotRun docs (requires stopped state)
   // ──────────────────────────────────────────────────────────
   async reset() {
     if (this.running) {
@@ -474,6 +485,61 @@ class EdgeTest {
     this.startedAt = null;
     logger.info(`[EdgeTest] Reset — deleted ${result.deletedCount} edge test BotRun docs.`);
     return { ok: true, deletedCount: result.deletedCount || 0 };
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // DELETE BOT — wipe one bot's edge test history
+  // Stops the bot's running instance (if any) so its in-memory
+  // stats are discarded — prevents stale flip state carrying over.
+  // ──────────────────────────────────────────────────────────
+  async deleteBot(botId) {
+    if (!botId) throw new Error('botId required');
+
+    // Stop the running instance for this bot (if any)
+    const instanceId = this.instances.get(botId);
+    if (instanceId) {
+      try {
+        botRunner.stop(instanceId);
+        logger.info(`[EdgeTest] Stopped ${botId} before deleting its history.`);
+      } catch (err) {
+        logger.warn(`[EdgeTest] Failed to stop ${botId}: ${err.message}`);
+      }
+      this.instances.delete(botId);
+    }
+    this.stoppedBots.delete(botId);
+
+    const result = await BotRun.deleteMany({ botId, isEdgeTest: true });
+    logger.info(`[EdgeTest] Deleted ${result.deletedCount} edge trades for ${botId}`);
+
+    return {
+      ok: true,
+      botId,
+      deletedCount: result.deletedCount || 0,
+      stoppedInstance: instanceId || null,
+    };
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // RESET ALL — stop test if running, then wipe everything
+  // This is the "Reset & Restart" flow. Safer than reset() because
+  // it stops the test automatically instead of throwing.
+  // ──────────────────────────────────────────────────────────
+  async resetAll() {
+    const wasRunning = this.running;
+    if (wasRunning) {
+      this.stop();
+    }
+    const result = await BotRun.deleteMany({ isEdgeTest: true });
+    this.stoppedBots.clear();
+    this.instances.clear();
+    this.startedAt = null;
+    this.running = false;
+    logger.info(`[EdgeTest] Reset ALL — deleted ${result.deletedCount} edge trades (was running: ${wasRunning})`);
+    return {
+      ok: true,
+      deletedCount: result.deletedCount || 0,
+      wasRunning,
+    };
   }
 
   // ──────────────────────────────────────────────────────────
