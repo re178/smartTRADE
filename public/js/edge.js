@@ -2,6 +2,13 @@
 // Edge Validation dashboard section.
 // Wires buttons from #section-edge to /api/edge-test/* endpoints.
 // Polls /status every 5s while test is running, renders progress + results.
+//
+// v2 additions:
+//   • Per-row delete buttons in results table (calls DELETE /bot/:botId)
+//   • "Delete All" button (calls DELETE /reset-all — safe while running)
+//   • "Start Fresh" button (reset-all → start in one action)
+//   • Flip state + recentWinRate shown in progress list
+//   • Busy state disables per-row delete buttons too
 
 'use strict';
 
@@ -19,11 +26,6 @@
     const v = Number(n);
     if (!Number.isFinite(v)) return '—';
     return v.toFixed(digits);
-  }
-  function fmtPct(n, digits = 1) {
-    const v = Number(n);
-    if (!Number.isFinite(v)) return '—';
-    return (v * 100).toFixed(digits) + '%';
   }
   function fmtCurrency(n) {
     const v = Number(n);
@@ -100,7 +102,11 @@
         body: JSON.stringify({ stake, targetSample }),
       });
       if (result.ok) {
-        alert(`Edge test started.\n${result.startedBots?.length || 0} bots running.`);
+        if (result.running) {
+          alert(`Edge test started.\n${result.startedBots?.length || 0} bots running.`);
+        } else {
+          alert(result.message || 'Nothing to start — all bots already at target.');
+        }
         await loadStatus();
         await loadResults();
         startPolling();
@@ -109,6 +115,50 @@
       }
     } catch (err) {
       alert('Start failed: ' + err.message);
+    } finally {
+      setButtonsBusy(false);
+    }
+  }
+
+  // NEW: reset everything then immediately start fresh
+  async function startFresh() {
+    if (!confirm(
+      'START FRESH?\n\n' +
+      'This will:\n' +
+      '• Stop any running edge test\n' +
+      '• Delete ALL edge test history from the database\n' +
+      '• Start a new test immediately\n\n' +
+      'This cannot be undone. Continue?'
+    )) return;
+
+    const stake = getStakeInput();
+    const targetSample = getTargetInput();
+
+    setButtonsBusy(true);
+    stopPolling();
+    try {
+      // Step 1: wipe everything (safely — stops test if running)
+      const reset = await api('/reset-all', { method: 'DELETE' });
+      console.log('[Edge] Reset complete:', reset);
+
+      // Step 2: start fresh
+      const result = await api('/start', {
+        method: 'POST',
+        body: JSON.stringify({ stake, targetSample }),
+      });
+
+      if (result.ok && result.running) {
+        alert(`Fresh test started.\n${result.startedBots?.length || 0} bots running.\nDeleted ${reset.deletedCount || 0} old trades.`);
+        await loadStatus();
+        await loadResults();
+        startPolling();
+      } else {
+        alert('Reset succeeded but start failed: ' + (result.error || result.message || 'unknown'));
+        await loadStatus();
+        await loadResults();
+      }
+    } catch (err) {
+      alert('Start fresh failed: ' + err.message);
     } finally {
       setButtonsBusy(false);
     }
@@ -160,16 +210,21 @@
     }
   }
 
+  // Updated: uses DELETE /reset-all so it works while test is running
   async function resetData() {
     if (!confirm(
       'Reset ALL Edge Validation data?\n\n' +
-      'This permanently deletes every BotRun with isEdgeTest=true.\n' +
-      'Normal bot runs are NOT affected.\n\n' +
+      'This will:\n' +
+      '• Stop the test if it is running\n' +
+      '• Delete every BotRun with isEdgeTest=true\n\n' +
+      'Normal bot runs are NOT affected.\n' +
       'This cannot be undone.'
     )) return;
+
     setButtonsBusy(true);
+    stopPolling();
     try {
-      const result = await api('/reset', { method: 'POST' });
+      const result = await api('/reset-all', { method: 'DELETE' });
       if (result.ok) {
         alert(`Reset complete. Deleted ${result.deletedCount || 0} edge test records.`);
         await loadStatus();
@@ -179,6 +234,33 @@
       }
     } catch (err) {
       alert('Reset failed: ' + err.message);
+    } finally {
+      setButtonsBusy(false);
+    }
+  }
+
+  // NEW: delete one bot's history (called from per-row button)
+  async function deleteBot(botId) {
+    if (!confirm(
+      `Delete all edge history for ${botId}?\n\n` +
+      `• Its running instance (if any) will be stopped\n` +
+      `• Its trades will be removed from the database\n` +
+      `• Other bots are unaffected\n\n` +
+      `Continue?`
+    )) return;
+
+    setButtonsBusy(true);
+    try {
+      const result = await api(`/bot/${encodeURIComponent(botId)}`, { method: 'DELETE' });
+      if (result.ok) {
+        console.log(`[Edge] Deleted ${result.deletedCount} trades for ${botId}`, result);
+        await loadStatus();
+        await loadResults();
+      } else {
+        alert('Delete failed: ' + (result.error || 'unknown'));
+      }
+    } catch (err) {
+      alert('Delete failed: ' + err.message);
     } finally {
       setButtonsBusy(false);
     }
@@ -252,11 +334,20 @@
     list.innerHTML = status.bots.map(b => {
       const pct = Math.round((b.progress || 0) * 100);
       const barClass = 'edge-progress-bar' + (pct >= 100 ? ' done' : '');
+
       const statusLine = b.running
         ? `<span class="text-success"><i class="fas fa-circle" style="font-size:0.5rem;"></i> running</span>`
         : b.stopped
           ? `<span class="text-primary"><i class="fas fa-check-circle"></i> done (${b.closedTrades})</span>`
           : `<span class="text-muted">idle</span>`;
+
+      // NEW: flip badge + recent win rate
+      const flipBadge = b.flipped
+        ? ` <span class="badge bg-warning text-dark ms-1" title="Direction flipped due to low win rate" style="font-size:0.65rem;">FLIPPED</span>`
+        : '';
+      const wrDisplay = (b.recentWinRate != null && b.closedTrades > 0)
+        ? ` <span class="text-muted ms-1" style="font-size:0.7rem;">WR ${(b.recentWinRate * 100).toFixed(0)}%</span>`
+        : '';
 
       const reasonLine = b.lastReason
         ? `<div class="bot-meta text-truncate" style="max-width: 100%;">${escapeHtml(b.lastReason)}</div>`
@@ -267,10 +358,12 @@
           <div>
             <span class="bot-name">${escapeHtml(b.name)}</span>
             <span class="bot-meta ms-2">${escapeHtml(b.assetClass)}</span>
+            ${flipBadge}
           </div>
           <div class="small text-end">
             <span class="fw-bold">${b.closedTrades}</span>
             <span class="text-muted">/${b.targetSample}</span>
+            ${wrDisplay}
             <span class="ms-2">${statusLine}</span>
           </div>
         </div>
@@ -312,7 +405,7 @@
     if (!tbody) return;
 
     if (!results.bots || results.bots.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="9" class="text-muted p-3">No bots found.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="10" class="text-muted p-3">No bots found.</td></tr>';
       return;
     }
 
@@ -331,6 +424,17 @@
       const edgeClass = edgePp > 0 ? 'text-success' : edgePp < 0 ? 'text-danger' : 'text-muted';
       const zClass = Math.abs(b.zScore || 0) >= 1.96 ? 'fw-bold' : '';
 
+      // NEW: per-row delete button (only if bot has any trades to delete)
+      const canDelete = (b.closedTrades || 0) > 0;
+      const deleteBtn = canDelete
+        ? `<button class="btn btn-sm btn-outline-danger py-0 px-2 edge-row-delete"
+                   onclick="window.edgeDeleteBot('${escapeHtml(b.botId)}')"
+                   title="Delete ${escapeHtml(b.name)}'s edge history"
+                   style="font-size:0.7rem;">
+             <i class="fas fa-trash"></i>
+           </button>`
+        : `<span class="text-muted small">—</span>`;
+
       return `<tr>
         <td><strong>${escapeHtml(b.name)}</strong><br><span class="small text-muted">${escapeHtml(b.botId)}</span></td>
         <td class="text-end">${b.closedTrades || 0}</td>
@@ -341,6 +445,7 @@
         <td class="text-end">${b.rr != null ? b.rr.toFixed(2) + ':1' : '—'}</td>
         <td class="text-end ${pnlClass(b.pnl)}">${fmtCurrency(b.pnl)}</td>
         <td>${verdictHtml}</td>
+        <td class="text-center">${deleteBtn}</td>
       </tr>`;
     }).join('');
   }
@@ -383,18 +488,26 @@
   // Button state management
   // ============================================================
   function setButtonsBusy(busy) {
-    ['edgeStartBtn', 'edgeStopBtn', 'edgeRefreshBtn', 'edgeExportBtn', 'edgeResetBtn']
+    // Main action buttons
+    ['edgeStartBtn', 'edgeStopBtn', 'edgeRefreshBtn', 'edgeExportBtn',
+     'edgeResetBtn', 'edgeStartFreshBtn']
       .forEach(id => {
         const el = document.getElementById(id);
         if (el) el.disabled = busy;
       });
+    // Per-row delete buttons (dynamically rendered) — disable during busy
+    document.querySelectorAll('.edge-row-delete').forEach(btn => {
+      btn.disabled = busy;
+    });
   }
 
   function updateButtonStates(status) {
     const startBtn = document.getElementById('edgeStartBtn');
     const stopBtn = document.getElementById('edgeStopBtn');
+    const freshBtn = document.getElementById('edgeStartFreshBtn');
     if (startBtn) startBtn.disabled = !!status.running;
     if (stopBtn) stopBtn.disabled = !status.running;
+    if (freshBtn) freshBtn.disabled = false; // Always enabled — it stops then restarts
   }
 
   // ============================================================
@@ -435,6 +548,7 @@
   // ============================================================
   document.addEventListener('DOMContentLoaded', function () {
     document.getElementById('edgeStartBtn')?.addEventListener('click', startTest);
+    document.getElementById('edgeStartFreshBtn')?.addEventListener('click', startFresh);
     document.getElementById('edgeStopBtn')?.addEventListener('click', stopTest);
     document.getElementById('edgeRefreshBtn')?.addEventListener('click', async () => {
       await loadStatus();
@@ -450,9 +564,12 @@
     });
   });
 
-  // Expose for index.html nav lazy-load
+  // Expose to global scope
+  // - loadEdgeStatus / loadEdgeResults: called by index.html nav lazy-load
+  // - edgeDeleteBot: called by per-row delete buttons (onclick attribute)
   window.loadEdgeStatus = loadStatus;
   window.loadEdgeResults = loadResults;
+  window.edgeDeleteBot = deleteBot;
 
   // Cleanup on page unload
   window.addEventListener('beforeunload', stopPolling);
