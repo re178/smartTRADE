@@ -165,6 +165,53 @@
     .digit-arrow { font-size: 2.5rem; color: #94a3b8; }
 
     /* ============================================================ */
+    /* EDGE VALIDATION SECTION                                       */
+    /* ============================================================ */
+    .edge-verdict {
+      display: inline-block; padding: 4px 10px; border-radius: 6px;
+      font-size: 0.72rem; font-weight: 700; letter-spacing: 0.03em;
+    }
+    .edge-verdict.edge { background: #d1fae5; color: #065f46; }
+    .edge-verdict.no-edge { background: #fee2e2; color: #991b1b; }
+    .edge-verdict.need-more-data { background: #fef3c7; color: #92400e; }
+    .edge-verdict.pending { background: #e9edf2; color: #475569; }
+
+    .edge-progress-wrap {
+      height: 10px; background: #e9edf2; border-radius: 5px; overflow: hidden;
+    }
+    .edge-progress-bar {
+      height: 100%; background: var(--primary); transition: width 0.4s ease;
+    }
+    .edge-progress-bar.done { background: var(--success); }
+
+    .edge-summary-banner {
+      padding: 16px 20px; border-radius: 10px; margin-bottom: 16px;
+      border: 1px solid transparent;
+    }
+    .edge-summary-banner.good { background: #ecfdf5; border-color: #a7f3d0; }
+    .edge-summary-banner.neutral { background: #eff6ff; border-color: #bfdbfe; }
+    .edge-summary-banner.bad { background: #fef2f2; border-color: #fecaca; }
+
+    .edge-bot-row { padding: 10px 0; border-bottom: 1px solid var(--border-light); }
+    .edge-bot-row:last-child { border-bottom: none; }
+    .edge-bot-row .bot-name { font-weight: 600; font-size: 0.88rem; }
+    .edge-bot-row .bot-meta { font-size: 0.72rem; color: var(--text-muted); }
+
+    .edge-rec-card {
+      padding: 14px 18px; border-left: 3px solid var(--primary);
+      background: #f8fafc; margin-bottom: 10px; border-radius: 6px;
+    }
+    .edge-rec-card .regime-label {
+      font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--text-muted); font-weight: 700; margin-bottom: 8px;
+    }
+    .edge-rec-card .rec-bot {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 6px 0; border-bottom: 1px dashed #e2e8f0; font-size: 0.82rem;
+    }
+    .edge-rec-card .rec-bot:last-child { border-bottom: none; }
+
+    /* ============================================================ */
     /* DEBUG BUTTON                                                  */
     /* ============================================================ */
     .debug-btn { position: fixed; bottom: 16px; right: 16px; z-index: 99998;
@@ -223,6 +270,7 @@
 
     <div class="nav-label">Analysis</div>
     <button class="nav-item" data-section="analytics"><i class="fas fa-chart-pie"></i> Analytics & Rankings</button>
+    <button class="nav-item" data-section="edge"><i class="fas fa-flask"></i> Edge Results</button>
     <button class="nav-item" data-section="signals"><i class="fas fa-crosshairs"></i> Signals & Opportunities</button>
     <button class="nav-item" data-section="risefall"><i class="fas fa-arrow-up-wide-short"></i> Rise / Fall</button>
     <button class="nav-item" data-section="evenodd"><i class="fas fa-scale-balanced"></i> Even / Odd</button>
@@ -458,7 +506,7 @@
   </div>
 
   <!-- ============================================================ -->
-  <!-- SECTION: ANALYTICS (NEW) -->
+  <!-- SECTION: ANALYTICS -->
   <!-- ============================================================ -->
   <div id="section-analytics" class="section-content" style="display:none;">
     <div class="row g-3 mb-3">
@@ -522,6 +570,105 @@
             <tbody id="anaMonthlyBody"><tr><td colspan="5" class="text-muted p-3">Loading...</td></tr></tbody>
           </table>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- SECTION: EDGE RESULTS -->
+  <!-- ============================================================ -->
+  <div id="section-edge" class="section-content" style="display:none;">
+    <div class="card mb-3">
+      <div class="card-header">
+        <span class="card-title"><i class="fas fa-flask"></i> Edge Validation</span>
+        <span class="badge bg-secondary" id="edgeStatusBadge">Idle</span>
+      </div>
+      <div class="card-body">
+        <div class="alert alert-info small mb-3">
+          <i class="fas fa-info-circle"></i>
+          Runs all 17 bots at <strong>equal stake</strong> with session stops disabled,
+          to statistically validate which bots have a real edge over random chance.
+          <br>
+          <strong>Takes hours</strong> (target sample per bot). Uses real demo trades. Only bots with
+          <code>z-score ≥ 1.96</code> after reaching the target sample are marked <strong>EDGE</strong>.
+        </div>
+
+        <div class="row g-2 mb-3">
+          <div class="col-6 col-md-3">
+            <label class="form-label small text-muted mb-1">Stake per trade ($)</label>
+            <input type="number" id="edgeStake" class="form-control form-control-sm" value="1" min="1" step="1">
+          </div>
+          <div class="col-6 col-md-3">
+            <label class="form-label small text-muted mb-1">Target sample (per bot)</label>
+            <input type="number" id="edgeTargetSample" class="form-control form-control-sm" value="160" min="30" step="10">
+          </div>
+          <div class="col-12 col-md-6 d-flex align-items-end gap-2">
+            <button class="btn btn-success btn-sm" id="edgeStartBtn"><i class="fas fa-play"></i> Start Edge Validation</button>
+            <button class="btn btn-danger btn-sm" id="edgeStopBtn" disabled><i class="fas fa-stop"></i> Stop</button>
+          </div>
+        </div>
+
+        <div class="d-flex flex-wrap gap-2 align-items-center">
+          <button class="btn btn-outline-primary btn-sm" id="edgeRefreshBtn"><i class="fas fa-sync-alt"></i> Refresh</button>
+          <button class="btn btn-outline-success btn-sm" id="edgeExportBtn"><i class="fas fa-download"></i> Export CSV</button>
+          <button class="btn btn-outline-danger btn-sm" id="edgeResetBtn"><i class="fas fa-trash"></i> Reset Data</button>
+          <span class="ms-auto small text-muted">Last refresh: <span id="edgeLastRefresh">never</span></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header">
+        <span class="card-title"><i class="fas fa-tasks"></i> Progress</span>
+        <span class="small text-muted" id="edgeProgressText">0 / 0 trades</span>
+      </div>
+      <div class="card-body">
+        <div class="edge-progress-wrap mb-3">
+          <div class="edge-progress-bar" id="edgeOverallBar" style="width:0%;"></div>
+        </div>
+        <div id="edgeProgressList">
+          <p class="text-muted small">Click "Start Edge Validation" to begin. Nothing has been collected yet.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header">
+        <span class="card-title"><i class="fas fa-award"></i> Statistical Results</span>
+      </div>
+      <div class="card-body">
+        <div id="edgeSummaryBanner" class="edge-summary-banner neutral">
+          <p class="mb-0 small">Collecting data — no verdicts yet.</p>
+        </div>
+        <div class="table-responsive">
+          <table class="table table-sm table-striped mb-0">
+            <thead>
+              <tr>
+                <th>Bot</th>
+                <th class="text-end">Trades</th>
+                <th class="text-end">Win Rate</th>
+                <th class="text-end">Base Rate</th>
+                <th class="text-end">Edge</th>
+                <th class="text-end">z-score</th>
+                <th class="text-end">R:R</th>
+                <th class="text-end">P/L</th>
+                <th>Verdict</th>
+              </tr>
+            </thead>
+            <tbody id="edgeResultsBody">
+              <tr><td colspan="9" class="text-muted p-3">Loading...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header">
+        <span class="card-title"><i class="fas fa-lightbulb"></i> Recommendations by Regime</span>
+      </div>
+      <div class="card-body" id="edgeRecommendations">
+        <p class="text-muted small">No recommendations yet — run the edge test first.</p>
       </div>
     </div>
   </div>
@@ -756,6 +903,7 @@
 <script src="js/digits.js"></script>
 <script src="js/live.js"></script>
 <script src="js/analytics.js"></script>
+<script src="js/edge.js"></script>
 
 <!-- ============================================================ -->
 <!-- INLINE: NAVIGATION & MOBILE SIDEBAR LOGIC                     -->
@@ -785,6 +933,7 @@
     tradingview: document.getElementById('section-tradingview'),
     bots: document.getElementById('section-bots'),
     analytics: document.getElementById('section-analytics'),
+    edge: document.getElementById('section-edge'),
     positions: document.getElementById('section-positions'),
     history: document.getElementById('section-history'),
     signals: document.getElementById('section-signals'),
@@ -797,6 +946,7 @@
   const pageTitle = document.getElementById('pageTitle');
   const titles = {
     tradingview: 'Trading View', bots: 'Bots', analytics: 'Analytics & Rankings',
+    edge: 'Edge Results',
     positions: 'Positions', history: 'Trade History', signals: 'Signals & Opportunities',
     risefall: 'Rise / Fall', evenodd: 'Even / Odd', digits: 'Digit Stream',
     regime: 'Market Regime', trademanagement: 'OTIE',
@@ -830,6 +980,12 @@
       // Lazy-load Analytics if entering that section
       if (sec === 'analytics' && window.loadAnalytics) {
         window.loadAnalytics();
+      }
+
+      // Lazy-load Edge Results if entering that section
+      if (sec === 'edge' && window.loadEdgeStatus) {
+        window.loadEdgeStatus();
+        window.loadEdgeResults();
       }
     });
   });
