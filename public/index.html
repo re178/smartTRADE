@@ -602,8 +602,9 @@
             <label class="form-label small text-muted mb-1">Target sample (per bot)</label>
             <input type="number" id="edgeTargetSample" class="form-control form-control-sm" value="160" min="30" step="10">
           </div>
-          <div class="col-12 col-md-6 d-flex align-items-end gap-2">
+          <div class="col-12 col-md-6 d-flex align-items-end gap-2 flex-wrap">
             <button class="btn btn-success btn-sm" id="edgeStartBtn"><i class="fas fa-play"></i> Start Edge Validation</button>
+            <button class="btn btn-outline-primary btn-sm" id="edgeStartFreshBtn" title="Stop, delete ALL edge history, and start a new test"><i class="fas fa-redo"></i> Start Fresh</button>
             <button class="btn btn-danger btn-sm" id="edgeStopBtn" disabled><i class="fas fa-stop"></i> Stop</button>
           </div>
         </div>
@@ -653,10 +654,11 @@
                 <th class="text-end">R:R</th>
                 <th class="text-end">P/L</th>
                 <th>Verdict</th>
+                <th class="text-center">Actions</th>
               </tr>
             </thead>
             <tbody id="edgeResultsBody">
-              <tr><td colspan="9" class="text-muted p-3">Loading...</td></tr>
+              <tr><td colspan="10" class="text-muted p-3">Loading...</td></tr>
             </tbody>
           </table>
         </div>
