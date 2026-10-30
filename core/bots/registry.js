@@ -1,7 +1,7 @@
 // core/bots/registry.js
 // 17 bots. Optimized for BIG WINS and SMALL LOSSES.
 // Includes ADAPTIVE RECOVERY, pip-size validation, price-precision rounding,
-// and session-level risk limits (take-profit / stop-loss / trailing / consecutive).
+// session-level risk limits, and per-bot base rates for edge validation.
 
 'use strict';
 
@@ -123,12 +123,16 @@ const BOTS = {
 
   // ============================================================
   // CATEGORY A — FX MULTIPLIER BOTS (7)
+  // Base rate for FX multiplier = 1 / (1 + RR). This assumes a
+  // driftless random walk; hitting SL is more likely than TP when
+  // RR > 1. Any win rate above base rate = potential edge.
   // ============================================================
 
   trend_rider: {
     id: 'trend_rider', name: 'Trend Rider',
     description: 'FX Multiplier. Tight Stop, Wide Target. (Risk 1 to make 4)',
     assetClass: 'fx', contractClass: 'multiplier',
+    baseRate: 0.20,  // RR 4:1 → random walk hits SL 80% of the time
     defaultConfig: {
       symbol: 'EURUSD', timeframe: 'M5', stake: 10, multiplier: 200,
       durationSec: 1800, minConfidence: 65, stopAfterLosses: 3,
@@ -151,7 +155,6 @@ const BOTS = {
       const entry = state.price.current;
       const pip = getPipSize(config.symbol);
       
-      // Ensure min 5 pips for SL, 15 pips for TP to satisfy Deriv API
       const koDist = Math.max(atr * 1.0, pip * 5); 
       const tpDist = Math.max(atr * 4.0, pip * 15); 
       
@@ -168,6 +171,7 @@ const BOTS = {
     id: 'range_scalper', name: 'Range Scalper',
     description: 'FX Multiplier. S/R bounce in RANGING. Tight Stop, Wide Target.',
     assetClass: 'fx', contractClass: 'multiplier',
+    baseRate: 0.21,  // RR 3.75:1
     defaultConfig: {
       symbol: 'EURUSD', timeframe: 'M5', stake: 5, multiplier: 100, durationSec: 900,
       knockoutLevel: null, takeProfitLevel: null,
@@ -201,6 +205,7 @@ const BOTS = {
     id: 'breakout_hunter', name: 'Breakout Hunter',
     description: 'FX Multiplier. 20-candle breakout. Risk 1 to make 4.5.',
     assetClass: 'fx', contractClass: 'multiplier',
+    baseRate: 0.18,  // RR 4.5:1
     defaultConfig: {
       symbol: 'EURUSD', timeframe: 'M5', stake: 10, multiplier: 200,
       durationSec: 1800, minAtrRatio: 1.2,
@@ -236,6 +241,7 @@ const BOTS = {
     id: 'momentum_burst', name: 'Momentum Burst',
     description: 'FX Multiplier. Velocity scalping. Risk 1 to make 3.',
     assetClass: 'fx', contractClass: 'multiplier',
+    baseRate: 0.25,  // RR 3:1
     defaultConfig: {
       symbol: 'EURUSD', timeframe: 'M1', stake: 5, multiplier: 300,
       durationSec: 300, velocityThreshold: 0.00005,
@@ -270,6 +276,7 @@ const BOTS = {
     id: 'pattern_reversal', name: 'Pattern Reversal',
     description: 'FX Multiplier. Reversal at S/R. Risk 1 to make 4.',
     assetClass: 'fx', contractClass: 'multiplier',
+    baseRate: 0.20,  // RR 4:1
     defaultConfig: {
       symbol: 'EURUSD', timeframe: 'M5', stake: 8, multiplier: 150, durationSec: 1800,
       knockoutLevel: null, takeProfitLevel: null,
@@ -313,6 +320,7 @@ const BOTS = {
     id: 'pullback_trader', name: 'Pullback Trader',
     description: 'FX Multiplier. EMA20 pullback. Risk 1 to make 4.',
     assetClass: 'fx', contractClass: 'multiplier',
+    baseRate: 0.20,  // RR 4:1
     defaultConfig: {
       symbol: 'EURUSD', timeframe: 'M5', stake: 10, multiplier: 200, durationSec: 1800,
       knockoutLevel: null, takeProfitLevel: null,
@@ -353,6 +361,7 @@ const BOTS = {
     id: 'squeeze_breaker', name: 'Squeeze Breaker',
     description: 'FX Multiplier. BB squeeze breakout. Risk 1 to make 4.',
     assetClass: 'fx', contractClass: 'multiplier',
+    baseRate: 0.20,  // RR 4:1
     defaultConfig: {
       symbol: 'EURUSD', timeframe: 'M5', stake: 10, multiplier: 200, durationSec: 1800,
       knockoutLevel: null, takeProfitLevel: null,
@@ -401,6 +410,7 @@ const BOTS = {
     id: 'even_odd_trader', name: 'Even/Odd Trader',
     description: 'Synthetic digit. Trades EVEN/ODD on extreme edge.',
     assetClass: 'synthetic_digit', contractClass: 'digit',
+    baseRate: 0.50,  // 5 even digits, 5 odd digits in 0-9
     defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, minEdge: 0.12, minSamples: 50 },
     evaluate(ctx) {
       const { digitView, config, stats } = ctx;
@@ -426,6 +436,7 @@ const BOTS = {
     id: 'over_under_trader', name: 'Over/Under Trader',
     description: 'Synthetic digit. Hunts 10% probability (pays ~9x).',
     assetClass: 'synthetic_digit', contractClass: 'digit',
+    baseRate: 0.10,  // 1 digit out of 10
     defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, threshold: 8, minSamples: 100 },
     evaluate(ctx) {
       const { digitView, config, stats } = ctx;
@@ -458,6 +469,7 @@ const BOTS = {
     id: 'matches_differs_trader', name: 'Matches/Differs Trader',
     description: 'Synthetic digit. Trades MATCH (pays ~9x) when digit is cold.',
     assetClass: 'synthetic_digit', contractClass: 'digit',
+    baseRate: 0.10,  // 1 digit out of 10
     defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, targetDigit: 5, minSamples: 100 },
     evaluate(ctx) {
       const { digitView, config, stats } = ctx;
@@ -486,6 +498,7 @@ const BOTS = {
     id: 'digit_streak_fade', name: 'Digit Streak Fade',
     description: 'Synthetic digit. Fades long even/odd streaks.',
     assetClass: 'synthetic_digit', contractClass: 'digit',
+    baseRate: 0.50,  // Binary even/odd outcome
     defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, minStreak: 6 },
     evaluate(ctx) {
       const { digitView, config, stats } = ctx;
@@ -510,6 +523,7 @@ const BOTS = {
     id: 'digit_hot_cold', name: 'Digit Hot/Cold',
     description: 'Synthetic digit. Hunts Extreme OVER/UNDER.',
     assetClass: 'synthetic_digit', contractClass: 'digit',
+    baseRate: 0.10,  // 1 digit out of 10
     defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, minSamples: 100 },
     evaluate(ctx) {
       const { digitView, config, stats } = ctx;
@@ -542,6 +556,7 @@ const BOTS = {
     id: 'rise_fall_momentum', name: 'Rise/Fall Momentum',
     description: 'Synthetic CALL/PUT based on tick direction bias.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
+    baseRate: 0.50,  // Binary CALL/PUT
     defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, minBias: 0.62, minSamples: 100 },
     evaluate(ctx) {
       const { digitView, config, stats } = ctx;
@@ -567,6 +582,7 @@ const BOTS = {
     id: 'rise_fall_streak', name: 'Rise/Fall Streak Fade',
     description: 'Synthetic CALL/PUT. Fades N consecutive rises or falls.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
+    baseRate: 0.50,  // Binary CALL/PUT
     defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, minStreak: 5 },
     evaluate(ctx) {
       const { digitView, config, stats } = ctx;
@@ -600,6 +616,7 @@ const BOTS = {
     id: 'rise_fall_breakout', name: 'Rise/Fall Breakout',
     description: 'Synthetic CALL/PUT on sharp directional tick burst.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
+    baseRate: 0.50,  // Binary CALL/PUT
     defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, lookbackTicks: 10, minMovePct: 0.08 },
     evaluate(ctx) {
       const { digitView, config, stats } = ctx;
@@ -631,6 +648,7 @@ const BOTS = {
     id: 'vol_high_low', name: 'Volatility High/Low',
     description: 'Synthetic ONETOUCH/NOTOUCH on momentum bias.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
+    baseRate: 0.30,  // Approximate ONETOUCH hit rate
     defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, barrierPips: 10 },
     evaluate(ctx) {
       const { digitView, config, stats } = ctx;
@@ -659,6 +677,7 @@ const BOTS = {
     id: 'vol_scalper', name: 'Volatility Scalper',
     description: 'Synthetic CALL/PUT. Quick 5-tick scalps.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
+    baseRate: 0.50,  // Binary CALL/PUT
     defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5 },
     evaluate(ctx) {
       const { digitView, config } = ctx;
@@ -679,14 +698,18 @@ const BOTS = {
 };
 
 // ── Session-level risk defaults ───────────────────────────────
-// Applied to every bot. Individual bot defaultConfig still wins on
-// Object.assign, so any bot that sets its own values keeps them.
-// botStopLoss is stored as a POSITIVE number ("max loss $10").
+// Applied to every bot. Individual bot defaultConfig wins on Object.assign.
+// maxStake: null means "no cap"; set to a number to enforce. Edge tests
+// override this with equal stake across all bots to control exposure.
 const RISK_DEFAULTS = {
   botTakeProfit: 20,          // stop when session PnL >= +$20
   botStopLoss: 10,            // stop when session PnL <= -$10
   trailingDrawdownPct: 25,    // once in profit, stop if PnL gives back 25% of peak
   stopAfterLosses: 3,         // hard stop after N consecutive losses
+  maxStake: 50,               // hard cap on stake per trade; set higher/0 to disable
+  minRiskReward: 0,           // minimum TP:SL ratio (0 = disabled); edge gate if > 0
+  allowedRegimes: [],         // [] = all regimes; else only enter in listed codes
+  allowedSessions: [],        // [] = all sessions; else only enter in listed sessions
 };
 
 for (const id in BOTS) {
