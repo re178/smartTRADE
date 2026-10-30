@@ -197,6 +197,13 @@ app.use(async (req, res, next) => {
 app.use('/api', apiRoutes);
 app.use('/api', botRoutes);
 
+// ── Edge Validation endpoints ─────────────────────────────────────
+// /start, /stop, /status, /results, /export, /reset
+// Mounted after apiRoutes and botRoutes so /api/bots/* and /api/*
+// handlers take precedence. This router is fully namespaced under
+// /api/edge-test/*, so there is no conflict.
+app.use('/api/edge-test', require('./api/edgeController'));
+
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'OK', message: 'RTS is running with Deriv broker' });
 });
@@ -659,7 +666,7 @@ function startPipelineTimer() {
 
 async function startCognitiveEngines() {
   try {
-    console.log('[CTOS] Cognitive engines active: Awareness, Regime, Decision, OTIE, StrategyRanker, BotRunner, DigitAnalyzer, BalanceGuard.');
+    console.log('[CTOS] Cognitive engines active: Awareness, Regime, Decision, OTIE, StrategyRanker, BotRunner, DigitAnalyzer, BalanceGuard, EdgeTest.');
   } catch (err) {
     console.error('[CTOS] Initialization error:', err.message);
   }
@@ -695,6 +702,7 @@ async function startServer() {
     console.log(`API base:       http://localhost:${PORT}/api`);
     console.log(`Signals:        http://localhost:${PORT}/api/signal/active`);
     console.log(`Bots:           http://localhost:${PORT}/api/bots`);
+    console.log(`Edge test:      http://localhost:${PORT}/api/edge-test/status`);
     console.log(`Digits:         http://localhost:${PORT}/api/digit`);
     console.log(`Balance guard:  http://localhost:${PORT}/api/balance-guard`);
     console.log(`Strategies:     http://localhost:${PORT}/debug/strategies`);
