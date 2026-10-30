@@ -1,6 +1,9 @@
 // models/BotRun.js
 // Every bot entry produces one BotRun doc. It is the receipt for that run.
 // Tracked fields: entry, exit, pnl, result, reasons, timestamps.
+// Edge-test fields: isEdgeTest, regimeCode, session, entryThesis —
+// populated by runner.js when config._edgeTest === true, consumed by
+// edgeTest.js for statistical edge validation and CSV export.
 
 'use strict';
 
@@ -29,11 +32,24 @@ const BotRunSchema = new mongoose.Schema({
   realizedProfit: { type: Number, default: 0 },
   result: { type: String, enum: ['WIN', 'LOSS', 'BREAKEVEN', null], default: null },
   status: { type: String, enum: ['OPEN', 'CLOSED'], default: 'OPEN', index: true },
+
+  // ── Edge-test metadata ─────────────────────────────────────────
+  // Populated when bot was started via edgeTest.start() (config._edgeTest = true)
+  isEdgeTest: { type: Boolean, default: false, index: true },
+  regimeCode: { type: String, default: null, index: true },
+  session:    { type: String, default: null, index: true },
+  // Full prediction / digitView snapshot at entry — populated for
+  // every trade (edge test or normal), so post-hoc analysis can
+  // correlate conditions with outcome.
+  entryThesis: { type: mongoose.Schema.Types.Mixed, default: null },
 }, { timestamps: true });
 
 BotRunSchema.index({ botId: 1, openedAt: -1 });
 BotRunSchema.index({ instanceId: 1, openedAt: -1 });
 BotRunSchema.index({ status: 1, openedAt: -1 });
+// Compound index — every edge query hits this triple
+BotRunSchema.index({ isEdgeTest: 1, botId: 1, status: 1 });
+BotRunSchema.index({ isEdgeTest: 1, status: 1, openedAt: 1 });
 
 /**
  * Aggregate stats for one bot (optionally since a date).
