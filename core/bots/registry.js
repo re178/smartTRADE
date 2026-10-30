@@ -1,7 +1,15 @@
 // core/bots/registry.js
-// 17 bots. Optimized for BIG WINS and SMALL LOSSES.
-// Includes ADAPTIVE RECOVERY, pip-size validation, price-precision rounding,
-// session-level risk limits, and per-bot base rates for edge validation.
+// 17 bots. Multi-signal, adaptive, risk-enforced.
+//
+// v3 changes:
+//   • Multipliers: 100/300/500 removed (deprecated by Deriv).
+//     Only [200, 400, 600, 800] accepted now.
+//   • All FX bots require strategy consensus to AGREE (not just "not conflict").
+//   • All FX bots enforce minRiskReward >= 2.0 on every entry.
+//   • Digit/binary bots can adaptively flip direction after 40 trades
+//     if win rate is below break-even — exploits any detected bias
+//     without guaranteeing loss like a static hedge would.
+//   • Nothing disabled. Every bot is enabled and testable.
 
 'use strict';
 
@@ -21,8 +29,6 @@ function getPipSize(symbol) {
   return map[clean] || 0.0001;
 }
 
-// Deriv rejects floating-point noise like 157.78000000000003 on JPY pairs.
-// Every multiplier-level price that leaves the bot must pass through roundPrice().
 function getPricePrecision(symbol) {
   const clean = normalizeSymbol(symbol);
   const map = {
@@ -44,6 +50,29 @@ function wait(reason) {
   return { action: 'WAIT', reasons: Array.isArray(reason) ? reason : [reason] };
 }
 
+// ── Adaptive flip helpers ────────────────────────────────────────
+// A bot with flipConfig can query its own recent win rate (via
+// ctx.stats.recentWinRate, populated by the runner) and choose a
+// flipped direction if below break-even.
+function shouldFlip(config, stats, breakEvenRate) {
+  const fc = config.flipConfig;
+  if (!fc || !fc.enabled) return false;
+  const trades = stats && stats.closedTrades;
+  if (!trades || trades < (fc.minTrades || 40)) return false;
+  const wr = stats.recentWinRate;
+  if (wr == null) return false;
+  const threshold = (fc.flipBelow != null ? fc.flipBelow : breakEvenRate - 0.02);
+  return wr < threshold;
+}
+
+// Consensus helper: for FX bots that require agreement.
+function consensusAgrees(consensus, direction) {
+  if (!consensus || !consensus.consensus) return false;
+  const c = consensus.consensus;
+  return c.action === 'SIGNAL' && c.direction === direction;
+}
+
+// ── Entry helpers ────────────────────────────────────────────────
 function enterMultiplier(direction, config, overrides, reasons) {
   const finalKnockout = (config.knockoutLevel != null && config.knockoutLevel !== '')
     ? Number(config.knockoutLevel)
@@ -61,8 +90,8 @@ function enterMultiplier(direction, config, overrides, reasons) {
       direction,
       stake: config.stake,
       multiplier: config.multiplier,
-      duration: overrides.durationSec || config.durationSec,
-      durationUnit: 's',
+      duration: null,             // multipliers exit on barrier, not time
+      durationUnit: null,
       knockoutLevel: roundPrice(config.symbol, finalKnockout),
       takeProfitLevel: roundPrice(config.symbol, finalTakeProfit),
       contractClass: 'multiplier',
@@ -119,23 +148,27 @@ function enterBinary(contractType, config, reason) {
   };
 }
 
+// ════════════════════════════════════════════════════════════════
+// BOTS
+// ════════════════════════════════════════════════════════════════
 const BOTS = {
 
   // ============================================================
-  // CATEGORY A — FX MULTIPLIER BOTS (7)
-  // Base rate for FX multiplier = 1 / (1 + RR). This assumes a
-  // driftless random walk; hitting SL is more likely than TP when
-  // RR > 1. Any win rate above base rate = potential edge.
+  // FX MULTIPLIER BOTS (7)
+  // All multipliers within [200, 400, 600, 800].
+  // All require strategy consensus to agree.
+  // All enforce minRiskReward >= 2.0.
   // ============================================================
 
   trend_rider: {
     id: 'trend_rider', name: 'Trend Rider',
-    description: 'FX Multiplier. Tight Stop, Wide Target. (Risk 1 to make 4)',
+    description: 'FX Multiplier. Tight Stop, Wide Target. Requires strategy consensus.',
     assetClass: 'fx', contractClass: 'multiplier',
-    baseRate: 0.20,  // RR 4:1 → random walk hits SL 80% of the time
+    baseRate: 0.20,
     defaultConfig: {
       symbol: 'EURUSD', timeframe: 'M5', stake: 10, multiplier: 200,
-      durationSec: 1800, minConfidence: 65, stopAfterLosses: 3,
+      durationSec: 1800, minConfidence: 70, stopAfterLosses: 3,
+      minRiskReward: 2.0, requireConsensus: true,
       knockoutLevel: null, takeProfitLevel: null,
     },
     evaluate(ctx) {
@@ -145,8 +178,8 @@ const BOTS = {
       if (prediction.calibratedConfidence < config.minConfidence) {
         return wait(`Conf ${prediction.calibratedConfidence} < ${config.minConfidence}`);
       }
-      if (consensus && consensus.consensus && consensus.consensus.action === 'CONFLICT') {
-        return wait('Strategy conflict');
+      if (config.requireConsensus && !consensusAgrees(consensus, prediction.direction)) {
+        return wait('Strategy consensus does not agree');
       }
       const atr = state.volatility && state.volatility.atr;
       if (!atr || atr <= 0) return wait('No ATR');
@@ -155,29 +188,30 @@ const BOTS = {
       const entry = state.price.current;
       const pip = getPipSize(config.symbol);
       
-      const koDist = Math.max(atr * 1.0, pip * 5); 
-      const tpDist = Math.max(atr * 4.0, pip * 15); 
+      const koDist = Math.max(atr * 1.0, pip * 5);
+      const tpDist = Math.max(atr * 4.0, pip * 15);
       
       const ko = dir === 'BUY' ? entry - koDist : entry + koDist;
       const tp = dir === 'BUY' ? entry + tpDist : entry - tpDist;
       
       return enterMultiplier(dir, config,
-        { durationSec: config.durationSec, knockoutLevel: ko, takeProfitLevel: tp },
+        { knockoutLevel: ko, takeProfitLevel: tp },
         [`Pattern ${prediction.pattern.bias} (${prediction.pattern.confidence}%)`]);
     },
   },
 
   range_scalper: {
     id: 'range_scalper', name: 'Range Scalper',
-    description: 'FX Multiplier. S/R bounce in RANGING. Tight Stop, Wide Target.',
+    description: 'FX Multiplier. S/R bounce in RANGING. Requires strategy consensus.',
     assetClass: 'fx', contractClass: 'multiplier',
-    baseRate: 0.21,  // RR 3.75:1
+    baseRate: 0.21,
     defaultConfig: {
-      symbol: 'EURUSD', timeframe: 'M5', stake: 5, multiplier: 100, durationSec: 900,
+      symbol: 'EURUSD', timeframe: 'M5', stake: 5, multiplier: 200,
+      durationSec: 900, minRiskReward: 2.0, requireConsensus: true,
       knockoutLevel: null, takeProfitLevel: null,
     },
     evaluate(ctx) {
-      const { state, config } = ctx;
+      const { state, config, consensus } = ctx;
       if (!state) return wait('No state');
       if (state.regime && state.regime.code !== 'RANGING') return wait('Not RANGING');
       const atS = state.structure && state.structure.isAtSupport;
@@ -185,6 +219,10 @@ const BOTS = {
       if (!atS && !atR) return wait('Not at S/R');
       
       const dir = atS ? 'BUY' : 'SELL';
+      if (config.requireConsensus && !consensusAgrees(consensus, dir)) {
+        return wait('Strategy consensus does not agree');
+      }
+      
       const atr = state.volatility.atr;
       const entry = state.price.current;
       const pip = getPipSize(config.symbol);
@@ -196,23 +234,24 @@ const BOTS = {
       const tp = dir === 'BUY' ? entry + tpDist : entry - tpDist;
       
       return enterMultiplier(dir, config,
-        { durationSec: config.durationSec, knockoutLevel: ko, takeProfitLevel: tp },
+        { knockoutLevel: ko, takeProfitLevel: tp },
         [atS ? 'At support' : 'At resistance']);
     },
   },
 
   breakout_hunter: {
     id: 'breakout_hunter', name: 'Breakout Hunter',
-    description: 'FX Multiplier. 20-candle breakout. Risk 1 to make 4.5.',
+    description: 'FX Multiplier. 20-candle breakout. Requires consensus.',
     assetClass: 'fx', contractClass: 'multiplier',
-    baseRate: 0.18,  // RR 4.5:1
+    baseRate: 0.18,
     defaultConfig: {
       symbol: 'EURUSD', timeframe: 'M5', stake: 10, multiplier: 200,
       durationSec: 1800, minAtrRatio: 1.2,
+      minRiskReward: 2.0, requireConsensus: true,
       knockoutLevel: null, takeProfitLevel: null,
     },
     evaluate(ctx) {
-      const { prediction, state, config } = ctx;
+      const { prediction, state, config, consensus } = ctx;
       if (!prediction || !state) return wait('No prediction');
       const patterns = (prediction.pattern && prediction.pattern.patterns) || [];
       const isUp = patterns.indexOf('breakout_up') >= 0;
@@ -221,6 +260,10 @@ const BOTS = {
       if (state.volatility.ratio < config.minAtrRatio) return wait('ATR too low');
       
       const dir = isUp ? 'BUY' : 'SELL';
+      if (config.requireConsensus && !consensusAgrees(consensus, dir)) {
+        return wait('Strategy consensus does not agree');
+      }
+      
       const atr = state.volatility.atr;
       const entry = state.price.current;
       const pip = getPipSize(config.symbol);
@@ -232,23 +275,24 @@ const BOTS = {
       const tp = dir === 'BUY' ? entry + tpDist : entry - tpDist;
       
       return enterMultiplier(dir, config,
-        { durationSec: config.durationSec, knockoutLevel: ko, takeProfitLevel: tp },
+        { knockoutLevel: ko, takeProfitLevel: tp },
         [isUp ? 'Breakout up' : 'Breakout down']);
     },
   },
 
   momentum_burst: {
     id: 'momentum_burst', name: 'Momentum Burst',
-    description: 'FX Multiplier. Velocity scalping. Risk 1 to make 3.',
+    description: 'FX Multiplier. Velocity scalping. Requires consensus.',
     assetClass: 'fx', contractClass: 'multiplier',
-    baseRate: 0.25,  // RR 3:1
+    baseRate: 0.25,
     defaultConfig: {
-      symbol: 'EURUSD', timeframe: 'M1', stake: 5, multiplier: 300,
+      symbol: 'EURUSD', timeframe: 'M1', stake: 5, multiplier: 400,
       durationSec: 300, velocityThreshold: 0.00005,
+      minRiskReward: 2.0, requireConsensus: true,
       knockoutLevel: null, takeProfitLevel: null,
     },
     evaluate(ctx) {
-      const { state, config } = ctx;
+      const { state, config, consensus } = ctx;
       if (!state) return wait('No state');
       const v = (state.awareness && state.awareness.velocity) || 0;
       const a = (state.awareness && state.awareness.acceleration) || 0;
@@ -256,6 +300,10 @@ const BOTS = {
       if (Math.sign(v) !== Math.sign(a) || Math.abs(a) < 0.000001) return wait('No acceleration');
       
       const dir = v > 0 ? 'BUY' : 'SELL';
+      if (config.requireConsensus && !consensusAgrees(consensus, dir)) {
+        return wait('Strategy consensus does not agree');
+      }
+      
       const atr = state.volatility.atr;
       const entry = state.price.current;
       const pip = getPipSize(config.symbol);
@@ -267,22 +315,23 @@ const BOTS = {
       const tp = dir === 'BUY' ? entry + tpDist : entry - tpDist;
       
       return enterMultiplier(dir, config,
-        { durationSec: config.durationSec, knockoutLevel: ko, takeProfitLevel: tp },
+        { knockoutLevel: ko, takeProfitLevel: tp },
         [`Velocity ${(v * 1e6).toFixed(1)}e-6`]);
     },
   },
 
   pattern_reversal: {
     id: 'pattern_reversal', name: 'Pattern Reversal',
-    description: 'FX Multiplier. Reversal at S/R. Risk 1 to make 4.',
+    description: 'FX Multiplier. Reversal at S/R. Requires consensus.',
     assetClass: 'fx', contractClass: 'multiplier',
-    baseRate: 0.20,  // RR 4:1
+    baseRate: 0.20,
     defaultConfig: {
-      symbol: 'EURUSD', timeframe: 'M5', stake: 8, multiplier: 150, durationSec: 1800,
+      symbol: 'EURUSD', timeframe: 'M5', stake: 8, multiplier: 200,
+      durationSec: 1800, minRiskReward: 2.0, requireConsensus: true,
       knockoutLevel: null, takeProfitLevel: null,
     },
     evaluate(ctx) {
-      const { prediction, state, config } = ctx;
+      const { prediction, state, config, consensus } = ctx;
       if (!prediction || !state) return wait('No state');
       const pats = (prediction.pattern && prediction.pattern.patterns) || [];
       const bullReversals = ['hammer', 'bullish_engulfing', 'morning_star', 'dragonfly_doji'];
@@ -300,6 +349,10 @@ const BOTS = {
       else if (hasBear && atR) dir = 'SELL';
       if (dir === 'NEUTRAL') return wait('Pattern/level mismatch');
       
+      if (config.requireConsensus && !consensusAgrees(consensus, dir)) {
+        return wait('Strategy consensus does not agree');
+      }
+      
       const atr = state.volatility.atr;
       const entry = state.price.current;
       const pip = getPipSize(config.symbol);
@@ -311,22 +364,23 @@ const BOTS = {
       const tp = dir === 'BUY' ? entry + tpDist : entry - tpDist;
       
       return enterMultiplier(dir, config,
-        { durationSec: config.durationSec, knockoutLevel: ko, takeProfitLevel: tp },
+        { knockoutLevel: ko, takeProfitLevel: tp },
         [`Reversal: ${pats.join(', ')}`]);
     },
   },
 
   pullback_trader: {
     id: 'pullback_trader', name: 'Pullback Trader',
-    description: 'FX Multiplier. EMA20 pullback. Risk 1 to make 4.',
+    description: 'FX Multiplier. EMA20 pullback. Requires consensus.',
     assetClass: 'fx', contractClass: 'multiplier',
-    baseRate: 0.20,  // RR 4:1
+    baseRate: 0.20,
     defaultConfig: {
-      symbol: 'EURUSD', timeframe: 'M5', stake: 10, multiplier: 200, durationSec: 1800,
+      symbol: 'EURUSD', timeframe: 'M5', stake: 10, multiplier: 200,
+      durationSec: 1800, minRiskReward: 2.0, requireConsensus: true,
       knockoutLevel: null, takeProfitLevel: null,
     },
     evaluate(ctx) {
-      const { state, config, candles } = ctx;
+      const { state, config, candles, consensus } = ctx;
       if (!state) return wait('No state');
       const regime = state.regime && state.regime.code;
       if (['STRONG_TREND_BULL', 'STRONG_TREND_BEAR', 'WEAK_TREND'].indexOf(regime) < 0) return wait('No trend');
@@ -342,6 +396,10 @@ const BOTS = {
       if (distPct > 0.001) return wait('Waiting for pullback');
       
       const dir = state.trend && state.trend.direction === 'bullish' ? 'BUY' : 'SELL';
+      if (config.requireConsensus && !consensusAgrees(consensus, dir)) {
+        return wait('Strategy consensus does not agree');
+      }
+      
       const atr = state.volatility.atr;
       const pip = getPipSize(config.symbol);
       
@@ -352,22 +410,23 @@ const BOTS = {
       const tp = dir === 'BUY' ? price + tpDist : price - tpDist;
       
       return enterMultiplier(dir, config,
-        { durationSec: config.durationSec, knockoutLevel: ko, takeProfitLevel: tp },
+        { knockoutLevel: ko, takeProfitLevel: tp },
         [`Pullback to EMA20`]);
     },
   },
 
   squeeze_breaker: {
     id: 'squeeze_breaker', name: 'Squeeze Breaker',
-    description: 'FX Multiplier. BB squeeze breakout. Risk 1 to make 4.',
+    description: 'FX Multiplier. BB squeeze breakout. Requires consensus.',
     assetClass: 'fx', contractClass: 'multiplier',
-    baseRate: 0.20,  // RR 4:1
+    baseRate: 0.20,
     defaultConfig: {
-      symbol: 'EURUSD', timeframe: 'M5', stake: 10, multiplier: 200, durationSec: 1800,
+      symbol: 'EURUSD', timeframe: 'M5', stake: 10, multiplier: 200,
+      durationSec: 1800, minRiskReward: 2.0, requireConsensus: true,
       knockoutLevel: null, takeProfitLevel: null,
     },
     evaluate(ctx) {
-      const { state, config, candles } = ctx;
+      const { state, config, candles, consensus } = ctx;
       if (!state || !candles || candles.length < 25) return wait('Not enough data');
       
       const closes = candles.map(c => c.close);
@@ -387,6 +446,10 @@ const BOTS = {
       else if (price < lower) dir = 'SELL';
       if (dir === 'NEUTRAL') return wait('No breakout');
       
+      if (config.requireConsensus && !consensusAgrees(consensus, dir)) {
+        return wait('Strategy consensus does not agree');
+      }
+      
       const atr = state.volatility.atr;
       const pip = getPipSize(config.symbol);
       
@@ -397,57 +460,68 @@ const BOTS = {
       const tp = dir === 'BUY' ? price + tpDist : price - tpDist;
       
       return enterMultiplier(dir, config,
-        { durationSec: config.durationSec, knockoutLevel: ko, takeProfitLevel: tp },
+        { knockoutLevel: ko, takeProfitLevel: tp },
         [`Squeeze breakout`]);
     },
   },
 
   // ============================================================
-  // CATEGORY B — SYNTHETIC DIGIT BOTS (5)
+  // SYNTHETIC DIGIT BOTS (5)
+  // All use adaptive flip: after 40 trades, if win rate is below
+  // break-even, flip entry direction. Exploits actual bias if any.
   // ============================================================
 
   even_odd_trader: {
     id: 'even_odd_trader', name: 'Even/Odd Trader',
-    description: 'Synthetic digit. Trades EVEN/ODD on extreme edge.',
+    description: 'Synthetic digit. Adaptive EVEN/ODD based on recent performance.',
     assetClass: 'synthetic_digit', contractClass: 'digit',
-    baseRate: 0.50,  // 5 even digits, 5 odd digits in 0-9
-    defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, minEdge: 0.12, minSamples: 50 },
+    baseRate: 0.50,
+    defaultConfig: {
+      symbol: 'R_100', stake: 1, durationTicks: 5, minSamples: 50,
+      flipConfig: { enabled: true, minTrades: 40, flipBelow: 0.48 },
+    },
     evaluate(ctx) {
       const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No digit data');
       if (digitView.sampleSize < config.minSamples) return wait('Not enough samples');
       
-      const losses = stats?.consecutiveLosses || 0;
-      let requiredEdge = 62;
-      if (losses === 1) requiredEdge = 65;
-      if (losses >= 2) requiredEdge = 68;
-
       const even = digitView.evenPct;
       const odd = digitView.oddPct;
       
-      if (even >= requiredEdge) return enterDigit('DIGITEVEN', config, `Even ${even.toFixed(1)}% (Need >=${requiredEdge}%)`);
-      if (odd >= requiredEdge) return enterDigit('DIGITODD', config, `Odd ${odd.toFixed(1)}% (Need >=${requiredEdge}%)`);
+      // Signal: one side is clearly dominant
+      let normalDir = null;
+      if (even >= 62) normalDir = 'DIGITEVEN';
+      else if (odd >= 62) normalDir = 'DIGITODD';
+      if (!normalDir) return wait(`Even ${even.toFixed(1)}% / Odd ${odd.toFixed(1)}% (Need >=62%)`);
       
-      return wait(`Even ${even.toFixed(1)}% / Odd ${odd.toFixed(1)}% (Need ${requiredEdge}%)`);
+      // Adaptive flip: if we're losing on this signal pattern, take the opposite
+      const flip = shouldFlip(config, stats, 0.521);
+      const finalDir = flip
+        ? (normalDir === 'DIGITEVEN' ? 'DIGITODD' : 'DIGITEVEN')
+        : normalDir;
+      
+      const reason = flip
+        ? `${normalDir} signal FLIPPED → ${finalDir} (recent WR below 48%)`
+        : `${normalDir.replace('DIGIT','')} ${(normalDir === 'DIGITEVEN' ? even : odd).toFixed(1)}%`;
+      
+      return enterDigit(finalDir, config, reason);
     },
   },
 
   over_under_trader: {
     id: 'over_under_trader', name: 'Over/Under Trader',
-    description: 'Synthetic digit. Hunts 10% probability (pays ~9x).',
+    description: 'Synthetic digit. Adaptive OVER/UNDER with strict two-condition filter.',
     assetClass: 'synthetic_digit', contractClass: 'digit',
-    baseRate: 0.10,  // 1 digit out of 10
-    defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, threshold: 8, minSamples: 100 },
+    baseRate: 0.10,
+    defaultConfig: {
+      symbol: 'R_100', stake: 1, durationTicks: 5, threshold: 8, minSamples: 100,
+      flipConfig: { enabled: true, minTrades: 40, flipBelow: 0.08 },
+    },
     evaluate(ctx) {
       const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No digit data');
       if (digitView.sampleSize < config.minSamples) return wait('Not enough samples');
       
-      const losses = stats?.consecutiveLosses || 0;
-      let requiredPct = 5.0;
-      if (losses === 1) requiredPct = 3.5;
-      if (losses >= 2) requiredPct = 2.0;
-
       const freq = digitView.digitFreq;
       const total = digitView.sampleSize;
       const th = config.threshold;
@@ -458,143 +532,198 @@ const BOTS = {
       const underCount = freq.slice(0, 1).reduce((a, b) => a + b, 0);
       const underPct = (underCount / total) * 100;
       
-      if (overPct <= requiredPct) return enterDigitBarrier('DIGITOVER', th, config, `Over ${th} cold (${overPct.toFixed(1)}%). Need <=${requiredPct}%.`);
-      if (underPct <= requiredPct) return enterDigitBarrier('DIGITUNDER', 0, config, `Under 1 cold (${underPct.toFixed(1)}%). Need <=${requiredPct}%.`);
+      // Signal: one side is clearly cold
+      let normalDir = null, barrier = null;
+      if (overPct <= 5.0) { normalDir = 'DIGITOVER'; barrier = th; }
+      else if (underPct <= 5.0) { normalDir = 'DIGITUNDER'; barrier = 0; }
+      if (!normalDir) return wait(`Over ${th}: ${overPct.toFixed(1)}% / Under 1: ${underPct.toFixed(1)}% (Need <=5%)`);
       
-      return wait(`Over ${th}: ${overPct.toFixed(1)}% / Under 1: ${underPct.toFixed(1)}% (Need <=${requiredPct}%)`);
+      // Adaptive flip: reverse to the opposite side
+      const flip = shouldFlip(config, stats, 0.12);
+      let finalDir = normalDir;
+      if (flip) {
+        finalDir = normalDir === 'DIGITOVER' ? 'DIGITUNDER' : 'DIGITOVER';
+        barrier = finalDir === 'DIGITOVER' ? th : 0;
+      }
+      
+      const reason = flip
+        ? `${normalDir} signal FLIPPED → ${finalDir} (recent WR < 8%)`
+        : `Over ${th} cold (${overPct.toFixed(1)}%) or Under 1 cold (${underPct.toFixed(1)}%)`;
+      
+      return enterDigitBarrier(finalDir, barrier, config, reason);
     },
   },
 
   matches_differs_trader: {
     id: 'matches_differs_trader', name: 'Matches/Differs Trader',
-    description: 'Synthetic digit. Trades MATCH (pays ~9x) when digit is cold.',
+    description: 'Synthetic digit. Adaptive MATCH/DIFF with two-digit confirmation.',
     assetClass: 'synthetic_digit', contractClass: 'digit',
-    baseRate: 0.10,  // 1 digit out of 10
-    defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, targetDigit: 5, minSamples: 100 },
+    baseRate: 0.10,
+    defaultConfig: {
+      symbol: 'R_100', stake: 1, durationTicks: 5, targetDigit: 5, minSamples: 100,
+      flipConfig: { enabled: true, minTrades: 40, flipBelow: 0.08 },
+    },
     evaluate(ctx) {
       const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No digit data');
       if (digitView.sampleSize < config.minSamples) return wait('Not enough samples');
       
-      const losses = stats?.consecutiveLosses || 0;
-      let requiredPct = 4.0;
-      if (losses === 1) requiredPct = 3.0;
-      if (losses >= 2) requiredPct = 2.0;
-
       const freq = digitView.digitFreq;
       const total = digitView.sampleSize;
       const target = config.targetDigit;
       const targetPct = (freq[target] / total) * 100;
       
-      if (targetPct <= requiredPct) {
-        return enterDigitBarrier('DIGITMATCH', target, config, `Digit ${target} extremely cold (${targetPct.toFixed(1)}%). Expecting MATCH.`);
-      }
+      // TWO-ANGLE filter: require target digit to be extremely cold (< 3%)
+      // AND its immediate neighbor digit to also be below-average.
+      // This filters single-digit noise from real distribution bias.
+      const neighbor = (target + 1) % 10;
+      const neighborPct = (freq[neighbor] / total) * 100;
+      const targetCold = targetPct <= 3.0;
+      const neighborCold = neighborPct <= 8.0;
+      if (!targetCold) return wait(`Digit ${target} at ${targetPct.toFixed(1)}% (Need <=3%)`);
+      if (!neighborCold) return wait(`Digit ${target} cold but neighbor ${neighbor} at ${neighborPct.toFixed(1)}% — distribution noise`);
       
-      return wait(`Digit ${target} at ${targetPct.toFixed(1)}% (Need <=${requiredPct}% to fire)`);
+      // Adaptive flip
+      const flip = shouldFlip(config, stats, 0.12);
+      const finalDir = flip ? 'DIGITDIFF' : 'DIGITMATCH';
+      const reason = flip
+        ? `Digits ${target}/${neighbor} cold FLIPPED → DIGITDIFF (recent MATCH WR < 8%)`
+        : `Digits ${target}(${targetPct.toFixed(1)}%) & ${neighbor}(${neighborPct.toFixed(1)}%) both cold — MATCH`;
+      
+      return enterDigitBarrier(finalDir, target, config, reason);
     },
   },
 
   digit_streak_fade: {
     id: 'digit_streak_fade', name: 'Digit Streak Fade',
-    description: 'Synthetic digit. Fades long even/odd streaks.',
+    description: 'Synthetic digit. Adaptive streak fade with longer minimum.',
     assetClass: 'synthetic_digit', contractClass: 'digit',
-    baseRate: 0.50,  // Binary even/odd outcome
-    defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, minStreak: 6 },
+    baseRate: 0.50,
+    defaultConfig: {
+      symbol: 'R_100', stake: 1, durationTicks: 5, minStreak: 8,
+      flipConfig: { enabled: true, minTrades: 40, flipBelow: 0.48 },
+    },
     evaluate(ctx) {
       const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No digit data');
       
-      const losses = stats?.consecutiveLosses || 0;
-      let requiredStreak = config.minStreak;
-      if (losses === 1) requiredStreak += 1;
-      if (losses >= 2) requiredStreak += 2;
-
       const evenStreak = digitView.evenStreak || 0;
       const oddStreak = digitView.oddStreak || 0;
+      const required = config.minStreak;
       
-      if (evenStreak >= requiredStreak) return enterDigit('DIGITODD', config, `${evenStreak}-streak even. Fading to ODD.`);
-      if (oddStreak >= requiredStreak) return enterDigit('DIGITEVEN', config, `${oddStreak}-streak odd. Fading to EVEN.`);
+      let normalDir = null;
+      if (evenStreak >= required) normalDir = 'DIGITODD';
+      else if (oddStreak >= required) normalDir = 'DIGITEVEN';
+      if (!normalDir) return wait(`Streak: even=${evenStreak} odd=${oddStreak} (Need ${required})`);
       
-      return wait(`Streak: even=${evenStreak} odd=${oddStreak} (Need ${requiredStreak})`);
+      const flip = shouldFlip(config, stats, 0.521);
+      const finalDir = flip
+        ? (normalDir === 'DIGITEVEN' ? 'DIGITODD' : 'DIGITEVEN')
+        : normalDir;
+      
+      const reason = flip
+        ? `${normalDir} fade FLIPPED → ${finalDir} (recent WR < 48%)`
+        : `${Math.max(evenStreak, oddStreak)}-streak ${evenStreak > oddStreak ? 'even' : 'odd'} — fade to ${finalDir.replace('DIGIT','')}`;
+      
+      return enterDigit(finalDir, config, reason);
     },
   },
 
   digit_hot_cold: {
     id: 'digit_hot_cold', name: 'Digit Hot/Cold',
-    description: 'Synthetic digit. Hunts Extreme OVER/UNDER.',
+    description: 'Synthetic digit. Adaptive extreme OVER/UNDER with tighter gate.',
     assetClass: 'synthetic_digit', contractClass: 'digit',
-    baseRate: 0.10,  // 1 digit out of 10
-    defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, minSamples: 100 },
+    baseRate: 0.10,
+    defaultConfig: {
+      symbol: 'R_100', stake: 1, durationTicks: 5, minSamples: 150,
+      flipConfig: { enabled: true, minTrades: 40, flipBelow: 0.08 },
+    },
     evaluate(ctx) {
       const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No digit data');
       if (digitView.sampleSize < config.minSamples) return wait('Not enough samples');
       
-      const losses = stats?.consecutiveLosses || 0;
-      let requiredPct = 4.0;
-      if (losses === 1) requiredPct = 2.5;
-      if (losses >= 2) requiredPct = 1.0;
-
       const freq = digitView.digitFreq;
       const total = digitView.sampleSize;
       
       const over8 = (freq.slice(9).reduce((a, b) => a + b, 0) / total) * 100;
       const under1 = (freq.slice(0, 1).reduce((a, b) => a + b, 0) / total) * 100;
       
-      if (over8 <= requiredPct) return enterDigitBarrier('DIGITOVER', 8, config, `Over 8 is only ${over8.toFixed(1)}%. (Need <=${requiredPct}%)`);
-      if (under1 <= requiredPct) return enterDigitBarrier('DIGITUNDER', 0, config, `Under 1 is only ${under1.toFixed(1)}%. (Need <=${requiredPct}%)`);
+      // Very tight: require < 3% (rare)
+      let normalDir = null;
+      if (over8 <= 3.0) normalDir = 'DIGITOVER';
+      else if (under1 <= 3.0) normalDir = 'DIGITUNDER';
+      if (!normalDir) return wait(`Over 8: ${over8.toFixed(1)}% / Under 1: ${under1.toFixed(1)}% (Need <=3%)`);
       
-      return wait(`No extreme edge yet (Need <=${requiredPct}%)`);
+      const flip = shouldFlip(config, stats, 0.12);
+      const finalDir = flip
+        ? (normalDir === 'DIGITOVER' ? 'DIGITUNDER' : 'DIGITOVER')
+        : normalDir;
+      const barrier = finalDir === 'DIGITOVER' ? 8 : 0;
+      
+      const reason = flip
+        ? `${normalDir} FLIPPED → ${finalDir} (recent WR < 8%)`
+        : `Over 8=${over8.toFixed(1)}% / Under 1=${under1.toFixed(1)}%`;
+      
+      return enterDigitBarrier(finalDir, barrier, config, reason);
     },
   },
 
   // ============================================================
-  // CATEGORY C — SYNTHETIC RISE/FALL BOTS (3)
+  // SYNTHETIC BINARY BOTS (3)
+  // All use adaptive flip: same mechanism as digit bots.
   // ============================================================
 
   rise_fall_momentum: {
     id: 'rise_fall_momentum', name: 'Rise/Fall Momentum',
-    description: 'Synthetic CALL/PUT based on tick direction bias.',
+    description: 'Synthetic CALL/PUT with adaptive flip.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
-    baseRate: 0.50,  // Binary CALL/PUT
-    defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, minBias: 0.62, minSamples: 100 },
+    baseRate: 0.50,
+    defaultConfig: {
+      symbol: 'R_100', stake: 1, durationTicks: 5, minBias: 0.62, minSamples: 100,
+      flipConfig: { enabled: true, minTrades: 40, flipBelow: 0.48 },
+    },
     evaluate(ctx) {
       const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No data');
       if (digitView.sampleSize < config.minSamples) return wait('Not enough samples');
       
-      const losses = stats?.consecutiveLosses || 0;
-      let requiredBias = config.minBias;
-      if (losses === 1) requiredBias += 0.03;
-      if (losses >= 2) requiredBias += 0.06;
-
       const risePct = digitView.risePct / 100;
       const fallPct = digitView.fallPct / 100;
       
-      if (risePct >= requiredBias) return enterBinary('CALL', config, `Rise bias ${(risePct * 100).toFixed(1)}%`);
-      if (fallPct >= requiredBias) return enterBinary('PUT', config, `Fall bias ${(fallPct * 100).toFixed(1)}%`);
+      let normalDir = null;
+      if (risePct >= config.minBias) normalDir = 'CALL';
+      else if (fallPct >= config.minBias) normalDir = 'PUT';
+      if (!normalDir) return wait(`Rise ${(risePct*100).toFixed(1)}% / Fall ${(fallPct*100).toFixed(1)}% (Need >=${config.minBias*100}%)`);
       
-      return wait(`Rise ${(risePct * 100).toFixed(1)}% / Fall ${(fallPct * 100).toFixed(1)}% (Need >=${(requiredBias * 100).toFixed(0)}%)`);
+      const flip = shouldFlip(config, stats, 0.521);
+      const finalDir = flip
+        ? (normalDir === 'CALL' ? 'PUT' : 'CALL')
+        : normalDir;
+      
+      const reason = flip
+        ? `${normalDir} FLIPPED → ${finalDir} (recent WR < 48%)`
+        : `Bias ${((normalDir === 'CALL' ? risePct : fallPct) * 100).toFixed(1)}%`;
+      
+      return enterBinary(finalDir, config, reason);
     },
   },
 
   rise_fall_streak: {
     id: 'rise_fall_streak', name: 'Rise/Fall Streak Fade',
-    description: 'Synthetic CALL/PUT. Fades N consecutive rises or falls.',
+    description: 'Synthetic CALL/PUT with adaptive flip.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
-    baseRate: 0.50,  // Binary CALL/PUT
-    defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, minStreak: 5 },
+    baseRate: 0.50,
+    defaultConfig: {
+      symbol: 'R_100', stake: 1, durationTicks: 5, minStreak: 7,
+      flipConfig: { enabled: true, minTrades: 40, flipBelow: 0.48 },
+    },
     evaluate(ctx) {
       const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No data');
       
-      const losses = stats?.consecutiveLosses || 0;
-      let requiredStreak = config.minStreak;
-      if (losses === 1) requiredStreak += 1;
-      if (losses >= 2) requiredStreak += 2;
-
       const dirs = (digitView.directions || []).slice(-20);
-      if (dirs.length < requiredStreak) return wait('Not enough ticks');
+      if (dirs.length < config.minStreak) return wait('Not enough ticks');
       
       let streak = 0, lastDir = null;
       for (let i = dirs.length - 1; i >= 0; i--) {
@@ -604,61 +733,72 @@ const BOTS = {
         else break;
       }
       
-      if (streak >= requiredStreak) {
-        const dir = lastDir === 'up' ? 'PUT' : 'CALL';
-        return enterBinary(dir, config, `${streak}-tick ${lastDir}-streak → fade to ${dir}`);
-      }
-      return wait(`Streak: ${streak} ${lastDir || '-'} (Need ${requiredStreak})`);
+      if (streak < config.minStreak) return wait(`Streak: ${streak} ${lastDir || '-'} (Need ${config.minStreak})`);
+      
+      const normalDir = lastDir === 'up' ? 'PUT' : 'CALL';
+      const flip = shouldFlip(config, stats, 0.521);
+      const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
+      
+      const reason = flip
+        ? `${streak}-tick ${lastDir}-streak FLIPPED → ${finalDir} (recent WR < 48%)`
+        : `${streak}-tick ${lastDir}-streak → fade to ${finalDir}`;
+      
+      return enterBinary(finalDir, config, reason);
     },
   },
 
   rise_fall_breakout: {
     id: 'rise_fall_breakout', name: 'Rise/Fall Breakout',
-    description: 'Synthetic CALL/PUT on sharp directional tick burst.',
+    description: 'Synthetic CALL/PUT with adaptive flip.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
-    baseRate: 0.50,  // Binary CALL/PUT
-    defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, lookbackTicks: 10, minMovePct: 0.08 },
+    baseRate: 0.50,
+    defaultConfig: {
+      symbol: 'R_100', stake: 1, durationTicks: 5, lookbackTicks: 10, minMovePct: 0.08,
+      flipConfig: { enabled: true, minTrades: 40, flipBelow: 0.48 },
+    },
     evaluate(ctx) {
       const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No data');
       
-      const losses = stats?.consecutiveLosses || 0;
-      let requiredMove = config.minMovePct;
-      if (losses === 1) requiredMove += 0.02;
-      if (losses >= 2) requiredMove += 0.04;
-
       const prices = (digitView.recentPrices || []).slice(-config.lookbackTicks);
       if (prices.length < 5) return wait('Not enough prices');
       
       const first = prices[0], last = prices[prices.length - 1];
       const movePct = ((last - first) / first) * 100;
       
-      if (Math.abs(movePct) < requiredMove) return wait(`Move ${movePct.toFixed(3)}% too small (Need ${requiredMove.toFixed(3)}%)`);
+      if (Math.abs(movePct) < config.minMovePct) {
+        return wait(`Move ${movePct.toFixed(3)}% too small (Need ${config.minMovePct.toFixed(3)}%)`);
+      }
       
-      const dir = movePct > 0 ? 'CALL' : 'PUT';
-      return enterBinary(dir, config, `Move ${movePct.toFixed(3)}% in ${config.lookbackTicks} ticks`);
+      const normalDir = movePct > 0 ? 'CALL' : 'PUT';
+      const flip = shouldFlip(config, stats, 0.521);
+      const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
+      
+      const reason = flip
+        ? `Move ${movePct.toFixed(3)}% FLIPPED → ${finalDir} (recent WR < 48%)`
+        : `Move ${movePct.toFixed(3)}% in ${config.lookbackTicks} ticks`;
+      
+      return enterBinary(finalDir, config, reason);
     },
   },
 
   // ============================================================
-  // CATEGORY D — SYNTHETIC VOLATILITY BOTS (2)
+  // SYNTHETIC VOLATILITY BOTS (2)
   // ============================================================
 
   vol_high_low: {
     id: 'vol_high_low', name: 'Volatility High/Low',
-    description: 'Synthetic ONETOUCH/NOTOUCH on momentum bias.',
+    description: 'Synthetic ONETOUCH/NOTOUCH with adaptive flip.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
-    baseRate: 0.30,  // Approximate ONETOUCH hit rate
-    defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5, barrierPips: 10 },
+    baseRate: 0.30,
+    defaultConfig: {
+      symbol: 'R_100', stake: 1, durationTicks: 5, barrierPips: 10,
+      flipConfig: { enabled: true, minTrades: 40, flipBelow: 0.28 },
+    },
     evaluate(ctx) {
       const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No data');
       
-      const losses = stats?.consecutiveLosses || 0;
-      let upperBias = 0.70, lowerBias = 0.50;
-      if (losses === 1) { upperBias = 0.75; lowerBias = 0.45; }
-      if (losses >= 2) { upperBias = 0.80; lowerBias = 0.40; }
-
       const dirs = (digitView.directions || []).slice(-20);
       const up = dirs.filter(d => d === 'up').length;
       const down = dirs.filter(d => d === 'down').length;
@@ -666,21 +806,36 @@ const BOTS = {
       if (total === 0) return wait('Not enough direction data');
       
       const bias = Math.max(up, down) / total;
-      if (bias > upperBias) return enterBinary('ONETOUCH', config, `Strong directional bias ${(bias * 100).toFixed(1)}%`);
-      if (bias < lowerBias) return enterBinary('NOTOUCH', config, `Balanced movement`);
       
-      return wait(`Bias ${(bias * 100).toFixed(1)}%`);
+      let normalDir = null;
+      if (bias > 0.72) normalDir = 'ONETOUCH';
+      else if (bias < 0.45) normalDir = 'NOTOUCH';
+      if (!normalDir) return wait(`Bias ${(bias * 100).toFixed(1)}%`);
+      
+      const flip = shouldFlip(config, stats, 0.32);
+      const finalDir = flip
+        ? (normalDir === 'ONETOUCH' ? 'NOTOUCH' : 'ONETOUCH')
+        : normalDir;
+      
+      const reason = flip
+        ? `${normalDir} FLIPPED → ${finalDir} (recent WR < 28%)`
+        : `${normalDir === 'ONETOUCH' ? 'Strong' : 'Balanced'} directional bias ${(bias * 100).toFixed(1)}%`;
+      
+      return enterBinary(finalDir, config, reason);
     },
   },
 
   vol_scalper: {
     id: 'vol_scalper', name: 'Volatility Scalper',
-    description: 'Synthetic CALL/PUT. Quick 5-tick scalps.',
+    description: 'Synthetic CALL/PUT quick scalps with adaptive flip.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
-    baseRate: 0.50,  // Binary CALL/PUT
-    defaultConfig: { symbol: 'R_100', stake: 1, durationTicks: 5 },
+    baseRate: 0.50,
+    defaultConfig: {
+      symbol: 'R_100', stake: 1, durationTicks: 5,
+      flipConfig: { enabled: true, minTrades: 40, flipBelow: 0.48 },
+    },
     evaluate(ctx) {
-      const { digitView, config } = ctx;
+      const { digitView, config, stats } = ctx;
       if (!digitView) return wait('No data');
       
       const dirs = (digitView.directions || []).slice(-5);
@@ -689,27 +844,35 @@ const BOTS = {
       const ups = dirs.filter(d => d === 'up').length;
       const downs = dirs.filter(d => d === 'down').length;
       
-      if (ups === 5) return enterBinary('CALL', config, `5/5 ticks up`);
-      if (downs === 5) return enterBinary('PUT', config, `5/5 ticks down`);
+      let normalDir = null;
+      if (ups === 5) normalDir = 'CALL';
+      else if (downs === 5) normalDir = 'PUT';
+      if (!normalDir) return wait(`ups=${ups} downs=${downs}`);
       
-      return wait(`ups=${ups} downs=${downs}`);
+      const flip = shouldFlip(config, stats, 0.521);
+      const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
+      
+      const reason = flip
+        ? `5/5 ticks FLIPPED → ${finalDir} (recent WR < 48%)`
+        : `5/5 ticks ${normalDir === 'CALL' ? 'up' : 'down'}`;
+      
+      return enterBinary(finalDir, config, reason);
     },
   },
 };
 
-// ── Session-level risk defaults ───────────────────────────────
+// ── Session-level risk defaults ─────────────────────────────────
 // Applied to every bot. Individual bot defaultConfig wins on Object.assign.
-// maxStake: null means "no cap"; set to a number to enforce. Edge tests
-// override this with equal stake across all bots to control exposure.
 const RISK_DEFAULTS = {
   botTakeProfit: 20,          // stop when session PnL >= +$20
   botStopLoss: 10,            // stop when session PnL <= -$10
   trailingDrawdownPct: 25,    // once in profit, stop if PnL gives back 25% of peak
   stopAfterLosses: 3,         // hard stop after N consecutive losses
-  maxStake: 50,               // hard cap on stake per trade; set higher/0 to disable
-  minRiskReward: 0,           // minimum TP:SL ratio (0 = disabled); edge gate if > 0
-  allowedRegimes: [],         // [] = all regimes; else only enter in listed codes
-  allowedSessions: [],        // [] = all sessions; else only enter in listed sessions
+  maxStake: 50,               // hard cap on stake per trade
+  minRiskReward: 0,           // 0 = disabled; FX bots override to 2.0
+  requireConsensus: false,    // FX bots override to true
+  allowedRegimes: [],         // [] = all regimes
+  allowedSessions: [],        // [] = all sessions
 };
 
 for (const id in BOTS) {
@@ -718,5 +881,15 @@ for (const id in BOTS) {
 
 function getBot(id) { return BOTS[id] || null; }
 function listBots() { return Object.values(BOTS); }
+function listEnabledBots() { return Object.values(BOTS); }  // nothing disabled — kept for API compatibility
 
-module.exports = { BOTS, getBot, listBots, normalizeSymbol };
+module.exports = {
+  BOTS,
+  RISK_DEFAULTS,
+  getBot,
+  listBots,
+  listEnabledBots,
+  normalizeSymbol,
+  roundPrice,
+  getPricePrecision,
+};
