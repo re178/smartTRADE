@@ -16,8 +16,7 @@ const logger = require('../../infrastructure/logger') || console;
 
 function normalizeSymbol(s) { return String(s || '').replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase(); }
 
-// Trading session detection by UTC hour. Used by allowedSessions gate
-// and as a tag on every BotRun for regime × session edge analysis.
+// Trading session detection by UTC hour.
 const SESSION_RANGES = [
   { code: 'ASIAN',               start: 0,  end: 7  },
   { code: 'LONDON',              start: 7,  end: 12 },
@@ -33,6 +32,10 @@ function detectSession(date = new Date()) {
   }
   return 'AFTER_HOURS';
 }
+
+// ── Flip rolling-window constants ────────────────────────────────
+const FLIP_WINDOW = 40;          // last N results drive the flip decision
+const FLIP_HYSTERESIS = 0.05;    // must exceed threshold by this much to un-flip
 
 class BotRunner extends EventEmitter {
   constructor() {
@@ -53,7 +56,15 @@ class BotRunner extends EventEmitter {
       instanceId, botId, name: bot.name, assetClass: bot.assetClass, contractClass: bot.contractClass,
       symbol, config: finalConfig, status: 'RUNNING', startedAt: new Date(), lastRunAt: null, lastReason: null,
       timer: null, _running: false, _lastEntryTime: 0,
-      stats: { runs: 0, entries: 0, wins: 0, losses: 0, pnl: 0, peakPnl: 0, consecutiveLosses: 0 },
+      stats: {
+        runs: 0, entries: 0, wins: 0, losses: 0, pnl: 0, peakPnl: 0, consecutiveLosses: 0,
+        // Adaptive flip tracking — consumed by registry.shouldFlip() via bot.evaluate(ctx)
+        closedTrades: 0,
+        recentResults: [],       // ['W','L',...] capped at FLIP_WINDOW
+        recentWinRate: null,     // null until first close; 0..1 afterwards
+        flipped: false,          // current flip state
+        flipHistory: [],         // [{atTrade, from, to, reason}]
+      },
     };
 
     const intervalMs = bot.assetClass === 'fx' ? 15000 : 5000;
@@ -90,13 +101,55 @@ class BotRunner extends EventEmitter {
   list() { return Array.from(this._instances.values()).map(i => this._summarize(i)); }
   get(instanceId) { const i = this._instances.get(instanceId); return i ? this._summarize(i) : null; }
 
+  // ─────────────────────────────────────────────────────────────
+  //  FLIP STATE — recomputed each cycle from recentResults
+  //  Sticky with hysteresis: once flipped, only un-flips if win rate
+  //  rises FLIP_HYSTERESIS above the threshold. Prevents oscillation
+  //  on bots that sit near the break-even line.
+  // ─────────────────────────────────────────────────────────────
+  _updateFlipState(instance) {
+    const fc = instance.config && instance.config.flipConfig;
+    const s = instance.stats;
+
+    if (!fc || !fc.enabled) {
+      if (s.flipped) {
+        s.flipHistory.push({ atTrade: s.closedTrades, from: true, to: false, reason: 'flipConfig disabled' });
+        s.flipped = false;
+      }
+      return;
+    }
+
+    const minTrades = fc.minTrades || 40;
+    if (s.closedTrades < minTrades || s.recentWinRate == null) {
+      return; // not enough data yet, keep current state (default false)
+    }
+
+    const threshold = fc.flipBelow != null ? fc.flipBelow : 0.48;
+    const wr = s.recentWinRate;
+
+    if (!s.flipped && wr < threshold) {
+      s.flipped = true;
+      s.flipHistory.push({ atTrade: s.closedTrades, from: false, to: true, reason: `WR ${(wr * 100).toFixed(1)}% < ${(threshold * 100).toFixed(1)}%` });
+      logger.info(`[BotRunner] ${instance.botId}/${instance.instanceId} FLIPPED ON — WR ${(wr * 100).toFixed(1)}%`);
+      this.emit('botFlip', { instanceId: instance.instanceId, botId: instance.botId, flipped: true, recentWinRate: wr, closedTrades: s.closedTrades });
+    } else if (s.flipped && wr > threshold + FLIP_HYSTERESIS) {
+      s.flipped = false;
+      s.flipHistory.push({ atTrade: s.closedTrades, from: true, to: false, reason: `WR ${(wr * 100).toFixed(1)}% > ${((threshold + FLIP_HYSTERESIS) * 100).toFixed(1)}%` });
+      logger.info(`[BotRunner] ${instance.botId}/${instance.instanceId} FLIPPED OFF — WR ${(wr * 100).toFixed(1)}%`);
+      this.emit('botFlip', { instanceId: instance.instanceId, botId: instance.botId, flipped: false, recentWinRate: wr, closedTrades: s.closedTrades });
+    }
+  }
+
   async _runCycle(instance) {
     if (instance.status !== 'RUNNING') return;
     if (instance._running) return;
     instance._running = true;
 
     try {
-      // 1. SETTLEMENT COOLDOWN: Prevent firing before the last trade settles
+      // Refresh flip state before evaluate — so bot.evaluate(ctx) sees current stats
+      this._updateFlipState(instance);
+
+      // 1. SETTLEMENT COOLDOWN
       if (instance._lastEntryTime && Date.now() - instance._lastEntryTime < 15000) {
         instance.lastReason = 'Awaiting trade settlement...';
         return;
@@ -111,7 +164,7 @@ class BotRunner extends EventEmitter {
         return;
       }
 
-      // 2b. Session PnL rules — take-profit / stop-loss / trailing drawdown
+      // 2b. Session PnL rules
       const s = instance.stats;
       const tp = Number(instance.config.botTakeProfit) || 0;
       const slAmt = Math.abs(Number(instance.config.botStopLoss) || 0);
@@ -142,7 +195,7 @@ class BotRunner extends EventEmitter {
         }
       }
 
-      // 2c. Session gate — skip if current session not in allowedSessions
+      // 2c. Session gate
       const allowedSessions = instance.config.allowedSessions;
       if (Array.isArray(allowedSessions) && allowedSessions.length > 0) {
         const currentSession = detectSession();
@@ -164,8 +217,8 @@ class BotRunner extends EventEmitter {
 
       const bot = getBot(instance.botId);
       const timeframe = instance.config.timeframe || 'M5';
-      
-      // Pass stats so bot can adapt thresholds based on consecutive losses
+
+      // Pass stats so bot can adapt thresholds / flip based on recent results
       const ctx = { config: instance.config, stats: instance.stats };
 
       if (bot.assetClass === 'fx') {
@@ -173,7 +226,7 @@ class BotRunner extends EventEmitter {
         if (!state) { instance.lastReason = 'no deep state'; return; }
         ctx.state = state;
 
-        // 2d. Regime gate — FX only (synthetics don't have regime)
+        // 2d. Regime gate — FX only
         const allowedRegimes = instance.config.allowedRegimes;
         if (Array.isArray(allowedRegimes) && allowedRegimes.length > 0) {
           const currentRegime = state.regime && state.regime.code;
@@ -195,7 +248,7 @@ class BotRunner extends EventEmitter {
       instance.stats.runs++;
 
       let result;
-      try { result = await bot.evaluate(ctx); } 
+      try { result = await bot.evaluate(ctx); }
       catch (evalErr) { instance.lastReason = `evaluate error: ${evalErr.message}`; return; }
 
       if (!result || result.action === 'WAIT') {
@@ -262,6 +315,8 @@ class BotRunner extends EventEmitter {
   _buildEntryThesis(instance, reasons, ctx) {
     const isEdgeTest = !!instance.config._edgeTest;
     const session = detectSession();
+    const flipLabel = instance.stats && instance.stats.flipped ? 'FLIPPED' : 'NORMAL';
+    const recentWinRate = instance.stats ? instance.stats.recentWinRate : null;
 
     if (instance.assetClass === 'fx') {
       const pred = ctx && ctx.prediction;
@@ -273,6 +328,8 @@ class BotRunner extends EventEmitter {
         reasons: reasons || [],
         edgeTest: isEdgeTest,
         session,
+        flip: flipLabel,
+        recentWinRate,
         confidence: pred ? pred.calibratedConfidence : null,
         direction: pred ? pred.direction : null,
         pattern: pred && pred.pattern ? {
@@ -300,6 +357,8 @@ class BotRunner extends EventEmitter {
       reasons: reasons || [],
       edgeTest: isEdgeTest,
       session,
+      flip: flipLabel,
+      recentWinRate,
       digitView: dv ? {
         sampleSize: dv.sampleSize,
         evenPct: dv.evenPct,
@@ -315,7 +374,6 @@ class BotRunner extends EventEmitter {
   async _execute(instance, signal, ctx) {
     const { tradeParams, direction, reasons } = signal;
 
-    // ── Stake validation (reject, do not clamp) ─────────────
     const stakeCheck = this._validateStake(instance, tradeParams.stake);
     if (!stakeCheck.ok) {
       instance.lastReason = `Execution blocked: ${stakeCheck.reason}`;
@@ -324,7 +382,6 @@ class BotRunner extends EventEmitter {
       return;
     }
 
-    // ── Risk-reward gate (FX multiplier only) ───────────────
     const rrCheck = this._validateRiskReward(instance, tradeParams, ctx);
     if (!rrCheck.ok) {
       instance.lastReason = `Execution blocked: ${rrCheck.reason}`;
@@ -343,7 +400,7 @@ class BotRunner extends EventEmitter {
       if (tradeParams.contractClass === 'multiplier') {
         result = await contractService.placeContract({
           symbol: tradeParams.symbol, direction: tradeParams.direction || direction, stake: stakeCheck.stake,
-          multiplier: tradeParams.multiplier, duration: tradeParams.duration, durationUnit: tradeParams.durationUnit || 's',
+          multiplier: tradeParams.multiplier,
           knockoutLevel: tradeParams.knockoutLevel, takeProfitLevel: tradeParams.takeProfitLevel,
           strategy: instance.botId, regimeCode: instance.config.regimeCode || 'NEUTRAL',
           entryThesis,
@@ -359,9 +416,8 @@ class BotRunner extends EventEmitter {
         throw new Error(`Unknown contractClass: ${tradeParams.contractClass}`);
       }
 
-      // Only mark as entered if the contract actually went through
       instance.stats.entries++;
-      instance._lastEntryTime = Date.now(); // Triggers 15-second cooldown
+      instance._lastEntryTime = Date.now();
       instance.lastReason = 'TRADE PLACED';
 
       await BotRun.create({
@@ -381,7 +437,6 @@ class BotRunner extends EventEmitter {
 
       this.emit('botEntry', { instanceId: instance.instanceId, botId: instance.botId, contractId: String(result.contractId), symbol: instance.config.symbol, side: tradeParams.contractType || direction, entryPrice: result.entryPrice, stake: stakeCheck.stake, reasons, timestamp: new Date().toISOString() });
     } catch (err) {
-      // If it fails, print the actual error, not "ENTERED"
       logger.error(`[BotRunner] ${instance.botId}/${instance.instanceId} entry failed: ${err.message}`);
       instance.lastReason = `Execution failed: ${err.message}`;
       this.emit('botError', { instanceId: instance.instanceId, botId: instance.botId, error: err.message });
@@ -405,23 +460,41 @@ class BotRunner extends EventEmitter {
       const instance = this._instances.get(run.instanceId);
       if (instance) {
         instance.stats.pnl += realizedProfit;
-        if (run.result === 'WIN') { 
-          instance.stats.wins++; 
-          instance.stats.consecutiveLosses = 0; 
+        instance.stats.closedTrades++;
+
+        if (run.result === 'WIN') {
+          instance.stats.wins++;
+          instance.stats.consecutiveLosses = 0;
         } else if (run.result === 'LOSS') {
-          instance.stats.losses++; 
+          instance.stats.losses++;
           instance.stats.consecutiveLosses++;
         }
-        this.emit('botResult', { instanceId: run.instanceId, botId: run.botId, contractId, result: run.result, pnl: realizedProfit, totalPnl: instance.stats.pnl, timestamp: new Date().toISOString() });
+
+        // Update rolling window for adaptive flip
+        if (run.result === 'WIN' || run.result === 'LOSS') {
+          instance.stats.recentResults.push(run.result === 'WIN' ? 'W' : 'L');
+          if (instance.stats.recentResults.length > FLIP_WINDOW) {
+            instance.stats.recentResults.shift();
+          }
+          const recentWins = instance.stats.recentResults.filter(x => x === 'W').length;
+          instance.stats.recentWinRate = recentWins / instance.stats.recentResults.length;
+        }
+
+        this.emit('botResult', { instanceId: run.instanceId, botId: run.botId, contractId, result: run.result, pnl: realizedProfit, totalPnl: instance.stats.pnl, recentWinRate: instance.stats.recentWinRate, flipped: instance.stats.flipped, timestamp: new Date().toISOString() });
       }
     } catch (err) { logger.error(`[BotRunner] _onTradeClosed failed: ${err.message}`); }
   }
 
   _summarize(instance) {
+    // Strip recentResults from summary to keep WS payloads lean
+    const statsForSummary = Object.assign({}, instance.stats);
+    delete statsForSummary.recentResults;
+
     return {
       instanceId: instance.instanceId, botId: instance.botId, name: instance.name, assetClass: instance.assetClass,
       contractClass: instance.contractClass, symbol: instance.symbol, status: instance.status, startedAt: instance.startedAt,
-      lastRunAt: instance.lastRunAt, lastReason: instance.lastReason, config: instance.config, stats: Object.assign({}, instance.stats),
+      lastRunAt: instance.lastRunAt, lastReason: instance.lastReason, config: instance.config,
+      stats: statsForSummary,
     };
   }
 }
