@@ -136,7 +136,6 @@
     .stat-change.positive { color: var(--success); }
     .stat-change.negative { color: var(--danger); }
 
-    /* Table Responsiveness */
     .table-responsive { -webkit-overflow-scrolling: touch; }
     .table th, .table td { white-space: nowrap; }
 
@@ -650,6 +649,7 @@
                 <th class="text-end">Win Rate</th>
                 <th class="text-end">Base Rate</th>
                 <th class="text-end">Edge</th>
+                <th class="text-end" title="Normal-phase win rate → Flipped-phase win rate (if any)">Flip Effect</th>
                 <th class="text-end">z-score</th>
                 <th class="text-end">R:R</th>
                 <th class="text-end">P/L</th>
@@ -658,7 +658,7 @@
               </tr>
             </thead>
             <tbody id="edgeResultsBody">
-              <tr><td colspan="10" class="text-muted p-3">Loading...</td></tr>
+              <tr><td colspan="11" class="text-muted p-3">Loading...</td></tr>
             </tbody>
           </table>
         </div>
@@ -916,7 +916,6 @@
   const overlay = document.getElementById('sidebarOverlay');
   const toggleBtn = document.getElementById('sidebarToggle');
   
-  // Mobile Sidebar Toggle
   function toggleSidebar() {
     sidebar.classList.toggle('open');
     if (sidebar.classList.contains('open')) {
@@ -929,7 +928,6 @@
   if (toggleBtn) toggleBtn.addEventListener('click', toggleSidebar);
   if (overlay) overlay.addEventListener('click', toggleSidebar);
 
-  // Section Navigation
   const navItems = document.querySelectorAll('.sidebar-nav .nav-item[data-section]');
   const sections = {
     tradingview: document.getElementById('section-tradingview'),
@@ -966,12 +964,10 @@
       
       if (pageTitle) pageTitle.textContent = titles[sec] || sec;
       
-      // Close sidebar automatically on mobile after clicking a link
       if (window.innerWidth <= 992) toggleSidebar();
       
       window.scrollTo({ top: 0, behavior: 'smooth' });
 
-      // Lazy-load digit data if entering analysis sections
       if ((sec === 'digits' || sec === 'risefall' || sec === 'evenodd')) {
         const sym = document.getElementById('digitSymbolSelect')?.value || 'EURUSD';
         fetch(`/api/digit/${sym}`).then(r => r.json())
@@ -979,12 +975,10 @@
           .catch(() => {});
       }
 
-      // Lazy-load Analytics if entering that section
       if (sec === 'analytics' && window.loadAnalytics) {
         window.loadAnalytics();
       }
 
-      // Lazy-load Edge Results if entering that section
       if (sec === 'edge' && window.loadEdgeStatus) {
         window.loadEdgeStatus();
         window.loadEdgeResults();
@@ -992,7 +986,6 @@
     });
   });
 
-  // Export CSV (from history)
   document.getElementById('exportCSVBtn')?.addEventListener('click', function () {
     const h = (window.dashboardState && window.dashboardState.history) || [];
     if (h.length === 0) { alert('No history to export.'); return; }
