@@ -16,7 +16,6 @@ const logger = require('../../infrastructure/logger') || console;
 
 function normalizeSymbol(s) { return String(s || '').replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase(); }
 
-// Trading session detection by UTC hour.
 const SESSION_RANGES = [
   { code: 'ASIAN',               start: 0,  end: 7  },
   { code: 'LONDON',              start: 7,  end: 12 },
@@ -33,9 +32,7 @@ function detectSession(date = new Date()) {
   return 'AFTER_HOURS';
 }
 
-// ── Flip rolling-window constants ────────────────────────────────
-const FLIP_WINDOW = 40;          // last N results drive the flip decision
-const FLIP_HYSTERESIS = 0.05;    // must exceed threshold by this much to un-flip
+const FLIP_HISTORY_MAX = 50;
 
 class BotRunner extends EventEmitter {
   constructor() {
@@ -58,12 +55,19 @@ class BotRunner extends EventEmitter {
       timer: null, _running: false, _lastEntryTime: 0,
       stats: {
         runs: 0, entries: 0, wins: 0, losses: 0, pnl: 0, peakPnl: 0, consecutiveLosses: 0,
-        // Adaptive flip tracking — consumed by registry.shouldFlip() via bot.evaluate(ctx)
         closedTrades: 0,
-        recentResults: [],       // ['W','L',...] capped at FLIP_WINDOW
-        recentWinRate: null,     // null until first close; 0..1 afterwards
-        flipped: false,          // current flip state
-        flipHistory: [],         // [{atTrade, from, to, reason}]
+
+        // Cumulative phase counters (never reset — for reporting/CSV)
+        normalTrades: 0, normalWins: 0, normalPnl: 0,
+        flippedTrades: 0, flippedWins: 0, flippedPnl: 0,
+
+        // Phase-local counters (reset on every flip toggle — for flip decision)
+        phaseTrades: 0, phaseWins: 0, phasePnl: 0,
+
+        // Current flip state + audit
+        flipped: false,
+        flipHistory: [],       // [{atTrade, from, to, reason, phaseTrades, phasePnl}]
+        flipCount: 0,
       },
     };
 
@@ -102,41 +106,92 @@ class BotRunner extends EventEmitter {
   get(instanceId) { const i = this._instances.get(instanceId); return i ? this._summarize(i) : null; }
 
   // ─────────────────────────────────────────────────────────────
-  //  FLIP STATE — recomputed each cycle from recentResults
-  //  Sticky with hysteresis: once flipped, only un-flips if win rate
-  //  rises FLIP_HYSTERESIS above the threshold. Prevents oscillation
-  //  on bots that sit near the break-even line.
+  //  FLIP STATE — phase-based decision
+  //
+  //  Two states: NORMAL and FLIPPED. Each toggle starts a new phase.
+  //  Phase counters (phaseTrades, phasePnl) reset on toggle.
+  //  Judgments use ONLY current-phase data — pre-flip losses don't
+  //  dilute post-flip wins, and vice versa.
+  //
+  //  Flip ON:  after flipMinTrades normal trades, if normal win rate
+  //            < flipBelowPct%  (default: 20 trades, 8% for matches_differs)
+  //
+  //  Un-flip:  after flipStableTrades flipped trades, if flipped PnL
+  //            is negative  (flip isn't working → try normal again)
+  //
+  //  Stay flipped:  as long as flipped PnL stays positive
   // ─────────────────────────────────────────────────────────────
   _updateFlipState(instance) {
-    const fc = instance.config && instance.config.flipConfig;
+    const c = instance.config;
     const s = instance.stats;
 
-    if (!fc || !fc.enabled) {
+    if (!c.flipEnabled) {
       if (s.flipped) {
-        s.flipHistory.push({ atTrade: s.closedTrades, from: true, to: false, reason: 'flipConfig disabled' });
+        s.flipHistory.push({
+          atTrade: s.closedTrades, from: true, to: false,
+          reason: 'flipEnabled disabled via config',
+          phaseTrades: s.phaseTrades, phasePnl: Number(s.phasePnl.toFixed(2)),
+        });
+        this._capFlipHistory(s);
         s.flipped = false;
+        s.flipCount++;
       }
       return;
     }
 
-    const minTrades = fc.minTrades || 40;
-    if (s.closedTrades < minTrades || s.recentWinRate == null) {
-      return; // not enough data yet, keep current state (default false)
+    const minTrades = Number(c.flipMinTrades) || 20;
+    const stableTrades = Number(c.flipStableTrades) || 20;
+    const flipThreshold = Number(c.flipBelowPct) || 10;
+
+    if (s.flipped) {
+      // ── Currently FLIPPED — decide if we should un-flip ──
+      if (s.phaseTrades < stableTrades) return;  // not enough flipped data
+
+      if (s.phasePnl < 0) {
+        // Flipped phase is losing money → try normal again
+        s.flipHistory.push({
+          atTrade: s.closedTrades, from: true, to: false,
+          reason: `flipped phase lost (${s.phaseTrades} trades, $${s.phasePnl.toFixed(2)})`,
+          phaseTrades: s.phaseTrades, phasePnl: Number(s.phasePnl.toFixed(2)),
+        });
+        this._capFlipHistory(s);
+        s.flipped = false;
+        s.flipCount++;
+        s.phaseTrades = 0;
+        s.phaseWins = 0;
+        s.phasePnl = 0;
+        logger.info(`[BotRunner] ${instance.botId}/${instance.instanceId} UN-FLIP — flipped phase ${s.phaseTrades} trades, PnL $${s.phasePnl.toFixed(2)}`);
+        this.emit('botFlip', { instanceId: instance.instanceId, botId: instance.botId, flipped: false, reason: 'flipped_phase_negative' });
+      }
+      // If phasePnl >= 0, stay flipped — the flip is working
+      return;
     }
 
-    const threshold = fc.flipBelow != null ? fc.flipBelow : 0.48;
-    const wr = s.recentWinRate;
+    // ── Currently NORMAL — decide if we should flip ──
+    if (s.phaseTrades < minTrades) return;  // not enough normal data
 
-    if (!s.flipped && wr < threshold) {
+    const normalWinRate = (s.phaseWins / s.phaseTrades) * 100;
+    if (normalWinRate < flipThreshold) {
+      // Normal phase is losing badly → try flip
+      s.flipHistory.push({
+        atTrade: s.closedTrades, from: false, to: true,
+        reason: `normal WR ${normalWinRate.toFixed(1)}% < ${flipThreshold}% (${s.phaseTrades} trades)`,
+        phaseTrades: s.phaseTrades, phasePnl: Number(s.phasePnl.toFixed(2)),
+      });
+      this._capFlipHistory(s);
       s.flipped = true;
-      s.flipHistory.push({ atTrade: s.closedTrades, from: false, to: true, reason: `WR ${(wr * 100).toFixed(1)}% < ${(threshold * 100).toFixed(1)}%` });
-      logger.info(`[BotRunner] ${instance.botId}/${instance.instanceId} FLIPPED ON — WR ${(wr * 100).toFixed(1)}%`);
-      this.emit('botFlip', { instanceId: instance.instanceId, botId: instance.botId, flipped: true, recentWinRate: wr, closedTrades: s.closedTrades });
-    } else if (s.flipped && wr > threshold + FLIP_HYSTERESIS) {
-      s.flipped = false;
-      s.flipHistory.push({ atTrade: s.closedTrades, from: true, to: false, reason: `WR ${(wr * 100).toFixed(1)}% > ${((threshold + FLIP_HYSTERESIS) * 100).toFixed(1)}%` });
-      logger.info(`[BotRunner] ${instance.botId}/${instance.instanceId} FLIPPED OFF — WR ${(wr * 100).toFixed(1)}%`);
-      this.emit('botFlip', { instanceId: instance.instanceId, botId: instance.botId, flipped: false, recentWinRate: wr, closedTrades: s.closedTrades });
+      s.flipCount++;
+      s.phaseTrades = 0;
+      s.phaseWins = 0;
+      s.phasePnl = 0;
+      logger.info(`[BotRunner] ${instance.botId}/${instance.instanceId} FLIP ON — normal phase ${s.phaseTrades} trades, WR ${normalWinRate.toFixed(1)}%`);
+      this.emit('botFlip', { instanceId: instance.instanceId, botId: instance.botId, flipped: true, reason: 'normal_phase_low_winrate' });
+    }
+  }
+
+  _capFlipHistory(s) {
+    if (s.flipHistory.length > FLIP_HISTORY_MAX) {
+      s.flipHistory = s.flipHistory.slice(-FLIP_HISTORY_MAX);
     }
   }
 
@@ -146,7 +201,6 @@ class BotRunner extends EventEmitter {
     instance._running = true;
 
     try {
-      // Refresh flip state before evaluate — so bot.evaluate(ctx) sees current stats
       this._updateFlipState(instance);
 
       // 1. SETTLEMENT COOLDOWN
@@ -218,7 +272,6 @@ class BotRunner extends EventEmitter {
       const bot = getBot(instance.botId);
       const timeframe = instance.config.timeframe || 'M5';
 
-      // Pass stats so bot can adapt thresholds / flip based on recent results
       const ctx = { config: instance.config, stats: instance.stats };
 
       if (bot.assetClass === 'fx') {
@@ -226,7 +279,6 @@ class BotRunner extends EventEmitter {
         if (!state) { instance.lastReason = 'no deep state'; return; }
         ctx.state = state;
 
-        // 2d. Regime gate — FX only
         const allowedRegimes = instance.config.allowedRegimes;
         if (Array.isArray(allowedRegimes) && allowedRegimes.length > 0) {
           const currentRegime = state.regime && state.regime.code;
@@ -316,7 +368,15 @@ class BotRunner extends EventEmitter {
     const isEdgeTest = !!instance.config._edgeTest;
     const session = detectSession();
     const flipLabel = instance.stats && instance.stats.flipped ? 'FLIPPED' : 'NORMAL';
-    const recentWinRate = instance.stats ? instance.stats.recentWinRate : null;
+    const phaseStats = instance.stats ? {
+      phaseTrades: instance.stats.phaseTrades,
+      phasePnl: Number(instance.stats.phasePnl.toFixed(2)),
+      normalTrades: instance.stats.normalTrades,
+      normalPnl: Number(instance.stats.normalPnl.toFixed(2)),
+      flippedTrades: instance.stats.flippedTrades,
+      flippedPnl: Number(instance.stats.flippedPnl.toFixed(2)),
+      flipCount: instance.stats.flipCount,
+    } : null;
 
     if (instance.assetClass === 'fx') {
       const pred = ctx && ctx.prediction;
@@ -329,7 +389,7 @@ class BotRunner extends EventEmitter {
         edgeTest: isEdgeTest,
         session,
         flip: flipLabel,
-        recentWinRate,
+        phaseStats,
         confidence: pred ? pred.calibratedConfidence : null,
         direction: pred ? pred.direction : null,
         pattern: pred && pred.pattern ? {
@@ -358,9 +418,10 @@ class BotRunner extends EventEmitter {
       edgeTest: isEdgeTest,
       session,
       flip: flipLabel,
-      recentWinRate,
+      phaseStats,
       digitView: dv ? {
         sampleSize: dv.sampleSize,
+        precision: dv.precision,
         evenPct: dv.evenPct,
         oddPct: dv.oddPct,
         risePct: dv.risePct,
@@ -435,7 +496,7 @@ class BotRunner extends EventEmitter {
         entryThesis,
       }).catch(err => logger.error(`[BotRunner] BotRun persist failed: ${err.message}`));
 
-      this.emit('botEntry', { instanceId: instance.instanceId, botId: instance.botId, contractId: String(result.contractId), symbol: instance.config.symbol, side: tradeParams.contractType || direction, entryPrice: result.entryPrice, stake: stakeCheck.stake, reasons, timestamp: new Date().toISOString() });
+      this.emit('botEntry', { instanceId: instance.instanceId, botId: instance.botId, contractId: String(result.contractId), symbol: instance.config.symbol, side: tradeParams.contractType || direction, entryPrice: result.entryPrice, stake: stakeCheck.stake, reasons, flipped: instance.stats.flipped, timestamp: new Date().toISOString() });
     } catch (err) {
       logger.error(`[BotRunner] ${instance.botId}/${instance.instanceId} entry failed: ${err.message}`);
       instance.lastReason = `Execution failed: ${err.message}`;
@@ -459,6 +520,9 @@ class BotRunner extends EventEmitter {
 
       const instance = this._instances.get(run.instanceId);
       if (instance) {
+        // Determine which phase this trade belonged to — trust entryThesis.flip
+        const tradeWasFlipped = run.entryThesis && run.entryThesis.flip === 'FLIPPED';
+
         instance.stats.pnl += realizedProfit;
         instance.stats.closedTrades++;
 
@@ -470,25 +534,40 @@ class BotRunner extends EventEmitter {
           instance.stats.consecutiveLosses++;
         }
 
-        // Update rolling window for adaptive flip
-        if (run.result === 'WIN' || run.result === 'LOSS') {
-          instance.stats.recentResults.push(run.result === 'WIN' ? 'W' : 'L');
-          if (instance.stats.recentResults.length > FLIP_WINDOW) {
-            instance.stats.recentResults.shift();
-          }
-          const recentWins = instance.stats.recentResults.filter(x => x === 'W').length;
-          instance.stats.recentWinRate = recentWins / instance.stats.recentResults.length;
+        // Cumulative per-phase buckets (never reset)
+        if (tradeWasFlipped) {
+          instance.stats.flippedTrades++;
+          instance.stats.flippedPnl += realizedProfit;
+          if (run.result === 'WIN') instance.stats.flippedWins++;
+        } else {
+          instance.stats.normalTrades++;
+          instance.stats.normalPnl += realizedProfit;
+          if (run.result === 'WIN') instance.stats.normalWins++;
         }
 
-        this.emit('botResult', { instanceId: run.instanceId, botId: run.botId, contractId, result: run.result, pnl: realizedProfit, totalPnl: instance.stats.pnl, recentWinRate: instance.stats.recentWinRate, flipped: instance.stats.flipped, timestamp: new Date().toISOString() });
+        // Phase-local counters (drive the flip decision — reset on toggle)
+        instance.stats.phaseTrades++;
+        instance.stats.phasePnl += realizedProfit;
+        if (run.result === 'WIN') instance.stats.phaseWins++;
+
+        this.emit('botResult', {
+          instanceId: run.instanceId, botId: run.botId, contractId,
+          result: run.result, pnl: realizedProfit, totalPnl: instance.stats.pnl,
+          flipped: instance.stats.flipped, tradeWasFlipped,
+          phaseTrades: instance.stats.phaseTrades,
+          phasePnl: Number(instance.stats.phasePnl.toFixed(2)),
+          timestamp: new Date().toISOString(),
+        });
       }
     } catch (err) { logger.error(`[BotRunner] _onTradeClosed failed: ${err.message}`); }
   }
 
   _summarize(instance) {
-    // Strip recentResults from summary to keep WS payloads lean
+    // Strip potentially-large fields to keep WS payloads lean
     const statsForSummary = Object.assign({}, instance.stats);
-    delete statsForSummary.recentResults;
+    if (statsForSummary.flipHistory && statsForSummary.flipHistory.length > 5) {
+      statsForSummary.flipHistory = statsForSummary.flipHistory.slice(-5);
+    }
 
     return {
       instanceId: instance.instanceId, botId: instance.botId, name: instance.name, assetClass: instance.assetClass,
