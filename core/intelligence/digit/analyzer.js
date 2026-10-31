@@ -7,6 +7,19 @@
 //   • Over/Under edge
 // Emits 'digitUpdate' per tick, 'digitSignal' when edge exceeds threshold.
 // Also tracks recentPrices and directions for breakout bots.
+//
+// [FIX-1] Digit extraction was hardcoded to .toFixed(5). For 2-decimal
+//         instruments (R_10/R_25/R_50/R_75/R_100 and other synthetics),
+//         toFixed(5) pads with trailing zeros — the "last digit" was
+//         ALWAYS 0. This corrupted every digit reading: evenPct=100,
+//         oddPct=0, digit 5 at 0%, etc. Betting MATCH on the "cold"
+//         digit lost 100% of the time; betting DIFF won 100% of the
+//         time. Both were artifacts of the bug, not real edge.
+//         Now uses per-symbol precision (getDigitPrecision).
+//
+// [FIX-2] Added degenerate-distribution detection. If a 100+ sample
+//         window has <3 unique digits, log a warning. This would have
+//         caught the above bug in production.
 
 'use strict';
 
@@ -17,9 +30,46 @@ const logger = require('../../../infrastructure/logger') || console;
 const MAX_HISTORY = 1000;
 const SIGNAL_MIN_SAMPLES = 50;
 const SIGNAL_MIN_EDGE = 0.08;
+const DEGENERATE_CHECK_SAMPLES = 100;
+const DEGENERATE_MIN_UNIQUE = 3;
 
 function normalizeSymbol(sym) {
   return String(sym || '').replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
+}
+
+/**
+ * How many decimals to round the price to BEFORE extracting the last digit.
+ * Must match the actual quote precision of each instrument — otherwise
+ * toFixed() pads with trailing zeros and every tick yields digit 0.
+ *
+ * Deriv volatility indices (R_10, R_25, R_50, R_75, R_100) are quoted at
+ * 2 decimals. 1HZ* synthetics also 2 decimals. FX pairs are 5 (JPY: 3).
+ * Metals/crypto vary.
+ */
+function getDigitPrecision(symbol) {
+  const clean = normalizeSymbol(symbol);
+  const map = {
+    // FX majors — 5 decimals
+    EURUSD: 5, GBPUSD: 5, AUDUSD: 5, NZDUSD: 5, USDCHF: 5, USDCAD: 5,
+    EURGBP: 5, EURAUD: 5, EURNZD: 5, GBPAUD: 5, GBPNZD: 5, AUDNZD: 5,
+    AUDCAD: 5, AUDCHF: 5, NZDCAD: 5, NZDCHF: 5, CADCHF: 5,
+    // JPY pairs — 3 decimals
+    USDJPY: 3, EURJPY: 3, GBPJPY: 3, AUDJPY: 3, NZDJPY: 3, CADJPY: 3, CHFJPY: 3,
+    // Metals — varies
+    XAUUSD: 2, XAGUSD: 3,
+    // Crypto — varies
+    BTCUSD: 2, ETHUSD: 2,
+    // Volatility indices — 2 decimals (this was the bug)
+    R_10: 2, R_25: 2, R_50: 2, R_75: 2, R_100: 2,
+    '1HZ10V': 2, '1HZ25V': 2, '1HZ50V': 2, '1HZ75V': 2, '1HZ100V': 2,
+    '1HZ150V': 2, '1HZ250V': 2,
+    // Jump / step indices — 2 decimals
+    JD10: 2, JD25: 2, JD50: 2, JD75: 2, JD100: 2,
+    STPRNG: 2, 'STPRNG100': 2,
+  };
+  // Default to 2 — safest for synthetics, which is where digit trading runs.
+  // If a new symbol is added that needs >2, add it to the map.
+  return map[clean] != null ? map[clean] : 2;
 }
 
 class DigitAnalyzer extends EventEmitter {
@@ -27,6 +77,8 @@ class DigitAnalyzer extends EventEmitter {
     super();
     this._state = new Map();
     this._lastSignal = new Map();
+    this._lastWarnedPrecision = new Map();   // per-symbol, throttle precision log
+    this._lastWarnedDegenerate = new Map();  // per-symbol, throttle corrupt-data log
     this._listening = false;
   }
 
@@ -44,10 +96,17 @@ class DigitAnalyzer extends EventEmitter {
     const mid = Number(tick.mid ?? (tick.bid + tick.ask) / 2);
     if (!Number.isFinite(mid) || mid <= 0) return;
 
-    // Extract last digit from 5-decimal formatted price
-    const formatted = mid.toFixed(5);
+    // [FIX-1] Use per-symbol precision instead of hardcoded 5.
+    const precision = getDigitPrecision(symbol);
+    const formatted = mid.toFixed(precision);
     const digit = parseInt(formatted[formatted.length - 1], 10);
     if (!Number.isFinite(digit)) return;
+
+    // Log precision per symbol once (first tick only, per process).
+    if (!this._lastWarnedPrecision.has(symbol)) {
+      this._lastWarnedPrecision.set(symbol, true);
+      logger.info(`[DigitAnalyzer] ${symbol} → precision=${precision} (mid=${mid} → digit=${digit})`);
+    }
 
     let s = this._state.get(symbol);
     if (!s) {
@@ -72,7 +131,24 @@ class DigitAnalyzer extends EventEmitter {
     s.lastPrice = mid;
     s.lastUpdate = Date.now();
 
-    const view = this._computeView(s, symbol, mid);
+    // [FIX-2] Degenerate detection — throttle to once per 60s per symbol
+    if (s.digits.length >= DEGENERATE_CHECK_SAMPLES) {
+      const last = s.digits.slice(-DEGENERATE_CHECK_SAMPLES);
+      const unique = new Set(last).size;
+      if (unique < DEGENERATE_MIN_UNIQUE) {
+        const lastWarn = this._lastWarnedDegenerate.get(symbol) || 0;
+        if (Date.now() - lastWarn > 60000) {
+          this._lastWarnedDegenerate.set(symbol, Date.now());
+          logger.warn(
+            `[DigitAnalyzer] ${symbol} DEGENERATE — only ${unique} unique digit(s) ` +
+            `in last ${DEGENERATE_CHECK_SAMPLES} ticks (${JSON.stringify(Array.from(new Set(last)))}). ` +
+            `Check precision or broker feed. Digit trading signals unreliable.`
+          );
+        }
+      }
+    }
+
+    const view = this._computeView(s, symbol, mid, precision);
     this.emit('digitUpdate', view);
 
     const sig = this._detectSignal(symbol, view);
@@ -82,7 +158,7 @@ class DigitAnalyzer extends EventEmitter {
     }
   }
 
-  _computeView(s, symbol, currentPrice) {
+  _computeView(s, symbol, currentPrice, precision) {
     const digits = s.digits;
     const directions = s.directions;
 
@@ -124,6 +200,7 @@ class DigitAnalyzer extends EventEmitter {
       previousDigit: digits.length >= 2 ? digits[digits.length - 2] : null,
       arrow,
       price: currentPrice,
+      precision,                       // expose so consumers can verify
       sampleSize: total,
 
       digitFreq: freq,
@@ -195,16 +272,19 @@ class DigitAnalyzer extends EventEmitter {
   }
 
   getView(symbol) {
-    const s = this._state.get(normalizeSymbol(symbol));
+    const clean = normalizeSymbol(symbol);
+    const s = this._state.get(clean);
     if (!s || !s.digits.length) return null;
-    return this._computeView(s, symbol, s.lastPrice);
+    const precision = getDigitPrecision(clean);
+    return this._computeView(s, symbol, s.lastPrice, precision);
   }
 
   getAllViews() {
     const out = {};
     for (const [symbol, s] of this._state) {
       if (s.digits.length > 0) {
-        out[symbol] = this._computeView(s, symbol, s.lastPrice);
+        const precision = getDigitPrecision(symbol);
+        out[symbol] = this._computeView(s, symbol, s.lastPrice, precision);
       }
     }
     return out;
@@ -216,3 +296,4 @@ class DigitAnalyzer extends EventEmitter {
 }
 
 module.exports = new DigitAnalyzer();
+module.exports.getDigitPrecision = getDigitPrecision;
