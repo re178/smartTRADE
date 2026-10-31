@@ -1,17 +1,21 @@
 // core/bots/registry.js
 // 17 bots. Multi-signal, adaptive, risk-enforced.
 //
-// v3 changes:
-//   • Multipliers: only [200, 400, 600, 800] accepted (Deriv deprecated
-//     100/300/500).
-//   • All FX bots require strategy consensus to AGREE (not just "not conflict").
-//   • All FX bots enforce minRiskReward >= 2.0 on every entry.
-//   • Digit/binary bots can adaptively flip direction after 40 trades if
-//     win rate is below break-even — exploits any detected bias without
-//     guaranteeing loss like a static hedge would.
-//   • shouldFlip() defers to stats.flipped (set by runner's hysteresis
-//     logic) so there is a single source of truth for flip state.
-//   • Nothing disabled. Every bot is enabled and testable.
+// v4 changes:
+//   • Flip config flattened to individual fields so it renders in the
+//     bot config form (public/js/bots.js auto-populates from defaultConfig).
+//   • Flip DISABLED by default on all bots EXCEPT matches_differs_trader.
+//     Reason: MATCH→DIFF is the only mathematically-valid flip (DIFF is the
+//     exact complement of MATCH at the same payout). Symmetric contracts
+//     (EVEN/ODD, RISE/FALL, CALL/PUT) have identical payouts on both sides,
+//     so flipping them just donates the same house edge in the other
+//     direction. OVER/UNDER flip currently switches barriers (OVER 8 →
+//     UNDER 0), which is NOT the opposite bet — disabled until fixed.
+//   • sanitizeDigitView() rejects corrupted digitAnalyzer output. The
+//     observed bug (evenPct=100, oddPct=0 across 1000 ticks) is impossible
+//     for real RNG — this guard prevents bots from trading on garbage.
+//   • flipBelowPct uses integer percent (8 = 8%) for form usability.
+//   • minTrades lowered to 20 so flip activates sooner on slow bots.
 
 'use strict';
 
@@ -52,13 +56,54 @@ function wait(reason) {
   return { action: 'WAIT', reasons: Array.isArray(reason) ? reason : [reason] };
 }
 
+// ── Sanitize digit data ────────────────────────────────────────
+// The analyzer can return corrupt data (seen in production:
+// evenPct=100, oddPct=0 across 1000 samples — impossible).
+// This guard verifies integrity before any bot trades on it.
+// Returns null if data is corrupt or missing → caller returns WAIT.
+function sanitizeDigitView(dv) {
+  if (!dv) return null;
+
+  // Rise/fall direction array is the minimum viable data
+  const hasDirections = Array.isArray(dv.directions) && dv.directions.length >= 5;
+
+  // Frequency array is required for digit-specific bots
+  const freq = dv.digitFreq;
+  const total = Number(dv.sampleSize) || 0;
+  const hasFreq = Array.isArray(freq) && freq.length === 10 && total > 0;
+
+  if (!hasDirections && !hasFreq) return null;
+
+  // If freq array is present, verify it sums to sampleSize (within 5%)
+  if (hasFreq) {
+    const freqSum = freq.reduce((a, b) => a + (Number(b) || 0), 0);
+    if (Math.abs(freqSum - total) > total * 0.05) {
+      return null; // corrupt: freq doesn't sum to sampleSize
+    }
+    // Recompute even/odd from raw freq — don't trust the derived fields
+    const evenCount = (freq[0] || 0) + (freq[2] || 0) + (freq[4] || 0) + (freq[6] || 0) + (freq[8] || 0);
+    const oddCount = (freq[1] || 0) + (freq[3] || 0) + (freq[5] || 0) + (freq[7] || 0) + (freq[9] || 0);
+    const evenPct = (evenCount / total) * 100;
+    const oddPct = (oddCount / total) * 100;
+    // Sanity: even + odd must be ~100
+    if (Math.abs(evenPct + oddPct - 100) > 2) {
+      return null; // corrupt: computed even/odd don't sum to 100
+    }
+    return Object.assign({}, dv, { evenPct, oddPct });
+  }
+
+  // Direction-only data — check streak plausibility
+  if (Number(dv.evenStreak) > 200 || Number(dv.oddStreak) > 200) {
+    return null; // corrupt: 200+ streak impossible
+  }
+  return dv;
+}
+
 // ── Adaptive flip helper ────────────────────────────────────────
-// Flip state is owned by runner._updateFlipState() with hysteresis.
-// Registry simply reads stats.flipped — a single source of truth.
-// The breakEvenRate arg is kept for API compatibility but unused.
+// Flip state is owned by runner._updateFlipState(). Registry just reads
+// stats.flipped — single source of truth. Uses flat config (flipEnabled).
 function shouldFlip(config, stats) {
-  const fc = config.flipConfig;
-  if (!fc || !fc.enabled) return false;
+  if (!config || !config.flipEnabled) return false;
   return !!(stats && stats.flipped);
 }
 
@@ -87,7 +132,7 @@ function enterMultiplier(direction, config, overrides, reasons) {
       direction,
       stake: config.stake,
       multiplier: config.multiplier,
-      duration: null,             // multipliers exit on barrier, not time
+      duration: null,
       durationUnit: null,
       knockoutLevel: roundPrice(config.symbol, finalKnockout),
       takeProfitLevel: roundPrice(config.symbol, finalTakeProfit),
@@ -152,9 +197,6 @@ const BOTS = {
 
   // ============================================================
   // FX MULTIPLIER BOTS (7)
-  // All multipliers within [200, 400, 600, 800].
-  // All require strategy consensus to agree.
-  // All enforce minRiskReward >= 2.0.
   // ============================================================
 
   trend_rider: {
@@ -464,25 +506,28 @@ const BOTS = {
 
   // ============================================================
   // SYNTHETIC DIGIT BOTS (5)
-  // All use adaptive flip via stats.flipped (owned by runner).
+  // Only matches_differs_trader has flip enabled by default —
+  // it's the only bot where MATCH↔DIFF is a mathematically-valid flip.
+  // The others default to flipEnabled: false (user can override in form).
   // ============================================================
 
   even_odd_trader: {
     id: 'even_odd_trader', name: 'Even/Odd Trader',
-    description: 'Synthetic digit. Adaptive EVEN/ODD based on recent performance.',
+    description: 'Synthetic digit. EVEN/ODD on extreme edge. Flip NOT recommended (50/50).',
     assetClass: 'synthetic_digit', contractClass: 'digit',
     baseRate: 0.50,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5, minSamples: 50,
-      flipConfig: { enabled: true, minTrades: 40, flipBelow: 0.48 },
+      flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
-      const { digitView, config, stats } = ctx;
-      if (!digitView) return wait('No digit data');
-      if (digitView.sampleSize < config.minSamples) return wait('Not enough samples');
+      const dv = sanitizeDigitView(ctx.digitView);
+      if (!dv) return wait('Corrupt or missing digit data');
+      if (dv.sampleSize < ctx.config.minSamples) return wait('Not enough samples');
       
-      const even = digitView.evenPct;
-      const odd = digitView.oddPct;
+      const { config, stats } = ctx;
+      const even = dv.evenPct;
+      const odd = dv.oddPct;
       
       let normalDir = null;
       if (even >= 62) normalDir = 'DIGITEVEN';
@@ -495,7 +540,7 @@ const BOTS = {
         : normalDir;
       
       const reason = flip
-        ? `${normalDir} signal FLIPPED → ${finalDir} (recent WR below 48%)`
+        ? `${normalDir} FLIPPED → ${finalDir}`
         : `${normalDir.replace('DIGIT','')} ${(normalDir === 'DIGITEVEN' ? even : odd).toFixed(1)}%`;
       
       return enterDigit(finalDir, config, reason);
@@ -504,20 +549,21 @@ const BOTS = {
 
   over_under_trader: {
     id: 'over_under_trader', name: 'Over/Under Trader',
-    description: 'Synthetic digit. Adaptive OVER/UNDER with strict two-condition filter.',
+    description: 'Synthetic digit. OVER/UNDER on rare digit. Flip changes barrier (review before enabling).',
     assetClass: 'synthetic_digit', contractClass: 'digit',
     baseRate: 0.10,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5, threshold: 8, minSamples: 100,
-      flipConfig: { enabled: true, minTrades: 40, flipBelow: 0.08 },
+      flipEnabled: false, flipBelowPct: 8, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
-      const { digitView, config, stats } = ctx;
-      if (!digitView) return wait('No digit data');
-      if (digitView.sampleSize < config.minSamples) return wait('Not enough samples');
+      const dv = sanitizeDigitView(ctx.digitView);
+      if (!dv) return wait('Corrupt or missing digit data');
+      if (dv.sampleSize < ctx.config.minSamples) return wait('Not enough samples');
       
-      const freq = digitView.digitFreq;
-      const total = digitView.sampleSize;
+      const { config, stats } = ctx;
+      const freq = dv.digitFreq;
+      const total = dv.sampleSize;
       const th = config.threshold;
       
       const overCount = freq.slice(th + 1).reduce((a, b) => a + b, 0);
@@ -531,6 +577,10 @@ const BOTS = {
       else if (underPct <= 5.0) { normalDir = 'DIGITUNDER'; barrier = 0; }
       if (!normalDir) return wait(`Over ${th}: ${overPct.toFixed(1)}% / Under 1: ${underPct.toFixed(1)}% (Need <=5%)`);
       
+      // NOTE: flip logic disabled by default. When enabled, this flips
+      // OVER 8 → UNDER 0 (different barrier), which is NOT the true
+      // opposite bet. A proper fix would be OVER 8 → DIFF(9). Disabled
+      // until that refactor lands.
       const flip = shouldFlip(config, stats);
       let finalDir = normalDir;
       if (flip) {
@@ -539,8 +589,8 @@ const BOTS = {
       }
       
       const reason = flip
-        ? `${normalDir} signal FLIPPED → ${finalDir} (recent WR below 8%)`
-        : `Over ${th} cold (${overPct.toFixed(1)}%) or Under 1 cold (${underPct.toFixed(1)}%)`;
+        ? `${normalDir} FLIPPED → ${finalDir}`
+        : `Over ${th} (${overPct.toFixed(1)}%) / Under 1 (${underPct.toFixed(1)}%)`;
       
       return enterDigitBarrier(finalDir, barrier, config, reason);
     },
@@ -548,34 +598,34 @@ const BOTS = {
 
   matches_differs_trader: {
     id: 'matches_differs_trader', name: 'Matches/Differs Trader',
-    description: 'Synthetic digit. Adaptive MATCH/DIFF with two-digit confirmation.',
+    description: 'Synthetic digit. MATCH/DIFF — flip is MATHEMATICALLY VALID (complementary bets).',
     assetClass: 'synthetic_digit', contractClass: 'digit',
     baseRate: 0.10,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5, targetDigit: 5, minSamples: 100,
-      flipConfig: { enabled: true, minTrades: 40, flipBelow: 0.08 },
+      flipEnabled: true, flipBelowPct: 8, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
-      const { digitView, config, stats } = ctx;
-      if (!digitView) return wait('No digit data');
-      if (digitView.sampleSize < config.minSamples) return wait('Not enough samples');
+      const dv = sanitizeDigitView(ctx.digitView);
+      if (!dv) return wait('Corrupt or missing digit data');
+      if (dv.sampleSize < ctx.config.minSamples) return wait('Not enough samples');
       
-      const freq = digitView.digitFreq;
-      const total = digitView.sampleSize;
+      const { config, stats } = ctx;
+      const freq = dv.digitFreq;
+      const total = dv.sampleSize;
       const target = config.targetDigit;
       const targetPct = (freq[target] / total) * 100;
       
+      // Two-angle filter: target digit very cold AND neighbor also below-average
       const neighbor = (target + 1) % 10;
       const neighborPct = (freq[neighbor] / total) * 100;
-      const targetCold = targetPct <= 3.0;
-      const neighborCold = neighborPct <= 8.0;
-      if (!targetCold) return wait(`Digit ${target} at ${targetPct.toFixed(1)}% (Need <=3%)`);
-      if (!neighborCold) return wait(`Digit ${target} cold but neighbor ${neighbor} at ${neighborPct.toFixed(1)}% — distribution noise`);
+      if (targetPct > 3.0) return wait(`Digit ${target} at ${targetPct.toFixed(1)}% (Need <=3%)`);
+      if (neighborPct > 8.0) return wait(`Digit ${target} cold but neighbor ${neighbor} at ${neighborPct.toFixed(1)}%`);
       
       const flip = shouldFlip(config, stats);
       const finalDir = flip ? 'DIGITDIFF' : 'DIGITMATCH';
       const reason = flip
-        ? `Digits ${target}/${neighbor} cold FLIPPED → DIGITDIFF (recent MATCH WR below 8%)`
+        ? `Digits ${target}/${neighbor} cold FLIPPED → DIGITDIFF`
         : `Digits ${target}(${targetPct.toFixed(1)}%) & ${neighbor}(${neighborPct.toFixed(1)}%) both cold — MATCH`;
       
       return enterDigitBarrier(finalDir, target, config, reason);
@@ -584,19 +634,20 @@ const BOTS = {
 
   digit_streak_fade: {
     id: 'digit_streak_fade', name: 'Digit Streak Fade',
-    description: 'Synthetic digit. Adaptive streak fade with longer minimum.',
+    description: 'Synthetic digit. Fades even/odd streaks. Flip NOT recommended (symmetric).',
     assetClass: 'synthetic_digit', contractClass: 'digit',
     baseRate: 0.50,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5, minStreak: 8,
-      flipConfig: { enabled: true, minTrades: 40, flipBelow: 0.48 },
+      flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
-      const { digitView, config, stats } = ctx;
-      if (!digitView) return wait('No digit data');
+      const dv = sanitizeDigitView(ctx.digitView);
+      if (!dv) return wait('Corrupt or missing digit data');
       
-      const evenStreak = digitView.evenStreak || 0;
-      const oddStreak = digitView.oddStreak || 0;
+      const { config, stats } = ctx;
+      const evenStreak = dv.evenStreak || 0;
+      const oddStreak = dv.oddStreak || 0;
       const required = config.minStreak;
       
       let normalDir = null;
@@ -610,8 +661,8 @@ const BOTS = {
         : normalDir;
       
       const reason = flip
-        ? `${normalDir} fade FLIPPED → ${finalDir} (recent WR below 48%)`
-        : `${Math.max(evenStreak, oddStreak)}-streak ${evenStreak > oddStreak ? 'even' : 'odd'} — fade to ${finalDir.replace('DIGIT','')}`;
+        ? `${normalDir} fade FLIPPED → ${finalDir}`
+        : `${Math.max(evenStreak, oddStreak)}-streak — fade to ${finalDir.replace('DIGIT','')}`;
       
       return enterDigit(finalDir, config, reason);
     },
@@ -619,20 +670,21 @@ const BOTS = {
 
   digit_hot_cold: {
     id: 'digit_hot_cold', name: 'Digit Hot/Cold',
-    description: 'Synthetic digit. Adaptive extreme OVER/UNDER with tighter gate.',
+    description: 'Synthetic digit. Extreme OVER 8 / UNDER 0. Flip changes barrier (review before enabling).',
     assetClass: 'synthetic_digit', contractClass: 'digit',
     baseRate: 0.10,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5, minSamples: 150,
-      flipConfig: { enabled: true, minTrades: 40, flipBelow: 0.08 },
+      flipEnabled: false, flipBelowPct: 8, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
-      const { digitView, config, stats } = ctx;
-      if (!digitView) return wait('No digit data');
-      if (digitView.sampleSize < config.minSamples) return wait('Not enough samples');
+      const dv = sanitizeDigitView(ctx.digitView);
+      if (!dv) return wait('Corrupt or missing digit data');
+      if (dv.sampleSize < ctx.config.minSamples) return wait('Not enough samples');
       
-      const freq = digitView.digitFreq;
-      const total = digitView.sampleSize;
+      const { config, stats } = ctx;
+      const freq = dv.digitFreq;
+      const total = dv.sampleSize;
       
       const over8 = (freq.slice(9).reduce((a, b) => a + b, 0) / total) * 100;
       const under1 = (freq.slice(0, 1).reduce((a, b) => a + b, 0) / total) * 100;
@@ -649,7 +701,7 @@ const BOTS = {
       const barrier = finalDir === 'DIGITOVER' ? 8 : 0;
       
       const reason = flip
-        ? `${normalDir} FLIPPED → ${finalDir} (recent WR below 8%)`
+        ? `${normalDir} FLIPPED → ${finalDir}`
         : `Over 8=${over8.toFixed(1)}% / Under 1=${under1.toFixed(1)}%`;
       
       return enterDigitBarrier(finalDir, barrier, config, reason);
@@ -657,25 +709,26 @@ const BOTS = {
   },
 
   // ============================================================
-  // SYNTHETIC BINARY BOTS (3)
+  // SYNTHETIC BINARY BOTS (3) — all symmetric, flip off by default
   // ============================================================
 
   rise_fall_momentum: {
     id: 'rise_fall_momentum', name: 'Rise/Fall Momentum',
-    description: 'Synthetic CALL/PUT with adaptive flip.',
+    description: 'Synthetic CALL/PUT. Flip NOT recommended (50/50).',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5, minBias: 0.62, minSamples: 100,
-      flipConfig: { enabled: true, minTrades: 40, flipBelow: 0.48 },
+      flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
-      const { digitView, config, stats } = ctx;
-      if (!digitView) return wait('No data');
-      if (digitView.sampleSize < config.minSamples) return wait('Not enough samples');
+      const dv = sanitizeDigitView(ctx.digitView);
+      if (!dv) return wait('Corrupt or missing digit data');
+      if (dv.sampleSize < ctx.config.minSamples) return wait('Not enough samples');
       
-      const risePct = digitView.risePct / 100;
-      const fallPct = digitView.fallPct / 100;
+      const { config, stats } = ctx;
+      const risePct = dv.risePct / 100;
+      const fallPct = dv.fallPct / 100;
       
       let normalDir = null;
       if (risePct >= config.minBias) normalDir = 'CALL';
@@ -688,7 +741,7 @@ const BOTS = {
         : normalDir;
       
       const reason = flip
-        ? `${normalDir} FLIPPED → ${finalDir} (recent WR below 48%)`
+        ? `${normalDir} FLIPPED → ${finalDir}`
         : `Bias ${((normalDir === 'CALL' ? risePct : fallPct) * 100).toFixed(1)}%`;
       
       return enterBinary(finalDir, config, reason);
@@ -697,18 +750,19 @@ const BOTS = {
 
   rise_fall_streak: {
     id: 'rise_fall_streak', name: 'Rise/Fall Streak Fade',
-    description: 'Synthetic CALL/PUT with adaptive flip.',
+    description: 'Synthetic CALL/PUT. Flip NOT recommended (50/50).',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5, minStreak: 7,
-      flipConfig: { enabled: true, minTrades: 40, flipBelow: 0.48 },
+      flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
-      const { digitView, config, stats } = ctx;
-      if (!digitView) return wait('No data');
+      const dv = sanitizeDigitView(ctx.digitView);
+      if (!dv) return wait('Corrupt or missing digit data');
       
-      const dirs = (digitView.directions || []).slice(-20);
+      const { config, stats } = ctx;
+      const dirs = (dv.directions || []).slice(-20);
       if (dirs.length < config.minStreak) return wait('Not enough ticks');
       
       let streak = 0, lastDir = null;
@@ -726,7 +780,7 @@ const BOTS = {
       const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
       
       const reason = flip
-        ? `${streak}-tick ${lastDir}-streak FLIPPED → ${finalDir} (recent WR below 48%)`
+        ? `${streak}-tick ${lastDir}-streak FLIPPED → ${finalDir}`
         : `${streak}-tick ${lastDir}-streak → fade to ${finalDir}`;
       
       return enterBinary(finalDir, config, reason);
@@ -735,18 +789,19 @@ const BOTS = {
 
   rise_fall_breakout: {
     id: 'rise_fall_breakout', name: 'Rise/Fall Breakout',
-    description: 'Synthetic CALL/PUT with adaptive flip.',
+    description: 'Synthetic CALL/PUT. Flip NOT recommended (50/50).',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5, lookbackTicks: 10, minMovePct: 0.08,
-      flipConfig: { enabled: true, minTrades: 40, flipBelow: 0.48 },
+      flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
-      const { digitView, config, stats } = ctx;
-      if (!digitView) return wait('No data');
+      const dv = sanitizeDigitView(ctx.digitView);
+      if (!dv) return wait('Corrupt or missing digit data');
       
-      const prices = (digitView.recentPrices || []).slice(-config.lookbackTicks);
+      const { config, stats } = ctx;
+      const prices = (dv.recentPrices || []).slice(-config.lookbackTicks);
       if (prices.length < 5) return wait('Not enough prices');
       
       const first = prices[0], last = prices[prices.length - 1];
@@ -761,31 +816,32 @@ const BOTS = {
       const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
       
       const reason = flip
-        ? `Move ${movePct.toFixed(3)}% FLIPPED → ${finalDir} (recent WR below 48%)`
-        : `Move ${movePct.toFixed(3)}% in ${config.lookbackTicks} ticks`;
+        ? `Move ${movePct.toFixed(3)}% FLIPPED → ${finalDir}`
+        : `Move ${movePct.toFixed(3)}%`;
       
       return enterBinary(finalDir, config, reason);
     },
   },
 
   // ============================================================
-  // SYNTHETIC VOLATILITY BOTS (2)
+  // SYNTHETIC VOLATILITY BOTS (2) — flip off by default
   // ============================================================
 
   vol_high_low: {
     id: 'vol_high_low', name: 'Volatility High/Low',
-    description: 'Synthetic ONETOUCH/NOTOUCH with adaptive flip.',
+    description: 'Synthetic ONETOUCH/NOTOUCH. Flip review before enabling.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.30,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5, barrierPips: 10,
-      flipConfig: { enabled: true, minTrades: 40, flipBelow: 0.28 },
+      flipEnabled: false, flipBelowPct: 28, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
-      const { digitView, config, stats } = ctx;
-      if (!digitView) return wait('No data');
+      const dv = sanitizeDigitView(ctx.digitView);
+      if (!dv) return wait('Corrupt or missing digit data');
       
-      const dirs = (digitView.directions || []).slice(-20);
+      const { config, stats } = ctx;
+      const dirs = (dv.directions || []).slice(-20);
       const up = dirs.filter(d => d === 'up').length;
       const down = dirs.filter(d => d === 'down').length;
       const total = up + down;
@@ -804,8 +860,8 @@ const BOTS = {
         : normalDir;
       
       const reason = flip
-        ? `${normalDir} FLIPPED → ${finalDir} (recent WR below 28%)`
-        : `${normalDir === 'ONETOUCH' ? 'Strong' : 'Balanced'} directional bias ${(bias * 100).toFixed(1)}%`;
+        ? `${normalDir} FLIPPED → ${finalDir}`
+        : `${normalDir === 'ONETOUCH' ? 'Strong' : 'Balanced'} bias ${(bias * 100).toFixed(1)}%`;
       
       return enterBinary(finalDir, config, reason);
     },
@@ -813,18 +869,19 @@ const BOTS = {
 
   vol_scalper: {
     id: 'vol_scalper', name: 'Volatility Scalper',
-    description: 'Synthetic CALL/PUT quick scalps with adaptive flip.',
+    description: 'Synthetic CALL/PUT. Flip NOT recommended (50/50).',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5,
-      flipConfig: { enabled: true, minTrades: 40, flipBelow: 0.48 },
+      flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
-      const { digitView, config, stats } = ctx;
-      if (!digitView) return wait('No data');
+      const dv = sanitizeDigitView(ctx.digitView);
+      if (!dv) return wait('Corrupt or missing digit data');
       
-      const dirs = (digitView.directions || []).slice(-5);
+      const { config, stats } = ctx;
+      const dirs = (dv.directions || []).slice(-5);
       if (dirs.length < 5) return wait('Not enough ticks');
       
       const ups = dirs.filter(d => d === 'up').length;
@@ -839,7 +896,7 @@ const BOTS = {
       const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
       
       const reason = flip
-        ? `5/5 ticks FLIPPED → ${finalDir} (recent WR below 48%)`
+        ? `5/5 ticks FLIPPED → ${finalDir}`
         : `5/5 ticks ${normalDir === 'CALL' ? 'up' : 'down'}`;
       
       return enterBinary(finalDir, config, reason);
@@ -849,6 +906,9 @@ const BOTS = {
 
 // ── Session-level risk defaults ─────────────────────────────────
 // Applied to every bot. Individual bot defaultConfig wins on Object.assign.
+// Flip fields are here so they show up in the bot form for ALL bots —
+// user can enable flip on any bot from the dashboard, but defaults
+// are safe (off except matches_differs).
 const RISK_DEFAULTS = {
   botTakeProfit: 20,
   botStopLoss: 10,
@@ -859,6 +919,11 @@ const RISK_DEFAULTS = {
   requireConsensus: false,
   allowedRegimes: [],
   allowedSessions: [],
+  // Flip fields — user-configurable per bot from dashboard
+  flipEnabled: false,       // master toggle — enable/disable adaptive flip
+  flipBelowPct: 10,         // flip ON when overall win rate drops below this %
+  flipMinTrades: 20,        // don't evaluate flip until N total trades placed
+  flipStableTrades: 20,     // un-flip check activates after N flipped trades
 };
 
 for (const id in BOTS) {
@@ -878,4 +943,5 @@ module.exports = {
   normalizeSymbol,
   roundPrice,
   getPricePrecision,
+  sanitizeDigitView,
 };
