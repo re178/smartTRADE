@@ -3,12 +3,12 @@
 // Wires buttons from #section-edge to /api/edge-test/* endpoints.
 // Polls /status every 5s while test is running, renders progress + results.
 //
-// v2 additions:
-//   • Per-row delete buttons in results table (calls DELETE /bot/:botId)
-//   • "Delete All" button (calls DELETE /reset-all — safe while running)
-//   • "Start Fresh" button (reset-all → start in one action)
-//   • Flip state + recentWinRate shown in progress list
-//   • Busy state disables per-row delete buttons too
+// v3 additions:
+//   • Progress list shows flip badge, phase PnL, flip count per bot
+//   • Results table adds "Flip Effect" column (normal WR → flipped WR)
+//   • Summary banner mentions flip successes/failures
+//   • Tooltip on flip effect cell shows recent flip history
+//   • Rows sorted by verdict, then PnL (best performers first)
 
 'use strict';
 
@@ -120,7 +120,6 @@
     }
   }
 
-  // NEW: reset everything then immediately start fresh
   async function startFresh() {
     if (!confirm(
       'START FRESH?\n\n' +
@@ -137,11 +136,9 @@
     setButtonsBusy(true);
     stopPolling();
     try {
-      // Step 1: wipe everything (safely — stops test if running)
       const reset = await api('/reset-all', { method: 'DELETE' });
       console.log('[Edge] Reset complete:', reset);
 
-      // Step 2: start fresh
       const result = await api('/start', {
         method: 'POST',
         body: JSON.stringify({ stake, targetSample }),
@@ -210,7 +207,6 @@
     }
   }
 
-  // Updated: uses DELETE /reset-all so it works while test is running
   async function resetData() {
     if (!confirm(
       'Reset ALL Edge Validation data?\n\n' +
@@ -239,7 +235,6 @@
     }
   }
 
-  // NEW: delete one bot's history (called from per-row button)
   async function deleteBot(botId) {
     if (!confirm(
       `Delete all edge history for ${botId}?\n\n` +
@@ -294,6 +289,87 @@
   }
 
   // ============================================================
+  // Flip rendering helpers
+  // ============================================================
+
+  // Badge shown next to bot name in progress list.
+  // Only shown if flipEnabled is true — otherwise no badge (flip not in play).
+  function renderFlipBadge(bot) {
+    if (!bot.flipEnabled) return '';
+    if (bot.flipped) {
+      return `<span class="badge bg-warning text-dark ms-1" title="Bot is betting the opposite direction" style="font-size:0.62rem;">FLIPPED</span>`;
+    }
+    return `<span class="badge bg-light text-muted ms-1" style="font-size:0.62rem;">NORMAL</span>`;
+  }
+
+  // Phase info line under each bot in progress list.
+  // Only shown if flipEnabled.
+  function renderPhaseLine(bot) {
+    if (!bot.flipEnabled) return '';
+    const phaseT = Number(bot.phaseTrades) || 0;
+    const phaseP = Number(bot.phasePnl) || 0;
+    const nT = Number(bot.normalTrades) || 0;
+    const nP = Number(bot.normalPnl) || 0;
+    const fT = Number(bot.flippedTrades) || 0;
+    const fP = Number(bot.flippedPnl) || 0;
+    const fc = Number(bot.flipCount) || 0;
+
+    const parts = [];
+    if (phaseT > 0) parts.push(`phase ${phaseT}t $${phaseP.toFixed(2)}`);
+    if (nT > 0) parts.push(`normal ${nT}t $${nP.toFixed(2)}`);
+    if (fT > 0) parts.push(`flipped ${fT}t $${fP.toFixed(2)}`);
+    if (fc > 0) parts.push(`flips ${fc}`);
+
+    if (parts.length === 0) return '';
+    return `<div class="small text-muted mt-1" style="font-size:0.7rem;">
+      <i class="fas fa-exchange-alt me-1"></i>${parts.join(' · ')}
+    </div>`;
+  }
+
+  // "Flip Effect" cell in results table.
+  // Shows normal WR → flipped WR with directional indicator.
+  // Returns '—' if the bot never flipped (or has no data on either side).
+  function renderFlipEffect(bot) {
+    const n = bot.normal || { trades: 0, winRate: 0, pnl: 0 };
+    const f = bot.flipped || { trades: 0, winRate: 0, pnl: 0 };
+
+    // Never flipped (or flipped with no data yet)
+    if (!f.trades || f.trades === 0) {
+      if (n.trades > 0 && bot.flipEnabled === undefined) {
+        // Legacy bots without flip config — show dash
+        return `<span class="text-muted small">—</span>`;
+      }
+      return `<span class="text-muted small">—</span>`;
+    }
+
+    // Flipped data exists — show comparison
+    const nWR = (n.winRate * 100).toFixed(1);
+    const fWR = (f.winRate * 100).toFixed(1);
+    const nP = Number(n.pnl) || 0;
+    const fP = Number(f.pnl) || 0;
+    const helped = fP > nP;
+    const arrow = helped ? '↑' : '↓';
+    const color = helped ? 'text-success' : 'text-danger';
+
+    // Tooltip: recent flip history
+    const live = bot.liveFlipState;
+    let tooltip = `${n.trades} normal trades → ${f.trades} flipped trades\n`;
+    tooltip += `Normal: ${nWR}% ($${nP.toFixed(2)})\n`;
+    tooltip += `Flipped: ${fWR}% ($${fP.toFixed(2)})\n`;
+    tooltip += helped ? 'Flip IMPROVED performance' : 'Flip HURT performance';
+    if (live && Array.isArray(live.flipHistory) && live.flipHistory.length > 0) {
+      tooltip += '\n\nRecent flips:';
+      for (const h of live.flipHistory.slice(-3)) {
+        tooltip += `\n@${h.atTrade}t ${h.from ? 'FLIP→NORMAL' : 'NORMAL→FLIP'}: ${h.reason}`;
+      }
+    }
+
+    return `<span class="${color} fw-bold" title="${escapeHtml(tooltip)}" style="cursor:help; font-size:0.85rem;">
+      ${nWR}% ${arrow} ${fWR}%
+    </span>`;
+  }
+
+  // ============================================================
   // Renderers
   // ============================================================
   function renderStatus(status) {
@@ -341,13 +417,8 @@
           ? `<span class="text-primary"><i class="fas fa-check-circle"></i> done (${b.closedTrades})</span>`
           : `<span class="text-muted">idle</span>`;
 
-      // NEW: flip badge + recent win rate
-      const flipBadge = b.flipped
-        ? ` <span class="badge bg-warning text-dark ms-1" title="Direction flipped due to low win rate" style="font-size:0.65rem;">FLIPPED</span>`
-        : '';
-      const wrDisplay = (b.recentWinRate != null && b.closedTrades > 0)
-        ? ` <span class="text-muted ms-1" style="font-size:0.7rem;">WR ${(b.recentWinRate * 100).toFixed(0)}%</span>`
-        : '';
+      const flipBadge = renderFlipBadge(b);
+      const phaseLine = renderPhaseLine(b);
 
       const reasonLine = b.lastReason
         ? `<div class="bot-meta text-truncate" style="max-width: 100%;">${escapeHtml(b.lastReason)}</div>`
@@ -363,13 +434,13 @@
           <div class="small text-end">
             <span class="fw-bold">${b.closedTrades}</span>
             <span class="text-muted">/${b.targetSample}</span>
-            ${wrDisplay}
             <span class="ms-2">${statusLine}</span>
           </div>
         </div>
         <div class="edge-progress-wrap">
           <div class="${barClass}" style="width:${pct}%;"></div>
         </div>
+        ${phaseLine}
         ${reasonLine}
       </div>`;
     }).join('');
@@ -379,17 +450,39 @@
     const banner = document.getElementById('edgeSummaryBanner');
     if (banner && results.summary) {
       const s = results.summary;
+
+      // Count flip outcomes: how many bots were helped vs hurt by flipping
+      let flipHelped = 0, flipHurt = 0, flipNeutral = 0;
+      for (const b of (results.bots || [])) {
+        const n = b.normal || { trades: 0 };
+        const f = b.flipped || { trades: 0, pnl: 0 };
+        const nPnl = Number((b.normal || {}).pnl) || 0;
+        const fPnl = Number(f.pnl) || 0;
+        if (n.trades >= 20 && f.trades >= 20) {
+          if (fPnl > nPnl + 0.01) flipHelped++;
+          else if (fPnl < nPnl - 0.01) flipHurt++;
+          else flipNeutral++;
+        }
+      }
+
+      const flipLine = flipHelped > 0 || flipHurt > 0
+        ? `<br><span class="small"><i class="fas fa-exchange-alt me-1"></i>` +
+          `<strong class="text-success">${flipHelped}</strong> improved by flip · ` +
+          `<strong class="text-danger">${flipHurt}</strong> hurt by flip · ` +
+          `<strong class="text-muted">${flipNeutral}</strong> neutral</span>`
+        : '';
+
       if (s.withEdge > 0) {
         banner.className = 'edge-summary-banner good';
         banner.innerHTML =
           `<strong>✓ ${s.withEdge} bot${s.withEdge === 1 ? '' : 's'} show statistical edge</strong> ` +
           `(z ≥ 1.96) out of ${s.totalBots}. ` +
-          `${s.noEdge} show no edge, ${s.needMoreData} still collecting.`;
+          `${s.noEdge} show no edge, ${s.needMoreData} still collecting.${flipLine}`;
       } else if (s.needMoreData > 0 && s.totalClosedTrades > 0) {
         banner.className = 'edge-summary-banner neutral';
         banner.innerHTML =
           `<strong>Collecting data</strong> — ${s.totalClosedTrades} closed trades so far, ` +
-          `${s.needMoreData} bot${s.needMoreData === 1 ? '' : 's'} still below target sample.`;
+          `${s.needMoreData} bot${s.needMoreData === 1 ? '' : 's'} still below target sample.${flipLine}`;
       } else if (s.totalClosedTrades === 0) {
         banner.className = 'edge-summary-banner neutral';
         banner.innerHTML = '<p class="mb-0 small">No edge data yet. Click <strong>Start Edge Validation</strong> to begin.</p>';
@@ -397,7 +490,7 @@
         banner.className = 'edge-summary-banner bad';
         banner.innerHTML =
           `<strong>No edge detected</strong> — ${s.noEdge} bot${s.noEdge === 1 ? '' : 's'} tested, ` +
-          `none above the statistical threshold.`;
+          `none above the statistical threshold.${flipLine}`;
       }
     }
 
@@ -405,17 +498,18 @@
     if (!tbody) return;
 
     if (!results.bots || results.bots.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="10" class="text-muted p-3">No bots found.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="11" class="text-muted p-3">No bots found.</td></tr>';
       return;
     }
 
-    // Sort: EDGE first, then NEED_MORE_DATA, then NO_EDGE; within each by trades desc
+    // Sort: EDGE first, then NEED_MORE_DATA, then NO_EDGE; within each by PnL desc
     const order = { EDGE: 0, NEED_MORE_DATA: 1, NO_EDGE: 2 };
     const sorted = [...results.bots].sort((a, b) => {
       const ao = order[a.verdict] != null ? order[a.verdict] : 9;
       const bo = order[b.verdict] != null ? order[b.verdict] : 9;
       if (ao !== bo) return ao - bo;
-      return (b.closedTrades || 0) - (a.closedTrades || 0);
+      // Within same verdict: by PnL (best first)
+      return (Number(b.pnl) || 0) - (Number(a.pnl) || 0);
     });
 
     tbody.innerHTML = sorted.map(b => {
@@ -424,7 +518,8 @@
       const edgeClass = edgePp > 0 ? 'text-success' : edgePp < 0 ? 'text-danger' : 'text-muted';
       const zClass = Math.abs(b.zScore || 0) >= 1.96 ? 'fw-bold' : '';
 
-      // NEW: per-row delete button (only if bot has any trades to delete)
+      const flipEffect = renderFlipEffect(b);
+
       const canDelete = (b.closedTrades || 0) > 0;
       const deleteBtn = canDelete
         ? `<button class="btn btn-sm btn-outline-danger py-0 px-2 edge-row-delete"
@@ -441,6 +536,7 @@
         <td class="text-end">${b.winRate != null ? (b.winRate * 100).toFixed(1) + '%' : '—'}</td>
         <td class="text-end text-muted">${b.baseRate != null ? (b.baseRate * 100).toFixed(0) + '%' : '—'}</td>
         <td class="text-end ${edgeClass}">${edgePp !== 0 ? (edgePp > 0 ? '+' : '') + edgePp.toFixed(1) + 'pp' : '—'}</td>
+        <td class="text-end">${flipEffect}</td>
         <td class="text-end ${zClass}">${b.zScore != null ? b.zScore.toFixed(2) : '—'}</td>
         <td class="text-end">${b.rr != null ? b.rr.toFixed(2) + ':1' : '—'}</td>
         <td class="text-end ${pnlClass(b.pnl)}">${fmtCurrency(b.pnl)}</td>
@@ -488,14 +584,12 @@
   // Button state management
   // ============================================================
   function setButtonsBusy(busy) {
-    // Main action buttons
     ['edgeStartBtn', 'edgeStopBtn', 'edgeRefreshBtn', 'edgeExportBtn',
      'edgeResetBtn', 'edgeStartFreshBtn']
       .forEach(id => {
         const el = document.getElementById(id);
         if (el) el.disabled = busy;
       });
-    // Per-row delete buttons (dynamically rendered) — disable during busy
     document.querySelectorAll('.edge-row-delete').forEach(btn => {
       btn.disabled = busy;
     });
@@ -507,11 +601,11 @@
     const freshBtn = document.getElementById('edgeStartFreshBtn');
     if (startBtn) startBtn.disabled = !!status.running;
     if (stopBtn) stopBtn.disabled = !status.running;
-    if (freshBtn) freshBtn.disabled = false; // Always enabled — it stops then restarts
+    if (freshBtn) freshBtn.disabled = false;
   }
 
   // ============================================================
-  // Polling — only while running
+  // Polling
   // ============================================================
   function startPolling() {
     stopPolling();
@@ -557,20 +651,14 @@
     document.getElementById('edgeExportBtn')?.addEventListener('click', exportCSV);
     document.getElementById('edgeResetBtn')?.addEventListener('click', resetData);
 
-    // Initial load (so buttons reflect state even if user lands on another section)
     loadStatus().then(() => {
-      // If already running on page load, resume polling
       if (_lastStatus && _lastStatus.running) startPolling();
     });
   });
 
-  // Expose to global scope
-  // - loadEdgeStatus / loadEdgeResults: called by index.html nav lazy-load
-  // - edgeDeleteBot: called by per-row delete buttons (onclick attribute)
   window.loadEdgeStatus = loadStatus;
   window.loadEdgeResults = loadResults;
   window.edgeDeleteBot = deleteBot;
 
-  // Cleanup on page unload
   window.addEventListener('beforeunload', stopPolling);
 })();
