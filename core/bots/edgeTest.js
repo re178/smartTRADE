@@ -7,18 +7,15 @@
 //   - Binomial z-score (statistical significance)
 //   - Verdict: EDGE / NO_EDGE / NEED_MORE_DATA
 //
-// One edge test runs at a time. Progress persists in BotRun docs, so
-// stats survive server restart — but the in-memory runner instances do
-// not, so a restart mid-test leaves the bots stopped and the test flagged
-// as paused. Clicking Start again resumes from where it left off.
+// v3 additions (flip-awareness):
+//   • _aggregate() splits stats by entryThesis.flip → normal vs flipped
+//   • _verdict() mentions flip phase comparison when both phases have data
+//   • status() exposes runner's phase counters (phaseTrades, phasePnl,
+//     normalTrades, normalPnl, flippedTrades, flippedPnl, flipCount)
+//   • results() returns flip breakdown per bot
+//   • exportCSV() adds a FlipStats summary column
 //
-// v2 additions:
-//   • deleteBot(botId)  — delete one bot's edge history (used by per-row
-//                         delete buttons in the dashboard)
-//   • resetAll()        — stop the test (if running) + delete all edge
-//                         history (used by "Reset & Restart" button)
-//   • exportCSV now emits a Flip column (NORMAL / FLIPPED) so the CSV
-//     shows which trades were made by a flipped bot instance.
+// One edge test runs at a time. Progress persists in BotRun docs.
 
 'use strict';
 
@@ -30,14 +27,12 @@ const logger = require('../../infrastructure/logger') || console;
 const DEFAULT_TARGET_SAMPLE = 160;
 const DEFAULT_STAKE = 1;
 const MONITOR_INTERVAL_MS = 10000;
-// Two-tailed p < 0.05. Conservative threshold — requires stronger evidence
-// than the one-tailed 1.645. Use 1.96 so a "verdict" is trustworthy.
 const Z_THRESHOLD = 1.96;
+const FLIP_PHASE_MIN_TRADES = 20;   // matches default flipMinTrades / flipStableTrades
 
 let _schemaVerified = false;
 async function _verifyBotRunSchema() {
   if (_schemaVerified) return;
-  // Probe write — verifies Mongoose doesn't silently strip our fields.
   let probeId = null;
   try {
     const probe = await BotRun.create({
@@ -79,13 +74,13 @@ class EdgeTest {
     this.startedAt = null;
     this.targetSample = DEFAULT_TARGET_SAMPLE;
     this.stake = DEFAULT_STAKE;
-    this.instances = new Map();     // botId -> instanceId
-    this.stoppedBots = new Set();   // botIds that reached target this run
+    this.instances = new Map();
+    this.stoppedBots = new Set();
     this._monitorTimer = null;
   }
 
   // ──────────────────────────────────────────────────────────
-  // START — spin up every bot in controlled edge-test mode
+  // START
   // ──────────────────────────────────────────────────────────
   async start(options = {}) {
     if (this.running) {
@@ -102,7 +97,6 @@ class EdgeTest {
       throw new Error(`Target sample too small: ${targetSample}. Minimum 30 trades for statistical meaning.`);
     }
 
-    // Clean up any orphan edge-test instances from a prior crashed run.
     try {
       const existing = botRunner.list();
       for (const inst of existing) {
@@ -124,7 +118,6 @@ class EdgeTest {
     const skippedBots = [];
 
     for (const bot of bots) {
-      // Pre-check: if already at target sample, don't even start.
       let existing = 0;
       try {
         existing = await BotRun.countDocuments({
@@ -140,11 +133,11 @@ class EdgeTest {
 
       const config = Object.assign({}, bot.defaultConfig, {
         stake: stake,
-        maxStake: stake,               // hard equal stake — no exceptions
-        botTakeProfit: 0,              // disabled — collect full sample
-        botStopLoss: 0,                // disabled
-        trailingDrawdownPct: 0,        // disabled
-        stopAfterLosses: 0,            // disabled
+        maxStake: stake,
+        botTakeProfit: 0,
+        botStopLoss: 0,
+        trailingDrawdownPct: 0,
+        stopAfterLosses: 0,
         _edgeTest: true,
       });
 
@@ -158,7 +151,6 @@ class EdgeTest {
       }
     }
 
-    // If everything was already complete, immediately declare finished
     if (this.instances.size === 0) {
       this.running = false;
       this.startedAt = null;
@@ -195,7 +187,7 @@ class EdgeTest {
   }
 
   // ──────────────────────────────────────────────────────────
-  // STOP — halt all edge-test instances, keep data
+  // STOP
   // ──────────────────────────────────────────────────────────
   stop() {
     if (!this.running) {
@@ -222,7 +214,7 @@ class EdgeTest {
   }
 
   // ──────────────────────────────────────────────────────────
-  // MONITOR — every 10s, check which bots hit target and stop them
+  // MONITOR
   // ──────────────────────────────────────────────────────────
   async _checkProgress() {
     if (!this.running) return;
@@ -259,7 +251,7 @@ class EdgeTest {
   }
 
   // ──────────────────────────────────────────────────────────
-  // STATUS — lightweight, for progress bars in the UI
+  // STATUS — now exposes runner's flip phase fields
   // ──────────────────────────────────────────────────────────
   async status() {
     const bots = listBots();
@@ -281,6 +273,8 @@ class EdgeTest {
       const instance = instanceId ? botRunner.get(instanceId) : null;
       const progress = this.targetSample > 0 ? Math.min(1, closed / this.targetSample) : 0;
 
+      // Pull phase-aware fields from runner's stats (v3)
+      const s = instance && instance.stats ? instance.stats : {};
       perBot.push({
         botId: bot.id,
         name: bot.name,
@@ -294,12 +288,20 @@ class EdgeTest {
         stopped: this.stoppedBots.has(bot.id),
         lastReason: instance ? instance.lastReason : null,
         pnl: instance && instance.stats ? instance.stats.pnl : null,
-        flipped: instance && instance.stats ? !!instance.stats.flipped : false,
-        recentWinRate: instance && instance.stats ? instance.stats.recentWinRate : null,
+        // Flip state
+        flipEnabled: !!(instance && instance.config && instance.config.flipEnabled),
+        flipped: !!s.flipped,
+        phaseTrades: s.phaseTrades || 0,
+        phasePnl: s.phasePnl != null ? Number(s.phasePnl.toFixed(2)) : 0,
+        normalTrades: s.normalTrades || 0,
+        normalPnl: s.normalPnl != null ? Number(s.normalPnl.toFixed(2)) : 0,
+        flippedTrades: s.flippedTrades || 0,
+        flippedPnl: s.flippedPnl != null ? Number(s.flippedPnl.toFixed(2)) : 0,
+        flipCount: s.flipCount || 0,
       });
     }
 
-    const totalClosed = perBot.reduce((s, b) => s + b.closedTrades, 0);
+    const totalClosed = perBot.reduce((sum, b) => sum + b.closedTrades, 0);
     const totalTarget = this.targetSample * bots.length;
     const overallProgress = totalTarget > 0 ? totalClosed / totalTarget : 0;
 
@@ -316,7 +318,7 @@ class EdgeTest {
   }
 
   // ──────────────────────────────────────────────────────────
-  // RESULTS — full statistical analysis with verdicts
+  // RESULTS — full statistical analysis with flip breakdown
   // ──────────────────────────────────────────────────────────
   async results() {
     const bots = listBots();
@@ -329,6 +331,16 @@ class EdgeTest {
 
       const stats = this._aggregate(docs, bot.baseRate != null ? bot.baseRate : 0.5);
       const verdict = this._verdict(stats, bot.baseRate != null ? bot.baseRate : 0.5);
+
+      // Live flip state (only available if instance is still running)
+      const instanceId = this.instances.get(bot.id);
+      const instance = instanceId ? botRunner.get(instanceId) : null;
+      const liveFlipState = instance && instance.stats ? {
+        flipped: !!instance.stats.flipped,
+        flipCount: instance.stats.flipCount || 0,
+        flipHistory: (instance.stats.flipHistory || []).slice(-5),
+      } : null;
+
       perBot.push({
         botId: bot.id,
         name: bot.name,
@@ -337,6 +349,7 @@ class EdgeTest {
         ...stats,
         verdict: verdict.code,
         verdictReason: verdict.reason,
+        liveFlipState,
       });
     }
 
@@ -344,8 +357,6 @@ class EdgeTest {
     const failed = perBot.filter(b => b.verdict === 'NO_EDGE');
     const pending = perBot.filter(b => b.verdict === 'NEED_MORE_DATA');
 
-    // Recommendation: for each regime, list top 3 bots with EDGE verdict that
-    // performed in that regime. Frontend can pick based on current regime.
     const recommendations = {};
     for (const b of withEdge) {
       for (const [regime, data] of Object.entries(b.byRegime || {})) {
@@ -377,37 +388,35 @@ class EdgeTest {
         withEdge: withEdge.length,
         noEdge: failed.length,
         needMoreData: pending.length,
-        totalClosedTrades: perBot.reduce((s, b) => s + b.closedTrades, 0),
+        totalClosedTrades: perBot.reduce((sum, b) => sum + b.closedTrades, 0),
       },
       recommendations,
     };
   }
 
   // ──────────────────────────────────────────────────────────
-  // CSV EXPORT — all edge test trades, fully enriched
+  // CSV EXPORT — added FlipStats summary column
   // ──────────────────────────────────────────────────────────
   async exportCSV() {
     const docs = await BotRun.find({ isEdgeTest: true })
       .sort({ openedAt: 1 })
       .lean();
 
-    if (docs.length === 0) {
-      return null; // caller returns 404
-    }
+    if (docs.length === 0) return null;
 
     const headers = [
       'Opened', 'Closed', 'Bot', 'Symbol', 'Side', 'ContractType',
       'Stake', 'Multiplier', 'Duration', 'DurationUnit',
       'EntryPrice', 'ExitPrice', 'TakeProfit', 'Knockout',
       'PnL', 'Result', 'Status',
-      'Session', 'Flip', 'RegimeCode', 'RegimeConfidence',
+      'Session', 'Flip', 'FlipStats', 'RegimeCode', 'RegimeConfidence',
       'Confidence', 'PredictedDirection',
       'PatternBias', 'PatternConfidence', 'Patterns',
       'MomentumRoc', 'MomentumDir', 'MomentumConsecutive',
       'VolatilityRegime', 'VolatilityRatio',
       'StrategyAction', 'StrategyDirection', 'StrategyConfidence', 'StrategyAgreeing',
-      'DigitSampleSize', 'DigitEvenPct', 'DigitOddPct', 'DigitRisePct', 'DigitFallPct',
-      'RecentWinRateAtEntry',
+      'DigitSampleSize', 'DigitPrecision', 'DigitEvenPct', 'DigitOddPct', 'DigitRisePct', 'DigitFallPct',
+      'PhaseStats',
       'Reasons',
     ];
 
@@ -420,6 +429,15 @@ class EdgeTest {
       const volatility = thesis.volatility || {};
       const consensus = thesis.strategyConsensus || {};
       const dv = thesis.digitView || {};
+      const ps = thesis.phaseStats || {};
+
+      // Compact flip-stats summary: "normal:N/W/flipped:N/W"
+      const nT = Number(ps.normalTrades) || 0;
+      const fT = Number(ps.flippedTrades) || 0;
+      const flipStats = `${nT}N/${fT}F`;
+
+      // Compact phase-stats: "phase:T/Pnl/flips:C"
+      const phaseStats = `${Number(ps.phaseTrades) || 0}t/${Number(ps.phasePnl) || 0}/f${Number(ps.flipCount) || 0}`;
 
       const row = [
         this._iso(d.openedAt),
@@ -441,6 +459,7 @@ class EdgeTest {
         this._csv(d.status),
         this._csv(d.session),
         this._csv(thesis.flip || 'NORMAL'),
+        this._csv(flipStats),
         this._csv(d.regimeCode),
         this._num(thesis.regimeConfidence),
         this._num(thesis.confidence),
@@ -458,11 +477,12 @@ class EdgeTest {
         this._num(consensus.confidence),
         this._csv((consensus.agreeing || []).join('|')),
         this._num(dv.sampleSize),
+        this._num(dv.precision),
         this._num(dv.evenPct),
         this._num(dv.oddPct),
         this._num(dv.risePct),
         this._num(dv.fallPct),
-        this._num(thesis.recentWinRate),
+        this._csv(phaseStats),
         this._csv((d.reasons || []).join(' | ')),
       ];
 
@@ -473,7 +493,7 @@ class EdgeTest {
   }
 
   // ──────────────────────────────────────────────────────────
-  // RESET — delete all edge test BotRun docs (requires stopped state)
+  // RESET / DELETE / RESET-ALL
   // ──────────────────────────────────────────────────────────
   async reset() {
     if (this.running) {
@@ -487,15 +507,9 @@ class EdgeTest {
     return { ok: true, deletedCount: result.deletedCount || 0 };
   }
 
-  // ──────────────────────────────────────────────────────────
-  // DELETE BOT — wipe one bot's edge test history
-  // Stops the bot's running instance (if any) so its in-memory
-  // stats are discarded — prevents stale flip state carrying over.
-  // ──────────────────────────────────────────────────────────
   async deleteBot(botId) {
     if (!botId) throw new Error('botId required');
 
-    // Stop the running instance for this bot (if any)
     const instanceId = this.instances.get(botId);
     if (instanceId) {
       try {
@@ -519,16 +533,9 @@ class EdgeTest {
     };
   }
 
-  // ──────────────────────────────────────────────────────────
-  // RESET ALL — stop test if running, then wipe everything
-  // This is the "Reset & Restart" flow. Safer than reset() because
-  // it stops the test automatically instead of throwing.
-  // ──────────────────────────────────────────────────────────
   async resetAll() {
     const wasRunning = this.running;
-    if (wasRunning) {
-      this.stop();
-    }
+    if (wasRunning) this.stop();
     const result = await BotRun.deleteMany({ isEdgeTest: true });
     this.stoppedBots.clear();
     this.instances.clear();
@@ -550,7 +557,9 @@ class EdgeTest {
     const wins = docs.filter(d => d.result === 'WIN').length;
     const losses = docs.filter(d => d.result === 'LOSS').length;
     const breakevens = docs.filter(d => d.result === 'BREAKEVEN').length;
-    const pnl = docs.reduce((s, d) => s + (Number(d.pnl) || 0), 0);
+    const pnl = docs.reduce((sum, d) => sum + (Number(d.pnl) || 0), 0);
+
+    // Overall RR
     const winPnls = docs.filter(d => d.result === 'WIN').map(d => Number(d.pnl) || 0);
     const lossPnls = docs.filter(d => d.result === 'LOSS').map(d => Math.abs(Number(d.pnl) || 0));
     const avgWin = winPnls.length ? winPnls.reduce((a, b) => a + b, 0) / winPnls.length : 0;
@@ -558,11 +567,18 @@ class EdgeTest {
     const rr = avgLoss > 0 ? avgWin / avgLoss : (avgWin > 0 ? Infinity : 0);
     const winRate = total > 0 ? wins / total : 0;
 
-    // Binomial z-score: (observed - expected) / sqrt(N * p * (1-p))
+    // Flip breakdown — split by entryThesis.flip
+    const normalDocs = docs.filter(d => !(d.entryThesis && d.entryThesis.flip === 'FLIPPED'));
+    const flippedDocs = docs.filter(d => d.entryThesis && d.entryThesis.flip === 'FLIPPED');
+    const normal = this._phaseSummary(normalDocs);
+    const flipped = this._phaseSummary(flippedDocs);
+
+    // Binomial z-score
     const expected = total * baseRate;
     const variance = total * baseRate * (1 - baseRate);
     const zScore = variance > 0 ? (wins - expected) / Math.sqrt(variance) : 0;
 
+    // Regime/session breakdowns
     const byRegime = {};
     const bySession = {};
     for (const d of docs) {
@@ -594,8 +610,25 @@ class EdgeTest {
       avgLoss: Number(avgLoss.toFixed(2)),
       rr: Number.isFinite(rr) ? Number(rr.toFixed(2)) : null,
       zScore: Number(zScore.toFixed(2)),
+      normal,
+      flipped,
       byRegime,
       bySession,
+    };
+  }
+
+  _phaseSummary(docs) {
+    const trades = docs.length;
+    const wins = docs.filter(d => d.result === 'WIN').length;
+    const losses = docs.filter(d => d.result === 'LOSS').length;
+    const pnl = docs.reduce((sum, d) => sum + (Number(d.pnl) || 0), 0);
+    const winRate = trades > 0 ? wins / trades : 0;
+    return {
+      trades,
+      wins,
+      losses,
+      winRate: Number(winRate.toFixed(4)),
+      pnl: Number(pnl.toFixed(2)),
     };
   }
 
@@ -606,21 +639,34 @@ class EdgeTest {
         reason: `${stats.closedTrades} / ${this.targetSample} closed trades`,
       };
     }
+
+    // Append flip context if both phases have meaningful sample
+    let flipContext = '';
+    const n = stats.normal;
+    const f = stats.flipped;
+    if (n && f && n.trades >= FLIP_PHASE_MIN_TRADES && f.trades >= FLIP_PHASE_MIN_TRADES) {
+      const nWR = (n.winRate * 100).toFixed(1);
+      const fWR = (f.winRate * 100).toFixed(1);
+      const nP = n.pnl.toFixed(2);
+      const fP = f.pnl.toFixed(2);
+      flipContext = ` | flip phase WR ${fWR}% ($${fP}) vs normal WR ${nWR}% ($${nP})`;
+    }
+
     if (stats.zScore >= Z_THRESHOLD) {
       return {
         code: 'EDGE',
-        reason: `Win rate ${(stats.winRate * 100).toFixed(1)}% vs base ${(baseRate * 100).toFixed(0)}%, z=${stats.zScore}`,
+        reason: `Win rate ${(stats.winRate * 100).toFixed(1)}% vs base ${(baseRate * 100).toFixed(0)}%, z=${stats.zScore}${flipContext}`,
       };
     }
     if (stats.zScore <= -Z_THRESHOLD) {
       return {
         code: 'NO_EDGE',
-        reason: `Significantly worse than base rate (z=${stats.zScore})`,
+        reason: `Significantly worse than base rate (z=${stats.zScore})${flipContext}`,
       };
     }
     return {
       code: 'NO_EDGE',
-      reason: `Win rate ${(stats.winRate * 100).toFixed(1)}% not distinguishable from base ${(baseRate * 100).toFixed(0)}% (z=${stats.zScore})`,
+      reason: `Win rate ${(stats.winRate * 100).toFixed(1)}% not distinguishable from base ${(baseRate * 100).toFixed(0)}% (z=${stats.zScore})${flipContext}`,
     };
   }
 
