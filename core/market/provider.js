@@ -1,23 +1,26 @@
 // core/market/provider.js – Market Data Provider (uses brokerFactory with product support)
+//
+// [FIX-PROVIDER-1] getBrokerForProduct previously called getBroker(product)
+//   with product potentially undefined. brokerFactory.getBroker() explicitly
+//   throws "Product must be specified" when product is falsy. Every strategy
+//   call into engine.getCandlesOnce() → provider.getCandles() → this path
+//   was dying with that error, which meant:
+//     • Every strategy returned null on every cycle
+//     • ranker.rank() got no signals → consensus.action never = 'SIGNAL'
+//     • All FX bots stuck on "Strategy consensus does not agree" forever
+//   Defaulting to 'deriv_cfd' — the only supported product in this build —
+//   unblocks every strategy in the engine. Callers that pass a product
+//   explicitly still get that product.
 
 const { getBroker } = require('../execution/brokerFactory');
 const logger = require('../../infrastructure/logger') || console;
 
-/**
- * Get the broker instance for the given product (or default if omitted).
- * @param {string} [product] - e.g., 'mt5', 'deriv_cfd', etc.
- * @returns {object} broker instance
- */
+const DEFAULT_PRODUCT = 'deriv_cfd';
+
 function getBrokerForProduct(product) {
-  return getBroker(product); // factory handles default internally
+  return getBroker(product || DEFAULT_PRODUCT);
 }
 
-/**
- * Get current prices for one or more instruments.
- * @param {string[]} instruments - Array of instrument names (e.g., ['EUR_USD'])
- * @param {string} [product] - Trading product (optional)
- * @returns {Promise<Object[]>} Array of price objects from broker.
- */
 async function getPrices(instruments, product) {
   const broker = getBrokerForProduct(product);
   if (!broker.isConnected()) {
@@ -26,14 +29,6 @@ async function getPrices(instruments, product) {
   return broker.getPrices(instruments);
 }
 
-/**
- * Get candlestick data for an instrument.
- * @param {string} instrument - Instrument name (e.g., 'EUR_USD')
- * @param {number} count - Number of candles to fetch (max 5000)
- * @param {string} granularity - Candlestick granularity (e.g., 'M5', 'H1', 'D')
- * @param {string} [product] - Trading product (optional)
- * @returns {Promise<Object[]>} Array of candle objects.
- */
 async function getCandles(instrument, count = 100, granularity = 'M5', product) {
   const broker = getBrokerForProduct(product);
   if (!broker.isConnected()) {
@@ -42,12 +37,6 @@ async function getCandles(instrument, count = 100, granularity = 'M5', product) 
   return broker.getCandles(instrument, count, granularity);
 }
 
-/**
- * Get the current mid price for an instrument.
- * @param {string} instrument - Instrument name
- * @param {string} [product] - Trading product (optional)
- * @returns {Promise<number>} Current mid price.
- */
 async function getCurrentPrice(instrument, product) {
   const prices = await getPrices([instrument], product);
   if (!prices || prices.length === 0) {
@@ -59,16 +48,6 @@ async function getCurrentPrice(instrument, product) {
   return (bid + ask) / 2;
 }
 
-/**
- * Fetch historical candles between two dates.
- * @param {string} instrument - Instrument name.
- * @param {Date} startDate - Start date.
- * @param {Date} endDate - End date.
- * @param {string} granularity - Granularity (e.g., 'M5', 'H1').
- * @param {number} maxCandlesPerRequest - Max candles per request (default 5000).
- * @param {string} [product] - Trading product (optional)
- * @returns {Promise<Object[]>} Array of candle objects sorted by time (ascending).
- */
 async function getHistoricalCandles(instrument, startDate, endDate, granularity = 'M5', maxCandlesPerRequest = 5000, product) {
   const broker = getBrokerForProduct(product);
   if (!broker.isConnected()) {
