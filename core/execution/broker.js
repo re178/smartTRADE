@@ -1,7 +1,12 @@
 // core/execution/broker.js – Stable Dual-WebSocket Deriv Broker
-// [FIX-1] Emits trade.closed when a contract settles — fixes BotRun P/L.
+//
+// [FIX-1] Emits trade.closed when a contract settles.
+// [FIX-2] _reconcileTradeStatus now includes deriv_digital + idempotent emit.
+// [FIX-3] Multipliers updated to [200, 400, 600, 800].
+// [FIX-4] placeMarketOrder no longer sends duration_unit: 's' (InvalidExpiry).
+// [FIX-5] Portfolio cache (3s TTL) + invalidation on buy/sell/close.
 // [FILE-4.4] tick event includes mid. Synthetics in symbol map + watchlist.
-// [FILE-4.1] getCandles uses ticks_history with style='candles' (no start:1).
+// [FILE-4.1] getCandles uses ticks_history with style='candles'.
 
 const WebSocket = require('ws');
 const axios = require('axios');
@@ -37,8 +42,10 @@ const ORDER_STATUS = {
 
 const CB_STATE = { CLOSED: 'CLOSED', OPEN: 'OPEN', HALF_OPEN: 'HALF_OPEN' };
 let _requestCounter = 0;
-const ACCEPTED_MULTIPLIERS = [100, 200, 300, 500, 800];
-const DEFAULT_MULTIPLIER = 100;
+
+// [FIX-3] Multipliers updated to [200, 400, 600, 800]
+const ACCEPTED_MULTIPLIERS = [200, 400, 600, 800];
+const DEFAULT_MULTIPLIER = ACCEPTED_MULTIPLIERS[0]; // 200
 
 function generateRequestId() { return ++_requestCounter; }
 
@@ -267,6 +274,11 @@ class DerivBroker extends EventEmitter {
     this.streaming = new StreamingManager(this);
     this.symbolManager = new SymbolManager();
 
+    // [FIX-5] Portfolio cache (3s TTL) — avoids hammering `{ portfolio: 1 }`
+    // when multiple callers (getOpenTrades, _reconcilePositions, resume flow)
+    // query positions within the same tick.
+    this._portfolioCache = { contracts: null, at: 0, ttl: 3000 };
+
     this._cbState = CB_STATE.CLOSED;
     this._cbFailureCount = 0;
     this._cbOpenedAt = null;
@@ -300,6 +312,7 @@ class DerivBroker extends EventEmitter {
       tradesReconciledClosed: 0, reconcileSkippedFresh: 0,
       reconcileSkippedFetchError: 0, reconcileSkippedFalseAlarm: 0,
       portfolioEmptyResponses: 0,
+      portfolioCacheHits: 0, portfolioCacheMisses: 0,
     };
 
     this.capabilities = { ...BROKER_CAPABILITIES };
@@ -825,6 +838,11 @@ class DerivBroker extends EventEmitter {
         this._openPositions = contracts
           .filter(c => c.status && ['open', 'active'].includes(c.status.toLowerCase()))
           .map(c => this._normalizeContract(c));
+        // [FIX-5] WS portfolio push is fresh server data → refresh the cache.
+        if (this._portfolioCache) {
+          this._portfolioCache.contracts = this._openPositions;
+          this._portfolioCache.at = Date.now();
+        }
         this.emit('_portfolioUpdated', this._openPositions);
         this.emit('positions', this._openPositions);
         handled = true;
@@ -898,11 +916,18 @@ class DerivBroker extends EventEmitter {
     }
   }
 
+  // [FIX-2] Reconcile both deriv_multiplier and deriv_digital trades.
+  // Emit trade.closed via eventBus (idempotent via _closedEmitted set) so
+  // downstream P/L attribution stays consistent with the WS settlement path.
   async _reconcileTradeStatus() {
     if (this._authState !== STATE.READY) return;
     let openTrades;
-    try { openTrades = await Trade.find({ status: 'OPEN', product: 'deriv_multiplier' }).lean(); }
-    catch (_) { return; }
+    try {
+      openTrades = await Trade.find({
+        status: 'OPEN',
+        product: { $in: ['deriv_multiplier', 'deriv_digital'] },
+      }).lean();
+    } catch (_) { return; }
     if (openTrades.length === 0) return;
     let portfolio;
     try { portfolio = await this.getOpenTrades(); }
@@ -913,24 +938,66 @@ class DerivBroker extends EventEmitter {
       const cid = String(trade.contractId);
       if (portfolioIds.has(cid)) { this._reconcileMissCounts.delete(cid); continue; }
       const openedAt = trade.openTime ? new Date(trade.openTime).getTime() : 0;
-      if (openedAt && (now - openedAt) < this.config.tradeReconcileMinAgeMs) { this.metrics.reconcileSkippedFresh++; continue; }
+      if (openedAt && (now - openedAt) < this.config.tradeReconcileMinAgeMs) {
+        this.metrics.reconcileSkippedFresh++;
+        continue;
+      }
       const misses = (this._reconcileMissCounts.get(cid) || 0) + 1;
       this._reconcileMissCounts.set(cid, misses);
       if (misses < this.config.tradeReconcileMissesRequired) continue;
       const verify = await this._verifyContractStatus(cid);
-      if (verify.status === 'open') { this.metrics.reconcileSkippedFalseAlarm++; this._reconcileMissCounts.delete(cid); continue; }
+      if (verify.status === 'open') {
+        this.metrics.reconcileSkippedFalseAlarm++;
+        this._reconcileMissCounts.delete(cid);
+        continue;
+      }
       if (verify.status === 'closed') {
+        const realizedProfit = Number(verify.profit || 0);
         try {
           await Trade.findOneAndUpdate({ contractId: cid }, {
             $set: {
-              status: 'CLOSED', closeTime: new Date(), floatingProfit: 0,
-              realizedProfit: verify.profit || 0, pnl: verify.profit || 0,
+              status: 'CLOSED',
+              closeTime: new Date(),
+              floatingProfit: 0,
+              realizedProfit,
+              pnl: realizedProfit,
               closePrice: verify.soldFor || null,
             },
           });
           this.metrics.tradesReconciledClosed++;
         } catch (_) {}
         this._reconcileMissCounts.delete(cid);
+        // Invalidate portfolio cache — a trade just changed state.
+        if (this._portfolioCache) this._portfolioCache.at = 0;
+
+        // [FIX-2] Idempotent trade.closed emit (shared set with WS settlement path)
+        if (!this._closedEmitted.has(cid)) {
+          this._closedEmitted.add(cid);
+          const riskAmount = Number(trade.stake || trade.lotSize || 1) || 1;
+          const closedPayload = {
+            contractId: cid,
+            strategy: trade.strategy || null,
+            instrument: trade.instrument || null,
+            regimeCode: (trade.entryThesis && trade.entryThesis.regime) || null,
+            realizedProfit,
+            riskAmount,
+            result: {
+              closePrice: verify.soldFor || null,
+              buyPrice: verify.buyPrice || null,
+            },
+            source: 'reconciliation',
+            timestamp: new Date().toISOString(),
+          };
+          try {
+            eventBus.emit('trade.closed', closedPayload);
+            logger.info(
+              `[DerivBroker] Emitted trade.closed (reconcile) for ${cid} — ` +
+              `pnl=${realizedProfit.toFixed(2)} strategy=${trade.strategy || 'unknown'}`
+            );
+          } catch (emitErr) {
+            logger.warn(`[DerivBroker] trade.closed (reconcile) emit failed for ${cid}: ${emitErr.message}`);
+          }
+        }
       }
     }
   }
@@ -1065,38 +1132,44 @@ class DerivBroker extends EventEmitter {
 
       // [FIX-1] Emit trade.closed the first time we see this contract settle.
       // BotRunner listens to this and updates BotRun.pnl + instance stats.
-      if (isFinal && !this._closedEmitted.has(key)) {
-        this._closedEmitted.add(key);
+      // [FIX-2] Shared _closedEmitted set with reconciliation path → idempotent.
+      if (isFinal) {
+        // [FIX-5] Contract settled → position gone → portfolio cache is stale.
+        if (this._portfolioCache) this._portfolioCache.at = 0;
 
-        let tradeDoc = null;
-        try { tradeDoc = await Trade.findOne({ contractId: String(key) }).lean(); } catch (_) {}
+        if (!this._closedEmitted.has(key)) {
+          this._closedEmitted.add(key);
 
-        const realizedProfit = Number(state.currentProfit ?? 0);
-        const riskAmount = Number(tradeDoc?.stake || tradeDoc?.lotSize || 1) || 1;
+          let tradeDoc = null;
+          try { tradeDoc = await Trade.findOne({ contractId: String(key) }).lean(); } catch (_) {}
 
-        const closedPayload = {
-          contractId: String(key),
-          strategy: tradeDoc?.strategy || null,
-          instrument: tradeDoc?.instrument || state.symbol || null,
-          regimeCode: (tradeDoc?.entryThesis && tradeDoc.entryThesis.regime) || null,
-          realizedProfit,
-          riskAmount,
-          result: {
-            closePrice: state.exitTick ?? state.sellPrice ?? state.currentSpot ?? null,
-            buyPrice: state.buyPrice ?? null,
-          },
-          source: 'broker_settlement',
-          timestamp: new Date().toISOString(),
-        };
+          const realizedProfit = Number(state.currentProfit ?? 0);
+          const riskAmount = Number(tradeDoc?.stake || tradeDoc?.lotSize || 1) || 1;
 
-        try {
-          eventBus.emit('trade.closed', closedPayload);
-          logger.info(
-            `[DerivBroker] Emitted trade.closed for ${key} — ` +
-            `pnl=${realizedProfit.toFixed(2)} strategy=${tradeDoc?.strategy || 'unknown'}`
-          );
-        } catch (emitErr) {
-          logger.warn(`[DerivBroker] trade.closed emit failed for ${key}: ${emitErr.message}`);
+          const closedPayload = {
+            contractId: String(key),
+            strategy: tradeDoc?.strategy || null,
+            instrument: tradeDoc?.instrument || state.symbol || null,
+            regimeCode: (tradeDoc?.entryThesis && tradeDoc.entryThesis.regime) || null,
+            realizedProfit,
+            riskAmount,
+            result: {
+              closePrice: state.exitTick ?? state.sellPrice ?? state.currentSpot ?? null,
+              buyPrice: state.buyPrice ?? null,
+            },
+            source: 'broker_settlement',
+            timestamp: new Date().toISOString(),
+          };
+
+          try {
+            eventBus.emit('trade.closed', closedPayload);
+            logger.info(
+              `[DerivBroker] Emitted trade.closed for ${key} — ` +
+              `pnl=${realizedProfit.toFixed(2)} strategy=${tradeDoc?.strategy || 'unknown'}`
+            );
+          } catch (emitErr) {
+            logger.warn(`[DerivBroker] trade.closed emit failed for ${key}: ${emitErr.message}`);
+          }
         }
       }
     } catch (err) {
@@ -1345,13 +1418,27 @@ class DerivBroker extends EventEmitter {
     }));
   }
 
+  // [FIX-5] Portfolio cache — 3s TTL. Invalidated on buy/sell/close and when
+  // a contract settles. Populated both from fetch and from WS portfolio pushes.
   async getOpenTrades() {
     await this._ensureAuthReady();
+    const now = Date.now();
+    if (this._portfolioCache && this._portfolioCache.contracts &&
+        (now - this._portfolioCache.at) < this._portfolioCache.ttl) {
+      this.metrics.portfolioCacheHits++;
+      return this._portfolioCache.contracts;
+    }
+    this.metrics.portfolioCacheMisses++;
     const resp = await this._sendAuthRequest({ portfolio: 1 });
     const contracts = (resp.portfolio?.contracts) || [];
-    return contracts
+    const normalized = contracts
       .filter(c => c.status && ['open', 'active'].includes(c.status.toLowerCase()))
       .map(c => this._normalizeContract(c));
+    if (this._portfolioCache) {
+      this._portfolioCache.contracts = normalized;
+      this._portfolioCache.at = now;
+    }
+    return normalized;
   }
   async getPositions() { return this.getOpenTrades(); }
 
@@ -1374,10 +1461,12 @@ class DerivBroker extends EventEmitter {
         throw new Error(`Invalid multiplier ${opts.multiplier}.`);
       }
     }
+    // [FIX-4] Multiplier contracts have no fixed expiry → do NOT send
+    // duration_unit: 's'. Sending it causes InvalidExpiry from Deriv.
     const proposalPayload = {
       proposal: 1, amount, basis: 'stake', contract_type: direction,
       currency: this.accountCurrency || 'USD', underlying_symbol: symbol,
-      multiplier: finalMultiplier, duration_unit: 's', subscribe: 1,
+      multiplier: finalMultiplier, subscribe: 1,
     };
     if (stopLoss != null || takeProfit != null) {
       proposalPayload.limit_order = {};
@@ -1396,6 +1485,11 @@ class DerivBroker extends EventEmitter {
     const entrySpot = Number(buy?.entry_spot ?? proposal.spot);
     if (!contractId || contractId === 'undefined') throw new Error('No contract ID');
     if (!Number.isFinite(purchasePrice) || purchasePrice <= 0) throw new Error(`Invalid purchase price.`);
+
+    // [FIX-5] A new position was opened — invalidate portfolio cache so the
+    // next getOpenTrades() returns the fresh list including this contract.
+    if (this._portfolioCache) this._portfolioCache.at = 0;
+
     this._subscribeOpenContract(contractId).catch(() => {});
     this.getOpenTrades().then(p => this.emit('positions', p)).catch(() => {});
     return {
@@ -1413,6 +1507,10 @@ class DerivBroker extends EventEmitter {
     if (!Number.isInteger(numericTradeId) || numericTradeId <= 0) throw new Error(`Invalid contract ID.`);
     const resp = await this._sendAuthRequest({ sell: numericTradeId, price: 0 });
     if (!resp.sell) throw new Error('Close failed');
+
+    // [FIX-5] Position closed — invalidate portfolio cache.
+    if (this._portfolioCache) this._portfolioCache.at = 0;
+
     let coid = this._orderMap.get(String(tradeId));
     if (!coid) {
       try {
@@ -1488,7 +1586,13 @@ class DerivBroker extends EventEmitter {
         skippedFetchError: this.metrics.reconcileSkippedFetchError,
         skippedFalseAlarm: this.metrics.reconcileSkippedFalseAlarm,
       },
-      portfolioDiagnostics: { emptyResponses: this.metrics.portfolioEmptyResponses },
+      portfolioDiagnostics: {
+        emptyResponses: this.metrics.portfolioEmptyResponses,
+        cacheHits: this.metrics.portfolioCacheHits,
+        cacheMisses: this.metrics.portfolioCacheMisses,
+        cacheTtlMs: this._portfolioCache?.ttl ?? 0,
+        cacheAgeMs: this._portfolioCache?.at ? (Date.now() - this._portfolioCache.at) : null,
+      },
       accountLoaded: !!(this._account && this._account.balance != null),
       acceptedMultipliers: ACCEPTED_MULTIPLIERS,
     };
@@ -1514,6 +1618,7 @@ class DerivBroker extends EventEmitter {
     if (this._tradeReconcileTimer) { clearInterval(this._tradeReconcileTimer); this._tradeReconcileTimer = null; }
     this._reconcileMissCounts.clear();
     this._closedEmitted.clear();
+    if (this._portfolioCache) { this._portfolioCache.contracts = null; this._portfolioCache.at = 0; }
   }
   _getReconnectDelay(attempt) {
     const base = this.config.reconnectBaseDelay;
