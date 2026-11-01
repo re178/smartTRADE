@@ -15,6 +15,10 @@
 //   per 30s (rate-limited by Deriv). With caching, 4 fetches (one per
 //   symbol per minute). Cache is keyed by symbol::timeframe and TTL'd.
 //   Also adds clearCandleCache() for testing.
+//
+// [FILE-4] EMA is now exported (was previously internal-only) so
+//   callers / tests / other modules can reuse the exact same EMA
+//   implementation that the strategies use internally.
 
 const marketProvider = require('../market/provider');
 const { formatPrice, getPipSize } = require('../../shared/helpers');
@@ -188,6 +192,7 @@ function SMA(prices, period) {
 
 /**
  * Exponential Moving Average (EMA)
+ * [FILE-4] Exported for external reuse.
  */
 function EMA(prices, period) {
   const result = [];
@@ -1041,6 +1046,8 @@ async function generateSignal(instrument, strategy = 'sma', params = {}) {
 module.exports = {
   generateSignal,
   STRATEGIES,
+  SMA,
+  EMA,            // [FILE-4] now exported
   ADX,
   ATR,
   RSI,
