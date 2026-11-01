@@ -1,21 +1,7 @@
 // core/execution/broker.js – Stable Dual-WebSocket Deriv Broker
-//
-// [FIX-1] Emits trade.closed when a contract settles.
-// [FIX-2] _reconcileTradeStatus now includes deriv_digital + idempotent emit.
-// [FIX-3] Multipliers updated to [200, 400, 600, 800].
-// [FIX-4] placeMarketOrder no longer sends duration_unit: 's' (InvalidExpiry).
-// [FIX-5] Portfolio cache (3s TTL) + invalidation on buy/sell/close.
+// [FIX-1] Emits trade.closed when a contract settles — fixes BotRun P/L.
 // [FILE-4.4] tick event includes mid. Synthetics in symbol map + watchlist.
-// [FILE-4.1] getCandles uses ticks_history with style='candles'.
-//
-// [FIX-RL] Dedicated portfolio limiter (30/min), single-flight dedupe, TTL
-//          cache, RateLimit-aware backoff, per-contract reconcile (no
-//          portfolio polling in the reconcile loop), shared connect fetch.
-// [FIX-MAP] symbolMap contains BOTH 'EUR_USD' and 'EURUSD' keys so
-//           contractService.toDerivSymbol() resolves FX pairs correctly.
-// [FIX-READY] _ensureAuthReady / _ensurePublicReady re-check state after
-//           connect() to avoid the "authReady already fired" race.
-// [FIX-LEAK] _closedEmitted is pruned on connect (FIFO), never grows unbounded.
+// [FILE-4.1] getCandles uses ticks_history with style='candles' (no start:1).
 
 const WebSocket = require('ws');
 const axios = require('axios');
@@ -51,10 +37,8 @@ const ORDER_STATUS = {
 
 const CB_STATE = { CLOSED: 'CLOSED', OPEN: 'OPEN', HALF_OPEN: 'HALF_OPEN' };
 let _requestCounter = 0;
-
-// [FIX-3] Deriv deprecated multipliers 100, 300, 500.
-const ACCEPTED_MULTIPLIERS = [200, 400, 600, 800];
-const DEFAULT_MULTIPLIER = 200;
+const ACCEPTED_MULTIPLIERS = [100, 200, 300, 500, 800];
+const DEFAULT_MULTIPLIER = 100;
 
 function generateRequestId() { return ++_requestCounter; }
 
@@ -104,11 +88,6 @@ function isPermanentApiError(err) {
   return (msg.includes('InputValidationFailed') || msg.includes('InvalidSymbol') ||
     msg.includes('ContractCreationFailure') || msg.includes('AuthorizationRequired') ||
     msg.includes('InvalidToken') || msg.includes('PermissionDenied') || msg.includes('InvalidExpiry'));
-}
-
-function isRateLimitError(err) {
-  if (!err || !err.message) return false;
-  return String(err.message).includes('RateLimit');
 }
 
 class RateLimiter {
@@ -260,10 +239,6 @@ class DerivBroker extends EventEmitter {
       tradeReconcileIntervalMs: parseInt(config.tradeReconcileIntervalMs || process.env.DERIV_TRADE_RECONCILE_INTERVAL || 30000),
       tradeReconcileMinAgeMs: parseInt(config.tradeReconcileMinAgeMs || process.env.DERIV_TRADE_RECONCILE_MIN_AGE || 60000),
       tradeReconcileMissesRequired: parseInt(config.tradeReconcileMissesRequired || process.env.DERIV_TRADE_RECONCILE_MISSES || 2),
-      // [FIX-RL / FIX-5] Portfolio rate-limit tuning — 3s TTL by default.
-      portfolioMinIntervalMs: parseInt(config.portfolioMinIntervalMs || process.env.DERIV_PORTFOLIO_MIN_INTERVAL_MS || 2000),
-      portfolioCacheTtlMs: parseInt(config.portfolioCacheTtlMs || process.env.DERIV_PORTFOLIO_CACHE_TTL_MS || 3000),
-      rateLimitBackoffBaseMs: parseInt(config.rateLimitBackoffBaseMs || process.env.DERIV_RATE_LIMIT_BACKOFF_MS || 3000),
     };
     this.validateConfig();
 
@@ -289,12 +264,6 @@ class DerivBroker extends EventEmitter {
     this._authReconnectTimer = null;
 
     this._rateLimiter = new RateLimiter(this.config.rateLimit, this.config.rateCapacity);
-    // [FIX-RL] Deriv caps portfolio + profit_table at 30/min. Dedicated bucket.
-    const portfolioRatePerSec = 30 / 60; // 0.5 req/s
-    this._portfolioLimiter = new RateLimiter(portfolioRatePerSec, 1);
-    this._portfolioInFlight = null;
-    this._portfolioCache = { trades: [], at: 0 };
-
     this.streaming = new StreamingManager(this);
     this.symbolManager = new SymbolManager();
 
@@ -304,7 +273,6 @@ class DerivBroker extends EventEmitter {
 
     this.symbolMap = { ...FALLBACK_SYMBOLS };
     this.reverseMap = {};
-    this._registerNoSeparatorAliases();
     for (const [k, v] of Object.entries(FALLBACK_SYMBOLS)) this.reverseMap[v] = k;
     this.spreadMap = {};
     for (const k of Object.keys(FALLBACK_SYMBOLS)) this.spreadMap[FALLBACK_SYMBOLS[k]] = 0.0001;
@@ -332,8 +300,6 @@ class DerivBroker extends EventEmitter {
       tradesReconciledClosed: 0, reconcileSkippedFresh: 0,
       reconcileSkippedFetchError: 0, reconcileSkippedFalseAlarm: 0,
       portfolioEmptyResponses: 0,
-      portfolioRequests: 0, portfolioCacheHits: 0, portfolioSingleFlight: 0,
-      rateLimitRetries: 0,
     };
 
     this.capabilities = { ...BROKER_CAPABILITIES };
@@ -347,21 +313,6 @@ class DerivBroker extends EventEmitter {
 
     logger.info('[DerivBroker] Initialized with Current Options API (OTP-URL auth).');
     logger.info(`[DerivBroker] Account type preference: ${this.config.accountType}`);
-    logger.info(`[DerivBroker] Portfolio limiter: 30/min, cache TTL ${this.config.portfolioCacheTtlMs}ms`);
-    logger.info(`[DerivBroker] Accepted multipliers: [${ACCEPTED_MULTIPLIERS.join(', ')}] (default ${DEFAULT_MULTIPLIER})`);
-  }
-
-  // [FIX-MAP] contractService.toDerivSymbol() looks up `symbolMap['EURUSD']`
-  // (no separator). Populate those aliases so lookups succeed.
-  _registerNoSeparatorAliases() {
-    for (const key of Object.keys(FALLBACK_SYMBOLS)) {
-      const noSep = key.replace(/_/g, '');
-      if (noSep !== key) this.symbolMap[noSep] = FALLBACK_SYMBOLS[key];
-    }
-  }
-
-  _invalidatePortfolioCache() {
-    this._portfolioCache = { trades: [], at: 0 };
   }
 
   validateConfig() {
@@ -470,14 +421,6 @@ class DerivBroker extends EventEmitter {
   }
 
   async _doConnect() {
-    // [FIX-LEAK] Prune _closedEmitted so it can't grow unbounded across reconnects.
-    if (this._closedEmitted.size > 5000) {
-      const oldest = Array.from(this._closedEmitted).slice(0, 2500);
-      for (const id of oldest) this._closedEmitted.delete(id);
-    }
-    // [FIX-5] Invalidate portfolio cache on fresh connect.
-    this._invalidatePortfolioCache();
-
     await Promise.all([this._connectPublic(), this._connectAuth()]);
     await this._loadSymbolsWithTimeout();
     if (!this._symbolsDiscovered) this._useFallbackSymbols();
@@ -486,14 +429,9 @@ class DerivBroker extends EventEmitter {
     this.emit('connected');
     await this._ensureBalanceLoaded();
     await this._subscribeDefaultSymbols();
-
-    // [FIX-RL] One shared portfolio fetch feeds reconcile + resume.
-    let positions = [];
-    try { positions = await this.getOpenTrades({ force: true }); } catch (_) {}
-
-    await this._reconcilePositions(positions);
+    await this._reconcilePositions();
     await this._loadPendingOrders();
-    await this._resumeContractSubscriptions(positions);
+    await this._resumeContractSubscriptions();
     await this._reconcileTradeStatus();
     this._startTradeReconcileTimer();
   }
@@ -628,7 +566,7 @@ class DerivBroker extends EventEmitter {
         lastErr = err;
         if (isPermanentApiError(err)) break;
         if (attempt < this.config.maxRetries) {
-          await sleep(this._backoffFor(err, attempt));
+          await sleep(this._getReconnectDelay(attempt));
           if (this._publicState !== STATE.CONNECTED) await this._connectPublic();
         }
       }
@@ -700,9 +638,7 @@ class DerivBroker extends EventEmitter {
   async _ensurePublicReady() {
     if (this._publicState === STATE.CONNECTED || this._publicState === STATE.READY) return;
     await this._connectPublic();
-    if (this._publicState !== STATE.CONNECTED && this._publicState !== STATE.READY) {
-      throw new Error(`Public WS not ready (state=${this._publicState})`);
-    }
+    await sleep(200);
   }
 
   async _connectAuth() {
@@ -797,8 +733,6 @@ class DerivBroker extends EventEmitter {
       this._authPendingRequests.delete(id);
     }
     this._contractSubscriptions.clear();
-    // [FIX-5] Reconnect means stale position data — invalidate.
-    this._invalidatePortfolioCache();
     if (this._authState !== STATE.DISCONNECTED && this._authState !== STATE.FATAL)
       this._authState = STATE.DISCONNECTED;
   }
@@ -835,20 +769,12 @@ class DerivBroker extends EventEmitter {
         lastErr = err;
         if (isPermanentApiError(err)) break;
         if (attempt < this.config.maxRetries) {
-          await sleep(this._backoffFor(err, attempt));
+          await sleep(this._getReconnectDelay(attempt));
           if (this._authState !== STATE.READY) await this._connectAuth();
         }
       }
     }
     throw lastErr;
-  }
-  // [FIX-RL] Unified backoff: RateLimit gets longer, deterministic waits.
-  _backoffFor(err, attempt) {
-    if (isRateLimitError(err)) {
-      this.metrics.rateLimitRetries++;
-      return this.config.rateLimitBackoffBaseMs * attempt;
-    }
-    return this._getReconnectDelay(attempt);
   }
   _sendAuthRawRequest(payload, timeoutMs = 15000, signal = null) {
     return new Promise((resolve, reject) => {
@@ -899,8 +825,6 @@ class DerivBroker extends EventEmitter {
         this._openPositions = contracts
           .filter(c => c.status && ['open', 'active'].includes(c.status.toLowerCase()))
           .map(c => this._normalizeContract(c));
-        // [FIX-5] Keep the cache warm from the portfolio response itself.
-        this._portfolioCache = { trades: this._openPositions, at: Date.now() };
         this.emit('_portfolioUpdated', this._openPositions);
         this.emit('positions', this._openPositions);
         handled = true;
@@ -926,13 +850,7 @@ class DerivBroker extends EventEmitter {
         this.emit('accountUpdate', this._account);
         handled = true;
       }
-      // [FIX-5] Any buy/sell response invalidates the portfolio cache —
-      // covers contractService's direct _sendAuthRequest path too.
-      if (msg.buy || msg.sell) {
-        this._invalidatePortfolioCache();
-        handled = true;
-      }
-      if (msg.proposal) handled = true;
+      if (msg.buy || msg.sell || msg.proposal) handled = true;
       if (!handled) logger.debug('[In Auth] Unhandled:', JSON.stringify(redactSensitive(msg)));
     } catch (e) { logger.error('[In Auth] Parse error:', e.message); }
   }
@@ -940,7 +858,6 @@ class DerivBroker extends EventEmitter {
   async _ensureAuthReady() {
     if (this._authState === STATE.READY) return;
     await this._connectAuth();
-    if (this._authState === STATE.READY) return;
     await new Promise((resolve, reject) => {
       const t = setTimeout(() => reject(new Error('Auth ready timeout')), this.config.readinessTimeout);
       this.once('authReady', () => { clearTimeout(t); resolve(); });
@@ -956,51 +873,10 @@ class DerivBroker extends EventEmitter {
     await this._reconcileTradeStatus();
   }
 
-  // ─────────────────────────────────────────────────────────────
-  // [FIX-RL / FIX-5] portfolio access — single-flight + cache + limiter
-  // ─────────────────────────────────────────────────────────────
-  async getOpenTrades({ force = false } = {}) {
-    const now = Date.now();
-
-    // Fast path: fresh cache (3s TTL per FIX-5). Most UI getPositions() calls.
-    if (!force && this._portfolioCache && (now - this._portfolioCache.at) < this.config.portfolioCacheTtlMs) {
-      this.metrics.portfolioCacheHits++;
-      return this._portfolioCache.trades;
-    }
-
-    // Single-flight: concurrent callers share one network request.
-    if (this._portfolioInFlight) {
-      this.metrics.portfolioSingleFlight++;
-      return this._portfolioInFlight;
-    }
-
-    this._portfolioInFlight = (async () => {
-      try {
-        await this._ensureAuthReady();
-        await this._portfolioLimiter.acquire();
-        this.metrics.portfolioRequests++;
-        const resp = await this._sendAuthRequest({ portfolio: 1 });
-        const contracts = (resp.portfolio?.contracts) || [];
-        if (contracts.length === 0) this.metrics.portfolioEmptyResponses++;
-        const trades = contracts
-          .filter(c => c.status && ['open', 'active'].includes(c.status.toLowerCase()))
-          .map(c => this._normalizeContract(c));
-        this._portfolioCache = { trades, at: Date.now() };
-        return trades;
-      } finally {
-        this._portfolioInFlight = null;
-      }
-    })();
-
-    return this._portfolioInFlight;
-  }
-  async getPositions() { return this.getOpenTrades(); }
-
-  async _resumeContractSubscriptions(positions = null) {
-    if (!positions) {
-      try { positions = await this.getOpenTrades(); } catch (_) { return; }
-    }
-    if (!positions || positions.length === 0) return;
+  async _resumeContractSubscriptions() {
+    let positions;
+    try { positions = await this.getOpenTrades(); } catch (_) { return; }
+    if (positions.length === 0) return;
     for (const pos of positions) {
       const contractId = String(pos.id);
       if (!contractId) continue;
@@ -1008,15 +884,11 @@ class DerivBroker extends EventEmitter {
         const existing = await Trade.findOne({ contractId: String(contractId) });
         if (!existing) {
           const side = pos.side === 'BUY' ? 'buy' : pos.side === 'SELL' ? 'sell' : 'buy';
-          // Detect product from contract_type so deriv_digital is preserved.
-          const rawCT = String(pos.contractType || pos.raw?.contract_type || '').toUpperCase();
-          const isMultiplier = rawCT.startsWith('MULT');
-          const product = isMultiplier ? 'deriv_multiplier' : 'deriv_digital';
           await Trade.create({
             contractId: String(contractId), instrument: pos.instrument, side,
             lotSize: pos.units || 0, openPrice: pos.entryPrice ?? pos.price ?? 0,
             status: 'OPEN', openTime: new Date(pos.openTime || Date.now()),
-            product, currentPrice: pos.currentPrice ?? pos.entryPrice ?? pos.price ?? null,
+            product: 'deriv_multiplier', currentPrice: pos.currentPrice ?? pos.entryPrice ?? pos.price ?? null,
             floatingProfit: pos.unrealizedPL ?? 0, stake: pos.purchasePrice ?? null,
             purchasePrice: pos.purchasePrice ?? null,
           });
@@ -1026,105 +898,40 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // [FIX-2 / FIX-RL] Reconcile uses per-contract verify (proposal_open_contract,
-  // 360/min budget) — NOT portfolio polling. Handles both multiplier and
-  // digital products and emits trade.closed idempotently.
   async _reconcileTradeStatus() {
     if (this._authState !== STATE.READY) return;
     let openTrades;
-    try {
-      openTrades = await Trade.find({
-        status: 'OPEN',
-        product: { $in: ['deriv_multiplier', 'deriv_digital'] },
-      }).lean();
-    } catch (_) { return; }
+    try { openTrades = await Trade.find({ status: 'OPEN', product: 'deriv_multiplier' }).lean(); }
+    catch (_) { return; }
     if (openTrades.length === 0) return;
-
+    let portfolio;
+    try { portfolio = await this.getOpenTrades(); }
+    catch (_) { this.metrics.reconcileSkippedFetchError++; return; }
+    const portfolioIds = new Set(portfolio.map(p => String(p.id)));
     const now = Date.now();
     for (const trade of openTrades) {
       const cid = String(trade.contractId);
-      if (!cid) continue;
-
-      // Live subscription will catch settlement — skip network verify.
-      if (this._contractSubscriptions.has(cid)) {
-        this._reconcileMissCounts.delete(cid);
-        continue;
-      }
-
+      if (portfolioIds.has(cid)) { this._reconcileMissCounts.delete(cid); continue; }
       const openedAt = trade.openTime ? new Date(trade.openTime).getTime() : 0;
-      if (openedAt && (now - openedAt) < this.config.tradeReconcileMinAgeMs) {
-        this.metrics.reconcileSkippedFresh++;
-        continue;
-      }
-
-      const verify = await this._verifyContractStatus(cid);
-
-      if (verify.status === 'open') {
-        this.metrics.reconcileSkippedFalseAlarm++;
-        this._reconcileMissCounts.delete(cid);
-        // Opportunistic subscribe so future cycles skip this trade.
-        if (!this._contractSubscriptions.has(cid)) {
-          this._subscribeOpenContract(cid).catch(() => {});
-        }
-        continue;
-      }
-      if (verify.status !== 'closed') continue;
-
+      if (openedAt && (now - openedAt) < this.config.tradeReconcileMinAgeMs) { this.metrics.reconcileSkippedFresh++; continue; }
       const misses = (this._reconcileMissCounts.get(cid) || 0) + 1;
       this._reconcileMissCounts.set(cid, misses);
       if (misses < this.config.tradeReconcileMissesRequired) continue;
-
-      try {
-        const oldDoc = await Trade.findOneAndUpdate(
-          { contractId: cid },
-          {
+      const verify = await this._verifyContractStatus(cid);
+      if (verify.status === 'open') { this.metrics.reconcileSkippedFalseAlarm++; this._reconcileMissCounts.delete(cid); continue; }
+      if (verify.status === 'closed') {
+        try {
+          await Trade.findOneAndUpdate({ contractId: cid }, {
             $set: {
               status: 'CLOSED', closeTime: new Date(), floatingProfit: 0,
               realizedProfit: verify.profit || 0, pnl: verify.profit || 0,
               closePrice: verify.soldFor || null,
             },
-          },
-          { new: false }
-        );
-        this.metrics.tradesReconciledClosed++;
-
-        // [FIX-2] Idempotent emit — shared _closedEmitted set with the
-        // subscription path so trade.closed fires exactly once per contract.
-        if (!this._closedEmitted.has(cid)) {
-          this._closedEmitted.add(cid);
-
-          const realizedProfit = Number(verify.profit ?? 0);
-          const riskAmount = Number(oldDoc?.stake || oldDoc?.lotSize || 1) || 1;
-
-          const closedPayload = {
-            contractId: cid,
-            strategy: oldDoc?.strategy || null,
-            instrument: oldDoc?.instrument || null,
-            regimeCode: (oldDoc?.entryThesis && oldDoc.entryThesis.regime) || null,
-            realizedProfit,
-            riskAmount,
-            result: {
-              closePrice: verify.soldFor ?? null,
-              buyPrice: verify.buyPrice ?? null,
-            },
-            source: 'broker_reconcile',
-            timestamp: new Date().toISOString(),
-          };
-
-          try {
-            eventBus.emit('trade.closed', closedPayload);
-            logger.info(
-              `[DerivBroker] Emitted trade.closed (reconcile) for ${cid} — ` +
-              `pnl=${realizedProfit.toFixed(2)} strategy=${oldDoc?.strategy || 'unknown'}`
-            );
-          } catch (emitErr) {
-            logger.warn(`[DerivBroker] trade.closed emit failed for ${cid}: ${emitErr.message}`);
-          }
-        }
-      } catch (err) {
-        logger.warn(`[DerivBroker] Reconcile update failed for ${cid}: ${err.message}`);
+          });
+          this.metrics.tradesReconciledClosed++;
+        } catch (_) {}
+        this._reconcileMissCounts.delete(cid);
       }
-      this._reconcileMissCounts.delete(cid);
     }
   }
 
@@ -1250,8 +1057,6 @@ class DerivBroker extends EventEmitter {
       update.pnl = state.currentProfit ?? 0;
       update.closeTime = state.sellTime || new Date();
       update.floatingProfit = 0;
-      // [FIX-5] Contract is gone from portfolio — invalidate cache.
-      this._invalidatePortfolioCache();
     }
 
     try {
@@ -1326,7 +1131,6 @@ class DerivBroker extends EventEmitter {
   }
   _useFallbackSymbols() {
     this.symbolMap = { ...FALLBACK_SYMBOLS };
-    this._registerNoSeparatorAliases();
     this.reverseMap = {};
     this.spreadMap = {};
     for (const [k, v] of Object.entries(FALLBACK_SYMBOLS)) {
@@ -1347,8 +1151,6 @@ class DerivBroker extends EventEmitter {
       if (fxMatch) {
         const ourPair = fxMatch[1] + '_' + fxMatch[2];
         this.symbolMap[ourPair] = derivSymbol;
-        // [FIX-MAP] Also register the no-separator alias for contractService.
-        this.symbolMap[fxMatch[1] + fxMatch[2]] = derivSymbol;
         this.reverseMap[derivSymbol] = ourPair;
         this.spreadMap[derivSymbol] = pip * 0.5;
         count++;
@@ -1399,10 +1201,9 @@ class DerivBroker extends EventEmitter {
     this.emit('orderUpdate', { clientOrderId, status, contractId });
   }
 
-  async _reconcilePositions(positions = null) {
-    if (!positions) {
-      try { positions = await this.getOpenTrades(); } catch (_) { return; }
-    }
+  async _reconcilePositions() {
+    let positions;
+    try { positions = await this.getOpenTrades(); } catch (_) { return; }
     try {
       const dbOrders = await Order.find({ status: ORDER_STATUS.FILLED });
       const dbMap = new Map();
@@ -1462,7 +1263,6 @@ class DerivBroker extends EventEmitter {
       units: c.amount ?? 0, unrealizedPL: Number(c.profit ?? c.profit_loss ?? 0),
       currentPrice, stopLoss: Number(c.stop_loss ?? 0),
       takeProfit: Number(c.take_profit ?? 0), openTime, status: 'OPEN', raw: c,
-      contractType: c.contract_type || null,
     };
   }
 
@@ -1545,6 +1345,16 @@ class DerivBroker extends EventEmitter {
     }));
   }
 
+  async getOpenTrades() {
+    await this._ensureAuthReady();
+    const resp = await this._sendAuthRequest({ portfolio: 1 });
+    const contracts = (resp.portfolio?.contracts) || [];
+    return contracts
+      .filter(c => c.status && ['open', 'active'].includes(c.status.toLowerCase()))
+      .map(c => this._normalizeContract(c));
+  }
+  async getPositions() { return this.getOpenTrades(); }
+
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null, options = {}) {
     await this._ensureAuthReady();
     if (!this._account || this._account.balance == null) {
@@ -1561,15 +1371,13 @@ class DerivBroker extends EventEmitter {
     else {
       finalMultiplier = Math.floor(Number(opts.multiplier));
       if (!Number.isFinite(finalMultiplier) || !ACCEPTED_MULTIPLIERS.includes(finalMultiplier)) {
-        throw new Error(`Invalid multiplier ${opts.multiplier}. Accepted: ${ACCEPTED_MULTIPLIERS.join(',')}`);
+        throw new Error(`Invalid multiplier ${opts.multiplier}.`);
       }
     }
-    // [FIX-4] Multiplier contracts do NOT accept duration_unit — sending
-    // it caused InvalidExpiry on every FX entry. Removed.
     const proposalPayload = {
       proposal: 1, amount, basis: 'stake', contract_type: direction,
       currency: this.accountCurrency || 'USD', underlying_symbol: symbol,
-      multiplier: finalMultiplier, subscribe: 1,
+      multiplier: finalMultiplier, duration_unit: 's', subscribe: 1,
     };
     if (stopLoss != null || takeProfit != null) {
       proposalPayload.limit_order = {};
@@ -1589,8 +1397,6 @@ class DerivBroker extends EventEmitter {
     if (!contractId || contractId === 'undefined') throw new Error('No contract ID');
     if (!Number.isFinite(purchasePrice) || purchasePrice <= 0) throw new Error(`Invalid purchase price.`);
     this._subscribeOpenContract(contractId).catch(() => {});
-    // [FIX-5] Invalidate cache after buy — new position must appear next fetch.
-    this._invalidatePortfolioCache();
     this.getOpenTrades().then(p => this.emit('positions', p)).catch(() => {});
     return {
       contractId, tradeID: contractId, ticket: contractId, purchasePrice,
@@ -1630,8 +1436,6 @@ class DerivBroker extends EventEmitter {
         this.emit('accountUpdate', this._account);
       }
     } catch (_) {}
-    // [FIX-5] Invalidate cache after sell.
-    this._invalidatePortfolioCache();
     this.getOpenTrades().then(p => this.emit('positions', p)).catch(() => {});
     return resp;
   }
@@ -1684,20 +1488,9 @@ class DerivBroker extends EventEmitter {
         skippedFetchError: this.metrics.reconcileSkippedFetchError,
         skippedFalseAlarm: this.metrics.reconcileSkippedFalseAlarm,
       },
-      portfolioDiagnostics: {
-        emptyResponses: this.metrics.portfolioEmptyResponses,
-        portfolioRequests: this.metrics.portfolioRequests,
-        cacheHits: this.metrics.portfolioCacheHits,
-        singleFlightJoins: this.metrics.portfolioSingleFlight,
-        rateLimitRetries: this.metrics.rateLimitRetries,
-        inFlight: !!this._portfolioInFlight,
-        cacheAgeMs: this._portfolioCache ? (Date.now() - this._portfolioCache.at) : null,
-        cacheSize: this._portfolioCache ? this._portfolioCache.trades.length : 0,
-        cacheTtlMs: this.config.portfolioCacheTtlMs,
-      },
+      portfolioDiagnostics: { emptyResponses: this.metrics.portfolioEmptyResponses },
       accountLoaded: !!(this._account && this._account.balance != null),
       acceptedMultipliers: ACCEPTED_MULTIPLIERS,
-      defaultMultiplier: DEFAULT_MULTIPLIER,
     };
   }
 
@@ -1705,7 +1498,7 @@ class DerivBroker extends EventEmitter {
   getAllContractStates() { return Array.from(this._contractStates.values()); }
 
   async killSwitch() {
-    const positions = await this.getOpenTrades({ force: true });
+    const positions = await this.getOpenTrades();
     for (const p of positions) { try { await this.closeTrade(p.id); } catch (_) {} }
     await this.disconnect();
   }
@@ -1716,8 +1509,6 @@ class DerivBroker extends EventEmitter {
     this._authState = STATE.DISCONNECTED;
     this._ready = false;
     this._connectPromise = null;
-    this._portfolioInFlight = null;
-    this._invalidatePortfolioCache();
     for (const [, timer] of this._contractPersistTimers) clearTimeout(timer);
     this._contractPersistTimers.clear();
     if (this._tradeReconcileTimer) { clearInterval(this._tradeReconcileTimer); this._tradeReconcileTimer = null; }
@@ -1744,4 +1535,19 @@ const brokerInstance = new DerivBroker({
   maxReconnectDelay: parseInt(process.env.DERIV_MAX_RECONNECT_DELAY) || 30000,
   maxRetries: parseInt(process.env.DERIV_MAX_RETRIES) || 3,
   maxQueueSize: parseInt(process.env.DERIV_MAX_QUEUE_SIZE) || 100,
-  rateLimit
+  rateLimit: parseFloat(process.env.DERIV_RATE_LIMIT) || 5,
+  rateCapacity: parseFloat(process.env.DERIV_RATE_CAPACITY) || 10,
+  readinessTimeout: parseInt(process.env.DERIV_READINESS_TIMEOUT) || 30000,
+  symbolTimeout: parseInt(process.env.DERIV_SYMBOL_TIMEOUT) || 30000,
+  heartbeatTimeout: parseInt(process.env.DERIV_HEARTBEAT_TIMEOUT) || 120000,
+  wsPingIntervalMs: parseInt(process.env.DERIV_WS_PING_INTERVAL) || 20000,
+  balanceTimeout: parseInt(process.env.DERIV_BALANCE_TIMEOUT) || 10000,
+  contractPersistIntervalMs: parseInt(process.env.DERIV_CONTRACT_PERSIST_INTERVAL_MS) || 3000,
+  contractSubscribeTimeout: parseInt(process.env.DERIV_CONTRACT_SUBSCRIBE_TIMEOUT) || 15000,
+  tradeReconcileIntervalMs: parseInt(process.env.DERIV_TRADE_RECONCILE_INTERVAL) || 30000,
+  tradeReconcileMinAgeMs: parseInt(process.env.DERIV_TRADE_RECONCILE_MIN_AGE) || 60000,
+  tradeReconcileMissesRequired: parseInt(process.env.DERIV_TRADE_RECONCILE_MISSES) || 2,
+});
+
+module.exports = brokerInstance;
+module.exports.DerivBroker = DerivBroker;
