@@ -10,6 +10,21 @@
 // [CHANGE-3B] Added purchasePrice — the amount actually paid to Deriv
 //   for the contract. Distinct from openPrice (the underlying market
 //   entry spot). Populated for Multiplier trades; null for CFD.
+//
+// [FIX-DIGIT-PERSIST] contractService.placeDigitOrBinary was failing to save
+//   both Order and Trade documents for every digit/binary contract
+//   (CALL/PUT/DIGITEVEN/DIGITODD/DIGITOVER/DIGITUNDER/DIGITMATCH/DIGITDIFF/
+//   ONETOUCH/NOTOUCH). Two root causes:
+//     1. side was sent as 'call'/'digiteven'/etc. — not in the enum.
+//        contractService now normalizes side to 'buy'/'sell' and stores the
+//        specific contract in contractType (added below).
+//     2. entryThesis was a rigid subobject that rejected the rich prediction
+//        snapshot the runner sends (pattern/momentum/volatility/digitView/
+//        flip/phaseStats/edgeTest/session/strategyConsensus/botId/instanceId/
+//        reasons) — plus rejected direction values 'BUY'/'SELL' vs. the old
+//        enum ['up','down','neutral']. Now Mixed, preserves everything.
+//   Also added contractType, barrier, durationUnit so digit/binary trades
+//   can be fully reconstructed from the Trade record alone.
 
 const mongoose = require('mongoose');
 
@@ -28,19 +43,33 @@ const TradeSchema = new mongoose.Schema(
       type: String,
       required: true,
       index: true,
-      description: 'Symbol, e.g., EURUSD',
+      description: 'Symbol, e.g., EURUSD or R_100',
     },
     side: {
       type: String,
       enum: ['buy', 'sell'],
       required: true,
-      description: 'Trade direction',
+      description: 'Direction: buy (price up / positive bet) or sell (price down / negative bet)',
+    },
+    // [FIX-DIGIT-PERSIST] Specific Deriv contract type. null for legacy CFD.
+    contractType: {
+      type: String,
+      default: null,
+      index: true,
+      description: 'MULTUP / MULTDOWN / CALL / PUT / DIGITEVEN / DIGITODD / DIGITOVER / DIGITUNDER / DIGITMATCH / DIGITDIFF / ONETOUCH / NOTOUCH',
+    },
+    // [FIX-DIGIT-PERSIST] Digit/touch barrier (e.g. '5' for DIGITMATCH,
+    // '8' for DIGITOVER, '0' for DIGITUNDER). null when not applicable.
+    barrier: {
+      type: String,
+      default: null,
+      description: 'Barrier used for digit/touch contracts (0-9 for digits)',
     },
     lotSize: {
       type: Number,
       required: true,
       min: 0,
-      description: 'Trade volume in lots',
+      description: 'Trade volume in lots (or stake for multiplier/digit contracts)',
     },
     openPrice: {
       type: Number,
@@ -113,12 +142,12 @@ const TradeSchema = new mongoose.Schema(
     strategy: {
       type: String,
       default: null,
-      description: 'Strategy name (if any)',
+      description: 'Strategy or bot ID that opened this trade (e.g. "trend_rider")',
     },
     product: {
       type: String,
       default: 'FX',
-      description: 'Product type (e.g., FX, CFD)',
+      description: 'Product type: deriv_multiplier / deriv_digital / FX',
     },
 
     // ---- Internal sync state ----
@@ -165,22 +194,30 @@ const TradeSchema = new mongoose.Schema(
     },
 
     // =============================================================
-    //  MULTIPLIER TRADING FIELDS
+    //  MULTIPLIER & DIGIT TRADING FIELDS
     // =============================================================
     stake: {
       type: Number,
       default: null,
-      description: 'Stake amount in account currency (for Multiplier trades)',
+      description: 'Stake amount in account currency',
     },
     multiplier: {
       type: Number,
       default: null,
-      description: 'Multiplier applied to the stake (for Multiplier trades)',
+      description: 'Multiplier applied to the stake (null for digit/binary)',
     },
     duration: {
       type: Number,
       default: null,
-      description: 'Duration of the Multiplier contract in seconds',
+      description: 'Contract duration (value in units of durationUnit)',
+    },
+    // [FIX-DIGIT-PERSIST] 's' for seconds (multiplier) or 't' for ticks
+    // (digit/binary). Was previously missing from the schema — silently
+    // dropped on every save.
+    durationUnit: {
+      type: String,
+      default: null,
+      description: "Duration unit: 's' (seconds) or 't' (ticks)",
     },
     knockoutLevel: {
       type: Number,
@@ -194,9 +231,6 @@ const TradeSchema = new mongoose.Schema(
     },
 
     // ---- [CHANGE-3B] Contract purchase cost ----
-    // Amount paid to Deriv for the contract. Distinct from openPrice,
-    // which is the underlying market entry spot. Populated for
-    // Multiplier trades; null for CFD trades.
     purchasePrice: {
       type: Number,
       default: null,
@@ -204,15 +238,19 @@ const TradeSchema = new mongoose.Schema(
       description: 'Amount paid to purchase the Deriv contract',
     },
 
-    // ---- Entry Thesis (prediction snapshot) ----
+    // ---- [FIX-DIGIT-PERSIST] Entry Thesis (free-form snapshot) ----
+    // Populated by contractService._persist with the runner's full snapshot:
+    //   FX bots:   { botId, instanceId, reasons, edgeTest, session, flip,
+    //                phaseStats, confidence, direction, pattern, momentum,
+    //                volatility, regime, regimeConfidence, strategyConsensus }
+    //   Digit bots: { botId, instanceId, reasons, edgeTest, session, flip,
+    //                 phaseStats, digitView }
+    // Previously typed as a rigid subobject that rejected everything except
+    // 6 legacy fields and failed on direction='BUY'/'SELL' (enum only
+    // allowed 'up'/'down'/'neutral'). Now Mixed — full snapshot preserved.
     entryThesis: {
-      direction: { type: String, enum: ['up', 'down', 'neutral'], default: null },
-      probability: { type: Number, default: null },
-      expectedMove: { type: Number, default: null },
-      expectedAdverse: { type: Number, default: null },
-      regime: { type: String, default: null },
-      sampleSize: { type: Number, default: null },
-      timestamp: { type: Date, default: null },
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
     },
 
     // ---- Trade Economics (snapshot at entry) ----
@@ -244,5 +282,8 @@ TradeSchema.index({ closeTime: -1 });
 TradeSchema.index({ stake: 1, multiplier: 1 });
 TradeSchema.index({ knockoutLevel: 1 });
 TradeSchema.index({ 'thesisMonitorState.thesisValid': 1 });
+// [FIX-DIGIT-PERSIST] New index for digit-specific queries (e.g. per-bot
+// per-contract-type analytics, reconciliation filters).
+TradeSchema.index({ contractType: 1, status: 1 });
 
 module.exports = mongoose.model('Trade', TradeSchema);
