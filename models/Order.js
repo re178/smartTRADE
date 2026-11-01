@@ -2,22 +2,20 @@
 // EXTENDED: Added Multiplier fields and proposal tracking.
 //
 // [CHANGE-4-1] contractId is a String — already matched Trade.js.
-//   Kept as-is; description clarified.
 // [CHANGE-4-2] Added purchasePrice (canonical) and filledPrice (compat
-//   alias used by orderService's orderData.filledPrice per File 2B).
-//   A pre('save') hook keeps the two in sync. entryPrice remains the
-//   underlying market entry price — distinct from the purchase cost.
+//   alias used by orderService's orderData.filledPrice).
 // [CHANGE-4-3] contractId now has a PARTIAL UNIQUE index that applies
-//   only when it is a non-null string. Pending orders (contractId: null)
-//   are unconstrained; confirmed contracts cannot be duplicated by either
-//   orderService's normal insert or the broker's repair path in
-//   _reconcilePositions().
+//   only when it is a non-null string.
 //
-// NOTE: The broker no longer creates Order documents inside
-//   placeMarketOrder (see File 1C). The only insert paths are
-//   orderService's new Order().save() and the broker's
-//   _reconcilePositions() repair path, which is guarded by a prior
-//   existence check and backed by the partial unique index.
+// [FIX-DIGIT-PERSIST] contractService.placeDigitOrBinary was failing to save
+//   Order documents for every digit/binary contract. Two root causes:
+//     1. side was sent as 'CALL'/'DIGITEVEN'/etc. — not in the enum.
+//        contractService now normalizes side to 'BUY'/'SELL' and stores the
+//        specific contract in contractType (added below).
+//     2. barrier, durationUnit, product, contractType were being silently
+//        dropped by strict mode. Now explicit fields.
+//   Also kept units + clientOrderId required (contractService now populates
+//   both in File 4).
 
 const mongoose = require('mongoose');
 
@@ -30,8 +28,6 @@ const OrderSchema = new mongoose.Schema(
 
     // ---- Legacy fields (kept) ----
     units: { type: Number, required: true },
-    // [CHANGE-4-2] Underlying market entry price. Distinct from
-    // purchasePrice / filledPrice (amount paid for the contract).
     entryPrice: {
       type: Number,
       default: null,
@@ -46,7 +42,6 @@ const OrderSchema = new mongoose.Schema(
       enum: ['PENDING', 'ACCEPTED', 'EXECUTING', 'FILLED', 'REJECTED', 'CANCELLED', 'CLOSED'],
       default: 'PENDING',
     },
-    // [CHANGE-4-1] String — matches Trade.contractId.
     contractId: {
       type: String,
       default: null,
@@ -80,7 +75,7 @@ const OrderSchema = new mongoose.Schema(
     duration: {
       type: Number,
       default: null,
-      description: 'Trade duration in seconds',
+      description: 'Trade duration (value in units of durationUnit)',
     },
 
     // ---- Price levels ----
@@ -95,24 +90,50 @@ const OrderSchema = new mongoose.Schema(
       description: 'Take-profit price level',
     },
 
-    // ---- [CHANGE-4-2] Contract purchase cost ----
-    // Canonical name. Amount paid to Deriv for the contract. For
-    // multipliers this is the Deriv-confirmed purchase price; for CFDs
-    // it stays null (a CFD has no purchase cost in this sense).
+    // ---- Contract purchase cost ----
     purchasePrice: {
       type: Number,
       default: null,
       min: 0,
       description: 'Amount paid to purchase the Deriv contract',
     },
-    // Compat alias used by orderService's orderData
-    // (see File 2B: filledPrice: purchasePrice). Kept in sync with
-    // purchasePrice by the pre('save') hook below.
     filledPrice: {
       type: Number,
       default: null,
       min: 0,
       description: 'Alias for purchasePrice (amount filled at); kept in sync by pre-save hook',
+    },
+
+    // =============================================================
+    //  DIGIT / BINARY TRADING FIELDS  [FIX-DIGIT-PERSIST]
+    // =============================================================
+    contractType: {
+      type: String,
+      default: null,
+      index: true,
+      description: 'MULTUP / MULTDOWN / CALL / PUT / DIGITEVEN / DIGITODD / DIGITOVER / DIGITUNDER / DIGITMATCH / DIGITDIFF / ONETOUCH / NOTOUCH',
+    },
+    barrier: {
+      type: String,
+      default: null,
+      description: 'Barrier used for digit/touch contracts (0-9 for digits)',
+    },
+    durationUnit: {
+      type: String,
+      default: null,
+      description: "Duration unit: 's' (seconds) or 't' (ticks)",
+    },
+    product: {
+      type: String,
+      default: null,
+      index: true,
+      description: 'Deriv product: deriv_multiplier / deriv_digital',
+    },
+    // [FIX-DIGIT-PERSIST] Carry the entryThesis snapshot on Order as well
+    // so the audit trail is complete even if the Trade record is delayed.
+    entryThesis: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
     },
 
     // ---- Proposal tracking (proposal-first execution) ----
@@ -135,11 +156,7 @@ const OrderSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// [CHANGE-4-2] Keep filledPrice and purchasePrice in lockstep.
-// orderService writes `filledPrice: purchasePrice` (File 2B) and the broker
-// repair path writes `purchasePrice` (File 1C). Whichever side sets one,
-// the other is populated on save. This hook does NOT fire for
-// findOneAndUpdate — callers using that operator must set both explicitly.
+// Keep filledPrice and purchasePrice in lockstep.
 OrderSchema.pre('save', function (next) {
   if (this.filledPrice != null && this.purchasePrice == null) {
     this.purchasePrice = this.filledPrice;
@@ -147,7 +164,6 @@ OrderSchema.pre('save', function (next) {
     this.filledPrice = this.purchasePrice;
   } else if (this.filledPrice != null && this.purchasePrice != null
              && this.filledPrice !== this.purchasePrice) {
-    // Prefer the canonical purchasePrice; log divergence for investigation.
     try {
       const logger = require('../infrastructure/logger') || console;
       logger.warn(
@@ -164,9 +180,6 @@ OrderSchema.pre('save', function (next) {
 // ---- Indexes ----
 OrderSchema.index({ clientOrderId: 1 });
 OrderSchema.index({ status: 1 });
-// [CHANGE-4-3] Enforce one confirmed Order per contract. Partial filter
-// scopes the uniqueness to non-null string contractIds, so PENDING orders
-// without a contract yet can coexist freely.
 OrderSchema.index(
   { contractId: 1 },
   {
@@ -179,5 +192,8 @@ OrderSchema.index({ proposalId: 1 });
 OrderSchema.index({ stake: 1, multiplier: 1 });
 OrderSchema.index({ duration: 1 });
 OrderSchema.index({ knockoutLevel: 1, takeProfitLevel: 1 });
+// [FIX-DIGIT-PERSIST] New index for per-product/per-contract-type analytics.
+OrderSchema.index({ product: 1, status: 1 });
+OrderSchema.index({ contractType: 1, status: 1 });
 
 module.exports = mongoose.model('Order', OrderSchema);
