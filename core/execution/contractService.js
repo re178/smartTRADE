@@ -18,6 +18,25 @@
 // [FIX-3] roundPrice() applies per-symbol decimal precision to
 //         knockoutLevel / takeProfitLevel before they hit Deriv's proposal API.
 //         Prevents USDJPY InputValidationFailed on float noise.
+//
+// [FIX-DIGIT-PERSIST] _persist() was failing to save Order and Trade docs
+//         for every digit/binary contract. Three root causes:
+//           1. side was stored as 'CALL'/'call'/'DIGITEVEN'/'digiteven'/etc.
+//              which violated both enums (Order: BUY/SELL; Trade: buy/sell).
+//              Now normalized: BUY for "positive bet" contracts (CALL, MULTUP,
+//              DIGITEVEN/OVER/MATCH, ONETOUCH), SELL for "negative bet"
+//              contracts (PUT, MULTDOWN, DIGITODD/UNDER/DIFF, NOTOUCH).
+//              The specific contract type is stored in contractType.
+//           2. Order.units and Order.clientOrderId were required but never
+//              populated. Now set from stake and contractId respectively.
+//           3. Trade.side was lowercased from an already-invalid value.
+//              Now normalized once via _normalizeSide() and reused.
+//
+// [FIX-DIGIT-PERSIST-2] Persist contractType, barrier, durationUnit, product,
+//              and entryThesis on BOTH Order and Trade. All five fields now
+//              exist in the schemas (Files 2 & 3), and populating them means
+//              digit/binary trades can be fully reconstructed from the DB
+//              without depending on the running bot instance.
 
 'use strict';
 
@@ -42,10 +61,38 @@ const CONTRACT_TYPES = {
   NOTOUCH: 'NOTOUCH',
 };
 
-// Deriv's current allowed multiplier set. Any value outside this is rejected
-// by the proposal API. Update here if Deriv changes their policy again.
+// Deriv's current allowed multiplier set.
 const ACCEPTED_MULTIPLIERS = [200, 400, 600, 800];
 const DEFAULT_MULTIPLIER = 200;
+
+// [FIX-DIGIT-PERSIST] Map a Deriv contract type to its semantic direction.
+// "Positive bet" contracts profit when the underlying goes UP or when a
+// statistical event (EVEN/MATCH/OVER/ONETOUCH) occurs.
+// "Negative bet" contracts profit when the underlying goes DOWN or when the
+// complementary event (ODD/DIFF/UNDER/NOTOUCH) occurs.
+//
+// This mapping lets us store a clean buy/sell side while keeping the
+// specific contract type in the contractType field.
+const SIDE_BUY_TYPES = new Set([
+  'MULTUP', 'CALL',
+  'DIGITEVEN', 'DIGITOVER', 'DIGITMATCH',
+  'ONETOUCH',
+]);
+const SIDE_SELL_TYPES = new Set([
+  'MULTDOWN', 'PUT',
+  'DIGITODD', 'DIGITUNDER', 'DIGITDIFF',
+  'NOTOUCH',
+]);
+
+function _normalizeSide(contractTypeOrSide) {
+  if (!contractTypeOrSide) return 'BUY';
+  const upper = String(contractTypeOrSide).toUpperCase();
+  if (upper === 'BUY' || upper === 'SELL') return upper;
+  if (SIDE_BUY_TYPES.has(upper)) return 'BUY';
+  if (SIDE_SELL_TYPES.has(upper)) return 'SELL';
+  // Unknown contract type — default to BUY so save doesn't fail.
+  return 'BUY';
+}
 
 function normalizeSymbol(s) {
   if (!s) return '';
@@ -70,10 +117,6 @@ function roundPrice(symbol, price) {
   return Math.round(Number(price) * f) / f;
 }
 
-/**
- * Map a symbol to the Deriv symbol used in API calls.
- * Synthetic indices (R_10, 1HZ100V, etc.) are passed through unchanged.
- */
 function toDerivSymbol(symbol, broker) {
   if (!symbol) return '';
   if (/^(R_|1HZ)/i.test(symbol)) return symbol;
@@ -89,9 +132,6 @@ function toDerivSymbol(symbol, broker) {
   return fxMap[clean] || symbol;
 }
 
-/**
- * Fetch a proposal from Deriv.
- */
 async function _fetchProposal(broker, params) {
   const resp = await broker._sendAuthRequest({ proposal: 1, ...params }, 15000);
   const proposal = resp && resp.proposal;
@@ -101,9 +141,6 @@ async function _fetchProposal(broker, params) {
   return proposal;
 }
 
-/**
- * Buy a proposal by id.
- */
 async function _buyProposal(broker, proposal) {
   const askPrice = Number(proposal.ask_price);
   if (!Number.isFinite(askPrice) || askPrice <= 0) {
@@ -118,7 +155,10 @@ async function _buyProposal(broker, proposal) {
 }
 
 /**
- * Persist Order + Trade documents for a confirmed contract.
+ * [FIX-DIGIT-PERSIST] Persist Order + Trade documents for a confirmed contract.
+ * Both sides populated with all fields required by their schemas.
+ * Errors on either write are logged but never re-thrown — the contract is
+ * already live at Deriv; the caller's job is to confirm the buy, not the DB.
  */
 async function _persist(params) {
   const {
@@ -127,50 +167,96 @@ async function _persist(params) {
     contractType, product, strategy, regimeCode, entryThesis,
   } = params;
 
+  // [FIX-DIGIT-PERSIST] Normalize side once for both schemas.
+  // Order.side = 'BUY'|'SELL' (uppercase enum).
+  // Trade.side = 'buy'|'sell' (lowercase enum).
+  const normalizedSide = _normalizeSide(side);
+  const orderSide = normalizedSide;                       // 'BUY' | 'SELL'
+  const tradeSide = normalizedSide.toLowerCase();          // 'buy' | 'sell'
+
+  const stakeNum = Number(stake) || 0;
+  const purchasePriceNum = Number(purchasePrice) || null;
+
+  // [FIX-DIGIT-PERSIST] Build the entryThesis snapshot ONCE, reused by both.
+  const thesisSnapshot = entryThesis && typeof entryThesis === 'object'
+    ? entryThesis
+    : null;
+
+  // ── Order document ─────────────────────────────────────────
   const orderDoc = await Order.create({
-    contractId,
+    // Required fields the schema enforces
+    clientOrderId: String(contractId),           // Order.clientOrderId is required + unique
     instrument: normalizeSymbol(symbol),
-    side,
-    stake: Number(stake) || 0,
-    multiplier: multiplier != null ? Number(multiplier) : null,
+    side: orderSide,
+    units: stakeNum,                             // Order.units is required
     status: 'FILLED',
-    product,
-    filledPrice: Number(purchasePrice) || null,
+    contractId: String(contractId),
+
+    // Cost / price
+    entryPrice: Number(entryPrice) || null,
+    purchasePrice: purchasePriceNum,
+    filledPrice: purchasePriceNum,               // pre-save hook keeps them in sync
+
+    // Timing
     placedAt: new Date(),
+    filledAt: new Date(),
     duration: duration != null ? parseInt(duration, 10) : null,
     durationUnit: durationUnit || null,
+
+    // Levels
     knockoutLevel: knockoutLevel != null ? Number(knockoutLevel) : null,
     takeProfitLevel: takeProfitLevel != null ? Number(takeProfitLevel) : null,
-    barrier: barrier != null ? String(barrier) : null,
+
+    // Multiplier / digit specific
+    stake: stakeNum,
+    multiplier: multiplier != null ? Number(multiplier) : null,
     contractType: contractType || null,
-    metadata: { strategy: strategy || null, regimeCode: regimeCode || null },
+    barrier: barrier != null ? String(barrier) : null,
+    product: product || null,
+
+    // Metadata / thesis
+    metadata: {
+      strategy: strategy || null,
+      regimeCode: regimeCode || null,
+    },
+    entryThesis: thesisSnapshot,
   }).catch(err => {
     logger.error(`[contractService] Order save failed for ${contractId}: ${err.message}`);
     return null;
   });
 
+  // ── Trade document ─────────────────────────────────────────
   const tradeDoc = await Trade.create({
-    contractId,
+    // Required fields the schema enforces
+    contractId: String(contractId),
     instrument: normalizeSymbol(symbol),
-    side: String(side || '').toLowerCase(),
-    lotSize: Number(stake) || 0,
-    stake: Number(stake) || 0,
-    multiplier: multiplier != null ? Number(multiplier) : null,
+    side: tradeSide,
+    lotSize: stakeNum,                           // Trade.lotSize is required
+    openPrice: Number(entryPrice) || 0,          // Trade.openPrice is required
     status: 'OPEN',
     openTime: new Date(),
-    openPrice: Number(entryPrice) || null,
-    purchasePrice: Number(purchasePrice) || null,
+
+    // Cost / price
+    purchasePrice: purchasePriceNum,
     currentPrice: Number(entryPrice) || null,
     floatingProfit: 0,
-    product,
+    product: product || null,
+
+    // Linkage
     strategy: strategy || null,
-    entryThesis: entryThesis || null,
-    knockoutLevel: knockoutLevel != null ? Number(knockoutLevel) : null,
-    takeProfitLevel: takeProfitLevel != null ? Number(takeProfitLevel) : null,
+
+    // Multiplier / digit specific
+    stake: stakeNum,
+    multiplier: multiplier != null ? Number(multiplier) : null,
     duration: duration != null ? parseInt(duration, 10) : null,
     durationUnit: durationUnit || null,
+    knockoutLevel: knockoutLevel != null ? Number(knockoutLevel) : null,
+    takeProfitLevel: takeProfitLevel != null ? Number(takeProfitLevel) : null,
     contractType: contractType || null,
     barrier: barrier != null ? String(barrier) : null,
+
+    // Full thesis snapshot (now Mixed in the schema — File 2)
+    entryThesis: thesisSnapshot,
   }).catch(err => {
     logger.error(`[contractService] Trade save failed for ${contractId}: ${err.message}`);
     return null;
@@ -182,17 +268,11 @@ async function _persist(params) {
 /**
  * Place a Multiplier contract (MULTUP / MULTDOWN).
  * FX trades use this.
- *
- * IMPORTANT: Do NOT send duration / duration_unit. Deriv multiplier contracts
- * exit on limit_order barrier hit (knockout / takeProfit) or manual close.
- * Sending duration_unit: 's' triggers InvalidExpiry — this was blocking every
- * FX bot entry since the system started.
  */
 async function placeMultiplier(params) {
   const {
     symbol, direction, stake, multiplier,
     knockoutLevel = null, takeProfitLevel = null,
-    // duration, durationUnit are INTENTIONALLY ignored for multipliers — see above
     strategy = null, regimeCode = null, entryThesis = null,
   } = params;
 
@@ -218,7 +298,6 @@ async function placeMultiplier(params) {
   const koRounded = roundPrice(symbol, knockoutLevel);
   const tpRounded = roundPrice(symbol, takeProfitLevel);
 
-  // No duration / duration_unit — multiplier contracts do not use them.
   const proposalParams = {
     amount: stakeNum,
     basis: 'stake',
@@ -268,8 +347,7 @@ async function placeMultiplier(params) {
 }
 
 /**
- * Place a Digital or Rise/Fall or Touch contract.
- * Synthetics only. These DO use duration (in ticks or seconds).
+ * Place a Digital or Rise/Fall or Touch contract. Synthetics only.
  */
 async function placeDigitOrBinary(params) {
   const {
@@ -336,9 +414,6 @@ async function placeDigitOrBinary(params) {
   };
 }
 
-/**
- * Universal entry — dispatches by contract class.
- */
 async function placeContract(params) {
   if (params.multiplier != null) return placeMultiplier(params);
   if (params.contractType) return placeDigitOrBinary(params);
