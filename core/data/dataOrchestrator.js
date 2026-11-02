@@ -27,8 +27,34 @@
 //   learningWeights.
 // [FILE-8L] recover() logs failures instead of swallowing.
 // [FILE-8M] get() honours aliases.
+//
+// [FIX-DO1] Regime-code coercion no longer spams the log. The 'unknown'
+//           sentinel (which deepMarketState and deepRegime emit when they
+//           can't determine a regime) is coerced to NEUTRAL silently,
+//           with a per-symbol DEBUG log throttled to once per 5 min. Only
+//           genuinely unrecognized codes (e.g. a new regime string that
+//           isn't in VALID_REGIME_CODES) fire WARN — throttled per code
+//           to once per 5 min. This eliminates the ~40+ [Orchestrator]
+//           Coerced unknown regime code lines/minute visible in production.
+// [FIX-DO2] _sanitizeHistoricalState now handles null/empty regime.code
+//           (coerces to NEUTRAL silently) and normalizes case before
+//           comparing against VALID_REGIME_CODES, so 'Unknown', 'UNKNOWN',
+//           and 'unknown' all take the same silent path.
+// [FIX-DO3] All console.warn/console.error replaced with logger.warn/error
+//           so these go to the configured log stream, not stdout.
+// [FIX-DO4] Snapshot and append flush timers are .unref()'d so a stalled
+//           flush cannot keep the Node process alive after shutdown.
+// [FIX-DO5] _warnedKeys capped at MAX_WARNED_KEYS (1000) to prevent
+//           unbounded memory growth on a long-running process.
+// [FIX-DO6] _snapshotQueue and _appendQueue capped at MAX_QUEUE_DEPTH
+//           (5000). When exceeded, oldest entries are dropped with a
+//           rate-limited warning — prevents OOM if DB writes stall.
+// [FIX-DO7] _handleBusiness / _handleKnowledge now attach a .catch() to
+//           the fire-and-forget _persistImmediately promise so a reject
+//           can never surface as unhandledRejection.
 
 const mongoose = require('mongoose');
+const logger = require('../../infrastructure/logger') || console;
 
 const DATA_CLASSES = {
   EPHEMERAL: 'ephemeral',
@@ -51,6 +77,19 @@ const VALID_REGIME_CODES = [
 ];
 const VALID_SOURCE_VALUES = ['live', 'backfill', 'backtest'];
 
+// [FIX-DO1] 'unknown' (any case) is a known sentinel — coerce silently.
+// Only codes NOT in this list AND NOT in VALID_REGIME_CODES generate WARN.
+const KNOWN_UNKNOWN_REGIME_VALUES = ['unknown', 'n/a', 'none', '', 'null', 'undefined'];
+
+// [FIX-DO5] Bounded warn set — prevents memory growth on long uptimes.
+const MAX_WARNED_KEYS = 1000;
+
+// [FIX-DO6] Bounded queues — prevents OOM if DB stalls.
+const MAX_QUEUE_DEPTH = 5000;
+
+// [FIX-DO1] Throttle windows for coercion diagnostics.
+const REGIME_LOG_THROTTLE_MS = 5 * 60 * 1000;
+
 // [FILE-8D] Cache key aliases
 const CACHE_KEY_ALIASES = {
   learningState: ['learningWeights'],
@@ -68,14 +107,31 @@ class DataOrchestrator {
     this._recovered = false;
     this._warnedKeys = new Set();
 
+    // [FIX-DO1] Per-symbol throttling for 'unknown' coercion (debug)
+    this._unknownRegimeLoggedAt = new Map();
+    // [FIX-DO1] Per-code throttling for genuinely unrecognized codes (warn)
+    this._unrecognizedRegimeLoggedAt = new Map();
+    // [FIX-DO6] Rate-limited warning state for queue overflow
+    this._queueOverflowWarnedAt = 0;
+
     this._flushSnapshots = this._flushSnapshots.bind(this);
     this._flushAppends = this._flushAppends.bind(this);
   }
 
+  // [FIX-DO3] Route through logger; [FIX-DO5] cap the set.
   _warnOnce(key, message) {
     if (this._warnedKeys.has(key)) return;
+    if (this._warnedKeys.size >= MAX_WARNED_KEYS) {
+      // Simple eviction: drop the oldest half when we hit the cap.
+      const drop = Math.floor(MAX_WARNED_KEYS / 2);
+      let i = 0;
+      for (const k of this._warnedKeys) {
+        this._warnedKeys.delete(k);
+        if (++i >= drop) break;
+      }
+    }
     this._warnedKeys.add(key);
-    console.warn(message);
+    logger.warn(message);
   }
 
   // ============================================================
@@ -172,26 +228,58 @@ class DataOrchestrator {
   _handleRecoverable(key, entry, policy) {
     this._cache.set(key, { ...entry, policy });
     if (policy.collection) {
+      // [FIX-DO6] Bounded queue
+      if (this._snapshotQueue.length >= MAX_QUEUE_DEPTH) {
+        this._warnQueueOverflow('snapshot');
+        this._snapshotQueue.shift();
+      }
       this._snapshotQueue.push({ key, data: entry.data, metadata: entry.metadata });
       if (!this._snapshotTimer) {
         this._snapshotTimer = setTimeout(this._flushSnapshots, policy.snapshotInterval);
+        // [FIX-DO4] Don't keep process alive waiting for flush
+        if (typeof this._snapshotTimer.unref === 'function') this._snapshotTimer.unref();
       }
     }
   }
 
   _handleResearch(key, entry, policy) {
+    // [FIX-DO6] Bounded queue
+    if (this._appendQueue.length >= MAX_QUEUE_DEPTH) {
+      this._warnQueueOverflow('append');
+      this._appendQueue.shift();
+    }
     this._appendQueue.push({ key, data: entry.data, metadata: entry.metadata });
     if (!this._appendTimer) {
       this._appendTimer = setTimeout(this._flushAppends, 2000);
+      // [FIX-DO4] Don't keep process alive waiting for flush
+      if (typeof this._appendTimer.unref === 'function') this._appendTimer.unref();
     }
   }
 
   _handleBusiness(key, entry, policy) {
-    this._persistImmediately(key, entry.data, entry.metadata, policy);
+    // [FIX-DO7] Attach .catch() — _persistImmediately is async but callers
+    // here are fire-and-forget. Internal try/catch handles the common case;
+    // this catch guards against the rare path where the try itself throws
+    // (e.g. require() of a missing model module).
+    this._persistImmediately(key, entry.data, entry.metadata, policy)
+      .catch(err => logger.warn(`[Orchestrator] Business persist rejected for '${key}': ${err.message}`));
   }
 
   _handleKnowledge(key, entry, policy) {
-    this._persistImmediately(key, entry.data, entry.metadata, policy);
+    // [FIX-DO7] Attach .catch() — see _handleBusiness note above.
+    this._persistImmediately(key, entry.data, entry.metadata, policy)
+      .catch(err => logger.warn(`[Orchestrator] Knowledge persist rejected for '${key}': ${err.message}`));
+  }
+
+  // [FIX-DO6] Rate-limited overflow warning (once per 60s).
+  _warnQueueOverflow(which) {
+    const now = Date.now();
+    if (now - this._queueOverflowWarnedAt < 60000) return;
+    this._queueOverflowWarnedAt = now;
+    logger.warn(
+      `[Orchestrator] ${which} queue exceeded ${MAX_QUEUE_DEPTH} items — ` +
+      `dropping oldest (DB flush may be stalled)`
+    );
   }
 
   // ============================================================
@@ -213,7 +301,6 @@ class DataOrchestrator {
   _resolveModelByName(name) {
     if (!name) return null;
 
-    // Try direct model-name matches with various casings
     const candidates = new Set([
       name,
       name.charAt(0).toUpperCase() + name.slice(1),
@@ -223,7 +310,6 @@ class DataOrchestrator {
       if (mongoose.models[candidate]) return mongoose.models[candidate];
     }
 
-    // Try collection-name match — case-insensitive, singular/plural tolerant
     const lowerName = name.toLowerCase();
     const stemName = lowerName.replace(/s$/, '');
     for (const model of Object.values(mongoose.models)) {
@@ -277,7 +363,7 @@ class DataOrchestrator {
         );
       } catch (err) {
         // [FILE-8F] Log with key
-        console.warn(`[Orchestrator] Snapshot save failed for '${key}': ${err.message}`);
+        logger.warn(`[Orchestrator] Snapshot save failed for '${key}': ${err.message}`);
       }
     }
   }
@@ -320,7 +406,7 @@ class DataOrchestrator {
         }
       } catch (err) {
         // [FILE-8F] Log with key
-        console.warn(`[Orchestrator] Append save failed for '${key}': ${err.message}`);
+        logger.warn(`[Orchestrator] Append save failed for '${key}': ${err.message}`);
       }
     }
   }
@@ -337,28 +423,73 @@ class DataOrchestrator {
   // ============================================================
   // SANITIZATION
   // ============================================================
+  // [FIX-DO1] + [FIX-DO2] Regime coercion rewritten:
+  //   • 'unknown' sentinel (any case) → silent coerce, throttled DEBUG log
+  //   • Genuinely unrecognized code    → coerce, throttled WARN
+  //   • null/empty regime.code         → silent coerce
+  // Only genuinely surprising strings fire a visible WARN.
   _sanitizeHistoricalState(doc) {
     if (!doc.source || !VALID_SOURCE_VALUES.includes(doc.source)) {
       doc.source = 'live';
     }
-    if (doc.regime && doc.regime.code) {
-      if (!VALID_REGIME_CODES.includes(doc.regime.code)) {
-        // [FILE-8J] Log which code was coerced
-        console.warn(
-          `[Orchestrator] Coerced unknown regime code '${doc.regime.code}' → 'NEUTRAL' ` +
-          `(symbol=${doc.symbol}, timeframe=${doc.timeframe})`
-        );
-        doc.regime.code = 'NEUTRAL';
-        doc.regime.name = 'Neutral / Mixed';
-      }
-    } else {
+
+    const symbol = doc.symbol || 'global';
+    const timeframe = doc.timeframe || 'M5';
+    const rawCode = doc.regime && doc.regime.code;
+    const normalized = typeof rawCode === 'string' ? rawCode.trim().toUpperCase() : '';
+
+    // [FIX-DO2] Empty / null / whitespace → silent NEUTRAL.
+    if (!normalized) {
       doc.regime = {
         code: 'NEUTRAL',
         name: 'Neutral / Mixed',
-        confidence: 50,
-        description: '',
+        confidence: (doc.regime && doc.regime.confidence) || 50,
+        description: (doc.regime && doc.regime.description) || '',
       };
+      return doc;
     }
+
+    if (VALID_REGIME_CODES.includes(normalized)) {
+      // Canonical code — just normalize the case in place.
+      if (doc.regime.code !== normalized) doc.regime.code = normalized;
+      return doc;
+    }
+
+    // Code is not in VALID_REGIME_CODES.
+    const lowerRaw = normalized.toLowerCase();
+
+    if (KNOWN_UNKNOWN_REGIME_VALUES.includes(lowerRaw)) {
+      // [FIX-DO1] Silent coerce for the known 'unknown' sentinel.
+      // Upstream (deepMarketState / deepRegime) emits this when it can't
+      // determine a regime; it's a normal runtime condition, not a bug.
+      // Log at DEBUG once per symbol per 5 min so the origin stays traceable.
+      const now = Date.now();
+      const last = this._unknownRegimeLoggedAt.get(symbol) || 0;
+      if (now - last >= REGIME_LOG_THROTTLE_MS) {
+        this._unknownRegimeLoggedAt.set(symbol, now);
+        logger.debug(
+          `[Orchestrator] Normalized regime '${rawCode}' → NEUTRAL ` +
+          `(symbol=${symbol}, timeframe=${timeframe}) — throttled ${REGIME_LOG_THROTTLE_MS / 1000}s`
+        );
+      }
+    } else {
+      // [FIX-DO1] Genuinely unrecognized code — this IS worth a WARN, but
+      // throttled per code so a misbehaving publisher can't flood the log.
+      const now = Date.now();
+      const last = this._unrecognizedRegimeLoggedAt.get(normalized) || 0;
+      if (now - last >= REGIME_LOG_THROTTLE_MS) {
+        this._unrecognizedRegimeLoggedAt.set(normalized, now);
+        logger.warn(
+          `[Orchestrator] Unrecognized regime code '${rawCode}' → NEUTRAL ` +
+          `(symbol=${symbol}, timeframe=${timeframe}). ` +
+          `Add it to VALID_REGIME_CODES if it's legitimate. ` +
+          `(throttled ${REGIME_LOG_THROTTLE_MS / 1000}s per code)`
+        );
+      }
+    }
+
+    doc.regime.code = 'NEUTRAL';
+    doc.regime.name = 'Neutral / Mixed';
     return doc;
   }
 
@@ -396,7 +527,7 @@ class DataOrchestrator {
       }
     } catch (err) {
       // [FILE-8F] Log with key
-      console.warn(`[Orchestrator] Immediate save failed for '${key}': ${err.message}`);
+      logger.warn(`[Orchestrator] Immediate save failed for '${key}': ${err.message}`);
     }
   }
 
@@ -453,7 +584,7 @@ class DataOrchestrator {
       this._recovered = true;
     } catch (err) {
       // [FILE-8L] Log so failures are visible
-      console.warn(`[Orchestrator] recover() failed: ${err.message}`);
+      logger.warn(`[Orchestrator] recover() failed: ${err.message}`);
     }
   }
 
@@ -484,7 +615,7 @@ class DataOrchestrator {
       }
     } catch (err) {
       // [FILE-8L] Log
-      console.warn(`[Orchestrator] _loadKnowledgeState failed: ${err.message}`);
+      logger.warn(`[Orchestrator] _loadKnowledgeState failed: ${err.message}`);
     }
   }
 
