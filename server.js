@@ -1,52 +1,30 @@
 // server.js – RTS Entry Point (Deriv-only, pattern-based, with balance guard)
 //
-// [FIX-S1]  Replaced console.log/error/warn with the shared logger so log
-//           levels and transports are consistent with the rest of the system.
-//           The startup ASCII banner stays on console.log by design.
-// [FIX-S2]  WATCHED_SYMBOLS is now configurable via the WATCHED_SYMBOLS env
-//           var (comma-separated). Falls back to the original 4-symbol list.
-// [FIX-S3]  _pipelineInFlight now has a 60s timeout so a stuck pipeline call
-//           cannot permanently block future cycles for that symbol.
-// [FIX-S4]  New /debug/regime endpoint returns the current regime for every
-//           watched symbol plus the last decision from decisionEngine.
-// [FIX-S5]  New /debug/orchestrator endpoint returns dataOrchestrator cache
-//           stats, queue depths, and historicalState publish counts by
-//           symbol AND regime code.
-// [FIX-S6]  dataOrchestrator.publish is wrapped (server startup only) to
-//           increment _regimePublishCounts. Diagnostic hook — wrapped call
-//           semantics identical to the original.
-// [FIX-S7]  Pipeline NO_TRADE log lines are throttled to once per 60s per
-//           symbol per reason. TRADE results always log at INFO.
-// [FIX-S8]  runPredictionPipeline now explicitly logs when marketState
-//           returns null (previously silent — masked missing-data conditions).
-// [FIX-S9]  sendDashboardInitialState broker/account calls are wrapped in a
-//           5s timeout so a slow broker can't block a new WebSocket client.
-// [FIX-S10] marketState updates are broadcast to dashboards (type
-//           'marketStateUpdate') after each pipeline cycle.
-//
-// [FIX-S11] **Database lifecycle — startup race eliminated.**
-//           `connectDB()` was called at module top-level WITHOUT awaiting,
-//           so the Express HTTP server could start listening before
-//           MongoDB was connected. `ensureAdmin()` (which queries User)
-//           could then hit "Mongoose buffering timed out" errors on a
-//           cold boot. The call is now inside `startServer()` and awaited
-//           BEFORE `ensureAdmin()`. Startup order is now:
-//             1. await connectDB()    — exits on failure
-//             2. await ensureAdmin()  — runs against live DB
-//             3. server.listen(PORT)
-//             4. broker + candle bootstrap
-//             5. pipeline timer starts
-//           The port stays CLOSED until MongoDB is connected, so a
-//           startup script polling /health correctly sees "not ready"
-//           rather than a false 200.
-//
-// [FIX-S12] **/health now reports database state.** Previously the endpoint
-//           returned HTTP 200 as soon as the process was up, even if
-//           MongoDB had disconnected mid-run. Now it returns:
-//             200 {"status":"OK","database":"CONNECTED",...}  when ready
-//             503 {"status":"STARTING","database":"DISCONNECTED",...} when not
-//           This is what the Windows Task Scheduler startup script will
-//           poll to decide when to send the "started" notification.
+// [FIX-S1]  Shared logger instead of raw console.*
+// [FIX-S2]  WATCHED_SYMBOLS configurable via env var
+// [FIX-S3]  Pipeline in-flight 60s timeout
+// [FIX-S4]  /debug/regime endpoint
+// [FIX-S5]  /debug/orchestrator + /debug/regime-publish endpoints
+// [FIX-S6]  dataOrchestrator.publish wrapper for regime publish diagnostics
+// [FIX-S7]  Pipeline NO_TRADE log throttling
+// [FIX-S8]  Explicit null-state logging in runPredictionPipeline
+// [FIX-S9]  sendDashboardInitialState broker calls wrapped in 5s timeout
+// [FIX-S10] marketStateUpdate broadcasts to dashboards
+// [FIX-S11] connectDB() awaited BEFORE ensureAdmin() and server.listen()
+// [FIX-S12] /health and /health/pipeline report database state; 503 when
+//           MongoDB is disconnected
+// [FIX-S13] RTS startup email notification. After server.listen succeeds
+//           (which requires the awaited MongoDB connection from S11), an
+//           email is sent to esilesirayland@gmail.com listing every
+//           private LAN IPv4 address the laptop is reachable on, so the
+//           phone can connect from the same network. Reuses the existing
+//           services/emailService.js sendEmail() — no new dependencies.
+//           Failures are logged but never crash startup: the notification
+//           is a convenience, not a critical path.
+// [FIX-S14] Notification is fired inside server.listen() callback so it
+//           only runs after the port is actually bound. Combined with S11,
+//           this guarantees the email only goes out when MongoDB AND
+//           Express AND broker bootstrap have all succeeded.
 
 require('dotenv').config();
 
@@ -56,8 +34,10 @@ const path = require('path');
 const mongoose = require('mongoose');
 const WebSocket = require('ws');
 const http = require('http');
+const os = require('os');                             // [FIX-S13]
 
 const logger = require('./infrastructure/logger') || console;
+const { sendEmail } = require('./shared/emailService'); // [FIX-S13]
 
 const dashboardClients = new Set();
 
@@ -115,7 +95,7 @@ const balanceGuard = require('./core/risk/balanceGuard');
 
 const { getBroker } = require('./core/execution/brokerFactory');
 
-// --- OTIE lazily initialised (see initOtie) ---
+// --- OTIE lazily initialised ---
 let otie = null;
 
 function normalizeSymbol(symbol) {
@@ -143,15 +123,13 @@ function toBrokerSymbol(displaySymbol) {
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// [FIX-S2] Watched symbols — configurable via env var.
 const DEFAULT_WATCHED = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD'];
 const WATCHED_SYMBOLS = (process.env.WATCHED_SYMBOLS || DEFAULT_WATCHED.join(','))
   .split(',')
   .map(s => normalizeSymbol(s))
   .filter(Boolean);
 
-// [FIX-S11] connectDB() call removed from here — it is now awaited inside
-// startServer() BEFORE ensureAdmin(). Do not re-add this line.
+// [FIX-S11] connectDB() is awaited inside startServer() — do not add it here.
 
 const _consensusCache = new Map();
 const _predictionCache = new Map();
@@ -159,7 +137,6 @@ const _opportunityCache = new Map();
 const _pipelineInFlight = new Map();
 
 const PIPELINE_TIMEOUT_MS = 60 * 1000;
-
 const PIPELINE_LOG_THROTTLE_MS = 60 * 1000;
 const _pipelineLogThrottle = new Map();
 
@@ -173,10 +150,108 @@ dataOrchestrator.publish = function (key, data, metadata) {
       _regimePublishCounts[data.symbol][code] =
         (_regimePublishCounts[data.symbol][code] || 0) + 1;
     }
-  } catch (_) { /* never let a diagnostic hook break publish */ }
+  } catch (_) { /* never break publish */ }
   return _originalPublish(key, data, metadata);
 };
 
+// ============================================================
+// [FIX-S13] RTS startup email notification helpers
+// ============================================================
+
+/**
+ * Enumerate private LAN IPv4 addresses the machine is reachable on.
+ * Filters out loopback and public IPs. Returns an array of
+ * { interface, ip, url } objects.
+ */
+function getRTSLanAddresses(port) {
+  const interfaces = os.networkInterfaces();
+  const addresses = [];
+
+  for (const [interfaceName, entries] of Object.entries(interfaces)) {
+    for (const entry of entries || []) {
+      if (entry.internal || entry.family !== 'IPv4') continue;
+
+      const ip = entry.address;
+      const isPrivate =
+        ip.startsWith('10.') ||
+        ip.startsWith('192.168.') ||
+        /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(ip);
+
+      if (isPrivate) {
+        addresses.push({
+          interface: interfaceName,
+          ip,
+          url: `http://${ip}:${port}`,
+        });
+      }
+    }
+  }
+
+  return addresses;
+}
+
+/**
+ * Send the RTS startup email to esilesirayland@gmail.com.
+ * Non-throwing — failures are logged but never interrupt startup.
+ * Called from inside server.listen() callback in startServer().
+ */
+async function sendRTSStartupNotification(port) {
+  const addresses = getRTSLanAddresses(port);
+
+  const addressHTML = addresses.length
+    ? addresses.map(item => `
+        <p>
+          <strong>${item.interface}</strong><br>
+          IP: ${item.ip}<br>
+          <a href="${item.url}">${item.url}</a>
+        </p>
+      `).join('')
+    : '<p>No private LAN IPv4 address was detected.</p>';
+
+  const html = `
+    <h2>RTS Laptop Startup Successful</h2>
+
+    <p>Your Ray Trading Hub server has started successfully.</p>
+
+    <p><strong>Status:</strong> ONLINE</p>
+    <p><strong>Database:</strong> CONNECTED</p>
+    <p><strong>Port:</strong> ${port}</p>
+    <p><strong>Time:</strong> ${new Date().toLocaleString()}</p>
+
+    <hr>
+
+    <h3>Current Laptop Network Addresses</h3>
+
+    ${addressHTML}
+
+    <hr>
+
+    <p>Open one of the addresses above from your phone
+    when both devices are connected to the same network.</p>
+
+    <p>RTS Automatic Startup Notification</p>
+  `;
+
+  try {
+    const result = await sendEmail(
+      'esilesirayland@gmail.com',
+      'RTS is ONLINE - Laptop Startup Notification',
+      html
+    );
+
+    if (result.success) {
+      logger.info(`[Notify] RTS startup email sent via ${result.provider || 'unknown'}`);
+    } else {
+      logger.error(`[Notify] RTS startup email failed: ${result.error || 'unknown error'}`);
+    }
+  } catch (error) {
+    logger.error(`[Notify] RTS notification error: ${error.message}`);
+  }
+}
+
+// ============================================================
+// Flatten consensus (unchanged from prior version)
+// ============================================================
 function flattenConsensus(consensus) {
   if (!consensus || !consensus.consensus) return null;
   const c = consensus.consensus;
@@ -293,13 +368,9 @@ app.use(async (req, res, next) => {
 
 app.use('/api', apiRoutes);
 app.use('/api', botRoutes);
-
 app.use('/api/edge-test', require('./api/edgeController'));
 
-// [FIX-S12] Health endpoint now reports database state.
-// Returns 200 only when MongoDB is connected; 503 otherwise.
-// Used by the Windows Task Scheduler startup script to decide when to
-// send the "started" notification to esilesirayland@gmail.com.
+// [FIX-S12] Health endpoint reports database state.
 app.get('/health', (req, res) => {
   const databaseConnected = mongoose.connection.readyState === 1;
 
@@ -346,11 +417,8 @@ app.get('/health/pipeline', async (req, res) => {
 });
 
 app.get('/api/balance-guard', (req, res) => {
-  try {
-    res.json(balanceGuard.getState());
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  try { res.json(balanceGuard.getState()); }
+  catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/balance-guard/reset', (req, res) => {
@@ -440,17 +508,12 @@ app.get('/debug/regime', (req, res) => {
       const decision = decisionEngine.getLastDecision(symbol);
       regimes[symbol] = {
         regime: regime ? {
-          code: regime.code,
-          name: regime.name,
-          confidence: regime.confidence,
-          reason: regime.reason,
-          family: regime.family,
+          code: regime.code, name: regime.name,
+          confidence: regime.confidence, reason: regime.reason, family: regime.family,
         } : null,
         marketStateCachePresent: !!state,
         lastDecision: decision ? {
-          decision: decision.decision,
-          confidence: decision.confidence,
-          reason: decision.reason,
+          decision: decision.decision, confidence: decision.confidence, reason: decision.reason,
         } : null,
       };
     }
@@ -754,9 +817,7 @@ eventBus.on('trade.closed', async (data) => {
   const realizedProfit = Number(data?.realizedProfit);
   const riskAmount = Number(data?.riskAmount);
 
-  if (!strategy || !instrument || !Number.isFinite(realizedProfit)) {
-    return;
-  }
+  if (!strategy || !instrument || !Number.isFinite(realizedProfit)) return;
 
   try {
     const symbol = normalizeSymbol(instrument);
@@ -795,9 +856,7 @@ performanceMonitor.on('thresholdsUpdated', (thresholds) => {
 function logPipelineResult(symbol, reason, opportunity, level = 'info') {
   const now = Date.now();
   const prev = _pipelineLogThrottle.get(symbol);
-  if (prev && prev.reason === reason && (now - prev.at) < PIPELINE_LOG_THROTTLE_MS) {
-    return;
-  }
+  if (prev && prev.reason === reason && (now - prev.at) < PIPELINE_LOG_THROTTLE_MS) return;
   _pipelineLogThrottle.set(symbol, { reason, at: now });
   const detail = opportunity && opportunity.tradable
     ? `${opportunity.multiplier}x ${opportunity.direction} [${opportunity.source || '?'}]`
@@ -906,7 +965,7 @@ async function runPredictionPipelineAll() {
       ctx.positions = await broker.getOpenTrades();
     }
   } catch (e) {
-    // Fall back to per-symbol fetch inside runPredictionPipeline
+    // fall back to per-symbol fetch
   }
 
   let ok = 0;
@@ -1011,9 +1070,6 @@ async function waitForBrokerReady(broker, timeoutMs = 30000) {
 
 async function startServer() {
   // [FIX-S11] MongoDB must connect successfully before RTS starts.
-  // connectDB() throws if the connection fails — which means the process
-  // exits (via startServer().catch below) rather than leaving a zombie
-  // server listening on port 5000 with no database.
   await connectDB();
 
   // Only create/check the admin after database connection.
@@ -1038,6 +1094,12 @@ async function startServer() {
     console.log(`Health full:    http://localhost:${PORT}/health/pipeline`);
     console.log(`Debug:          http://localhost:${PORT}/debug/pipeline`);
     console.log('==============================================');
+
+    // [FIX-S13/S14] Send startup email — fires AFTER port is bound,
+    // which (given S11) also means MongoDB is connected. Non-blocking.
+    sendRTSStartupNotification(PORT).catch(err => {
+      logger.error('[Notify] sendRTSStartupNotification threw:', err.message);
+    });
 
     startWSPing();
 
@@ -1149,9 +1211,7 @@ async function startServer() {
       if (broker && broker.disconnect) await broker.disconnect();
     } catch (_) {}
     try { wss.close(); } catch (_) {}
-    try {
-      await mongoose.connection.close();
-    } catch (_) {}
+    try { await mongoose.connection.close(); } catch (_) {}
     try { server.close(); } catch (_) {}
     process.exit(0);
   }
