@@ -4,12 +4,39 @@
 //
 // Routes by prediction.modeLabel:
 //   • conflict          → NO_TRADE STRATEGY_CONFLICT
+//   • silent            → NO_TRADE NO_SIGNAL          [FIX-O1]
 //   • no_data           → NO_TRADE NO_DATA
 //   • strategy_only     → strategy-consensus gate (2+ agree, valid levels)
 //   • combined / pattern_only / analogue_only → ATR path simulation
 //
 // Every candidate multiplier is evaluated on 500 synthetic ATR-drawn paths.
 // No historical state is consulted.
+//
+// [FIX-O1] `silent` mode (predictor produced no usable signal) was not
+//          recognized by the router, so it fell through to the direction
+//          check and returned UNCERTAIN_DIRECTION. It now returns the
+//          dedicated NO_SIGNAL reason — clearer in logs and for pipeline
+//          downstream branches that key on reason.
+// [FIX-O2] Path simulation checked TP before SL within the same candle.
+//          When both levels are inside a candle's [low, high] range, the
+//          TP check won, biasing probTP upward and overstating EV. We now
+//          check SL first (conservative convention) so borderline trades
+//          are rejected rather than approved on optimistic sim data.
+// [FIX-O3] `probabilities` on the TRADE response was defaulting to a
+//          fixed {0.33, 0.33, 0.34} distribution when prediction.probabilities
+//          was absent. It now falls back to the SIM's computed
+//          {probTP, probSL, probOther} so downstream consumers see values
+//          consistent with tradeEconomics.
+// [FIX-O4] `preCheckCommon` divided `marketData.spread` by `pipSize`
+//          without guarding against a missing / zero / NaN pip size
+//          (synthetics sometimes have no pip concept). NaN > threshold is
+//          false → check silently passed. Now guarded; missing pipSize
+//          skips the spread gate rather than pretending it passed.
+// [FIX-O5] Added diagnostic in preCheckCommon that logs at WARN when
+//          calibratedConfidence is dramatically lower than strategyConsensus
+//          .confidence. This makes the current 55 → 36/33/31 drop visible
+//          in production without changing behavior. Fix the upstream
+//          calibrator (predictionEngine.js) to address it.
 
 'use strict';
 
@@ -70,6 +97,7 @@ const NO_TRADE_REASONS = {
   STRATEGY_WEAK: 'STRATEGY_WEAK',
   INVALID_STRATEGY_LEVELS: 'INVALID_STRATEGY_LEVELS',
   NO_DATA: 'NO_DATA',
+  NO_SIGNAL: 'NO_SIGNAL',   // [FIX-O1]
 };
 
 // ========================================================================
@@ -83,7 +111,7 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
   const modeLabel = prediction.modeLabel || 'analogue_only';
   const source = prediction.source || 'analogue';
 
-  // 1. Conflict
+  // 1. Conflict — most specific, gets first say
   if (modeLabel === 'conflict' || source === 'conflict') {
     const reasons = prediction.strategyConsensus?.reasons || [];
     logger.info(
@@ -97,7 +125,23 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
     );
   }
 
-  // 2. No data
+  // [FIX-O1] 2. Silent — predictor produced no usable signal.
+  // Previously this fell through to the direction check and logged
+  // UNCERTAIN_DIRECTION, which was misleading and forced downstream
+  // consumers to reason about mode=undefined vs mode=silent separately.
+  if (modeLabel === 'silent' || source === 'silent') {
+    logger.info(
+      `[Opportunity] ${prediction.symbol} NO_TRADE NO_SIGNAL ` +
+      `(predictor silent — no usable signal this cycle)`
+    );
+    return createNoTradeResponse(
+      NO_TRADE_REASONS.NO_SIGNAL,
+      'Predictor returned no signal',
+      prediction
+    );
+  }
+
+  // 3. No data
   if (modeLabel === 'no_data') {
     return createNoTradeResponse(
       NO_TRADE_REASONS.NO_DATA,
@@ -106,7 +150,7 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
     );
   }
 
-  // 3. Direction
+  // 4. Direction
   if (prediction.direction === 'NEUTRAL' || !prediction.direction) {
     logger.info(
       `[Opportunity] ${prediction.symbol} NO_TRADE UNCERTAIN_DIRECTION ` +
@@ -119,11 +163,11 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
     );
   }
 
-  // 4. Common pre-checks
+  // 5. Common pre-checks
   const preCheck = preCheckCommon(prediction, account, marketData);
   if (preCheck) return preCheck;
 
-  // 5. Route
+  // 6. Route
   if (modeLabel === 'strategy_only') {
     return evaluateStrategyOnly(prediction, account, openPositions, marketData, riskConfig);
   }
@@ -139,6 +183,21 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
 // ========================================================================
 function preCheckCommon(prediction, account, marketData) {
   const { calibratedConfidence = 0, marketQuality = 50 } = prediction;
+
+  // [FIX-O5] Diagnostic — surface the calibration drop without blocking.
+  // In production logs, the ranker emits conf=55 while calibratedConfidence
+  // arrives at 36/33/31, which is what triggers LOW_CONFIDENCE. Seeing the
+  // delta in the log makes the upstream issue (predictionEngine calibration)
+  // visible without changing behavior here.
+  const consensusConf = Number(prediction.strategyConsensus?.confidence);
+  if (Number.isFinite(consensusConf) && consensusConf > calibratedConfidence + 15) {
+    logger.warn(
+      `[Opportunity] ${prediction.symbol} confidence drop: ` +
+      `calibrated=${calibratedConfidence.toFixed(1)} vs consensus=${consensusConf.toFixed(1)} ` +
+      `(Δ=${(consensusConf - calibratedConfidence).toFixed(1)}) — ` +
+      `check predictionEngine calibration`
+    );
+  }
 
   if (calibratedConfidence < CONFIG.MIN_CONFIDENCE) {
     logger.info(
@@ -164,18 +223,28 @@ function preCheckCommon(prediction, account, marketData) {
     );
   }
 
+  // [FIX-O4] Guard pipSize — synthetics may not have a sensible pip size,
+  // and NaN > threshold is false (silently passing the gate). If we can't
+  // compute pips, skip the spread gate rather than pretend it passed.
   if (marketData?.spread) {
     const pipSize = getPipSize(prediction.symbol);
-    const spreadPips = marketData.spread / pipSize;
-    if (spreadPips > CONFIG.MAX_SPREAD_PIPS) {
-      logger.info(
-        `[Opportunity] ${prediction.symbol} NO_TRADE HIGH_SPREAD — ` +
-        `spread=${spreadPips.toFixed(2)} pips (max ${CONFIG.MAX_SPREAD_PIPS})`
-      );
-      return createNoTradeResponse(
-        NO_TRADE_REASONS.HIGH_SPREAD,
-        `Spread ${spreadPips.toFixed(2)} pips exceeds ${CONFIG.MAX_SPREAD_PIPS}`,
-        prediction
+    if (Number.isFinite(pipSize) && pipSize > 0) {
+      const spreadPips = marketData.spread / pipSize;
+      if (Number.isFinite(spreadPips) && spreadPips > CONFIG.MAX_SPREAD_PIPS) {
+        logger.info(
+          `[Opportunity] ${prediction.symbol} NO_TRADE HIGH_SPREAD — ` +
+          `spread=${spreadPips.toFixed(2)} pips (max ${CONFIG.MAX_SPREAD_PIPS})`
+        );
+        return createNoTradeResponse(
+          NO_TRADE_REASONS.HIGH_SPREAD,
+          `Spread ${spreadPips.toFixed(2)} pips exceeds ${CONFIG.MAX_SPREAD_PIPS}`,
+          prediction
+        );
+      }
+    } else {
+      logger.debug(
+        `[Opportunity] ${prediction.symbol} spread check skipped — ` +
+        `pipSize unavailable (symbol=${prediction.symbol})`
       );
     }
   }
@@ -360,7 +429,7 @@ async function evaluateStrategyOnly(prediction, account, openPositions, marketDa
 }
 
 // ========================================================================
-// ATR-based path evaluation (replaces analogue-based)
+// ATR-based path evaluation
 // ========================================================================
 async function evaluateWithPaths(prediction, account, openPositions, marketData, riskConfig, mode) {
   const {
@@ -371,7 +440,7 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
 
   const isCombined = mode === 'combined';
 
-  // ---- Sample-size gate (relaxed — pattern predictor supplies candles.length) ----
+  // ---- Sample-size gate ----
   const sampleSize = prediction.sampleSize || 0;
   if (sampleSize < 20) {
     logger.info(`[Opportunity] ${symbol} NO_TRADE LOW_SAMPLE_SIZE — ${sampleSize} candles`);
@@ -393,13 +462,16 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
   }
 
   // ---- Expected move pip-normalized ----
+  // [FIX-O4] Same guard as preCheckCommon — skip rather than NaN-compare.
   const pipSize = getPipSize(prediction.symbol);
-  if (Math.abs(prediction.expectedMove || 0) < pipSize * 2) {
-    return createNoTradeResponse(
-      NO_TRADE_REASONS.LOW_EXPECTED_MOVE,
-      `Expected move ${((prediction.expectedMove || 0) / pipSize).toFixed(2)} pips < 2`,
-      prediction
-    );
+  if (Number.isFinite(pipSize) && pipSize > 0) {
+    if (Math.abs(prediction.expectedMove || 0) < pipSize * 2) {
+      return createNoTradeResponse(
+        NO_TRADE_REASONS.LOW_EXPECTED_MOVE,
+        `Expected move ${((prediction.expectedMove || 0) / pipSize).toFixed(2)} pips < 2`,
+        prediction
+      );
+    }
   }
 
   // ---- MAE ratio ----
@@ -502,12 +574,14 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
 
       for (let i = 0; i < path.prices.length; i++) {
         const hi = path.highs[i], lo = path.lows[i];
+        // [FIX-O2] SL first — conservative. When a single candle spans both
+        // TP and SL, previously TP won (biased probTP upward, overstated EV).
         if (direction === 'BUY') {
-          if (hi >= takeProfitLevel) { hitTP = true; exitPrice = takeProfitLevel; break; }
           if (lo <= knockoutLevel)   { hitSL = true; exitPrice = knockoutLevel;   break; }
+          if (hi >= takeProfitLevel) { hitTP = true; exitPrice = takeProfitLevel; break; }
         } else {
-          if (lo <= takeProfitLevel) { hitTP = true; exitPrice = takeProfitLevel; break; }
           if (hi >= knockoutLevel)   { hitSL = true; exitPrice = knockoutLevel;   break; }
+          if (lo <= takeProfitLevel) { hitTP = true; exitPrice = takeProfitLevel; break; }
         }
       }
       if (!exitPrice) exitPrice = path.prices[path.prices.length - 1];
@@ -557,7 +631,7 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
     );
   }
 
-  // ---- Duration: convert candles → seconds via timeframe ----
+  // ---- Duration ----
   const TF_SECONDS = { M1: 60, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400, D1: 86400 };
   const tfSec = TF_SECONDS[prediction.timeframe] || 300;
   const candlesToMax = prediction.timeToMaxFavorable || 5;
@@ -611,7 +685,14 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
     entryPrice,
     knockoutLevel,
     takeProfitLevel,
-    probabilities: prediction.probabilities || { up: 0.33, down: 0.33, neutral: 0.34 },
+    // [FIX-O3] Use sim's computed values when the predictor doesn't supply
+    // a directional distribution. The previous 0.33/0.33/0.34 fallback was
+    // a placeholder that didn't match tradeEconomics.
+    probabilities: prediction.probabilities || {
+      up: bestMetrics.probTP,
+      down: bestMetrics.probSL,
+      neutral: bestMetrics.probOther,
+    },
     source: mode,
     tradeEconomics: {
       probTP: bestMetrics.probTP,
