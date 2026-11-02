@@ -15,6 +15,20 @@
 // [FIX-D] Symbol maps seeded from FALLBACK_SYMBOLS + no-underscore aliases,
 //         then overlaid by discovery. Pairs missed by active_symbols keep
 //         their fallback mapping.
+// [FIX-C1] placeMarketOrder converts caller-supplied SL/TP *price levels*
+//          into Deriv Multiplier `limit_order` *currency amounts* (2 decimals).
+//          Sending price levels to Deriv triggers ContractBuyValidationError
+//          "Only 2 decimal places allowed." on `take_profit`.
+// [FIX-C2] Portfolio requests use in-flight dedupe and treat RateLimit as a
+//          hard stop (no inline retry) with a shared cooldown window. During
+//          cooldown, getOpenTrades() serves stale cache instead of hammering
+//          Deriv. Eliminates the 120+/min portfolio RateLimit storm.
+// [FIX-H2] getCandles no longer sends `adjust_start_time: 1`, which caps the
+//          returned window at the market's session depth (M5 was returning
+//          177/500). Also warns when < 80% of requested candles come back.
+// [FIX-M5] _verifyContractStatus applies exponential backoff (60s → 15min)
+//          after consecutive 'unknown' responses, so rate-limited contract
+//          verification stops re-polling the same 13 IDs every 60s.
 // [FILE-4.4] tick event includes mid. Synthetics in symbol map + watchlist.
 // [FILE-4.1] getCandles uses ticks_history with style='candles'.
 
@@ -57,6 +71,15 @@ let _requestCounter = 0;
 const ACCEPTED_MULTIPLIERS = [200, 400, 600, 800];
 const DEFAULT_MULTIPLIER = ACCEPTED_MULTIPLIERS[0]; // 200
 
+// [FIX-C2] Shared rate-limit cooldown window.
+const RATE_LIMIT_COOLDOWN_MS = 5000;
+const RATE_LIMIT_LOG_THROTTLE_MS = 5000;
+// [FIX-M5] Contract-verify backoff bounds.
+const VERIFY_BACKOFF_BASE_MS = 60_000;
+const VERIFY_BACKOFF_MAX_MS = 15 * 60_000;
+// [FIX-C1] Deriv min SL/TP amount in account currency for Multiplier contracts.
+const MIN_LIMIT_ORDER_AMOUNT = 0.01;
+
 function generateRequestId() { return ++_requestCounter; }
 
 function generateClientOrderId() {
@@ -71,19 +94,15 @@ function generateClientOrderId() {
 function toDerivSymbol(pair, symbolMap) {
   if (!pair) return null;
   const upper = pair.toUpperCase();
-  // 1. Exact key hit (covers EUR_USD, R_100, etc.)
   if (symbolMap[upper]) return symbolMap[upper];
-  // 2. Insert underscore at 3-char split for 6-char FX pairs (EURUSD → EUR_USD)
   if (upper.length === 6 && !upper.includes('_')) {
     const sep = upper.slice(0, 3) + '_' + upper.slice(3);
     if (symbolMap[sep]) return symbolMap[sep];
   }
-  // 3. Strip underscore for underscored inputs (EUR_USD → EURUSD alias)
   if (upper.includes('_')) {
     const noSep = upper.replace(/_/g, '');
     if (symbolMap[noSep]) return symbolMap[noSep];
   }
-  // 4. Pass through unchanged (synthetics / unexpected names)
   return upper;
 }
 
@@ -121,6 +140,19 @@ function isPermanentApiError(err) {
   return (msg.includes('InputValidationFailed') || msg.includes('InvalidSymbol') ||
     msg.includes('ContractCreationFailure') || msg.includes('AuthorizationRequired') ||
     msg.includes('InvalidToken') || msg.includes('PermissionDenied') || msg.includes('InvalidExpiry'));
+}
+
+// [FIX-C2] Detect Deriv rate-limit errors from either thrown errors or raw
+// message objects. Shared by _sendAuthRequest and _handleAuthMessage.
+function isRateLimitError(err) {
+  if (!err || !err.message) return false;
+  return err.message.includes('RateLimit');
+}
+function isRateLimitErrorMsg(errObj) {
+  if (!errObj) return false;
+  if (errObj.code === 'RateLimit') return true;
+  if (typeof errObj.message === 'string' && errObj.message.includes('rate limit')) return true;
+  return false;
 }
 
 class RateLimiter {
@@ -300,17 +332,18 @@ class DerivBroker extends EventEmitter {
     this.streaming = new StreamingManager(this);
     this.symbolManager = new SymbolManager();
 
-    // [FIX-5] Portfolio cache (3s TTL) — avoids hammering `{ portfolio: 1 }`
-    // when multiple callers (getOpenTrades, _reconcilePositions, resume flow)
-    // query positions within the same tick.
+    // [FIX-5] Portfolio cache (3s TTL)
     this._portfolioCache = { contracts: null, at: 0, ttl: 3000 };
+    // [FIX-C2] In-flight dedupe for portfolio + shared rate-limit cooldown.
+    this._portfolioInflight = null;
+    this._rateLimitUntil = 0;
+    this._lastRateLimitLogAt = 0;
 
     this._cbState = CB_STATE.CLOSED;
     this._cbFailureCount = 0;
     this._cbOpenedAt = null;
 
-    // [FIX-D] Seed the symbol maps with fallback entries + no-underscore
-    // aliases so any pair not returned by active_symbols still resolves.
+    // [FIX-D] Seed the symbol maps with fallback entries + no-underscore aliases
     this._seedSymbolMaps();
     this._symbolsDiscovered = false;
     this._symbolsLoaded = false;
@@ -325,6 +358,8 @@ class DerivBroker extends EventEmitter {
     this._contractPersistTimers = new Map();
     this._contractUpdateCounts = new Map();
     this._reconcileMissCounts = new Map();
+    // [FIX-M5] Per-contract backoff tracking for repeated 'unknown' verifies.
+    this._verifyUnknownCounts = new Map();
     this._closedEmitted = new Set();
     this._tradeReconcileTimer = null;
 
@@ -337,6 +372,12 @@ class DerivBroker extends EventEmitter {
       reconcileSkippedFetchError: 0, reconcileSkippedFalseAlarm: 0,
       portfolioEmptyResponses: 0,
       portfolioCacheHits: 0, portfolioCacheMisses: 0,
+      // [FIX-C2] Diagnostics
+      portfolioInflightJoins: 0, portfolioRateLimitedServed: 0,
+      // [FIX-C1] Diagnostics
+      limitOrderConverted: 0, limitOrderSkippedWrongSide: 0,
+      // [FIX-M5] Diagnostics
+      verifyBackoffHits: 0,
     };
 
     this.capabilities = { ...BROKER_CAPABILITIES };
@@ -383,8 +424,6 @@ class DerivBroker extends EventEmitter {
   getSpread(instrument) {
     if (!instrument) return 0;
     let symbol = toDerivSymbol(instrument, this.symbolMap);
-    // [FIX-A] toDerivSymbol now handles both EURUSD and EUR_USD, but keep
-    // this defensive normalization for any future map that omits aliases.
     if (symbol && !symbol.startsWith('frx')) {
       const upper = symbol.toUpperCase();
       if (upper.length === 6 && !upper.includes('_')) {
@@ -490,9 +529,7 @@ class DerivBroker extends EventEmitter {
     this._startTradeReconcileTimer();
   }
 
-  // [FIX-B] Cancellable timeout. Previously sleep(timeoutMs).then(warn) stayed
-  // alive after _accountReady resolved normally, producing a phantom
-  // "Balance load timeout" log 10s later.
+  // [FIX-B] Cancellable timeout for balance load.
   async _ensureBalanceLoaded(timeoutMs = this.config.balanceTimeout) {
     if (this._account && this._account.balance != null) return this._account;
     if (!this._accountReady) {
@@ -823,6 +860,9 @@ class DerivBroker extends EventEmitter {
     while (this._authMessageQueue.length > 0)
       this._sendAuthRaw(this._authMessageQueue.shift().payload);
   }
+
+  // [FIX-C2] RateLimit → hard stop (no inline retry) + shared cooldown.
+  // Non-rate-limit retryable errors still use exponential backoff.
   async _sendAuthRequest(payload, timeoutMs = 15000, signal = null) {
     await this._rateLimiter.acquire();
     if (this._authState !== STATE.READY) await this._connectAuth();
@@ -834,6 +874,11 @@ class DerivBroker extends EventEmitter {
         return await this._sendAuthRawRequest(payload, timeoutMs, signal);
       } catch (err) {
         lastErr = err;
+        if (isRateLimitError(err)) {
+          // [FIX-C2] Extend cooldown, do NOT retry inline. Caller decides.
+          this._setRateLimitCooldown();
+          throw err;
+        }
         if (isPermanentApiError(err)) break;
         if (attempt < this.config.maxRetries) {
           await sleep(this._getReconnectDelay(attempt));
@@ -865,6 +910,15 @@ class DerivBroker extends EventEmitter {
       this._sendAuthRaw(msg);
     });
   }
+
+  // [FIX-C2] Rate-limit cooldown helpers.
+  _setRateLimitCooldown() {
+    this._rateLimitUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+  }
+  _isInRateLimitCooldown() {
+    return this._rateLimitUntil > 0 && Date.now() < this._rateLimitUntil;
+  }
+
   _handleAuthMessage(rawData) {
     try {
       const msg = JSON.parse(rawData);
@@ -875,7 +929,20 @@ class DerivBroker extends EventEmitter {
         handled = true;
       }
       if (msg.pong) { handled = true; }
-      if (msg.error) logger.error('[In Auth] API Error:', JSON.stringify(msg.error));
+      // [FIX-C2] RateLimit errors get throttled logging + cooldown. Other
+      // errors log immediately.
+      if (msg.error) {
+        if (isRateLimitErrorMsg(msg.error)) {
+          this._setRateLimitCooldown();
+          const now = Date.now();
+          if (now - this._lastRateLimitLogAt >= RATE_LIMIT_LOG_THROTTLE_MS) {
+            this._lastRateLimitLogAt = now;
+            logger.warn(`[In Auth] API Error: RateLimit (cooldown active, ${RATE_LIMIT_COOLDOWN_MS}ms)`);
+          }
+        } else {
+          logger.error('[In Auth] API Error:', JSON.stringify(msg.error));
+        }
+      }
       if (msg.req_id && this._authPendingRequests.has(msg.req_id)) {
         const p = this._authPendingRequests.get(msg.req_id);
         clearTimeout(p.timeout);
@@ -892,7 +959,6 @@ class DerivBroker extends EventEmitter {
         this._openPositions = contracts
           .filter(c => c.status && ['open', 'active'].includes(c.status.toLowerCase()))
           .map(c => this._normalizeContract(c));
-        // [FIX-5] WS portfolio push is fresh server data → refresh the cache.
         if (this._portfolioCache) {
           this._portfolioCache.contracts = this._openPositions;
           this._portfolioCache.at = Date.now();
@@ -927,10 +993,8 @@ class DerivBroker extends EventEmitter {
     } catch (e) { logger.error('[In Auth] Parse error:', e.message); }
   }
 
-  // [FIX-C] If _authState transitions to READY during _connectAuth(), the
-  // authReady event has already been emitted before we attach our listener.
-  // Re-check the state after the await so we never wait 30s for a listener
-  // that will never fire.
+  // [FIX-C] Re-check state after _connectAuth() resolves to close the
+  // authReady-emitted-before-listener race.
   async _ensureAuthReady() {
     if (this._authState === STATE.READY) return;
     await this._connectAuth();
@@ -975,9 +1039,6 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // [FIX-2] Reconcile both deriv_multiplier and deriv_digital trades.
-  // Emit trade.closed via eventBus (idempotent via _closedEmitted set) so
-  // downstream P/L attribution stays consistent with the WS settlement path.
   async _reconcileTradeStatus() {
     if (this._authState !== STATE.READY) return;
     let openTrades;
@@ -1026,10 +1087,7 @@ class DerivBroker extends EventEmitter {
           this.metrics.tradesReconciledClosed++;
         } catch (_) {}
         this._reconcileMissCounts.delete(cid);
-        // Invalidate portfolio cache — a trade just changed state.
         if (this._portfolioCache) this._portfolioCache.at = 0;
-
-        // [FIX-2] Idempotent trade.closed emit (shared set with WS settlement path)
         if (!this._closedEmitted.has(cid)) {
           this._closedEmitted.add(cid);
           const riskAmount = Number(trade.stake || trade.lotSize || 1) || 1;
@@ -1061,14 +1119,47 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  async _verifyContractStatus(contractId) {
+  // [FIX-M5] Exponential backoff on repeated 'unknown' responses. Once a
+  // contract has returned 'unknown' N times in a row, we wait 60s, 120s,
+  // 240s, … (cap 15min) before trying again. A successful verify resets
+  // the counter. This stops the "same 13 contracts re-verified every 60s"
+  // pattern that emerges when Deriv rate-limits proposal_open_contract.
+  _recordVerifyUnknown(key, reason = 'unknown') {
+    const prev = this._verifyUnknownCounts.get(key) || { count: 0 };
+    const count = prev.count + 1;
+    const delayMs = Math.min(
+      VERIFY_BACKOFF_BASE_MS * Math.pow(2, count - 1),
+      VERIFY_BACKOFF_MAX_MS
+    );
+    this._verifyUnknownCounts.set(key, {
+      count,
+      nextRetryAt: Date.now() + delayMs,
+      lastReason: reason,
+    });
+  }
+
+  async _verifyContractStatus(contractId, bypassBackoff = false) {
     const key = String(contractId);
     const numericId = Number(key);
     if (!Number.isInteger(numericId) || numericId <= 0) return { status: 'unknown' };
+
+    // [FIX-M5] Backoff gate — skip the network call if we recently got
+    // 'unknown' for this contract.
+    if (!bypassBackoff) {
+      const tracking = this._verifyUnknownCounts.get(key);
+      if (tracking && tracking.nextRetryAt && Date.now() < tracking.nextRetryAt) {
+        this.metrics.verifyBackoffHits++;
+        return { status: 'unknown', backoff: true };
+      }
+    }
+
     try {
       const resp = await this._sendAuthRequest({ proposal_open_contract: 1, contract_id: numericId }, 8000);
       const poc = resp?.proposal_open_contract;
-      if (!poc) return { status: 'unknown' };
+      if (!poc) {
+        this._recordVerifyUnknown(key, 'empty-response');
+        return { status: 'unknown' };
+      }
       const finalStatuses = ['sold', 'won', 'lost', 'cancelled', 'expired'];
       const isFinal = poc.is_sold || poc.is_expired || finalStatuses.includes(String(poc.status || '').toLowerCase());
       const soldFor = poc.sell_price != null ? Number(poc.sell_price) : null;
@@ -1076,15 +1167,24 @@ class DerivBroker extends EventEmitter {
       const profit = (soldFor != null && buyPrice != null) ? (soldFor - buyPrice) : null;
       const limitStopLoss = poc.limit_order?.stop_loss != null ? Number(poc.limit_order.stop_loss) : null;
       const limitTakeProfit = poc.limit_order?.take_profit != null ? Number(poc.limit_order.take_profit) : null;
+
+      // Success — reset backoff
+      this._verifyUnknownCounts.delete(key);
+
       return isFinal
         ? { status: 'closed', profit, soldFor, buyPrice, limitStopLoss, limitTakeProfit }
         : { status: 'open', profit, soldFor, buyPrice, limitStopLoss, limitTakeProfit };
-    } catch (_) { return { status: 'unknown' }; }
+    } catch (err) {
+      const reason = isRateLimitError(err) ? 'rate-limited' : 'error';
+      this._recordVerifyUnknown(key, reason);
+      return { status: 'unknown' };
+    }
   }
 
   async getContractStatus(contractId) {
     await this._ensureAuthReady();
-    return this._verifyContractStatus(contractId);
+    // [FIX-M5] Public callers bypass backoff — they want a fresh answer.
+    return this._verifyContractStatus(contractId, true);
   }
 
   _startTradeReconcileTimer() {
@@ -1189,11 +1289,7 @@ class DerivBroker extends EventEmitter {
       const res = await Trade.findOneAndUpdate({ contractId: String(key) }, { $set: update }, { new: false });
       if (res) this.metrics.contractUpdatesPersisted++;
 
-      // [FIX-1] Emit trade.closed the first time we see this contract settle.
-      // BotRunner listens to this and updates BotRun.pnl + instance stats.
-      // [FIX-2] Shared _closedEmitted set with reconciliation path → idempotent.
       if (isFinal) {
-        // [FIX-5] Contract settled → position gone → portfolio cache is stale.
         if (this._portfolioCache) this._portfolioCache.at = 0;
 
         if (!this._closedEmitted.has(key)) {
@@ -1236,8 +1332,7 @@ class DerivBroker extends EventEmitter {
     }
   }
 
-  // [FIX-B] Cancellable timeout. Previously the losing sleep(...).then(throw)
-  // became an unhandled rejection when _loadSymbolsInternal won the race.
+  // [FIX-B] Cancellable timeout for symbol load.
   async _loadSymbolsWithTimeout() {
     let timer = null;
     const timeoutPromise = new Promise((_resolve, reject) => {
@@ -1245,9 +1340,6 @@ class DerivBroker extends EventEmitter {
       if (typeof timer.unref === 'function') timer.unref();
     });
     const loadPromise = this._loadSymbolsInternal();
-    // If the timeout wins, swallow the eventual outcome of loadPromise so
-    // it doesn't surface as an unhandled rejection. When loadPromise wins,
-    // we clearTimeout below so the timeout callback never fires.
     loadPromise.catch(() => {});
     try {
       return await Promise.race([loadPromise, timeoutPromise]);
@@ -1274,15 +1366,10 @@ class DerivBroker extends EventEmitter {
       throw new Error('No symbols received');
     }
   }
-  // [FIX-D] Fallback path now seeds from _seedSymbolMaps (which adds the
-  // no-underscore aliases) rather than duplicating the FALLBACK_SYMBOLS body.
   _useFallbackSymbols() {
     this._seedSymbolMaps();
     this._symbolsDiscovered = true; this._symbolsLoaded = true;
   }
-  // [FIX-D] Overlay discovered symbols on top of the fallback seed so that
-  // any pair missed by active_symbols keeps its fallback mapping. Both
-  // EUR_USD and EURUSD keys are populated for every FX pair.
   _buildSymbolMaps(symbols) {
     this._seedSymbolMaps();
     let count = 0;
@@ -1297,7 +1384,7 @@ class DerivBroker extends EventEmitter {
         const ourPair = fxMatch[1] + '_' + fxMatch[2];
         const noSep = fxMatch[1] + fxMatch[2];
         this.symbolMap[ourPair] = derivSymbol;
-        this.symbolMap[noSep] = derivSymbol; // [FIX-D] alias
+        this.symbolMap[noSep] = derivSymbol;
         this.reverseMap[derivSymbol] = ourPair;
         this.spreadMap[derivSymbol] = pip * 0.5;
         count++;
@@ -1466,6 +1553,11 @@ class DerivBroker extends EventEmitter {
     return results;
   }
 
+  // [FIX-H2] Removed `adjust_start_time: 1`. That flag was silently
+  // truncating the returned window to the market's current session depth,
+  // causing M5 to return only 177/500 candles while M1 returned full count.
+  // We now warn when <80% of the requested candles come back so the issue
+  // is visible if it recurs.
   async getCandles(instrument, count = 100, granularity = 'M5') {
     await this._ensurePublicReady();
     const symbol = toDerivSymbol(instrument, this.symbolMap);
@@ -1474,7 +1566,7 @@ class DerivBroker extends EventEmitter {
     const sec = intervalMap[granularity] || 300;
     const safeCount = Math.max(1, Math.min(parseInt(count) || 100, 5000));
     const reqPayload = {
-      ticks_history: symbol, adjust_start_time: 1, count: safeCount,
+      ticks_history: symbol, count: safeCount,
       end: 'latest', style: 'candles', granularity: sec,
     };
     logger.info(`[DerivBroker] getCandles(${instrument}/${granularity}) → ${symbol} count=${safeCount} gran=${sec}s`);
@@ -1489,35 +1581,141 @@ class DerivBroker extends EventEmitter {
       logger.warn(`[DerivBroker] getCandles(${instrument}): 0 candles`);
       return [];
     }
+    if (resp.candles.length < safeCount * 0.8) {
+      logger.warn(
+        `[DerivBroker] getCandles(${instrument}/${granularity}): only ` +
+        `${resp.candles.length}/${safeCount} candles returned (market may have limited history)`
+      );
+    }
     logger.info(`[DerivBroker] getCandles(${instrument}) ✓ ${resp.candles.length} candles`);
     return resp.candles.slice(-safeCount).map(c => ({
       mid: { o: c.open, h: c.high, l: c.low, c: c.close }, time: c.epoch, complete: true,
     }));
   }
 
-  // [FIX-5] Portfolio cache — 3s TTL. Invalidated on buy/sell/close and when
-  // a contract settles. Populated both from fetch and from WS portfolio pushes.
+  // [FIX-5] + [FIX-C2]
+  // 1. Cache hit → return cached array.
+  // 2. In-flight dedupe → if another caller is already fetching, join.
+  // 3. Rate-limit cooldown → serve stale cache, no network call.
+  // 4. Fetch. On RateLimit → return stale cache if available, else rethrow.
   async getOpenTrades() {
     await this._ensureAuthReady();
     const now = Date.now();
+
     if (this._portfolioCache && this._portfolioCache.contracts &&
         (now - this._portfolioCache.at) < this._portfolioCache.ttl) {
       this.metrics.portfolioCacheHits++;
       return this._portfolioCache.contracts;
     }
-    this.metrics.portfolioCacheMisses++;
-    const resp = await this._sendAuthRequest({ portfolio: 1 });
-    const contracts = (resp.portfolio?.contracts) || [];
-    const normalized = contracts
-      .filter(c => c.status && ['open', 'active'].includes(c.status.toLowerCase()))
-      .map(c => this._normalizeContract(c));
-    if (this._portfolioCache) {
-      this._portfolioCache.contracts = normalized;
-      this._portfolioCache.at = now;
+
+    // [FIX-C2] In-flight dedupe.
+    if (this._portfolioInflight) {
+      this.metrics.portfolioCacheHits++;
+      this.metrics.portfolioInflightJoins++;
+      return this._portfolioInflight;
     }
-    return normalized;
+
+    // [FIX-C2] Cooldown gate — avoid firing new requests while Deriv is
+    // telling us we're rate-limited. Serve stale cache if we have one.
+    if (this._isInRateLimitCooldown() && this._portfolioCache?.contracts) {
+      this.metrics.portfolioCacheHits++;
+      this.metrics.portfolioRateLimitedServed++;
+      return this._portfolioCache.contracts;
+    }
+
+    this.metrics.portfolioCacheMisses++;
+    this._portfolioInflight = (async () => {
+      try {
+        const resp = await this._sendAuthRequest({ portfolio: 1 });
+        const contracts = (resp.portfolio?.contracts) || [];
+        const normalized = contracts
+          .filter(c => c.status && ['open', 'active'].includes(c.status.toLowerCase()))
+          .map(c => this._normalizeContract(c));
+        if (this._portfolioCache) {
+          this._portfolioCache.contracts = normalized;
+          this._portfolioCache.at = Date.now();
+        }
+        return normalized;
+      } catch (err) {
+        // [FIX-C2] RateLimit → serve stale cache rather than propagate.
+        if (isRateLimitError(err) && this._portfolioCache?.contracts) {
+          this.metrics.portfolioRateLimitedServed++;
+          logger.debug(
+            `[DerivBroker] Portfolio rate-limited; serving stale cache ` +
+            `(age ${Date.now() - this._portfolioCache.at}ms)`
+          );
+          return this._portfolioCache.contracts;
+        }
+        throw err;
+      } finally {
+        this._portfolioInflight = null;
+      }
+    })();
+    return this._portfolioInflight;
   }
   async getPositions() { return this.getOpenTrades(); }
+
+  // [FIX-C1] Convert caller-supplied SL/TP *price levels* into Deriv
+  // Multiplier `limit_order` *currency amounts* (2 decimals). Deriv rejects
+  // price levels in this field with "Only 2 decimal places allowed."
+  //
+  // Amount formula for Multiplier contracts:
+  //   notional   = stake × multiplier
+  //   profitAmt  = notional × (price_delta / entry)
+  //   stop_loss  = positive amount (the loss is implied by the field name)
+  //   take_profit= positive amount
+  //
+  // Uses the freshest available reference price: streaming cache if
+  // <5s old, else a base proposal (only when SL/TP are actually needed).
+  _buildLimitOrder(symbol, direction, units, finalMultiplier, stopLossPrice, takeProfitPrice, referencePrice) {
+    if (stopLossPrice == null && takeProfitPrice == null) return { limitOrder: {}, referencePrice, usedBaseProposal: false };
+    if (referencePrice == null || !Number.isFinite(referencePrice) || referencePrice <= 0) {
+      return { limitOrder: {}, referencePrice: null, usedBaseProposal: false, needsBaseProposal: true };
+    }
+
+    const stake = Math.abs(Number(units));
+    const notional = stake * finalMultiplier;
+    const limitOrder = {};
+
+    if (stopLossPrice != null) {
+      const sl = Number(stopLossPrice);
+      if (Number.isFinite(sl) && sl > 0) {
+        const priceDiff = direction === 'MULTUP' ? (referencePrice - sl) : (sl - referencePrice);
+        if (priceDiff > 0) {
+          const lossAmount = notional * priceDiff / referencePrice;
+          const rounded = Math.round(lossAmount * 100) / 100;
+          if (rounded >= MIN_LIMIT_ORDER_AMOUNT) limitOrder.stop_loss = rounded;
+        } else {
+          this.metrics.limitOrderSkippedWrongSide++;
+          logger.warn(
+            `[DerivBroker] placeMarketOrder: stopLoss ${sl} is on the wrong side of ` +
+            `reference ${referencePrice} for ${direction} — omitting stop_loss`
+          );
+        }
+      }
+    }
+
+    if (takeProfitPrice != null) {
+      const tp = Number(takeProfitPrice);
+      if (Number.isFinite(tp) && tp > 0) {
+        const priceDiff = direction === 'MULTUP' ? (tp - referencePrice) : (referencePrice - tp);
+        if (priceDiff > 0) {
+          const profitAmount = notional * priceDiff / referencePrice;
+          const rounded = Math.round(profitAmount * 100) / 100;
+          if (rounded >= MIN_LIMIT_ORDER_AMOUNT) limitOrder.take_profit = rounded;
+        } else {
+          this.metrics.limitOrderSkippedWrongSide++;
+          logger.warn(
+            `[DerivBroker] placeMarketOrder: takeProfit ${tp} is on the wrong side of ` +
+            `reference ${referencePrice} for ${direction} — omitting take_profit`
+          );
+        }
+      }
+    }
+
+    if (Object.keys(limitOrder).length > 0) this.metrics.limitOrderConverted++;
+    return { limitOrder, referencePrice, usedBaseProposal: false };
+  }
 
   async placeMarketOrder(instrument, units, stopLoss = null, takeProfit = null, options = {}) {
     await this._ensureAuthReady();
@@ -1538,18 +1736,48 @@ class DerivBroker extends EventEmitter {
         throw new Error(`Invalid multiplier ${opts.multiplier}.`);
       }
     }
+
     // [FIX-4] Multiplier contracts have no fixed expiry → do NOT send
     // duration_unit: 's'. Sending it causes InvalidExpiry from Deriv.
-    const proposalPayload = {
+    const baseProposalPayload = {
       proposal: 1, amount, basis: 'stake', contract_type: direction,
       currency: this.accountCurrency || 'USD', underlying_symbol: symbol,
       multiplier: finalMultiplier, subscribe: 1,
     };
-    if (stopLoss != null || takeProfit != null) {
-      proposalPayload.limit_order = {};
-      if (stopLoss != null) proposalPayload.limit_order.stop_loss = Number(stopLoss);
-      if (takeProfit != null) proposalPayload.limit_order.take_profit = Number(takeProfit);
+
+    // [FIX-C1] Resolve reference price for limit_order conversion.
+    let referencePrice = null;
+    const cached = this.streaming.getPrice(symbol);
+    if (cached && cached.mid != null && Number.isFinite(cached.mid) && cached.mid > 0) {
+      const age = Date.now() - (cached.time || 0);
+      if (age < 5000) referencePrice = cached.mid;
     }
+
+    // If SL/TP requested but we have no fresh reference price, get spot
+    // from a lightweight base proposal (no limit_order).
+    if ((stopLoss != null || takeProfit != null) && referencePrice == null) {
+      try {
+        const baseResp = await this._sendAuthRequest(baseProposalPayload);
+        const baseProp = baseResp.proposal;
+        if (baseProp?.spot != null) {
+          const spot = Number(baseProp.spot);
+          if (Number.isFinite(spot) && spot > 0) referencePrice = spot;
+        }
+      } catch (err) {
+        // If the base proposal itself fails (e.g. RateLimit), let the main
+        // proposal attempt surface the real error.
+        logger.debug(`[DerivBroker] placeMarketOrder: base proposal for spot failed: ${err.message}`);
+      }
+    }
+
+    // Build limit_order as currency amounts.
+    const { limitOrder } = this._buildLimitOrder(
+      symbol, direction, units, finalMultiplier, stopLoss, takeProfit, referencePrice
+    );
+
+    const proposalPayload = { ...baseProposalPayload };
+    if (Object.keys(limitOrder).length > 0) proposalPayload.limit_order = limitOrder;
+
     const proposalResp = await this._sendAuthRequest(proposalPayload);
     const proposal = proposalResp.proposal;
     if (!proposal?.id) throw new Error(`Proposal missing: ${JSON.stringify(proposalResp)}`);
@@ -1563,8 +1791,6 @@ class DerivBroker extends EventEmitter {
     if (!contractId || contractId === 'undefined') throw new Error('No contract ID');
     if (!Number.isFinite(purchasePrice) || purchasePrice <= 0) throw new Error(`Invalid purchase price.`);
 
-    // [FIX-5] A new position was opened — invalidate portfolio cache so the
-    // next getOpenTrades() returns the fresh list including this contract.
     if (this._portfolioCache) this._portfolioCache.at = 0;
 
     this._subscribeOpenContract(contractId).catch(() => {});
@@ -1585,7 +1811,6 @@ class DerivBroker extends EventEmitter {
     const resp = await this._sendAuthRequest({ sell: numericTradeId, price: 0 });
     if (!resp.sell) throw new Error('Close failed');
 
-    // [FIX-5] Position closed — invalidate portfolio cache.
     if (this._portfolioCache) this._portfolioCache.at = 0;
 
     let coid = this._orderMap.get(String(tradeId));
@@ -1653,6 +1878,8 @@ class DerivBroker extends EventEmitter {
         trackedContracts: this._contractStates.size,
         totalUpdates: this.metrics.contractUpdates,
         persistedUpdates: this.metrics.contractUpdatesPersisted,
+        verifyBackoffHits: this.metrics.verifyBackoffHits,
+        verifyBackoffTracked: this._verifyUnknownCounts.size,
       },
       tradeReconciliation: {
         intervalMs: this.config.tradeReconcileIntervalMs,
@@ -1669,6 +1896,14 @@ class DerivBroker extends EventEmitter {
         cacheMisses: this.metrics.portfolioCacheMisses,
         cacheTtlMs: this._portfolioCache?.ttl ?? 0,
         cacheAgeMs: this._portfolioCache?.at ? (Date.now() - this._portfolioCache.at) : null,
+        inflightJoins: this.metrics.portfolioInflightJoins,
+        rateLimitedServed: this.metrics.portfolioRateLimitedServed,
+        rateLimitCooldownRemainingMs: Math.max(0, this._rateLimitUntil - Date.now()),
+      },
+      limitOrderDiagnostics: {
+        converted: this.metrics.limitOrderConverted,
+        skippedWrongSide: this.metrics.limitOrderSkippedWrongSide,
+        minAmount: MIN_LIMIT_ORDER_AMOUNT,
       },
       accountLoaded: !!(this._account && this._account.balance != null),
       acceptedMultipliers: ACCEPTED_MULTIPLIERS,
@@ -1694,7 +1929,10 @@ class DerivBroker extends EventEmitter {
     this._contractPersistTimers.clear();
     if (this._tradeReconcileTimer) { clearInterval(this._tradeReconcileTimer); this._tradeReconcileTimer = null; }
     this._reconcileMissCounts.clear();
+    this._verifyUnknownCounts.clear();
     this._closedEmitted.clear();
+    this._portfolioInflight = null;
+    this._rateLimitUntil = 0;
     if (this._portfolioCache) { this._portfolioCache.contracts = null; this._portfolioCache.at = 0; }
   }
   _getReconnectDelay(attempt) {
