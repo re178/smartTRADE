@@ -4,27 +4,71 @@
 // Uses proper Effective Sample Size (ESS).
 // Regime compatibility weighting.
 //
-// [FILE-4A] computeEdge() — missing method that both analyticsDashboard
-//   and decisionEngine call. Wraps getPredictionDistribution.
-// [FILE-4B] calibrateConfidence() — missing method that decisionEngine calls.
-//   Buckets historical states by stored confidence, computes empirical
-//   win rate per bucket, returns the bucket matching the query confidence.
-// [FILE-4C] avgReturnR is computed from real outcomes (was hardcoded 0).
-// [FILE-4D] findSimilar now returns `stats` alias with
-//   { count, winRate, avgReturnR, avgMFE, avgMAE, medianReturnR, profitFactor }.
-//   This is what openTradeIntelligenceV5 reads.
-// [FILE-4E] getSymbolVariants strips 'frx' prefix properly.
-// [FILE-4F] qualifiedCount threshold raised to 2.0 (was 1.0).
-// [FILE-4G] MIN_STATES_FOR_REFRESH lowered to 200 (was 10000).
-// [FILE-4H] loadStats logs failures instead of silently falling back.
-// [FILE-4I] findSimilar projection includes `confidence` for calibration.
-// [FILE-4J] getPredictionDistribution correctly reads s.outcome.win.
-// [FILE-4K] Empty-result handling returns stats: {} rather than undefined.
-// [FILE-4.1] Per-symbol movement threshold in getPredictionDistribution.
-//   Was CONFIG.MOVEMENT_THRESHOLD = 0.0005 fixed, which classified ~95%
-//   of EUR/USD 5-min moves as neutral. Now uses pipSize(symbol) × 2.
+// [FILE-4A] computeEdge()
+// [FILE-4B] calibrateConfidence()
+// [FILE-4C] avgReturnR from real outcomes (was hardcoded 0)
+// [FILE-4D] findSimilar returns `stats` alias
+// [FILE-4E] getSymbolVariants strips 'frx'
+// [FILE-4F] qualifiedCount threshold raised to 2.0
+// [FILE-4G] MIN_STATES_FOR_REFRESH lowered to 200
+// [FILE-4H] loadStats logs failures
+// [FILE-4I] findSimilar projection includes `confidence`
+// [FILE-4J] getPredictionDistribution reads s.outcome.win
+// [FILE-4K] Empty-result handling returns stats: {}
+// [FILE-4.1] Per-symbol movement threshold
+//
+// [FIX-SS1] calibrateConfidence() is now **opt-in via CONFIG.CALIBRATION_ENABLED**
+//           (default false). The historical state data in the current database
+//           was produced during a broken era (InvalidSymbol failures,
+//           take_profit rejections, LOW_MARKET_QUALITY rejects). Every sample
+//           labeled with confidence 50-59 has outcome5.win=false, so the
+//           empirical win rate in that bucket is 0%. Applying that rate to
+//           the now-fixed pipeline was downgrading every healthy 55% signal
+//           to 33% → NO_TRADE. The flag lets you start clean; once 7-30 days
+//           of healthy trades have accumulated you can flip it on and the
+//           calibration will self-correct from real data.
+//
+// [FIX-SS2] Sample-size-aware blending replaces hard replacement. Previously
+//           the empirical rate fully replaced the caller's confidence as soon
+//           as the bucket had 10+ samples (regardless of the rate's variance).
+//           Now:
+//             blend = min(MAX_BLEND, samples / FULL_TRUST_SAMPLES)
+//           So 30 samples contribute 15% of the final value, 100 samples
+//           contribute 50%, 200+ samples cap at 70%. The caller's calibrated
+//           confidence never gets hijacked by a noisy 15-sample bucket.
+//
+// [FIX-SS3] Recency filter (CALIBRATION_WINDOW_DAYS, default 30). Only
+//           samples younger than the window are used. Without this, a clean
+//           pipeline running for a week would still be calibrated against
+//           year-old data from the broken era.
+//
+// [FIX-SS4] Minimum win-rate guard (CALIBRATION_MIN_WINS = 3). If a bucket
+//           has 30+ samples but fewer than 3 wins, treat the bucket as
+//           "insufficient evidence" and return raw confidence rather than
+//           zero. Prevents the exact failure mode we're in now even if the
+//           flag is on by mistake.
+//
+// [FIX-SS5] Diagnostic log when calibration actually affects the result.
+//           Shows: bucket, sample count, win rate, raw → calibrated,
+//           blend percentage. Makes future drift debuggable from the log
+//           alone without needing a DB query.
+//
+// [FIX-SS6] Runtime toggle methods setCalibrationEnabled(bool) and
+//           getConfig() exposed for /debug endpoints. No restart required
+//           to disable calibration mid-session.
+//
+// [FIX-SS7] All console.warn / console.log replaced with logger.warn /
+//           logger.info so logs go through the configured transport and
+//           respect LOG_LEVEL.
+//
+// [FIX-SS8] computeEdge() returns null on failure instead of a fully-zero
+//           object. The decision engine's `edge && edge.sampleSize >= 20`
+//           gate now correctly rejects a null edge and falls back to the
+//           rule-based scorer, rather than treating a fake zero-edge as real
+//           signal absence.
 
 const HistoricalState = require('../../../models/HistoricalState');
+const logger = require('../../../infrastructure/logger') || console;
 
 // -------------------- Configuration --------------------
 const CONFIG = {
@@ -45,13 +89,29 @@ const CONFIG = {
   },
   RECENCY_HALF_LIFE_DAYS: 30,
   NORMALIZER_REFRESH_INTERVAL_MS: 60 * 60 * 1000,
-  MIN_STATES_FOR_REFRESH: 200,                 // [FILE-4G]
+  MIN_STATES_FOR_REFRESH: 200,
   GAUSSIAN_SIGMA: 0.15,
-  MOVEMENT_THRESHOLD: 0.0005,                  // fallback only; per-symbol threshold used below
-  QUALIFIED_DISTANCE_THRESHOLD: 2.0,           // [FILE-4F]
-  // [FILE-4.1] Pips used for movement threshold. `pipSize(symbol) × 2` gives
-  // each pair a "small but meaningful 5-min directional move" boundary.
+  MOVEMENT_THRESHOLD: 0.0005,
+  QUALIFIED_DISTANCE_THRESHOLD: 2.0,
   MOVEMENT_THRESHOLD_PIPS: 2,
+
+  // [FIX-SS1] Default OFF until post-fix data accumulates.
+  CALIBRATION_ENABLED: false,
+  // [FIX-SS3] Only use data within this many days.
+  CALIBRATION_WINDOW_DAYS: 30,
+  // Bucket width for confidence calibration.
+  CALIBRATION_BUCKET_SIZE: 10,
+  // [FIX-SS2] Minimum samples in a bucket before calibration considers it.
+  CALIBRATION_MIN_SAMPLES: 30,
+  // [FIX-SS4] Minimum wins — below this, bucket is treated as insufficient.
+  CALIBRATION_MIN_WINS: 3,
+  // [FIX-SS2] Samples needed for the blend to reach max weight.
+  CALIBRATION_FULL_TRUST_SAMPLES: 200,
+  // [FIX-SS2] Maximum weight the empirical rate can carry.
+  CALIBRATION_MAX_BLEND: 0.70,
+  // Cap on how many historical rows to pull per calibration call.
+  CALIBRATION_MAX_SAMPLES: 5000,
+
   REGIME_WEIGHTS: {
     'STRONG_TREND_BULL':   { 'STRONG_TREND_BULL': 1.0, 'WEAK_TREND': 0.7, 'NEUTRAL': 0.5, 'STRONG_TREND_BEAR': 0.1, 'HIGH_VOLATILITY': 0.4, 'LOW_VOLATILITY': 0.6, 'RANGING': 0.3, 'BREAKOUT': 0.6, 'REVERSAL': 0.3 },
     'STRONG_TREND_BEAR':   { 'STRONG_TREND_BEAR': 1.0, 'WEAK_TREND': 0.7, 'NEUTRAL': 0.5, 'STRONG_TREND_BULL': 0.1, 'HIGH_VOLATILITY': 0.4, 'LOW_VOLATILITY': 0.6, 'RANGING': 0.3, 'BREAKOUT': 0.6, 'REVERSAL': 0.3 },
@@ -65,10 +125,7 @@ const CONFIG = {
   },
 };
 
-// -------------------- Pip sizes (for movement threshold) --------------------
-// [FILE-4.1] Per-symbol pip size. Used to scale the movement threshold
-// so a "meaningful 5-min move" isn't the same absolute price for USD/JPY
-// (pip = 0.01) as for EUR/USD (pip = 0.0001).
+// -------------------- Pip sizes --------------------
 function getPipSize(symbol) {
   if (!symbol) return 0.0001;
   const clean = symbol.replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
@@ -83,7 +140,6 @@ function getPipSize(symbol) {
 }
 
 // -------------------- Symbol variants --------------------
-// [FILE-4E] Strip 'frx' prefix before generating variants.
 function getSymbolVariants(symbol) {
   if (!symbol) return [];
   const stripped = symbol.replace(/^frx/i, '');
@@ -100,7 +156,8 @@ function getSymbolVariants(symbol) {
   return Array.from(variants);
 }
 
-// -------------------- Utility Functions --------------------
+// -------------------- Utilities --------------------
+// (weightedPercentile is unused; retained for API compatibility.)
 function weightedPercentile(values, weights, p) {
   if (!values.length || !weights.length || values.length !== weights.length) return 0;
   const sorted = values.map((v, i) => ({ v, w: weights[i] })).sort((a, b) => a.v - b.v);
@@ -202,8 +259,7 @@ class RobustNormalizer {
 
         let result = await HistoricalState.aggregate(pipeline);
         if (result.length === 0) {
-          // [FILE-4H] Log rather than silently fall back
-          console.warn('[StateStore] loadStats: no outcome5-labeled states yet — using default stats.');
+          logger.warn('[StateStore] loadStats: no outcome5-labeled states yet — using default stats.');
           this.stats = this._defaultStats();
         } else {
           const s = result[0];
@@ -224,15 +280,14 @@ class RobustNormalizer {
             const iqr = (vals.q3 - vals.q1) || 1e-6;
             this.stats[key] = { median: vals.med, iqr };
           }
-          console.log(`[StateStore] loadStats refreshed from ${totalStates} labeled states.`);
+          logger.info(`[StateStore] loadStats refreshed from ${totalStates} labeled states.`);
         }
 
         this.isLoaded = true;
         this.lastRefreshed = now;
         this.stateCountAtLastRefresh = totalStates;
       } catch (err) {
-        // [FILE-4H] Log the failure
-        console.warn('[StateStore] loadStats failed:', err.message);
+        logger.warn('[StateStore] loadStats failed:', err.message);
         this.stats = this._defaultStats();
         this.isLoaded = true;
       } finally {
@@ -376,7 +431,7 @@ class StateStore {
           structure: 1,
           session: 1,
           summary: 1,
-          confidence: 1,   // [FILE-4I] for calibrateConfidence
+          confidence: 1,
         },
       },
     ];
@@ -384,7 +439,6 @@ class StateStore {
     const candidates = await HistoricalState.aggregate(pipeline);
 
     if (candidates.length === 0) {
-      // [FILE-4K] Return stats: {} so consumers don't crash on .stats access
       return {
         states: [],
         distanceStats: null,
@@ -429,7 +483,6 @@ class StateStore {
       ? weightedStates.reduce((s, c) => s + c.distance * c.totalWeight, 0) / totalW
       : avgDist;
 
-    // [FILE-4F] Threshold raised to 2.0
     const qualified = weightedStates.filter(c => c.distance <= CONFIG.QUALIFIED_DISTANCE_THRESHOLD);
 
     const distBuckets = {
@@ -450,7 +503,6 @@ class StateStore {
       ? totalW * totalW / weightedStates.reduce((s, c) => s + c.totalWeight * c.totalWeight, 0)
       : 0;
 
-    // [FILE-4D] Compute the `stats` alias that OTIE reads.
     const outcomeStates = weightedStates.filter(s => s.outcome && s.outcome.returnR != null);
     const totalOutcomeWeight = outcomeStates.reduce((s, c) => s + c.totalWeight, 0);
 
@@ -494,7 +546,7 @@ class StateStore {
         min: minDist, max: maxDist, avg: avgDist,
         median: medianDist, weightedAvg: weightedAvgDist,
       },
-      stats: statsAlias,   // [FILE-4D] alias
+      stats: statsAlias,
       candidateCount: weightedStates.length,
       qualifiedCount: qualified.length,
       effectiveSampleSize: ess,
@@ -522,9 +574,6 @@ class StateStore {
     let sumTimeMFE = 0, sumTimeMAE = 0;
     let sumReturnR = 0, sumWeightR = 0;
 
-    // [FILE-4.1] Per-symbol movement threshold. Was fixed at CONFIG.MOVEMENT_THRESHOLD
-    // (0.0005) which classified ~95% of EUR/USD 5-min moves as neutral.
-    // Now scales with pip size: 2 pips per symbol.
     const symbolPipSize = getPipSize(symbol || 'EURUSD');
     const moveThreshold = symbolPipSize * CONFIG.MOVEMENT_THRESHOLD_PIPS;
 
@@ -549,7 +598,6 @@ class StateStore {
       if (s.timeToMaxFavorable !== null && s.timeToMaxFavorable !== undefined) sumTimeMFE += s.timeToMaxFavorable * w;
       if (s.timeToMaxAdverse !== null && s.timeToMaxAdverse !== undefined) sumTimeMAE += s.timeToMaxAdverse * w;
 
-      // [FILE-4C] Compute returnR from outcomes
       if (s.outcome?.returnR != null) {
         sumReturnR += s.outcome.returnR * w;
         sumWeightR += w;
@@ -568,10 +616,8 @@ class StateStore {
     const mae = sumMAE / totalValidWeight;
     const timeToMaxFavorable = sumTimeMFE / totalValidWeight;
     const timeToMaxAdverse = sumTimeMAE / totalValidWeight;
-    // [FILE-4C] Real avgReturnR
     const avgReturnR = sumWeightR > 0 ? sumReturnR / sumWeightR : 0;
 
-    // [FILE-4J] Win rate from outcome.win
     let winWeight = 0;
     for (const s of states) {
       if (s.outcome?.win) winWeight += s.totalWeight;
@@ -600,7 +646,7 @@ class StateStore {
       distanceDistribution: result.distanceDistribution || {},
       analogues: states,
       winRate: winRate,
-      avgReturnR: avgReturnR,   // [FILE-4C]
+      avgReturnR: avgReturnR,
     };
   }
 
@@ -633,8 +679,9 @@ class StateStore {
 
   // ============================================================
   //  [FILE-4A] computeEdge
-  //  Wraps getPredictionDistribution for callers that want a compact
-  //  { winRate, avgReturnR, sampleSize } shape.
+  //  [FIX-SS8] Return null on failure so decision/engine.js correctly
+  //  falls back to rule-based scoring instead of treating a zero-edge
+  //  as a real signal absence.
   // ============================================================
   async computeEdge(features, symbol, timeframe = 'M5', lookahead = 5, k = CONFIG.DEFAULT_K, regimeCode = null) {
     try {
@@ -654,36 +701,38 @@ class StateStore {
         weightedAverageDistance: dist.weightedAverageDistance,
       };
     } catch (err) {
-      console.warn('[StateStore] computeEdge failed:', err.message);
-      return {
-        winRate: 0,
-        avgReturnR: 0,
-        sampleSize: 0,
-        effectiveSampleSize: 0,
-        qualifiedCount: 0,
-        candidateCount: 0,
-        probUp: 0.33,
-        probDown: 0.33,
-        probNeutral: 0.34,
-        expectedMove: 0,
-        averageDistance: 0,
-        weightedAverageDistance: 0,
-      };
+      logger.warn('[StateStore] computeEdge failed:', err.message);
+      // [FIX-SS8] null, not a fake zero-edge
+      return null;
     }
   }
 
   // ============================================================
-  //  [FILE-4B] calibrateConfidence
-  //  Buckets historical states by their stored confidence, computes
-  //  empirical win rate per bucket, returns the bucket matching the
-  //  query confidence.
+  //  [FIX-SS1..SS5] calibrateConfidence
   // ============================================================
   async calibrateConfidence(query, lookahead = 5, k = CONFIG.DEFAULT_K) {
+    const rawConfidence = Number(query && query.confidence);
+
+    // [FIX-SS1] Kill switch — off by default until data catches up.
+    if (!CONFIG.CALIBRATION_ENABLED) {
+      return {
+        calibratedConfidence: rawConfidence,
+        sampleSize: 0,
+        bucket: null,
+        disabled: true,
+      };
+    }
+
     try {
-      const { symbol, confidence, timeframe = 'M5' } = query;
-      if (!Number.isFinite(confidence)) {
-        return { calibratedConfidence: confidence, sampleSize: 0, bucket: null };
+      const { symbol, timeframe = 'M5' } = query;
+      if (!Number.isFinite(rawConfidence)) {
+        return { calibratedConfidence: rawConfidence, sampleSize: 0, bucket: null };
       }
+
+      // [FIX-SS3] Recency filter
+      const cutoff = new Date(
+        Date.now() - CONFIG.CALIBRATION_WINDOW_DAYS * 24 * 60 * 60 * 1000
+      );
 
       const variants = getSymbolVariants(symbol || '');
       const symbolFilter = variants.length === 1
@@ -695,12 +744,13 @@ class StateStore {
           $match: {
             ...symbolFilter,
             timeframe,
+            timestamp: { $gte: cutoff },
             confidence: { $ne: null, $gte: 0 },
             [`outcome${lookahead}.win`]: { $exists: true },
           },
         },
         { $sort: { timestamp: -1 } },
-        { $limit: 5000 },
+        { $limit: CONFIG.CALIBRATION_MAX_SAMPLES },
         {
           $project: {
             confidence: 1,
@@ -711,11 +761,8 @@ class StateStore {
       ];
 
       const docs = await HistoricalState.aggregate(pipeline);
-      if (docs.length < 30) {
-        return { calibratedConfidence: confidence, sampleSize: docs.length, bucket: null };
-      }
 
-      const bucketSize = 10;
+      const bucketSize = CONFIG.CALIBRATION_BUCKET_SIZE;
       const buckets = new Map();
       for (const d of docs) {
         const b = Math.floor(d.confidence / bucketSize) * bucketSize;
@@ -725,33 +772,91 @@ class StateStore {
         if (d.win) bucket.wins++;
       }
 
-      const queryBucket = Math.floor(confidence / bucketSize) * bucketSize;
+      const queryBucket = Math.floor(rawConfidence / bucketSize) * bucketSize;
       const match = buckets.get(queryBucket);
 
-      if (!match || match.total < 10) {
-        return { calibratedConfidence: confidence, sampleSize: match?.total || 0, bucket: queryBucket };
+      // [FIX-SS2] Insufficient samples
+      if (!match || match.total < CONFIG.CALIBRATION_MIN_SAMPLES) {
+        return {
+          calibratedConfidence: rawConfidence,
+          sampleSize: match?.total || 0,
+          bucket: queryBucket,
+          insufficientSamples: true,
+        };
+      }
+
+      // [FIX-SS4] Guard against zero-win buckets (broken-era data or noise)
+      if (match.wins < CONFIG.CALIBRATION_MIN_WINS) {
+        logger.warn(
+          `[StateStore] calibrateConfidence: bucket ${queryBucket} has ` +
+          `${match.wins}/${match.total} wins — below min ${CONFIG.CALIBRATION_MIN_WINS}, ` +
+          `returning raw ${rawConfidence}`
+        );
+        return {
+          calibratedConfidence: rawConfidence,
+          sampleSize: match.total,
+          bucket: queryBucket,
+          lowWins: true,
+        };
       }
 
       const empiricalWinRate = match.wins / match.total;
+      const empiricalConfidence = empiricalWinRate * 100;
+
+      // [FIX-SS2] Sample-size-aware blend
+      const blend = Math.min(
+        CONFIG.CALIBRATION_MAX_BLEND,
+        match.total / CONFIG.CALIBRATION_FULL_TRUST_SAMPLES
+      );
+      const calibrated = rawConfidence * (1 - blend) + empiricalConfidence * blend;
+
+      // [FIX-SS5] Diagnostic log
+      logger.info(
+        `[StateStore] calibrateConfidence ${symbol}/${timeframe} bucket=${queryBucket}: ` +
+        `${match.wins}/${match.total} wins (${(empiricalWinRate * 100).toFixed(1)}%), ` +
+        `raw=${Math.round(rawConfidence)} → ${Math.round(calibrated)} (blend=${(blend * 100).toFixed(0)}%)`
+      );
+
       return {
-        calibratedConfidence: Math.round(empiricalWinRate * 100),
+        calibratedConfidence: Math.round(calibrated),
         sampleSize: match.total,
         bucket: queryBucket,
         winRate: empiricalWinRate,
+        blend,
+        empiricalConfidence,
       };
     } catch (err) {
-      console.warn('[StateStore] calibrateConfidence failed:', err.message);
-      return { calibratedConfidence: query.confidence, sampleSize: 0, bucket: null };
+      logger.warn('[StateStore] calibrateConfidence failed:', err.message);
+      return { calibratedConfidence: rawConfidence, sampleSize: 0, bucket: null };
     }
   }
 
+  // [FIX-SS6] Runtime toggles for /debug endpoints — no restart needed.
+  setCalibrationEnabled(enabled) {
+    CONFIG.CALIBRATION_ENABLED = !!enabled;
+    logger.info(`[StateStore] calibration ${CONFIG.CALIBRATION_ENABLED ? 'ENABLED' : 'DISABLED'}`);
+    return CONFIG.CALIBRATION_ENABLED;
+  }
+
+  isCalibrationEnabled() {
+    return !!CONFIG.CALIBRATION_ENABLED;
+  }
+
+  getConfig() {
+    return {
+      CALIBRATION_ENABLED: CONFIG.CALIBRATION_ENABLED,
+      CALIBRATION_WINDOW_DAYS: CONFIG.CALIBRATION_WINDOW_DAYS,
+      CALIBRATION_MIN_SAMPLES: CONFIG.CALIBRATION_MIN_SAMPLES,
+      CALIBRATION_MIN_WINS: CONFIG.CALIBRATION_MIN_WINS,
+      CALIBRATION_FULL_TRUST_SAMPLES: CONFIG.CALIBRATION_FULL_TRUST_SAMPLES,
+      CALIBRATION_MAX_BLEND: CONFIG.CALIBRATION_MAX_BLEND,
+      CALIBRATION_BUCKET_SIZE: CONFIG.CALIBRATION_BUCKET_SIZE,
+    };
+  }
+
   // ---- Cleanup ----
-  _cleanCache() {
-    // Cache is unused; kept for compatibility. No-op.
-  }
-  invalidateCache() {
-    this._edgeCache.clear();
-  }
+  _cleanCache() { /* no-op */ }
+  invalidateCache() { this._edgeCache.clear(); }
 }
 
 // ---- Singleton ----
