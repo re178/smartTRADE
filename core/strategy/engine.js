@@ -19,6 +19,30 @@
 // [FILE-4] EMA is now exported (was previously internal-only) so
 //   callers / tests / other modules can reuse the exact same EMA
 //   implementation that the strategies use internally.
+//
+// [FIX-E] validateSignal() now performs the checks its header has
+//   always promised (spread, max positions, daily loss, duplicate
+//   suppression). All checks are soft-fail-open: they only block when
+//   the caller actually supplied the data to evaluate them.
+// [FIX-F] getSession() now uses non-overlapping ranges so every hour
+//   maps to exactly one session (previously London/NY and Asia/Sydney
+//   overlapped and the first match won).
+// [FIX-G] detectRegime() logs `regime=unknown` per instrument at
+//   throttled intervals, and calculateConfidence() explicitly handles
+//   the 'unknown' case rather than falling through silently.
+// [FIX-H] multiTimeframeAnalysis() uses HTF-aware cache TTLs (M15=5m,
+//   H1=15m, H4=1h, D=30m) so higher-timeframe candles are not refetched
+//   every pipeline cycle.
+// [FIX-I] strategyAI() memoizes its result for 60s so weightedvote and
+//   the standalone `ai` strategy share one AI call per cycle instead of
+//   firing two.
+// [FIX-J] getCandlesOnce() always fetches a canonical CANDLE_COUNT and
+//   slices to the caller's requested count, so callers with different
+//   count needs (marketState's 200 vs strategy's 500) share one cache
+//   entry without truncation surprises.
+// [FIX-K] Strategy error logging is throttled per (strategy, errorCode)
+//   so transient failures do not flood the log with identical lines.
+// [FIX-L] getCandleCacheStats() now reports inflight state per entry.
 
 const marketProvider = require('../market/provider');
 const { formatPrice, getPipSize } = require('../../shared/helpers');
@@ -59,6 +83,13 @@ const CONFIG = {
   CANDLE_CACHE_TTL_MS: 55 * 1000,
 };
 
+// [FIX-E] Validation thresholds. MAX_SPREAD_PIPS defaults to 3 which
+// mirrors opportunityEngine's gate; tighten or loosen in one place.
+const VALIDATION = {
+  MAX_SPREAD_PIPS: 3,
+  DUPLICATE_WINDOW_MS: 60 * 1000,
+};
+
 // ---------- UTILITY HELPERS ----------
 function roundPrice(price) {
   return Math.round(price * 100000) / 100000;
@@ -93,34 +124,57 @@ function getPipValue(instrument, accountCurrency = 'USD', lotSize = 1) {
 // single rank cycle = 10 strategies × 4 symbols = 40 REST fetches every
 // 30 seconds → Deriv rate limit.
 //
-// The cache key is `${instrument}::${timeframe}`. TTL is 55s (slightly
-// less than a 1-minute M5 candle cycle) so the pipeline always sees
-// fresh candles but concurrent strategies share one fetch.
+// The cache key is `${instrument}::${timeframe}`. TTL is caller-provided
+// (default 55s) so HTF analysis can use longer TTLs without affecting M5
+// freshness. A successful fetch is cached. A failed fetch is NOT cached
+// so the next strategy call retries — prevents cache-poisoning from a
+// transient failure.
 //
-// A successful fetch is cached. A failed fetch is NOT cached so the
-// next strategy call retries — prevents cache-poisoning from a transient
-// failure.
+// [FIX-J] Cache always fetches CONFIG.CANDLE_COUNT (500). Callers with
+//         smaller count needs receive a slice. This preserves the cache
+//         invariant that one entry holds one canonical fetch regardless
+//         of how many candles each caller wants.
+// [FIX-H] Callers can pass `{ ttlMs }` to override the default TTL.
 const _candlesCache = new Map();  // key -> { candles, at }
 const _inflightFetches = new Map(); // key -> Promise (dedupe concurrent)
 
-async function getCandlesOnce(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME) {
+// [FIX-H] Higher-timeframe candles change slowly — cache them longer.
+const HTF_TTL_MS = {
+  M1: 60 * 1000,
+  M5: 55 * 1000,
+  M15: 5 * 60 * 1000,
+  M30: 15 * 60 * 1000,
+  H1: 15 * 60 * 1000,
+  H4: 60 * 60 * 1000,
+  D: 30 * 60 * 1000,
+  D1: 30 * 60 * 1000,
+};
+
+async function getCandlesOnce(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME, opts = {}) {
+  const ttl = opts.ttlMs ?? CONFIG.CANDLE_CACHE_TTL_MS;
+  const count = opts.count ?? CONFIG.CANDLE_COUNT;
   const key = `${instrument}::${timeframe}`;
   const now = Date.now();
 
-  // Cache hit
+  // Cache hit — freshness is judged against the CALLER's TTL, not a
+  // cached TTL. A short-TTL caller always gets recent data; a long-TTL
+  // caller can reuse aggressively.
   const cached = _candlesCache.get(key);
-  if (cached && (now - cached.at) < CONFIG.CANDLE_CACHE_TTL_MS) {
-    return cached.candles;
+  if (cached && (now - cached.at) < ttl) {
+    const r = cached.candles;
+    return r.length > count ? r.slice(-count) : r;
   }
 
   // In-flight dedupe: if another strategy is already fetching this key,
   // await its promise instead of firing a second fetch
   if (_inflightFetches.has(key)) {
-    return _inflightFetches.get(key);
+    const inflight = await _inflightFetches.get(key);
+    return (inflight && inflight.length > count) ? inflight.slice(-count) : inflight;
   }
 
   const fetchPromise = (async () => {
     try {
+      // Always fetch canonical count — callers slice on return.
       const candles = await marketProvider.getCandles(instrument, CONFIG.CANDLE_COUNT, timeframe);
       if (candles && candles.length > 0) {
         _candlesCache.set(key, { candles, at: Date.now() });
@@ -132,7 +186,8 @@ async function getCandlesOnce(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME) 
   })();
 
   _inflightFetches.set(key, fetchPromise);
-  return fetchPromise;
+  const result = await fetchPromise;
+  return (result && result.length > count) ? result.slice(-count) : result;
 }
 
 /**
@@ -157,16 +212,19 @@ function clearCandleCache(instrument = null, timeframe = null) {
   _candlesCache.delete(`${instrument}::${timeframe}`);
 }
 
+// [FIX-L] Report inflight state per entry alongside age/freshness.
 function getCandleCacheStats() {
   const stats = [];
   const now = Date.now();
   for (const [key, entry] of _candlesCache) {
+    const ageMs = now - entry.at;
     stats.push({
       key,
-      ageMs: now - entry.at,
+      ageMs,
       ttlMs: CONFIG.CANDLE_CACHE_TTL_MS,
       count: entry.candles?.length || 0,
-      fresh: (now - entry.at) < CONFIG.CANDLE_CACHE_TTL_MS,
+      fresh: ageMs < CONFIG.CANDLE_CACHE_TTL_MS,
+      inflight: _inflightFetches.has(key),
     });
   }
   return stats;
@@ -513,19 +571,46 @@ function findSupportResistance(candles, lookback = 30, clusterRadius = 0.001) {
 }
 
 // ---------- MARKET REGIME ----------
-function detectRegime(candles) {
-  if (candles.length < 100) return { regime: 'unknown', volatility: 'normal', trend: 'neutral', adx: null };
+// [FIX-G] Throttled 'unknown' logging per instrument. `instrument` is
+// optional so internal callers that don't care can omit it.
+const _regimeUnknownLoggedAt = new Map();
+const REGIME_LOG_THROTTLE_MS = 5 * 60 * 1000;
+
+function _logRegimeUnknown(instrument, reason, sampleSize) {
+  if (!instrument) return;
+  const now = Date.now();
+  const last = _regimeUnknownLoggedAt.get(instrument) || 0;
+  if (now - last >= REGIME_LOG_THROTTLE_MS) {
+    _regimeUnknownLoggedAt.set(instrument, now);
+    logger.debug(
+      `[Strategy] regime=unknown for ${instrument} (${reason}, n=${sampleSize}) ` +
+      `— throttled ${REGIME_LOG_THROTTLE_MS / 1000}s`
+    );
+  }
+}
+
+function detectRegime(candles, instrument = null) {
+  if (candles.length < 100) {
+    _logRegimeUnknown(instrument, 'insufficient candles (<100)', candles.length);
+    return { regime: 'unknown', volatility: 'normal', trend: 'neutral', adx: null };
+  }
   const adxData = ADX(candles, CONFIG.ADX_PERIOD);
   const adx = adxData ? adxData.adx : null;
   const atrArray = ATR(candles, CONFIG.ATR_PERIOD);
-  if (!atrArray || atrArray.length < 20) return { regime: 'unknown', volatility: 'normal', trend: 'neutral', adx };
+  if (!atrArray || atrArray.length < 20) {
+    _logRegimeUnknown(instrument, 'insufficient ATR history (<20)', atrArray ? atrArray.length : 0);
+    return { regime: 'unknown', volatility: 'normal', trend: 'neutral', adx };
+  }
   const lastATR = atrArray[atrArray.length - 1];
   const recentATR = atrArray.slice(-20);
   const avgATR = recentATR.reduce((a, b) => a + b, 0) / recentATR.length;
   const volatility = lastATR > avgATR * 1.5 ? 'high' : (lastATR < avgATR * 0.7 ? 'low' : 'normal');
   const closes = candles.map(c => parseFloat(c.mid.c));
   const ema200 = EMA(closes, 200);
-  if (ema200.length < 50) return { regime: 'unknown', volatility, trend: 'neutral', adx };
+  if (ema200.length < 50) {
+    _logRegimeUnknown(instrument, 'insufficient EMA200 history (<50)', ema200.length);
+    return { regime: 'unknown', volatility, trend: 'neutral', adx };
+  }
   const lastEma = ema200[ema200.length - 1];
   const prevEma = ema200[ema200.length - 2];
   const trend = lastEma > prevEma ? 'bullish' : (lastEma < prevEma ? 'bearish' : 'neutral');
@@ -536,12 +621,20 @@ function detectRegime(candles) {
 }
 
 // ---------- SESSION ----------
+// [FIX-F] Non-overlapping ranges so every hour maps to exactly one
+// session. Preserves the effective mappings the old (first-match-wins)
+// code produced but makes the intent explicit and removes the latent
+// London/NY and Asia/Sydney overlaps:
+//   22:00–00:00 Sydney
+//   00:00–07:00 Asia
+//   07:00–15:00 London
+//   15:00–20:00 New York
+//   20:00–22:00 Other
 function getSession() {
   const hour = new Date().getUTCHours();
-  if (hour >= 7 && hour < 15) return 'London';
-  if (hour >= 12 && hour < 20) return 'New York';
-  if (hour >= 0 && hour < 8) return 'Asia';
-  if (hour >= 22 || hour < 6) return 'Sydney';
+  if (hour >= 22 || hour < 7) return hour >= 22 ? 'Sydney' : 'Asia';
+  if (hour < 15) return 'London';
+  if (hour < 20) return 'New York';
   return 'Other';
 }
 
@@ -551,10 +644,18 @@ async function multiTimeframeAnalysis(instrument, timeframe = CONFIG.DEFAULT_TIM
   const higher = htf[timeframe] || [];
   const trends = {};
   for (const tf of higher) {
-    const candles = await getCandlesOnce(instrument, tf);
-    if (!candles || candles.length < 50) continue;
-    const regime = detectRegime(candles);
-    trends[tf] = regime.trend;
+    // [FIX-H] HTF-aware TTL — M15 refreshed every 5 min, H1 every 15 min,
+    // H4 every hour, D every 30 min. Prevents re-fetching slow-moving
+    // higher-timeframe candles on every pipeline cycle.
+    const ttlMs = HTF_TTL_MS[tf] ?? CONFIG.CANDLE_CACHE_TTL_MS;
+    try {
+      const candles = await getCandlesOnce(instrument, tf, { ttlMs });
+      if (!candles || candles.length < 50) continue;
+      const regime = detectRegime(candles, instrument);
+      trends[tf] = regime.trend;
+    } catch (_) {
+      // HTF is best-effort; a transient failure should not kill the signal.
+    }
   }
   return trends;
 }
@@ -575,8 +676,14 @@ function calculateConfidence(signal, indicators, context) {
   }
   if (indicators.volumeRatio !== null && indicators.volumeRatio > 1.2) conf += 5;
   if (indicators.aiConfidence !== null) conf = (conf + indicators.aiConfidence) / 2;
-  if (context.regime === 'trending' && signal.side === 'BUY' && indicators.trendStrength > 0) conf += 10;
-  else if (context.regime === 'trending' && signal.side === 'SELL' && indicators.trendStrength < 0) conf += 10;
+  // [FIX-G] Explicit regime branches so the 'unknown' case is auditable
+  // instead of relying on implicit fall-through. 'unknown' = no adjustment.
+  if (context.regime === 'trending') {
+    if (signal.side === 'BUY' && indicators.trendStrength > 0) conf += 10;
+    else if (signal.side === 'SELL' && indicators.trendStrength < 0) conf += 10;
+  } else if (context.regime === 'unknown') {
+    // No bonus, no penalty — regime could not be determined.
+  }
   if (context.htfTrends) {
     const bullish = Object.values(context.htfTrends).filter(t => t === 'bullish').length;
     const bearish = Object.values(context.htfTrends).filter(t => t === 'bearish').length;
@@ -594,6 +701,9 @@ function calculateRiskScore(signal, indicators, accountCurrency = 'USD') {
   let risk = 0;
   if (indicators.adx && indicators.adx < 20) risk += 20;
   if (indicators.volatility === 'high') risk += 15;
+  // [FIX-G] Regime 'unknown' flows through as volatility === 'normal',
+  // so no special-case branch is needed here. Kept neutral for symmetry
+  // with calculateConfidence().
   const slDistance = Math.abs(signal.entryPrice - signal.stopLoss);
   const atr = indicators.atr || 0.001;
   if (slDistance < atr * 0.5) risk += 20;
@@ -613,7 +723,82 @@ function calculatePositionSize(accountBalance, riskPct, stopLoss, entryPrice, in
 }
 
 // ---------- SIGNAL VALIDATION ----------
+// [FIX-E] Previously a no-op returning true. Now performs four checks.
+// All checks are soft-fail-open: they only block when the caller actually
+// supplied the data to evaluate them (missing fields → check skipped).
+// Return type stays boolean for caller compatibility; warnings are logged
+// internally so decisions are auditable.
+const _recentSignals = new Map(); // key: strategy::pair::side -> timestamp
+
 async function validateSignal(signal, account = {}) {
+  if (!signal) return false;
+
+  // 1. Spread check — only block if a spread value was actually provided.
+  const spreadPips = Number(
+    signal.spreadPips ?? signal.spread ?? account.spreadPips ?? account.spread
+  );
+  if (Number.isFinite(spreadPips) && spreadPips > VALIDATION.MAX_SPREAD_PIPS) {
+    logger.warn(
+      `[Strategy] Reject ${signal.strategy}/${signal.pair}: ` +
+      `spread ${spreadPips.toFixed(2)}p > ${VALIDATION.MAX_SPREAD_PIPS}p`
+    );
+    return false;
+  }
+
+  // 2. Max concurrent positions.
+  const openCount = Number(
+    account.openPositions ??
+    account.openTrades ??
+    account.positionCount ??
+    (Array.isArray(account.positions) ? account.positions.length : NaN)
+  );
+  if (Number.isFinite(openCount) && openCount >= CONFIG.MAX_POSITIONS) {
+    logger.warn(
+      `[Strategy] Reject ${signal.strategy}/${signal.pair}: ` +
+      `${openCount} open >= MAX_POSITIONS ${CONFIG.MAX_POSITIONS}`
+    );
+    return false;
+  }
+
+  // 3. Daily loss cap.
+  const balance = Number(
+    account.balance ?? account.equity ?? account.accountBalance
+  );
+  const dailyPnl = Number(
+    account.dailyPnL ?? account.dailyPnl ?? account.dayPnL ?? account.realizedToday
+  );
+  if (Number.isFinite(balance) && balance > 0 && Number.isFinite(dailyPnl)) {
+    const lossPct = (-dailyPnl / balance) * 100;
+    if (lossPct >= CONFIG.MAX_DAILY_LOSS_PCT) {
+      logger.warn(
+        `[Strategy] Reject ${signal.strategy}/${signal.pair}: ` +
+        `daily loss ${lossPct.toFixed(2)}% >= ${CONFIG.MAX_DAILY_LOSS_PCT}%`
+      );
+      return false;
+    }
+  }
+
+  // 4. Duplicate suppression — same strategy+pair+side within window.
+  const dupKey = `${signal.strategy}::${signal.pair}::${signal.side}`;
+  const now = Date.now();
+  const last = _recentSignals.get(dupKey) || 0;
+  if (now - last < VALIDATION.DUPLICATE_WINDOW_MS) {
+    logger.debug(
+      `[Strategy] Duplicate suppressed ${dupKey} ` +
+      `(last=${(now - last) / 1000}s ago, window=${VALIDATION.DUPLICATE_WINDOW_MS / 1000}s)`
+    );
+    return false;
+  }
+  _recentSignals.set(dupKey, now);
+
+  // Periodic cleanup so the map cannot grow unbounded on long uptimes.
+  if (_recentSignals.size > 500) {
+    const cutoff = now - VALIDATION.DUPLICATE_WINDOW_MS * 5;
+    for (const [k, t] of _recentSignals) {
+      if (t < cutoff) _recentSignals.delete(k);
+    }
+  }
+
   return true;
 }
 
@@ -856,8 +1041,20 @@ async function strategyIchimoku(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME
   return { pair: instrument, side, entryPrice: roundPrice(currentPrice), stopLoss: roundPrice(stopLoss), takeProfit: roundPrice(takeProfit), confidence: 76, strategy: 'Ichimoku', timestamp: new Date().toISOString() };
 }
 
+// [FIX-I] AI results memoized for 60s per instrument+timeframe so
+// weightedvote and the standalone `ai` strategy share one AI call.
+const _aiSignalMemo = new Map(); // key -> { at, value }
+const AI_MEMO_TTL_MS = 60 * 1000;
+
 async function strategyAI(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME) {
   if (!getAISignal) return null;
+
+  const memoKey = `${instrument}::${timeframe}`;
+  const memo = _aiSignalMemo.get(memoKey);
+  if (memo && (Date.now() - memo.at) < AI_MEMO_TTL_MS) {
+    return memo.value;
+  }
+
   const candles = await getCandlesOnce(instrument, timeframe);
   if (!candles || candles.length < 50) return null;
   const closes = candles.map(c => parseFloat(c.mid.c));
@@ -899,14 +1096,19 @@ async function strategyAI(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME) {
     volume: vol,
   };
   const aiSignal = await getAISignal(instrument, candles, indicators);
-  if (!aiSignal) return null;
+  if (!aiSignal) {
+    // Cache negative result briefly so weightdedvote doesn't retry the
+    // same failing call in the same cycle.
+    _aiSignalMemo.set(memoKey, { at: Date.now(), value: null });
+    return null;
+  }
   const currentPrice = closes[lastIdx];
   const stopDistance = atr14 ? atr14 * 1.5 : 0.0015;
   let sl = aiSignal.stopLoss;
   let tp = aiSignal.takeProfit;
   if (!sl) sl = aiSignal.side === 'BUY' ? currentPrice - stopDistance : currentPrice + stopDistance;
   if (!tp) tp = aiSignal.side === 'BUY' ? currentPrice + stopDistance * 2 : currentPrice - stopDistance * 2;
-  return {
+  const signal = {
     pair: instrument,
     side: aiSignal.side,
     entryPrice: roundPrice(currentPrice),
@@ -917,12 +1119,20 @@ async function strategyAI(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME) {
     timestamp: new Date().toISOString(),
     reason: aiSignal.reason || 'AI analysis',
   };
+  _aiSignalMemo.set(memoKey, { at: Date.now(), value: signal });
+  if (_aiSignalMemo.size > 100) {
+    const cutoff = Date.now() - AI_MEMO_TTL_MS * 2;
+    for (const [k, v] of _aiSignalMemo) {
+      if (v.at < cutoff) _aiSignalMemo.delete(k);
+    }
+  }
+  return signal;
 }
 
 async function strategyWeightedVote(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME) {
   const candles = await getCandlesOnce(instrument, timeframe);
   if (!candles || candles.length < 100) return null;
-  const regime = detectRegime(candles);
+  const regime = detectRegime(candles, instrument);
   let weights = { SMA: 0.2, EMA: 0.2, RSI: 0.15, MACD: 0.2, AI: 0.25 };
   if (regime.regime === 'trending') {
     weights = { SMA: 0.25, EMA: 0.25, RSI: 0.05, MACD: 0.2, AI: 0.25 };
@@ -978,6 +1188,32 @@ const STRATEGIES = {
   weightedvote: strategyWeightedVote,
 };
 
+// [FIX-K] Throttled error logger keyed by (strategy, errorCode).
+const _strategyErrorLoggedAt = new Map(); // key -> { at, suppressed }
+const STRATEGY_ERROR_THROTTLE_MS = 60 * 1000;
+
+function _logStrategyError(strategy, error) {
+  const code = (error && (error.code || error.message)) || 'UNKNOWN';
+  const message = (error && error.message) || String(code);
+  const key = `${strategy}::${code}`;
+  const now = Date.now();
+  const entry = _strategyErrorLoggedAt.get(key);
+  if (!entry || (now - entry.at) >= STRATEGY_ERROR_THROTTLE_MS) {
+    const suppressed = entry ? entry.suppressed : 0;
+    const suffix = suppressed > 0 ? ` (suppressed ${suppressed})` : '';
+    logger.error(`[Strategy] ${strategy} error: ${message}${suffix}`);
+    _strategyErrorLoggedAt.set(key, { at: now, suppressed: 0 });
+  } else {
+    entry.suppressed++;
+  }
+  if (_strategyErrorLoggedAt.size > 200) {
+    const cutoff = now - STRATEGY_ERROR_THROTTLE_MS * 5;
+    for (const [k, v] of _strategyErrorLoggedAt) {
+      if (v.at < cutoff) _strategyErrorLoggedAt.delete(k);
+    }
+  }
+}
+
 // ---------- MAIN GENERATOR ----------
 async function generateSignal(instrument, strategy = 'sma', params = {}) {
   const strategyFn = STRATEGIES[strategy];
@@ -998,7 +1234,7 @@ async function generateSignal(instrument, strategy = 'sma', params = {}) {
     const atrArray = ATR(candles, CONFIG.ATR_PERIOD);
     const rsi = RSI(closes, CONFIG.RSI_PERIOD);
     const vol = getVolume(candles);
-    const regime = detectRegime(candles);
+    const regime = detectRegime(candles, instrument);
     const htfTrends = await multiTimeframeAnalysis(instrument, timeframe);
 
     const indicators = {
@@ -1037,7 +1273,8 @@ async function generateSignal(instrument, strategy = 'sma', params = {}) {
     logger.info(`[Strategy] ${strategy} generated ${signal.side} for ${instrument} (conf: ${signal.confidence}%)`);
     return signal;
   } catch (error) {
-    logger.error(`[Strategy] ${strategy} error:`, error.message);
+    // [FIX-K] Throttled so transient failures don't flood the log.
+    _logStrategyError(strategy, error);
     return null;
   }
 }
@@ -1066,4 +1303,7 @@ module.exports = {
   getCandlesOnce,
   clearCandleCache,
   getCandleCacheStats,
+  // [FIX-E] Exposed for testing / debugging validation logic directly.
+  _VALIDATION: VALIDATION,
+  _clearRecentSignals() { _recentSignals.clear(); },
 };
