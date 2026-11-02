@@ -33,10 +33,40 @@
 //              Now normalized once via _normalizeSide() and reused.
 //
 // [FIX-DIGIT-PERSIST-2] Persist contractType, barrier, durationUnit, product,
-//              and entryThesis on BOTH Order and Trade. All five fields now
-//              exist in the schemas (Files 2 & 3), and populating them means
-//              digit/binary trades can be fully reconstructed from the DB
-//              without depending on the running bot instance.
+//              and entryThesis on BOTH Order and Trade.
+//
+// [FIX-CS-C1] **ROOT CAUSE FIX for ContractBuyValidationError on FX multipliers.**
+//             Deriv's Multiplier contracts expect `limit_order.stop_loss` and
+//             `limit_order.take_profit` as CURRENCY AMOUNTS (2 decimals), NOT
+//             PRICE LEVELS. The previous code sent `1.12044` / `1.12249` as
+//             if they were prices — Deriv interprets them as $1.12 / $1.12
+//             and rejects with "Only 2 decimal places allowed."
+//
+//             Now placeMultiplier() does:
+//               1. Resolves a reference entry price (streaming cache if fresh,
+//                  otherwise a base proposal without limit_order).
+//               2. Converts price levels to amounts:
+//                    notional   = stake × multiplier
+//                    priceDiff  = |level - entry|
+//                    amount     = notional × priceDiff / entry
+//                  Result rounded to 2 decimals.
+//               3. Sends the AMOUNT to Deriv, but persists the original
+//                  PRICE LEVELS in Order.knockoutLevel / Trade.knockoutLevel
+//                  (schemas expect prices, and this preserves intent).
+//
+//             This is the fix that unblocks FX bot entries. The C1 fix in
+//             broker.js still applies for callers that use broker.placeMarketOrder
+//             (e.g. modifySLTP, closeTrade), but bot entries go through
+//             contractService directly and needed their own conversion.
+//
+// [FIX-CS-C2] Defensive guards on the SL/TP conversion:
+//               • Skips SL/TP amounts below $0.01 (stake too small / SL too tight)
+//               • Caps SL amount at stake (can't lose more than stake on Multiplier)
+//               • Skips SL/TP on wrong side of entry (with WARN — the runner's
+//                 [FIX-M4c] should have already rejected, but double-check here)
+//               • If base proposal fails (rate limit), proceeds without limit_order
+//                 and logs WARN — OTIE watchdog is the backstop
+//             All conversions log at INFO so the amount values are visible.
 
 'use strict';
 
@@ -61,18 +91,16 @@ const CONTRACT_TYPES = {
   NOTOUCH: 'NOTOUCH',
 };
 
-// Deriv's current allowed multiplier set.
 const ACCEPTED_MULTIPLIERS = [200, 400, 600, 800];
 const DEFAULT_MULTIPLIER = 200;
 
-// [FIX-DIGIT-PERSIST] Map a Deriv contract type to its semantic direction.
-// "Positive bet" contracts profit when the underlying goes UP or when a
-// statistical event (EVEN/MATCH/OVER/ONETOUCH) occurs.
-// "Negative bet" contracts profit when the underlying goes DOWN or when the
-// complementary event (ODD/DIFF/UNDER/NOTOUCH) occurs.
-//
-// This mapping lets us store a clean buy/sell side while keeping the
-// specific contract type in the contractType field.
+// [FIX-CS-C1] Minimum amount for a limit_order field (Deriv rejects 0.00).
+const MIN_LIMIT_ORDER_AMOUNT = 0.01;
+
+// [FIX-CS-C1] Max age of streaming-cache price before we prefer a fresh
+// base proposal. 5s is well within any normal market-data subscription gap.
+const CACHE_PRICE_MAX_AGE_MS = 5000;
+
 const SIDE_BUY_TYPES = new Set([
   'MULTUP', 'CALL',
   'DIGITEVEN', 'DIGITOVER', 'DIGITMATCH',
@@ -90,7 +118,6 @@ function _normalizeSide(contractTypeOrSide) {
   if (upper === 'BUY' || upper === 'SELL') return upper;
   if (SIDE_BUY_TYPES.has(upper)) return 'BUY';
   if (SIDE_SELL_TYPES.has(upper)) return 'SELL';
-  // Unknown contract type — default to BUY so save doesn't fail.
   return 'BUY';
 }
 
@@ -99,7 +126,6 @@ function normalizeSymbol(s) {
   return String(s).replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
 }
 
-// ── Per-symbol price precision (mirrors core/bots/registry.js) ──
 function getPricePrecision(symbol) {
   const clean = normalizeSymbol(symbol);
   const map = {
@@ -154,12 +180,125 @@ async function _buyProposal(broker, proposal) {
   return buy;
 }
 
+// ============================================================
+// [FIX-CS-C1] Multiplier limit_order conversion
+// ============================================================
+
 /**
- * [FIX-DIGIT-PERSIST] Persist Order + Trade documents for a confirmed contract.
- * Both sides populated with all fields required by their schemas.
- * Errors on either write are logged but never re-thrown — the contract is
- * already live at Deriv; the caller's job is to confirm the buy, not the DB.
+ * Resolve a reference entry price for computing limit_order AMOUNTS.
+ *
+ * Order of preference:
+ *   1. Streaming cache — free, but only if < CACHE_PRICE_MAX_AGE_MS old
+ *   2. Base proposal (no limit_order) — one API call, authoritative
+ *
+ * Returns null if neither path produces a usable price.
  */
+async function _resolveReferenceEntry(broker, derivSymbol, baseProposalParams) {
+  // 1. Streaming cache
+  try {
+    const cached = broker.streaming && typeof broker.streaming.getPrice === 'function'
+      ? broker.streaming.getPrice(derivSymbol)
+      : null;
+    if (cached && Number.isFinite(cached.mid) && cached.mid > 0) {
+      const age = Date.now() - (cached.time || 0);
+      if (age <= CACHE_PRICE_MAX_AGE_MS) {
+        logger.debug(
+          `[contractService] Reference entry from cache: ${cached.mid} ` +
+          `(age ${age}ms) for ${derivSymbol}`
+        );
+        return cached.mid;
+      }
+    }
+  } catch (_) { /* cache miss is fine */ }
+
+  // 2. Base proposal
+  try {
+    const baseProposal = await _fetchProposal(broker, baseProposalParams);
+    const spot = Number(baseProposal.spot);
+    if (Number.isFinite(spot) && spot > 0) {
+      logger.debug(
+        `[contractService] Reference entry from base proposal: ${spot} for ${derivSymbol}`
+      );
+      return spot;
+    }
+  } catch (err) {
+    logger.warn(
+      `[contractService] Base proposal for ${derivSymbol} failed: ${err.message} — ` +
+      `will proceed without limit_order`
+    );
+  }
+
+  return null;
+}
+
+/**
+ * [FIX-CS-C1] Convert SL/TP PRICE LEVELS to currency AMOUNTS for Deriv
+ * Multiplier `limit_order`.
+ *
+ * Deriv's Multiplier contracts size stop-loss / take-profit by the LOSS or
+ * PROFIT they should trigger at, expressed in account currency. A caller
+ * that has SL=1.11969 / TP=1.12249 (price levels) must convert to amounts:
+ *
+ *   notional   = stake × multiplier
+ *   priceDiff  = |level - entry|
+ *   amount     = notional × priceDiff / entry
+ *
+ * @returns {{ stop_loss?: number, take_profit?: number }}
+ */
+function _buildMultiplierLimitOrder(stake, multiplier, direction, entryPrice, stopLossPrice, takeProfitPrice) {
+  const limitOrder = {};
+  const notional = Number(stake) * Number(multiplier);
+  if (!Number.isFinite(notional) || notional <= 0) return limitOrder;
+  if (!Number.isFinite(entryPrice) || entryPrice <= 0) return limitOrder;
+
+  if (stopLossPrice != null) {
+    const sl = Number(stopLossPrice);
+    if (Number.isFinite(sl) && sl > 0) {
+      const priceDiff = direction === 'BUY' ? (entryPrice - sl) : (sl - entryPrice);
+      if (priceDiff > 0) {
+        const lossAmount = notional * priceDiff / entryPrice;
+        let rounded = Math.round(lossAmount * 100) / 100;
+        // [FIX-CS-C2] Multiplier loss cannot exceed the stake — cap it.
+        const stakeNum = Number(stake) || 0;
+        if (stakeNum > 0 && rounded > stakeNum) rounded = Math.floor(stakeNum * 100) / 100;
+        if (rounded >= MIN_LIMIT_ORDER_AMOUNT) {
+          limitOrder.stop_loss = rounded;
+        }
+      } else {
+        logger.warn(
+          `[contractService] stop_loss ${sl} is on the wrong side of ` +
+          `entry ${entryPrice} for ${direction} — omitting`
+        );
+      }
+    }
+  }
+
+  if (takeProfitPrice != null) {
+    const tp = Number(takeProfitPrice);
+    if (Number.isFinite(tp) && tp > 0) {
+      const priceDiff = direction === 'BUY' ? (tp - entryPrice) : (entryPrice - tp);
+      if (priceDiff > 0) {
+        const profitAmount = notional * priceDiff / entryPrice;
+        const rounded = Math.round(profitAmount * 100) / 100;
+        if (rounded >= MIN_LIMIT_ORDER_AMOUNT) {
+          limitOrder.take_profit = rounded;
+        }
+      } else {
+        logger.warn(
+          `[contractService] take_profit ${tp} is on the wrong side of ` +
+          `entry ${entryPrice} for ${direction} — omitting`
+        );
+      }
+    }
+  }
+
+  return limitOrder;
+}
+
+// ============================================================
+// Persistence
+// ============================================================
+
 async function _persist(params) {
   const {
     contractId, symbol, side, stake, multiplier, duration, durationUnit,
@@ -167,54 +306,43 @@ async function _persist(params) {
     contractType, product, strategy, regimeCode, entryThesis,
   } = params;
 
-  // [FIX-DIGIT-PERSIST] Normalize side once for both schemas.
-  // Order.side = 'BUY'|'SELL' (uppercase enum).
-  // Trade.side = 'buy'|'sell' (lowercase enum).
   const normalizedSide = _normalizeSide(side);
-  const orderSide = normalizedSide;                       // 'BUY' | 'SELL'
-  const tradeSide = normalizedSide.toLowerCase();          // 'buy' | 'sell'
+  const orderSide = normalizedSide;
+  const tradeSide = normalizedSide.toLowerCase();
 
   const stakeNum = Number(stake) || 0;
   const purchasePriceNum = Number(purchasePrice) || null;
 
-  // [FIX-DIGIT-PERSIST] Build the entryThesis snapshot ONCE, reused by both.
   const thesisSnapshot = entryThesis && typeof entryThesis === 'object'
     ? entryThesis
     : null;
 
-  // ── Order document ─────────────────────────────────────────
   const orderDoc = await Order.create({
-    // Required fields the schema enforces
-    clientOrderId: String(contractId),           // Order.clientOrderId is required + unique
+    clientOrderId: String(contractId),
     instrument: normalizeSymbol(symbol),
     side: orderSide,
-    units: stakeNum,                             // Order.units is required
+    units: stakeNum,
     status: 'FILLED',
     contractId: String(contractId),
 
-    // Cost / price
     entryPrice: Number(entryPrice) || null,
     purchasePrice: purchasePriceNum,
-    filledPrice: purchasePriceNum,               // pre-save hook keeps them in sync
+    filledPrice: purchasePriceNum,
 
-    // Timing
     placedAt: new Date(),
     filledAt: new Date(),
     duration: duration != null ? parseInt(duration, 10) : null,
     durationUnit: durationUnit || null,
 
-    // Levels
     knockoutLevel: knockoutLevel != null ? Number(knockoutLevel) : null,
     takeProfitLevel: takeProfitLevel != null ? Number(takeProfitLevel) : null,
 
-    // Multiplier / digit specific
     stake: stakeNum,
     multiplier: multiplier != null ? Number(multiplier) : null,
     contractType: contractType || null,
     barrier: barrier != null ? String(barrier) : null,
     product: product || null,
 
-    // Metadata / thesis
     metadata: {
       strategy: strategy || null,
       regimeCode: regimeCode || null,
@@ -225,27 +353,22 @@ async function _persist(params) {
     return null;
   });
 
-  // ── Trade document ─────────────────────────────────────────
   const tradeDoc = await Trade.create({
-    // Required fields the schema enforces
     contractId: String(contractId),
     instrument: normalizeSymbol(symbol),
     side: tradeSide,
-    lotSize: stakeNum,                           // Trade.lotSize is required
-    openPrice: Number(entryPrice) || 0,          // Trade.openPrice is required
+    lotSize: stakeNum,
+    openPrice: Number(entryPrice) || 0,
     status: 'OPEN',
     openTime: new Date(),
 
-    // Cost / price
     purchasePrice: purchasePriceNum,
     currentPrice: Number(entryPrice) || null,
     floatingProfit: 0,
     product: product || null,
 
-    // Linkage
     strategy: strategy || null,
 
-    // Multiplier / digit specific
     stake: stakeNum,
     multiplier: multiplier != null ? Number(multiplier) : null,
     duration: duration != null ? parseInt(duration, 10) : null,
@@ -255,7 +378,6 @@ async function _persist(params) {
     contractType: contractType || null,
     barrier: barrier != null ? String(barrier) : null,
 
-    // Full thesis snapshot (now Mixed in the schema — File 2)
     entryThesis: thesisSnapshot,
   }).catch(err => {
     logger.error(`[contractService] Trade save failed for ${contractId}: ${err.message}`);
@@ -265,10 +387,10 @@ async function _persist(params) {
   return { order: orderDoc, trade: tradeDoc };
 }
 
-/**
- * Place a Multiplier contract (MULTUP / MULTDOWN).
- * FX trades use this.
- */
+// ============================================================
+// Multiplier contract (FX)
+// ============================================================
+
 async function placeMultiplier(params) {
   const {
     symbol, direction, stake, multiplier,
@@ -295,10 +417,12 @@ async function placeMultiplier(params) {
   const derivSymbol = toDerivSymbol(symbol, broker);
   const contractType = direction === 'BUY' ? 'MULTUP' : 'MULTDOWN';
 
+  // Rounded PRICE levels — these are what we persist in the DB.
   const koRounded = roundPrice(symbol, knockoutLevel);
   const tpRounded = roundPrice(symbol, takeProfitLevel);
 
-  const proposalParams = {
+  // Base proposal params (no limit_order yet)
+  const baseProposalParams = {
     amount: stakeNum,
     basis: 'stake',
     contract_type: contractType,
@@ -307,10 +431,40 @@ async function placeMultiplier(params) {
     multiplier: multNum,
   };
 
-  if (koRounded != null || tpRounded != null) {
-    proposalParams.limit_order = {};
-    if (koRounded != null) proposalParams.limit_order.stop_loss = koRounded;
-    if (tpRounded != null) proposalParams.limit_order.take_profit = tpRounded;
+  // [FIX-CS-C1] Convert price levels → currency amounts for Deriv.
+  const needLimitOrder = (koRounded != null || tpRounded != null);
+  let limitOrderAmounts = {};
+
+  if (needLimitOrder) {
+    const referenceEntry = await _resolveReferenceEntry(broker, derivSymbol, baseProposalParams);
+    if (referenceEntry != null) {
+      limitOrderAmounts = _buildMultiplierLimitOrder(
+        stakeNum, multNum, direction, referenceEntry, koRounded, tpRounded
+      );
+      if (Object.keys(limitOrderAmounts).length > 0) {
+        logger.info(
+          `[contractService] ${symbol} ${direction}: ` +
+          `entry=${referenceEntry} SL=${koRounded}→$${limitOrderAmounts.stop_loss ?? '-'} ` +
+          `TP=${tpRounded}→$${limitOrderAmounts.take_profit ?? '-'}`
+        );
+      } else {
+        logger.warn(
+          `[contractService] ${symbol} ${direction}: limit_order conversion produced no valid amounts ` +
+          `(entry=${referenceEntry}, SL=${koRounded}, TP=${tpRounded}) — proceeding without SL/TP`
+        );
+      }
+    } else {
+      logger.warn(
+        `[contractService] ${symbol} ${direction}: could not resolve reference entry price ` +
+        `— proceeding without SL/TP (OTIE watchdog is the backstop)`
+      );
+    }
+  }
+
+  // Final proposal — with amounts if we have them, without if we don't
+  const proposalParams = { ...baseProposalParams };
+  if (Object.keys(limitOrderAmounts).length > 0) {
+    proposalParams.limit_order = limitOrderAmounts;
   }
 
   const proposal = await _fetchProposal(broker, proposalParams);
@@ -324,6 +478,7 @@ async function placeMultiplier(params) {
   const entryPrice = Number(buy.entry_spot || proposal.spot || 0);
   const purchasePrice = Number(buy.buy_price || proposal.ask_price);
 
+  // Persist: PRICE LEVELS in DB (not the converted amounts)
   const persisted = await _persist({
     contractId, symbol, side: direction, stake: stakeNum, multiplier: multNum,
     duration: null, durationUnit: null,
@@ -346,9 +501,10 @@ async function placeMultiplier(params) {
   };
 }
 
-/**
- * Place a Digital or Rise/Fall or Touch contract. Synthetics only.
- */
+// ============================================================
+// Digital / binary contract (synthetics)
+// ============================================================
+
 async function placeDigitOrBinary(params) {
   const {
     symbol, contractType, stake,
@@ -430,4 +586,7 @@ module.exports = {
   roundPrice,
   _fetchProposal,
   _buyProposal,
+  // [FIX-CS-C1] exposed for testing
+  _buildMultiplierLimitOrder,
+  _resolveReferenceEntry,
 };
