@@ -34,11 +34,22 @@ function detectSession(date = new Date()) {
 
 const FLIP_HISTORY_MAX = 50;
 
+// [FIX-M4] Symbol lock TTL — held during _execute + a short tail so the
+// newly-opened position is visible to other bots' position checks.
+const SYMBOL_LOCK_TTL_MS = 30_000;
+const SYMBOL_LOCK_TAIL_MS = 5_000;
+
+// [FIX-R2] Entry-failure backoff so a persistent failure doesn't
+// retry every cycle (FX bots cycle every 15s, synthetics every 5s).
+const ENTRY_FAILURE_BACKOFF_MS = 30_000;
+
 class BotRunner extends EventEmitter {
   constructor() {
     super();
     this._instances = new Map();
     this._nextInstanceId = 1;
+    // [FIX-M4] symbol → { instanceId, acquiredAt, expiresAt }
+    this._symbolLocks = new Map();
   }
 
   start(botId, config = {}) {
@@ -53,6 +64,8 @@ class BotRunner extends EventEmitter {
       instanceId, botId, name: bot.name, assetClass: bot.assetClass, contractClass: bot.contractClass,
       symbol, config: finalConfig, status: 'RUNNING', startedAt: new Date(), lastRunAt: null, lastReason: null,
       timer: null, _running: false, _lastEntryTime: 0,
+      // [FIX-R2] When > Date.now(), skip cycles to avoid rapid entry retry
+      _entryFailureBackoffUntil: 0,
       stats: {
         runs: 0, entries: 0, wins: 0, losses: 0, pnl: 0, peakPnl: 0, consecutiveLosses: 0,
         closedTrades: 0,
@@ -89,6 +102,10 @@ class BotRunner extends EventEmitter {
     if (instance.timer) clearInterval(instance.timer);
     instance.status = 'STOPPED';
     instance.stoppedAt = new Date();
+    // [FIX-M4] Release any symbol lock this instance still holds.
+    for (const [sym, lock] of this._symbolLocks) {
+      if (lock.instanceId === instanceId) this._symbolLocks.delete(sym);
+    }
     this._instances.delete(instanceId);
     logger.info(`[BotRunner] Stopped ${instance.name} (${instanceId})`);
     const summary = this._summarize(instance);
@@ -106,20 +123,46 @@ class BotRunner extends EventEmitter {
   get(instanceId) { const i = this._instances.get(instanceId); return i ? this._summarize(i) : null; }
 
   // ─────────────────────────────────────────────────────────────
+  //  [FIX-M4] SYMBOL LOCK — prevents two bots opening positions on
+  //  the same instrument simultaneously. Without this, three bots
+  //  targeting frxEURUSD could all pass their position check within
+  //  the same 5-10s evaluation window, then all submit entries.
+  // ─────────────────────────────────────────────────────────────
+  _tryAcquireSymbolLock(symbol, instanceId, ttlMs = SYMBOL_LOCK_TTL_MS) {
+    const now = Date.now();
+    const existing = this._symbolLocks.get(symbol);
+    if (existing && existing.expiresAt > now && existing.instanceId !== instanceId) {
+      return false;
+    }
+    this._symbolLocks.set(symbol, { instanceId, acquiredAt: now, expiresAt: now + ttlMs });
+    return true;
+  }
+
+  _releaseSymbolLock(symbol, instanceId) {
+    const lock = this._symbolLocks.get(symbol);
+    if (lock && lock.instanceId === instanceId) {
+      this._symbolLocks.delete(symbol);
+    }
+  }
+
+  // [FIX-M4] Shorten the lock's TTL after a successful entry so other
+  // bots aren't blocked longer than the position-propagation window.
+  _shortenSymbolLock(symbol, instanceId, ttlMs = SYMBOL_LOCK_TAIL_MS) {
+    const lock = this._symbolLocks.get(symbol);
+    if (lock && lock.instanceId === instanceId) {
+      this._symbolLocks.set(symbol, { ...lock, expiresAt: Date.now() + ttlMs });
+    }
+  }
+
+  _cleanupExpiredLocks() {
+    const now = Date.now();
+    for (const [sym, lock] of this._symbolLocks) {
+      if (lock.expiresAt <= now) this._symbolLocks.delete(sym);
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────
   //  FLIP STATE — phase-based decision
-  //
-  //  Two states: NORMAL and FLIPPED. Each toggle starts a new phase.
-  //  Phase counters (phaseTrades, phasePnl) reset on toggle.
-  //  Judgments use ONLY current-phase data — pre-flip losses don't
-  //  dilute post-flip wins, and vice versa.
-  //
-  //  Flip ON:  after flipMinTrades normal trades, if normal win rate
-  //            < flipBelowPct%  (default: 20 trades, 8% for matches_differs)
-  //
-  //  Un-flip:  after flipStableTrades flipped trades, if flipped PnL
-  //            is negative  (flip isn't working → try normal again)
-  //
-  //  Stay flipped:  as long as flipped PnL stays positive
   // ─────────────────────────────────────────────────────────────
   _updateFlipState(instance) {
     const c = instance.config;
@@ -145,14 +188,16 @@ class BotRunner extends EventEmitter {
 
     if (s.flipped) {
       // ── Currently FLIPPED — decide if we should un-flip ──
-      if (s.phaseTrades < stableTrades) return;  // not enough flipped data
+      if (s.phaseTrades < stableTrades) return;
 
       if (s.phasePnl < 0) {
-        // Flipped phase is losing money → try normal again
+        // [FIX-R1] Capture phase values BEFORE reset so the log is accurate.
+        const phaseTradesAtToggle = s.phaseTrades;
+        const phasePnlAtToggle = s.phasePnl;
         s.flipHistory.push({
           atTrade: s.closedTrades, from: true, to: false,
-          reason: `flipped phase lost (${s.phaseTrades} trades, $${s.phasePnl.toFixed(2)})`,
-          phaseTrades: s.phaseTrades, phasePnl: Number(s.phasePnl.toFixed(2)),
+          reason: `flipped phase lost (${phaseTradesAtToggle} trades, $${phasePnlAtToggle.toFixed(2)})`,
+          phaseTrades: phaseTradesAtToggle, phasePnl: Number(phasePnlAtToggle.toFixed(2)),
         });
         this._capFlipHistory(s);
         s.flipped = false;
@@ -160,23 +205,24 @@ class BotRunner extends EventEmitter {
         s.phaseTrades = 0;
         s.phaseWins = 0;
         s.phasePnl = 0;
-        logger.info(`[BotRunner] ${instance.botId}/${instance.instanceId} UN-FLIP — flipped phase ${s.phaseTrades} trades, PnL $${s.phasePnl.toFixed(2)}`);
+        logger.info(`[BotRunner] ${instance.botId}/${instance.instanceId} UN-FLIP — flipped phase ${phaseTradesAtToggle} trades, PnL $${phasePnlAtToggle.toFixed(2)}`);
         this.emit('botFlip', { instanceId: instance.instanceId, botId: instance.botId, flipped: false, reason: 'flipped_phase_negative' });
       }
-      // If phasePnl >= 0, stay flipped — the flip is working
       return;
     }
 
     // ── Currently NORMAL — decide if we should flip ──
-    if (s.phaseTrades < minTrades) return;  // not enough normal data
+    if (s.phaseTrades < minTrades) return;
 
     const normalWinRate = (s.phaseWins / s.phaseTrades) * 100;
     if (normalWinRate < flipThreshold) {
-      // Normal phase is losing badly → try flip
+      // [FIX-R1] Capture before reset so the log reflects the triggering phase.
+      const phaseTradesAtToggle = s.phaseTrades;
+      const phasePnlAtToggle = s.phasePnl;
       s.flipHistory.push({
         atTrade: s.closedTrades, from: false, to: true,
-        reason: `normal WR ${normalWinRate.toFixed(1)}% < ${flipThreshold}% (${s.phaseTrades} trades)`,
-        phaseTrades: s.phaseTrades, phasePnl: Number(s.phasePnl.toFixed(2)),
+        reason: `normal WR ${normalWinRate.toFixed(1)}% < ${flipThreshold}% (${phaseTradesAtToggle} trades)`,
+        phaseTrades: phaseTradesAtToggle, phasePnl: Number(phasePnlAtToggle.toFixed(2)),
       });
       this._capFlipHistory(s);
       s.flipped = true;
@@ -184,7 +230,7 @@ class BotRunner extends EventEmitter {
       s.phaseTrades = 0;
       s.phaseWins = 0;
       s.phasePnl = 0;
-      logger.info(`[BotRunner] ${instance.botId}/${instance.instanceId} FLIP ON — normal phase ${s.phaseTrades} trades, WR ${normalWinRate.toFixed(1)}%`);
+      logger.info(`[BotRunner] ${instance.botId}/${instance.instanceId} FLIP ON — normal phase ${phaseTradesAtToggle} trades, WR ${normalWinRate.toFixed(1)}%`);
       this.emit('botFlip', { instanceId: instance.instanceId, botId: instance.botId, flipped: true, reason: 'normal_phase_low_winrate' });
     }
   }
@@ -202,6 +248,17 @@ class BotRunner extends EventEmitter {
 
     try {
       this._updateFlipState(instance);
+
+      // [FIX-M4] Garbage-collect expired symbol locks each cycle.
+      this._cleanupExpiredLocks();
+
+      // [FIX-R2] Entry failure backoff — if the last entry attempt failed,
+      // wait before retrying so we don't spam the broker / log.
+      if (instance._entryFailureBackoffUntil && Date.now() < instance._entryFailureBackoffUntil) {
+        const remaining = Math.ceil((instance._entryFailureBackoffUntil - Date.now()) / 1000);
+        instance.lastReason = `Entry failure backoff (${remaining}s)`;
+        return;
+      }
 
       // 1. SETTLEMENT COOLDOWN
       if (instance._lastEntryTime && Date.now() - instance._lastEntryTime < 15000) {
@@ -266,6 +323,15 @@ class BotRunner extends EventEmitter {
       const positions = await broker.getOpenTrades().catch(() => []);
       if (positions.some(p => normalizeSymbol(p.instrument) === instance.symbol)) {
         instance.lastReason = 'waiting for current trade to close';
+        return;
+      }
+
+      // [FIX-M4] If another instance holds the lock for this symbol, wait.
+      // (Belt-and-suspenders: the position check above misses concurrent
+      // entries where neither has filled yet.)
+      const existingLock = this._symbolLocks.get(instance.symbol);
+      if (existingLock && existingLock.expiresAt > Date.now() && existingLock.instanceId !== instance.instanceId) {
+        instance.lastReason = `Symbol ${instance.symbol} locked by ${existingLock.instanceId}`;
         return;
       }
 
@@ -338,15 +404,41 @@ class BotRunner extends EventEmitter {
     return { ok: true, stake: requested };
   }
 
-  _validateRiskReward(instance, tradeParams, ctx) {
-    const minRR = Number(instance.config.minRiskReward) || 0;
-    if (minRR <= 0) return { ok: true };
+  // [FIX-M4c] Extend validation to reject SL/TP on the wrong side of entry.
+  // Previous code used Math.abs() which hid direction — a TP below entry for
+  // a BUY would pass as a valid "distance" and reach broker where the C1
+  // fix would then silently omit the field (trade proceeds with no TP).
+  // Rejecting here is safer.
+  _validateRiskReward(instance, tradeParams, ctx, direction) {
+    // Only multiplier contracts use knockoutLevel / takeProfitLevel.
     if (tradeParams.contractClass !== 'multiplier') return { ok: true };
 
-    const entryPrice = ctx && ctx.state && ctx.state.price && ctx.state.price.current;
+    const entryPrice =
+      (ctx && ctx.state && ctx.state.price && ctx.state.price.current) ||
+      Number(tradeParams.entryPrice) || null;
     const ko = Number(tradeParams.knockoutLevel);
     const tp = Number(tradeParams.takeProfitLevel);
+    const dir = tradeParams.direction || direction || null;
 
+    // [FIX-M4c] Side validation — independent of minRR config.
+    if (Number.isFinite(entryPrice) && entryPrice > 0 && dir) {
+      const isBuy = dir === 'BUY' || dir === 'MULTUP';
+      if (Number.isFinite(ko)) {
+        const wrongSide = isBuy ? ko >= entryPrice : ko <= entryPrice;
+        if (wrongSide) {
+          return { ok: false, reason: `KO ${ko} on wrong side of entry ${entryPrice} for ${dir}` };
+        }
+      }
+      if (Number.isFinite(tp)) {
+        const wrongSide = isBuy ? tp <= entryPrice : tp >= entryPrice;
+        if (wrongSide) {
+          return { ok: false, reason: `TP ${tp} on wrong side of entry ${entryPrice} for ${dir}` };
+        }
+      }
+    }
+
+    const minRR = Number(instance.config.minRiskReward) || 0;
+    if (minRR <= 0) return { ok: true };
     if (!Number.isFinite(entryPrice) || entryPrice <= 0) return { ok: true };
     if (!Number.isFinite(ko) || !Number.isFinite(tp)) return { ok: true };
 
@@ -434,6 +526,9 @@ class BotRunner extends EventEmitter {
 
   async _execute(instance, signal, ctx) {
     const { tradeParams, direction, reasons } = signal;
+    // [FIX-M4] Lock key — falls back to the instance's configured symbol if
+    // the bot's tradeParams doesn't specify one.
+    const lockSymbol = normalizeSymbol(tradeParams.symbol || instance.symbol);
 
     const stakeCheck = this._validateStake(instance, tradeParams.stake);
     if (!stakeCheck.ok) {
@@ -443,11 +538,20 @@ class BotRunner extends EventEmitter {
       return;
     }
 
-    const rrCheck = this._validateRiskReward(instance, tradeParams, ctx);
+    const rrCheck = this._validateRiskReward(instance, tradeParams, ctx, direction);
     if (!rrCheck.ok) {
       instance.lastReason = `Execution blocked: ${rrCheck.reason}`;
       logger.warn(`[BotRunner] ${instance.instanceId} — ${instance.lastReason}`);
       this.emit('botError', { instanceId: instance.instanceId, botId: instance.botId, error: rrCheck.reason });
+      return;
+    }
+
+    // [FIX-M4] Acquire the symbol lock. Only one bot per symbol can be
+    // between "decided to enter" and "position is visible in portfolio".
+    if (!this._tryAcquireSymbolLock(lockSymbol, instance.instanceId, SYMBOL_LOCK_TTL_MS)) {
+      const holder = this._symbolLocks.get(lockSymbol);
+      instance.lastReason = `Execution blocked: ${lockSymbol} locked by ${holder ? holder.instanceId : 'unknown'}`;
+      logger.debug(`[BotRunner] ${instance.instanceId} — ${instance.lastReason}`);
       return;
     }
 
@@ -457,6 +561,17 @@ class BotRunner extends EventEmitter {
     const currentRegime = ctx && ctx.state && ctx.state.regime ? ctx.state.regime.code : null;
 
     try {
+      // [FIX-M4] Re-check positions now that we hold the lock. This catches
+      // the window between the cycle-start check and this entry attempt,
+      // where another bot may have filled a trade.
+      const broker = getBroker('deriv_cfd');
+      const freshPositions = await broker.getOpenTrades().catch(() => []);
+      if (freshPositions.some(p => normalizeSymbol(p.instrument) === lockSymbol)) {
+        instance.lastReason = 'Execution blocked: position opened by concurrent bot';
+        this._releaseSymbolLock(lockSymbol, instance.instanceId);
+        return;
+      }
+
       let result;
       if (tradeParams.contractClass === 'multiplier') {
         result = await contractService.placeContract({
@@ -480,27 +595,48 @@ class BotRunner extends EventEmitter {
       instance.stats.entries++;
       instance._lastEntryTime = Date.now();
       instance.lastReason = 'TRADE PLACED';
+      // [FIX-R2] Successful entry clears any pending failure backoff.
+      instance._entryFailureBackoffUntil = 0;
 
-      await BotRun.create({
-        botId: instance.botId, instanceId: instance.instanceId, contractId: String(result.contractId),
-        symbol: normalizeSymbol(instance.config.symbol), side: tradeParams.contractType || direction,
-        contractType: tradeParams.contractType || null, stake: Number(stakeCheck.stake),
-        multiplier: tradeParams.multiplier || null, duration: tradeParams.duration || null,
-        durationUnit: tradeParams.durationUnit || null, barrier: tradeParams.barrier != null ? String(tradeParams.barrier) : null,
-        entryPrice: result.entryPrice, takeProfitLevel: tradeParams.takeProfitLevel != null ? Number(tradeParams.takeProfitLevel) : null,
-        knockoutLevel: tradeParams.knockoutLevel != null ? Number(tradeParams.knockoutLevel) : null,
-        reasons: reasons || [], openedAt: new Date(), status: 'OPEN',
-        isEdgeTest,
-        regimeCode: currentRegime,
-        session: currentSession,
-        entryThesis,
-      }).catch(err => logger.error(`[BotRunner] BotRun persist failed: ${err.message}`));
+      // [FIX-R3] Persist BotRun with proper error handling. If persist fails
+      // we log at ERROR (not swallow) because _onTradeClosed won't find it.
+      try {
+        await BotRun.create({
+          botId: instance.botId, instanceId: instance.instanceId, contractId: String(result.contractId),
+          symbol: normalizeSymbol(instance.config.symbol), side: tradeParams.contractType || direction,
+          contractType: tradeParams.contractType || null, stake: Number(stakeCheck.stake),
+          multiplier: tradeParams.multiplier || null, duration: tradeParams.duration || null,
+          durationUnit: tradeParams.durationUnit || null, barrier: tradeParams.barrier != null ? String(tradeParams.barrier) : null,
+          entryPrice: result.entryPrice, takeProfitLevel: tradeParams.takeProfitLevel != null ? Number(tradeParams.takeProfitLevel) : null,
+          knockoutLevel: tradeParams.knockoutLevel != null ? Number(tradeParams.knockoutLevel) : null,
+          reasons: reasons || [], openedAt: new Date(), status: 'OPEN',
+          isEdgeTest,
+          regimeCode: currentRegime,
+          session: currentSession,
+          entryThesis,
+        });
+      } catch (persistErr) {
+        logger.error(
+          `[BotRunner] BotRun persist failed for ${result.contractId} ` +
+          `(${instance.botId}/${instance.instanceId}): ${persistErr.message}`
+        );
+        // Trade is live — don't abort. _onTradeClosed will warn if it can't match.
+      }
 
       this.emit('botEntry', { instanceId: instance.instanceId, botId: instance.botId, contractId: String(result.contractId), symbol: instance.config.symbol, side: tradeParams.contractType || direction, entryPrice: result.entryPrice, stake: stakeCheck.stake, reasons, flipped: instance.stats.flipped, timestamp: new Date().toISOString() });
+
+      // [FIX-M4] Success → shorten the lock TTL. After ~5s the position is
+      // visible in portfolio, so other bots can rely on the position check.
+      this._shortenSymbolLock(lockSymbol, instance.instanceId, SYMBOL_LOCK_TAIL_MS);
     } catch (err) {
+      // [FIX-R2] Set failure backoff so the bot doesn't retry immediately
+      // next cycle with the same bad payload / network condition.
+      instance._entryFailureBackoffUntil = Date.now() + ENTRY_FAILURE_BACKOFF_MS;
       logger.error(`[BotRunner] ${instance.botId}/${instance.instanceId} entry failed: ${err.message}`);
       instance.lastReason = `Execution failed: ${err.message}`;
       this.emit('botError', { instanceId: instance.instanceId, botId: instance.botId, error: err.message });
+      // [FIX-M4] Failure → release lock immediately so other bots can try.
+      this._releaseSymbolLock(lockSymbol, instance.instanceId);
     }
   }
 
@@ -509,7 +645,15 @@ class BotRunner extends EventEmitter {
       const contractId = String(data && data.contractId || '');
       if (!contractId) return;
       const run = await BotRun.findOne({ contractId, status: 'OPEN' });
-      if (!run) return;
+      if (!run) {
+        // [FIX-R3] Surface missing BotRun at WARN — indicates a persist failure
+        // during entry. Stats won't update for this contract.
+        logger.warn(
+          `[BotRunner] _onTradeClosed: no OPEN BotRun for contract ${contractId} ` +
+          `(entry persist may have failed)`
+        );
+        return;
+      }
 
       const realizedProfit = Number(data.realizedProfit || 0);
       run.pnl = realizedProfit; run.realizedProfit = realizedProfit;
@@ -520,7 +664,6 @@ class BotRunner extends EventEmitter {
 
       const instance = this._instances.get(run.instanceId);
       if (instance) {
-        // Determine which phase this trade belonged to — trust entryThesis.flip
         const tradeWasFlipped = run.entryThesis && run.entryThesis.flip === 'FLIPPED';
 
         instance.stats.pnl += realizedProfit;
@@ -534,7 +677,6 @@ class BotRunner extends EventEmitter {
           instance.stats.consecutiveLosses++;
         }
 
-        // Cumulative per-phase buckets (never reset)
         if (tradeWasFlipped) {
           instance.stats.flippedTrades++;
           instance.stats.flippedPnl += realizedProfit;
@@ -545,7 +687,6 @@ class BotRunner extends EventEmitter {
           if (run.result === 'WIN') instance.stats.normalWins++;
         }
 
-        // Phase-local counters (drive the flip decision — reset on toggle)
         instance.stats.phaseTrades++;
         instance.stats.phasePnl += realizedProfit;
         if (run.result === 'WIN') instance.stats.phaseWins++;
@@ -563,7 +704,6 @@ class BotRunner extends EventEmitter {
   }
 
   _summarize(instance) {
-    // Strip potentially-large fields to keep WS payloads lean
     const statsForSummary = Object.assign({}, instance.stats);
     if (statsForSummary.flipHistory && statsForSummary.flipHistory.length > 5) {
       statsForSummary.flipHistory = statsForSummary.flipHistory.slice(-5);
