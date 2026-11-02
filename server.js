@@ -1,38 +1,52 @@
 // server.js – RTS Entry Point (Deriv-only, pattern-based, with balance guard)
 //
-// [FIX-S1] Replaced console.log/error/warn with the shared logger so log
-//          levels and transports are consistent with the rest of the system.
-//          The startup ASCII banner stays on console.log by design.
-// [FIX-S2] WATCHED_SYMBOLS is now configurable via the WATCHED_SYMBOLS env
-//          var (comma-separated). Falls back to the original 4-symbol list.
-//          This lets you add synthetics without editing the file.
-// [FIX-S3] _pipelineInFlight now has a 60s timeout so a stuck pipeline call
-//          (broker getAccount hanging, etc.) cannot permanently block future
-//          cycles for that symbol.
-// [FIX-S4] New /debug/regime endpoint returns the current regime for every
-//          watched symbol plus the last decision from decisionEngine. This
-//          is the fastest way to confirm whether the "unknown regime"
-//          coerce spam has stopped after the dataOrchestrator fix deploys.
-// [FIX-S5] New /debug/orchestrator endpoint returns dataOrchestrator cache
-//          stats, queue depths, and — critically — the per-symbol,
-//          per-code publish counts for historicalState. If a symbol shows
-//          a count under key 'unknown', we've located the source. If not,
-//          the message is coming from a document mutated AFTER publish.
-// [FIX-S6] dataOrchestrator.publish is wrapped (server startup only) to
-//          increment _regimePublishCounts. This is a diagnostic hook —
-//          wrapped call semantics are identical to the original.
-// [FIX-S7] Pipeline NO_TRADE log lines are throttled to once per 60s per
-//          symbol per reason. TRADE results always log at INFO. Previously
-//          every cycle logged all 4 symbols regardless of whether anything
-//          changed.
-// [FIX-S8] runPredictionPipeline now explicitly logs when marketState
-//          returns null (previously silent — masked missing-data conditions).
-// [FIX-S9] sendDashboardInitialState broker/account calls are wrapped in a
-//          5s timeout so a slow broker can't block a new WebSocket client
-//          from receiving its initial state.
+// [FIX-S1]  Replaced console.log/error/warn with the shared logger so log
+//           levels and transports are consistent with the rest of the system.
+//           The startup ASCII banner stays on console.log by design.
+// [FIX-S2]  WATCHED_SYMBOLS is now configurable via the WATCHED_SYMBOLS env
+//           var (comma-separated). Falls back to the original 4-symbol list.
+// [FIX-S3]  _pipelineInFlight now has a 60s timeout so a stuck pipeline call
+//           cannot permanently block future cycles for that symbol.
+// [FIX-S4]  New /debug/regime endpoint returns the current regime for every
+//           watched symbol plus the last decision from decisionEngine.
+// [FIX-S5]  New /debug/orchestrator endpoint returns dataOrchestrator cache
+//           stats, queue depths, and historicalState publish counts by
+//           symbol AND regime code.
+// [FIX-S6]  dataOrchestrator.publish is wrapped (server startup only) to
+//           increment _regimePublishCounts. Diagnostic hook — wrapped call
+//           semantics identical to the original.
+// [FIX-S7]  Pipeline NO_TRADE log lines are throttled to once per 60s per
+//           symbol per reason. TRADE results always log at INFO.
+// [FIX-S8]  runPredictionPipeline now explicitly logs when marketState
+//           returns null (previously silent — masked missing-data conditions).
+// [FIX-S9]  sendDashboardInitialState broker/account calls are wrapped in a
+//           5s timeout so a slow broker can't block a new WebSocket client.
 // [FIX-S10] marketState updates are broadcast to dashboards (type
-//           'marketStateUpdate') after each pipeline cycle. The dashboard
-//           previously had no real-time view of regime/quality changes.
+//           'marketStateUpdate') after each pipeline cycle.
+//
+// [FIX-S11] **Database lifecycle — startup race eliminated.**
+//           `connectDB()` was called at module top-level WITHOUT awaiting,
+//           so the Express HTTP server could start listening before
+//           MongoDB was connected. `ensureAdmin()` (which queries User)
+//           could then hit "Mongoose buffering timed out" errors on a
+//           cold boot. The call is now inside `startServer()` and awaited
+//           BEFORE `ensureAdmin()`. Startup order is now:
+//             1. await connectDB()    — exits on failure
+//             2. await ensureAdmin()  — runs against live DB
+//             3. server.listen(PORT)
+//             4. broker + candle bootstrap
+//             5. pipeline timer starts
+//           The port stays CLOSED until MongoDB is connected, so a
+//           startup script polling /health correctly sees "not ready"
+//           rather than a false 200.
+//
+// [FIX-S12] **/health now reports database state.** Previously the endpoint
+//           returned HTTP 200 as soon as the process was up, even if
+//           MongoDB had disconnected mid-run. Now it returns:
+//             200 {"status":"OK","database":"CONNECTED",...}  when ready
+//             503 {"status":"STARTING","database":"DISCONNECTED",...} when not
+//           This is what the Windows Task Scheduler startup script will
+//           poll to decide when to send the "started" notification.
 
 require('dotenv').config();
 
@@ -136,23 +150,19 @@ const WATCHED_SYMBOLS = (process.env.WATCHED_SYMBOLS || DEFAULT_WATCHED.join(','
   .map(s => normalizeSymbol(s))
   .filter(Boolean);
 
-connectDB();
+// [FIX-S11] connectDB() call removed from here — it is now awaited inside
+// startServer() BEFORE ensureAdmin(). Do not re-add this line.
 
 const _consensusCache = new Map();
 const _predictionCache = new Map();
 const _opportunityCache = new Map();
-const _pipelineInFlight = new Map(); // symbol -> Promise (dedupe)
+const _pipelineInFlight = new Map();
 
-// [FIX-S3] Pipeline in-flight timeout.
 const PIPELINE_TIMEOUT_MS = 60 * 1000;
 
-// [FIX-S7] Per-symbol log throttling for repeated NO_TRADE reasons.
 const PIPELINE_LOG_THROTTLE_MS = 60 * 1000;
-const _pipelineLogThrottle = new Map(); // symbol -> { reason, at }
+const _pipelineLogThrottle = new Map();
 
-// [FIX-S6] Regime-code publish counters per symbol. Populated by the
-// wrapped dataOrchestrator.publish below. Used by /debug/orchestrator to
-// locate the source of 'unknown' regime codes.
 const _regimePublishCounts = {};
 const _originalPublish = dataOrchestrator.publish.bind(dataOrchestrator);
 dataOrchestrator.publish = function (key, data, metadata) {
@@ -286,8 +296,29 @@ app.use('/api', botRoutes);
 
 app.use('/api/edge-test', require('./api/edgeController'));
 
+// [FIX-S12] Health endpoint now reports database state.
+// Returns 200 only when MongoDB is connected; 503 otherwise.
+// Used by the Windows Task Scheduler startup script to decide when to
+// send the "started" notification to esilesirayland@gmail.com.
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'OK', message: 'RTS is running with Deriv broker' });
+  const databaseConnected = mongoose.connection.readyState === 1;
+
+  if (!databaseConnected) {
+    return res.status(503).json({
+      status: 'STARTING',
+      database: 'DISCONNECTED',
+      message: 'RTS is waiting for MongoDB',
+      readyState: mongoose.connection.readyState,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  res.status(200).json({
+    status: 'OK',
+    database: 'CONNECTED',
+    message: 'RTS is running with Deriv broker',
+    timestamp: new Date().toISOString(),
+  });
 });
 
 app.get('/health/pipeline', async (req, res) => {
@@ -298,10 +329,12 @@ app.get('/health/pipeline', async (req, res) => {
     const hasMarketData = cache.size > 0;
     const hasConsensus = _consensusCache.size > 0;
     const hasBots = botRunner.list().length > 0;
-    const healthy = connected && hasMarketData && hasConsensus;
+    const dbConnected = mongoose.connection.readyState === 1;
+    const healthy = connected && hasMarketData && hasConsensus && dbConnected;
     res.status(healthy ? 200 : 503).json({
       healthy,
       brokerConnected: connected,
+      databaseConnected: dbConnected,
       marketCachePopulated: hasMarketData,
       strategyConsensusActive: hasConsensus,
       runningBots: hasBots,
@@ -355,15 +388,17 @@ app.get('/debug/pipeline', async (req, res) => {
 
     res.json({
       timestamp: new Date().toISOString(),
+      database: {
+        connected: mongoose.connection.readyState === 1,
+        readyState: mongoose.connection.readyState,
+      },
       broker: {
         connected: broker.isConnected ? broker.isConnected() : false,
         publicState: brokerHealth.publicState,
         authState: brokerHealth.authState,
         contractMonitoring: brokerHealth.contractMonitoring,
         accountLoaded: brokerHealth.accountLoaded,
-        // [FIX-C2] Surface portfolio dedupe + rate-limit stats
         portfolioDiagnostics: brokerHealth.portfolioDiagnostics,
-        // [FIX-C1] Surface SL/TP conversion stats
         limitOrderDiagnostics: brokerHealth.limitOrderDiagnostics,
       },
       marketCache: { symbolCount: cache.size, symbols: Array.from(cache.keys()) },
@@ -396,7 +431,6 @@ app.get('/debug/pipeline', async (req, res) => {
   }
 });
 
-// [FIX-S4] Regime debug — the fastest way to trace the 'unknown' coerce.
 app.get('/debug/regime', (req, res) => {
   try {
     const regimes = {};
@@ -430,9 +464,6 @@ app.get('/debug/regime', (req, res) => {
   }
 });
 
-// [FIX-S5] Orchestrator debug — exposes cache stats, queue depths, and
-// historicalState publish counts by symbol AND regime code. If any symbol
-// has a count under key 'unknown' here, we've located the source.
 app.get('/debug/orchestrator', (req, res) => {
   try {
     const cacheStats = dataOrchestrator.getCacheStats();
@@ -451,8 +482,6 @@ app.get('/debug/orchestrator', (req, res) => {
   }
 });
 
-// [FIX-S5] Focused view: only the 'unknown' coerce source. Returns a
-// compact summary that makes it obvious whether the fix worked.
 app.get('/debug/regime-publish', (req, res) => {
   try {
     const summary = {};
@@ -466,8 +495,8 @@ app.get('/debug/regime-publish', (req, res) => {
       hasUnknownCode: hasUnknown,
       bySymbol: summary,
       note: hasUnknown
-        ? 'Some publisher is emitting historicalState with regime.code="unknown". Check the symbols with "unknown" entries — send core/data/candleBootstrapper.js or core/awareness/engine.js for further tracing.'
-        : 'No historicalState doc with regime.code="unknown" has been published since server start. If coerce logs still appear, the code was mutated after publish (in the append queue) — check dataOrchestrator._handleResearch callers.',
+        ? 'Some publisher is emitting historicalState with regime.code="unknown".'
+        : 'No historicalState doc with regime.code="unknown" has been published since server start.',
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -549,7 +578,7 @@ app.get('/debug/strategies', async (req, res) => {
           action: consensus.consensus?.action,
           direction: consensus.consensus?.direction,
           confidence: consensus.consensus?.confidence,
-          confidenceBreakdown: consensus.consensus?.confidenceBreakdown,   // [FIX-RN5]
+          confidenceBreakdown: consensus.consensus?.confidenceBreakdown,
           anchorStrategy: consensus.consensus?.anchorStrategy,
           agreeing: consensus.consensus?.agreeing,
           conflicting: consensus.consensus?.conflicting,
@@ -597,6 +626,10 @@ app.get('/debug/status', (req, res) => {
       botRunner: botRunner ? 'running' : 'not loaded',
       digitAnalyzer: digitAnalyzer ? 'running' : 'not loaded',
       balanceGuard: balanceGuard ? 'running' : 'not loaded',
+    },
+    database: {
+      connected: mongoose.connection.readyState === 1,
+      readyState: mongoose.connection.readyState,
     },
     lastCandle: candleStore.getHistory('EURUSD', 'M5', 1)[0] || null,
     lastMarketState: lastState,
@@ -648,8 +681,6 @@ function enhanceAccount(accountData, broker) {
   return { ...accountData, tradeMode, server: srv };
 }
 
-// [FIX-S9] Wrap broker calls in a timeout so a slow broker can't block
-// new WebSocket client initialization.
 function withTimeout(promise, ms, fallback) {
   let timer = null;
   return Promise.race([
@@ -761,7 +792,6 @@ performanceMonitor.on('thresholdsUpdated', (thresholds) => {
   }
 });
 
-// [FIX-S7] Log helper with per-symbol throttling for repetitive reasons.
 function logPipelineResult(symbol, reason, opportunity, level = 'info') {
   const now = Date.now();
   const prev = _pipelineLogThrottle.get(symbol);
@@ -778,7 +808,6 @@ function logPipelineResult(symbol, reason, opportunity, level = 'info') {
 async function runPredictionPipeline(symbol, ctx = {}) {
   try {
     const state = await require('./core/intelligence/deep/marketState').compute(symbol, 'M5', 200);
-    // [FIX-S8] Explicitly log null-state condition.
     if (!state) {
       logPipelineResult(symbol, 'NO_STATE', null, 'debug');
       return false;
@@ -811,7 +840,6 @@ async function runPredictionPipeline(symbol, ctx = {}) {
     _predictionCache.set(symbol, prediction);
     broadcastToDashboards('prediction', prediction);
 
-    // [FIX-S10] Broadcast marketState summary so dashboard sees real-time state.
     try {
       broadcastToDashboards('marketStateUpdate', {
         symbol,
@@ -835,7 +863,6 @@ async function runPredictionPipeline(symbol, ctx = {}) {
     _opportunityCache.set(symbol, opportunity);
     broadcastToDashboards('opportunity', opportunity);
 
-    // [FIX-S7] Throttled pipeline logging.
     if (opportunity.tradable) {
       logPipelineResult(symbol, 'TRADE', opportunity, 'info');
     } else {
@@ -848,7 +875,6 @@ async function runPredictionPipeline(symbol, ctx = {}) {
   }
 }
 
-// [FIX-S3] Add 60s timeout to prevent stuck in-flight entries.
 function runPredictionPipelineOnce(symbol, ctx) {
   if (_pipelineInFlight.has(symbol)) return _pipelineInFlight.get(symbol);
   let timer = null;
@@ -894,8 +920,6 @@ async function runPredictionPipelineAll() {
       reasons[key] = (reasons[key] || 0) + 1;
     }
   }
-  // [FIX-S7] Cycle summary — one line instead of N. Only log when it
-  // changes or at INFO when trades occurred.
   const hasTrades = Object.prototype.hasOwnProperty.call(reasons, 'TRADE');
   const summary = `${ok}/${WATCHED_SYMBOLS.length} ran [${Object.entries(reasons).map(([k, v]) => `${k}×${v}`).join(', ') || 'no opportunities'}]`;
   if (hasTrades) logger.info(`[Pipeline] Cycle: ${summary}`);
@@ -986,11 +1010,19 @@ async function waitForBrokerReady(broker, timeoutMs = 30000) {
 }
 
 async function startServer() {
+  // [FIX-S11] MongoDB must connect successfully before RTS starts.
+  // connectDB() throws if the connection fails — which means the process
+  // exits (via startServer().catch below) rather than leaving a zombie
+  // server listening on port 5000 with no database.
+  await connectDB();
+
+  // Only create/check the admin after database connection.
   await ensureAdmin();
 
   server.listen(PORT, () => {
     console.log('==============================================');
     console.log(`RTS server running on http://localhost:${PORT}`);
+    console.log(`Database:       MongoDB connected`);
     console.log(`Dashboard:      http://localhost:${PORT}`);
     console.log(`API base:       http://localhost:${PORT}/api`);
     console.log(`Signals:        http://localhost:${PORT}/api/signal/active`);
@@ -1002,7 +1034,8 @@ async function startServer() {
     console.log(`Regime:         http://localhost:${PORT}/debug/regime`);
     console.log(`Orchestrator:   http://localhost:${PORT}/debug/orchestrator`);
     console.log(`Regime publish: http://localhost:${PORT}/debug/regime-publish`);
-    console.log(`Health:         http://localhost:${PORT}/health/pipeline`);
+    console.log(`Health:         http://localhost:${PORT}/health`);
+    console.log(`Health full:    http://localhost:${PORT}/health/pipeline`);
     console.log(`Debug:          http://localhost:${PORT}/debug/pipeline`);
     console.log('==============================================');
 
@@ -1083,6 +1116,7 @@ async function startServer() {
     setTimeout(() => {
       console.log('==============================================');
       console.log('RTS Subsystem Status:');
+      console.log(`   Database:          ${mongoose.connection.readyState === 1 ? 'connected' : 'DISCONNECTED'}`);
       try {
         const broker = getBroker('deriv_cfd');
         console.log(`   Broker:            ${broker.isConnected() ? 'connected' : 'disconnected'}`);
@@ -1115,6 +1149,9 @@ async function startServer() {
       if (broker && broker.disconnect) await broker.disconnect();
     } catch (_) {}
     try { wss.close(); } catch (_) {}
+    try {
+      await mongoose.connection.close();
+    } catch (_) {}
     try { server.close(); } catch (_) {}
     process.exit(0);
   }
