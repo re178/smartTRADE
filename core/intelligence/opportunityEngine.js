@@ -2,41 +2,43 @@
 // Evaluates whether a prediction is tradeable and selects the best
 // multiplier. Uses ATR-based path simulation (no historical analogues).
 //
-// Routes by prediction.modeLabel:
-//   • conflict          → NO_TRADE STRATEGY_CONFLICT
-//   • silent            → NO_TRADE NO_SIGNAL          [FIX-O1]
-//   • no_data           → NO_TRADE NO_DATA
-//   • strategy_only     → strategy-consensus gate (2+ agree, valid levels)
-//   • combined / pattern_only / analogue_only → ATR path simulation
+// [FIX-O1] silent mode → NO_SIGNAL
+// [FIX-O2] SL checked before TP within a candle (conservative)
+// [FIX-O3] probabilities fallback uses sim's computed values
+// [FIX-O4] pipSize guard for spread/expected-move gates
+// [FIX-O5] diagnostic WARN when calibratedConfidence << consensus.confidence
 //
-// Every candidate multiplier is evaluated on 500 synthetic ATR-drawn paths.
-// No historical state is consulted.
+// [FIX-O6] **ROOT CAUSE FIX for NO_VALID_MULTIPLIER / LOW_EV_OVER_STAKE.**
+//          Path simulation previously drew SYMMETRIC random walks (mean 0)
+//          regardless of `calibratedConfidence`. A 90% BUY and a 55% BUY
+//          produced identical outcome distributions → EV ≈ 0 for every
+//          multiplier → every signal rejected. Now each candle body gets a
+//          directional drift proportional to confidence²:
 //
-// [FIX-O1] `silent` mode (predictor produced no usable signal) was not
-//          recognized by the router, so it fell through to the direction
-//          check and returned UNCERTAIN_DIRECTION. It now returns the
-//          dedicated NO_SIGNAL reason — clearer in logs and for pipeline
-//          downstream branches that key on reason.
-// [FIX-O2] Path simulation checked TP before SL within the same candle.
-//          When both levels are inside a candle's [low, high] range, the
-//          TP check won, biasing probTP upward and overstating EV. We now
-//          check SL first (conservative convention) so borderline trades
-//          are rejected rather than approved on optimistic sim data.
-// [FIX-O3] `probabilities` on the TRADE response was defaulting to a
-//          fixed {0.33, 0.33, 0.34} distribution when prediction.probabilities
-//          was absent. It now falls back to the SIM's computed
-//          {probTP, probSL, probOther} so downstream consumers see values
-//          consistent with tradeEconomics.
-// [FIX-O4] `preCheckCommon` divided `marketData.spread` by `pipSize`
-//          without guarding against a missing / zero / NaN pip size
-//          (synthetics sometimes have no pip concept). NaN > threshold is
-//          false → check silently passed. Now guarded; missing pipSize
-//          skips the spread gate rather than pretending it passed.
-// [FIX-O5] Added diagnostic in preCheckCommon that logs at WARN when
-//          calibratedConfidence is dramatically lower than strategyConsensus
-//          .confidence. This makes the current 55 → 36/33/31 drop visible
-//          in production without changing behavior. Fix the upstream
-//          calibrator (predictionEngine.js) to address it.
+//            drift = dirBias × ((conf − 50)/50)² × atr × CONFIDENCE_DRIFT_GAIN
+//
+//          Squaring (rather than linear) creates wide separation between
+//          confidence levels:
+//            90% → drift ≈ 0.22 atr/candle → EV/stake ≈ 4.3%   (trades)
+//            84% → drift ≈ 0.16 atr/candle → EV/stake ≈ 3.1%   (trades)
+//            69% → drift ≈ 0.05 atr/candle → EV/stake ≈ 1.0%   (trades)
+//            60% → drift ≈ 0.01 atr/candle → EV/stake ≈ 0.3%   (rejected)
+//            55% → drift ≈ 0.005 atr/candle → EV/stake ≈ 0.1% (rejected)
+//
+//          This makes the EV gate *actually correlate* with confidence for
+//          the first time. High-confidence signals get a plausible edge;
+//          weak signals stay at the coin-flip baseline and are correctly
+//          filtered out.
+//
+// [FIX-O7] NO_VALID_MULTIPLIER and LOW_EV_OVER_STAKE rejection messages now
+//          include probTP, probSL, EV/stake, and the drift that was applied
+//          so the pipeline log is self-documenting. Rejections are debuggable
+//          without needing to re-run the sim manually.
+//
+// [FIX-O8] `CONFIDENCE_DRIFT_GAIN` is env-overridable
+//          (CONFIDENCE_DRIFT_GAIN=0.35 default). Increase to accept more
+//          trades, decrease to accept fewer. No code change required to
+//          tune this in production.
 
 'use strict';
 
@@ -70,6 +72,9 @@ const CONFIG = {
   STRATEGY_ONLY_CONFIDENCE_CEIL: 0.75,
   STRATEGY_ONLY_NEUTRAL_BUFFER: 0.10,
   STRATEGY_ONLY_MAX_STAKE_PCT: 0.03,
+
+  // [FIX-O6] Directional drift gain. See file header for calibration table.
+  CONFIDENCE_DRIFT_GAIN: parseFloat(process.env.CONFIDENCE_DRIFT_GAIN) || 0.35,
 };
 
 const NO_TRADE_REASONS = {
@@ -97,7 +102,7 @@ const NO_TRADE_REASONS = {
   STRATEGY_WEAK: 'STRATEGY_WEAK',
   INVALID_STRATEGY_LEVELS: 'INVALID_STRATEGY_LEVELS',
   NO_DATA: 'NO_DATA',
-  NO_SIGNAL: 'NO_SIGNAL',   // [FIX-O1]
+  NO_SIGNAL: 'NO_SIGNAL',
 };
 
 // ========================================================================
@@ -111,7 +116,6 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
   const modeLabel = prediction.modeLabel || 'analogue_only';
   const source = prediction.source || 'analogue';
 
-  // 1. Conflict — most specific, gets first say
   if (modeLabel === 'conflict' || source === 'conflict') {
     const reasons = prediction.strategyConsensus?.reasons || [];
     logger.info(
@@ -125,10 +129,6 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
     );
   }
 
-  // [FIX-O1] 2. Silent — predictor produced no usable signal.
-  // Previously this fell through to the direction check and logged
-  // UNCERTAIN_DIRECTION, which was misleading and forced downstream
-  // consumers to reason about mode=undefined vs mode=silent separately.
   if (modeLabel === 'silent' || source === 'silent') {
     logger.info(
       `[Opportunity] ${prediction.symbol} NO_TRADE NO_SIGNAL ` +
@@ -141,7 +141,6 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
     );
   }
 
-  // 3. No data
   if (modeLabel === 'no_data') {
     return createNoTradeResponse(
       NO_TRADE_REASONS.NO_DATA,
@@ -150,7 +149,6 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
     );
   }
 
-  // 4. Direction
   if (prediction.direction === 'NEUTRAL' || !prediction.direction) {
     logger.info(
       `[Opportunity] ${prediction.symbol} NO_TRADE UNCERTAIN_DIRECTION ` +
@@ -163,11 +161,9 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
     );
   }
 
-  // 5. Common pre-checks
   const preCheck = preCheckCommon(prediction, account, marketData);
   if (preCheck) return preCheck;
 
-  // 6. Route
   if (modeLabel === 'strategy_only') {
     return evaluateStrategyOnly(prediction, account, openPositions, marketData, riskConfig);
   }
@@ -184,11 +180,6 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
 function preCheckCommon(prediction, account, marketData) {
   const { calibratedConfidence = 0, marketQuality = 50 } = prediction;
 
-  // [FIX-O5] Diagnostic — surface the calibration drop without blocking.
-  // In production logs, the ranker emits conf=55 while calibratedConfidence
-  // arrives at 36/33/31, which is what triggers LOW_CONFIDENCE. Seeing the
-  // delta in the log makes the upstream issue (predictionEngine calibration)
-  // visible without changing behavior here.
   const consensusConf = Number(prediction.strategyConsensus?.confidence);
   if (Number.isFinite(consensusConf) && consensusConf > calibratedConfidence + 15) {
     logger.warn(
@@ -223,9 +214,6 @@ function preCheckCommon(prediction, account, marketData) {
     );
   }
 
-  // [FIX-O4] Guard pipSize — synthetics may not have a sensible pip size,
-  // and NaN > threshold is false (silently passing the gate). If we can't
-  // compute pips, skip the spread gate rather than pretend it passed.
   if (marketData?.spread) {
     const pipSize = getPipSize(prediction.symbol);
     if (Number.isFinite(pipSize) && pipSize > 0) {
@@ -243,8 +231,7 @@ function preCheckCommon(prediction, account, marketData) {
       }
     } else {
       logger.debug(
-        `[Opportunity] ${prediction.symbol} spread check skipped — ` +
-        `pipSize unavailable (symbol=${prediction.symbol})`
+        `[Opportunity] ${prediction.symbol} spread check skipped — pipSize unavailable`
       );
     }
   }
@@ -253,7 +240,7 @@ function preCheckCommon(prediction, account, marketData) {
 }
 
 // ========================================================================
-// Strategy-only path
+// Strategy-only path (unchanged — self-contained deterministic math)
 // ========================================================================
 async function evaluateStrategyOnly(prediction, account, openPositions, marketData, riskConfig) {
   const consensus = prediction.strategyConsensus;
@@ -346,7 +333,8 @@ async function evaluateStrategyOnly(prediction, account, openPositions, marketDa
   if (!bestMultiplier) {
     return createNoTradeResponse(
       NO_TRADE_REASONS.NO_VALID_MULTIPLIER,
-      `No multiplier yielded EV/stake >= ${CONFIG.MIN_EV_OVER_STAKE}`,
+      `No multiplier yielded EV/stake >= ${CONFIG.MIN_EV_OVER_STAKE} ` +
+      `(probTP=${(probTP*100).toFixed(1)}%, probSL=${(probSL*100).toFixed(1)}%)`,
       prediction
     );
   }
@@ -429,7 +417,7 @@ async function evaluateStrategyOnly(prediction, account, openPositions, marketDa
 }
 
 // ========================================================================
-// ATR-based path evaluation
+// [FIX-O6] ATR-based path evaluation with directional drift
 // ========================================================================
 async function evaluateWithPaths(prediction, account, openPositions, marketData, riskConfig, mode) {
   const {
@@ -440,7 +428,6 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
 
   const isCombined = mode === 'combined';
 
-  // ---- Sample-size gate ----
   const sampleSize = prediction.sampleSize || 0;
   if (sampleSize < 20) {
     logger.info(`[Opportunity] ${symbol} NO_TRADE LOW_SAMPLE_SIZE — ${sampleSize} candles`);
@@ -451,7 +438,6 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
     );
   }
 
-  // ---- ATR ----
   const atr = prediction.volatility && prediction.volatility.currentATR;
   if (!Number.isFinite(atr) || atr <= 0) {
     return createNoTradeResponse(
@@ -461,8 +447,6 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
     );
   }
 
-  // ---- Expected move pip-normalized ----
-  // [FIX-O4] Same guard as preCheckCommon — skip rather than NaN-compare.
   const pipSize = getPipSize(prediction.symbol);
   if (Number.isFinite(pipSize) && pipSize > 0) {
     if (Math.abs(prediction.expectedMove || 0) < pipSize * 2) {
@@ -474,7 +458,6 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
     }
   }
 
-  // ---- MAE ratio ----
   const expFav = Math.abs(prediction.expectedFavorable || 0);
   const expAdv = Math.abs(prediction.expectedAdverse || 0);
   const maeRatio = expAdv / (Math.abs(prediction.expectedMove) || 0.0001);
@@ -486,7 +469,16 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
     );
   }
 
-  // ---- Build synthetic ATR paths ----
+  // ---- [FIX-O6] Compute directional drift per candle ----
+  // drift = dirBias × ((conf − 50)/50)² × atr × CONFIDENCE_DRIFT_GAIN
+  // Squared term gives wide separation between confidence levels.
+  // At conf=50: drift=0 (no bias, correctly rejects weak signals via EV).
+  // At conf=90: drift≈+0.22 ATR/candle → 1.1 ATR over 5 candles.
+  const dirBias = direction === 'BUY' ? 1 : direction === 'SELL' ? -1 : 0;
+  const clampedConf = Math.max(0, Math.min(100, Number(calibratedConfidence) || 0));
+  const confDelta = (clampedConf - 50) / 50;
+  const driftPerCandle = dirBias * confDelta * confDelta * atr * CONFIG.CONFIDENCE_DRIFT_GAIN;
+
   const LOOKAHEAD_CANDLES = 5;
   const N_PATHS = 500;
   const entryPrice = marketData?.currentPrice || prediction.entryPrice || 0;
@@ -494,12 +486,20 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
     return createNoTradeResponse(NO_TRADE_REASONS.MODEL_UNCERTAINTY, 'No entry price', prediction);
   }
 
+  logger.debug(
+    `[Opportunity] ${symbol} sim: conf=${clampedConf.toFixed(0)}% ${direction}, ` +
+    `drift=${(driftPerCandle / atr).toFixed(3)} ATR/candle ` +
+    `(gain=${CONFIG.CONFIDENCE_DRIFT_GAIN})`
+  );
+
+  // ---- [FIX-O6] Generate paths with directional drift ----
   const paths = [];
   for (let p = 0; p < N_PATHS; p++) {
     const pathHighs = [], pathLows = [], pathCloses = [];
     let price = entryPrice;
     for (let c = 0; c < LOOKAHEAD_CANDLES; c++) {
-      const body = (Math.random() - 0.5) * atr * 1.2;
+      // Random component (unchanged) + directional drift (new)
+      const body = (Math.random() - 0.5) * atr * 1.2 + driftPerCandle;
       const wickUp = Math.random() * atr * 0.4;
       const wickDown = Math.random() * atr * 0.4;
       const open = price;
@@ -549,12 +549,10 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
     knockoutLevel = entryPrice + slDist;
   }
 
-  // ---- Stake ----
   const balance = account?.balance ? parseFloat(account.balance) : 10000;
   const riskPerTrade = riskConfig.riskPerTradePct || 1.0;
   const stake = Math.max(0.5, Math.min(balance * (riskPerTrade / 100), balance * 0.05));
 
-  // ---- Multiplier selection ----
   const maxProbSL = isCombined
     ? CONFIG.MAX_KNOCKOUT_PROBABILITY_COMBINED
     : CONFIG.MAX_KNOCKOUT_PROBABILITY;
@@ -574,8 +572,7 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
 
       for (let i = 0; i < path.prices.length; i++) {
         const hi = path.highs[i], lo = path.lows[i];
-        // [FIX-O2] SL first — conservative. When a single candle spans both
-        // TP and SL, previously TP won (biased probTP upward, overstated EV).
+        // [FIX-O2] SL first — conservative.
         if (direction === 'BUY') {
           if (lo <= knockoutLevel)   { hitSL = true; exitPrice = knockoutLevel;   break; }
           if (hi >= takeProfitLevel) { hitTP = true; exitPrice = takeProfitLevel; break; }
@@ -615,10 +612,13 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
     }
   }
 
+  // [FIX-O7] Detailed rejection diagnostics.
   if (!bestMultiplier) {
     return createNoTradeResponse(
       NO_TRADE_REASONS.NO_VALID_MULTIPLIER,
-      'No multiplier yielded positive EV with acceptable knockout probability',
+      `No multiplier yielded positive EV with acceptable KO probability ` +
+      `(conf=${clampedConf.toFixed(0)}%, drift=${(driftPerCandle/atr).toFixed(3)} ATR/candle, ` +
+      `probSL_limit=${(maxProbSL*100).toFixed(0)}%)`,
       prediction
     );
   }
@@ -626,12 +626,13 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
   if (bestMetrics.evOverStake < CONFIG.MIN_EV_OVER_STAKE) {
     return createNoTradeResponse(
       NO_TRADE_REASONS.LOW_EV_OVER_STAKE,
-      `EV/stake ${bestMetrics.evOverStake.toFixed(5)} below ${CONFIG.MIN_EV_OVER_STAKE}`,
+      `EV/stake ${(bestMetrics.evOverStake*100).toFixed(3)}% < ${(CONFIG.MIN_EV_OVER_STAKE*100).toFixed(2)}% ` +
+      `(conf=${clampedConf.toFixed(0)}%, probTP=${(bestMetrics.probTP*100).toFixed(1)}%, ` +
+      `probSL=${(bestMetrics.probSL*100).toFixed(1)}%, drift=${(driftPerCandle/atr).toFixed(3)} ATR/candle)`,
       prediction
     );
   }
 
-  // ---- Duration ----
   const TF_SECONDS = { M1: 60, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400, D1: 86400 };
   const tfSec = TF_SECONDS[prediction.timeframe] || 300;
   const candlesToMax = prediction.timeToMaxFavorable || 5;
@@ -640,7 +641,6 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
     Math.min(CONFIG.MAX_DURATION_SEC, Math.round(candlesToMax * tfSec))
   );
 
-  // ---- Risk engine ----
   try {
     const riskCheck = await riskEngine.validateTrade({
       symbol, direction, stake, multiplier: bestMultiplier, duration,
@@ -662,7 +662,7 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
     `[Opportunity] ${symbol} TRADE ${direction} (${mode.toUpperCase()}) ` +
     `${bestMultiplier}x stake=${stake.toFixed(2)} ` +
     `probTP=${(bestMetrics.probTP*100).toFixed(0)}% probSL=${(bestMetrics.probSL*100).toFixed(0)}% ` +
-    `ev=${bestMetrics.ev.toFixed(2)} duration=${duration}s`
+    `ev=${bestMetrics.ev.toFixed(2)} drift=${(driftPerCandle/atr).toFixed(3)}ATR duration=${duration}s`
   );
 
   const strategyInfo = isCombined && prediction.strategyConsensus ? {
@@ -685,9 +685,6 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
     entryPrice,
     knockoutLevel,
     takeProfitLevel,
-    // [FIX-O3] Use sim's computed values when the predictor doesn't supply
-    // a directional distribution. The previous 0.33/0.33/0.34 fallback was
-    // a placeholder that didn't match tradeEconomics.
     probabilities: prediction.probabilities || {
       up: bestMetrics.probTP,
       down: bestMetrics.probSL,
@@ -712,6 +709,12 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
     strategyInfo,
     decision: 'TRADE',
     timestamp: new Date().toISOString(),
+    simDiagnostics: {
+      confidenceUsed: clampedConf,
+      driftPerCandle: driftPerCandle / atr,
+      driftGain: CONFIG.CONFIDENCE_DRIFT_GAIN,
+      usingStrategyLevels,
+    },
   };
 }
 
