@@ -57,7 +57,6 @@ const riskEngine = require('./core/risk/riskEngine');
 
 const analyticsDashboard = require('./core/analytics/dashboard');
 const candleBootstrapper = require('./core/data/candleBootstrapper');
-const otie = require('./core/intelligence/openTradeIntelligenceV5');
 const performanceMonitor = require('./core/performance/performanceMonitor');
 
 const botRunner = require('./core/bots/runner');
@@ -66,9 +65,32 @@ const balanceGuard = require('./core/risk/balanceGuard');
 
 const { getBroker } = require('./core/execution/brokerFactory');
 
+// --- OTIE is now lazily initialised (see initOtie) to avoid warming up
+//     before the broker auth/portfolio snapshot is ready. ---
+let otie = null;
+
 function normalizeSymbol(symbol) {
   if (!symbol) return '';
   return symbol.replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
+}
+
+// Deriv symbol alias map — used only for logging / preflight. Real
+// normalization belongs in DerivBroker.getCandles().
+const BROKER_SYMBOL_MAP = {
+  EURUSD: 'frxEURUSD',
+  GBPUSD: 'frxGBPUSD',
+  USDJPY: 'frxUSDJPY',
+  AUDUSD: 'frxAUDUSD',
+  R_10: 'R_10',
+  R_25: 'R_25',
+  R_50: 'R_50',
+  R_75: 'R_75',
+  R_100: 'R_100',
+};
+
+function toBrokerSymbol(displaySymbol) {
+  const key = normalizeSymbol(displaySymbol);
+  return BROKER_SYMBOL_MAP[key] || displaySymbol;
 }
 
 const app = express();
@@ -79,6 +101,7 @@ connectDB();
 const _consensusCache = new Map();
 const _predictionCache = new Map();
 const _opportunityCache = new Map();
+const _pipelineInFlight = new Map(); // symbol -> Promise (dedupe)
 
 function flattenConsensus(consensus) {
   if (!consensus || !consensus.consensus) return null;
@@ -197,11 +220,6 @@ app.use(async (req, res, next) => {
 app.use('/api', apiRoutes);
 app.use('/api', botRoutes);
 
-// ── Edge Validation endpoints ─────────────────────────────────────
-// /start, /stop, /status, /results, /export, /reset
-// Mounted after apiRoutes and botRoutes so /api/bots/* and /api/*
-// handlers take precedence. This router is fully namespaced under
-// /api/edge-test/*, so there is no conflict.
 app.use('/api/edge-test', require('./api/edgeController'));
 
 app.get('/health', (req, res) => {
@@ -265,7 +283,7 @@ app.get('/debug/pipeline', async (req, res) => {
 
     let otieState = {};
     try {
-      otieState = otie.getAllStates ? otie.getAllStates() : {};
+      otieState = otie && otie.getAllStates ? otie.getAllStates() : {};
     } catch (_) {}
 
     res.json({
@@ -284,7 +302,10 @@ app.get('/debug/pipeline', async (req, res) => {
         hasMetrics: Object.keys(dashboardMetrics).length > 0,
         totalTrades: dashboardMetrics.totalTrades || 0,
       },
-      otie: { observerCount: otie.observerCount || 0, states: otieState },
+      otie: {
+        observerCount: (otie && otie.observerCount) || 0,
+        states: otieState,
+      },
       strategyPipeline: {
         rankerActive: _consensusCache.size > 0,
         symbolsWithConsensus: Array.from(_consensusCache.keys()),
@@ -490,7 +511,7 @@ async function sendDashboardInitialState(ws) {
     const enhancedAccount = enhanceAccount(account, broker);
 
     let otieState = {};
-    try { otieState = otie.getAllStates ? otie.getAllStates() : {}; } catch (_) {}
+    try { otieState = otie && otie.getAllStates ? otie.getAllStates() : {}; } catch (_) {}
 
     let strategyConsensus = {};
     try {
@@ -528,9 +549,8 @@ eventBus.on('account.fetched', (account) => broadcast('account', account));
 eventBus.on('trade.closed', (data) => broadcast('tradeClosed', data));
 eventBus.on('order.placed', (data) => broadcast('trade.placed', data));
 eventBus.on('position.updated', (data) => broadcast('positions', data));
-otie.on('otieV5State', (state) => broadcast('otieV5State', state));
-otie.on('otieV5Action', (action) => broadcast('otieV5Action', action));
-otie.on('otieState', (state) => broadcast('otieState', state));
+
+// OTIE listeners are attached inside initOtie(), after broker is ready.
 
 eventBus.on('trade.closed', async (data) => {
   const contractId = data?.contractId;
@@ -579,7 +599,7 @@ performanceMonitor.on('thresholdsUpdated', (thresholds) => {
 
 const WATCHED_SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD'];
 
-async function runPredictionPipeline(symbol) {
+async function runPredictionPipeline(symbol, ctx = {}) {
   try {
     const state = await require('./core/intelligence/deep/marketState').compute(symbol, 'M5', 200);
     if (!state) {
@@ -597,8 +617,8 @@ async function runPredictionPipeline(symbol) {
     }
 
     const broker = getBroker('deriv_cfd');
-    const account = await broker.getAccount();
-    const positions = await broker.getOpenTrades();
+    const account = ctx.account || await broker.getAccount();
+    const positions = ctx.positions || await broker.getOpenTrades();
 
     const marketData = {
       currentPrice: state.price.current,
@@ -635,10 +655,31 @@ async function runPredictionPipeline(symbol) {
   }
 }
 
+function runPredictionPipelineOnce(symbol, ctx) {
+  if (_pipelineInFlight.has(symbol)) return _pipelineInFlight.get(symbol);
+  const p = runPredictionPipeline(symbol, ctx)
+    .catch(err => { console.error(`[Pipeline] Uncaught for ${symbol}:`, err.message); return false; })
+    .finally(() => { _pipelineInFlight.delete(symbol); });
+  _pipelineInFlight.set(symbol, p);
+  return p;
+}
+
 async function runPredictionPipelineAll() {
+  // Cache account/positions once per cycle (was 2 calls * 4 symbols = 8 API calls/cycle)
+  let ctx = { account: null, positions: null };
+  try {
+    const broker = getBroker('deriv_cfd');
+    if (broker.isConnected()) {
+      ctx.account = await broker.getAccount();
+      ctx.positions = await broker.getOpenTrades();
+    }
+  } catch (e) {
+    // Fall back to per-symbol fetch inside runPredictionPipeline
+  }
+
   let ok = 0;
   for (const symbol of WATCHED_SYMBOLS) {
-    const result = await runPredictionPipeline(symbol);
+    const result = await runPredictionPipelineOnce(symbol, ctx);
     if (result) ok++;
   }
   if (ok === 0) {
@@ -648,7 +689,8 @@ async function runPredictionPipelineAll() {
 
 candleStore.on('candleClosed', async (candle) => {
   if (candle.timeframe === 'M5' && WATCHED_SYMBOLS.includes(candle.symbol)) {
-    await runPredictionPipeline(candle.symbol);
+    // Dedupe: pipeline timer may also fire on the same symbol
+    await runPredictionPipelineOnce(candle.symbol, {});
   }
 });
 
@@ -686,10 +728,48 @@ async function startDerivBroker() {
     broker.on('_portfolioUpdated', (positions) => broadcastToDashboards('positions', positions));
     await broker.connect();
     console.log('[Deriv] Broker connected.');
+    return broker;
   } catch (err) {
     console.error('[Deriv] Failed to start Deriv broker:', err.message);
     throw err;
   }
+}
+
+// Lazily initialise OTIE once the broker auth/portfolio snapshot is available.
+function initOtie() {
+  if (otie) return otie;
+  try {
+    otie = require('./core/intelligence/openTradeIntelligenceV5');
+    otie.on('otieV5State', (state) => broadcast('otieV5State', state));
+    otie.on('otieV5Action', (action) => broadcast('otieV5Action', action));
+    otie.on('otieState', (state) => broadcast('otieState', state));
+    console.log('[OTIE] Post-auth initialisation hook attached.');
+  } catch (err) {
+    console.error('[OTIE] Failed to initialise:', err.message);
+  }
+  return otie;
+}
+
+async function waitForBrokerReady(broker, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  if (typeof broker.waitForAuthReady === 'function') {
+    try { await broker.waitForAuthReady(timeoutMs); }
+    catch (e) { console.warn('[Broker] auth ready timeout:', e.message); }
+  }
+  if (typeof broker.waitForPortfolio === 'function') {
+    try { await broker.waitForPortfolio(timeoutMs); }
+    catch (e) { console.warn('[Broker] portfolio ready timeout:', e.message); }
+  }
+  while (Date.now() < deadline) {
+    const ready = typeof broker.isReady === 'function'
+      ? broker.isReady()
+      : broker.isConnected && broker.isConnected();
+    if (ready) return true;
+    await sleep(250);
+  }
+  return !!(broker.isConnected && broker.isConnected());
 }
 
 async function startServer() {
@@ -750,36 +830,41 @@ async function startServer() {
     try { analyticsDashboard.start(); console.log('Analytics dashboard started.'); }
     catch (err) { console.error('Analytics dashboard failed:', err.message); }
 
-    try {
-      candleBootstrapper.bootstrap()
-        .then(() => console.log('Candle bootstrap complete.'))
-        .catch(err => console.warn('Candle bootstrap failed (non-fatal):', err.message));
-    } catch (err) {
-      console.warn('Candle bootstrap threw (non-fatal):', err.message);
-    }
-
-    setTimeout(() => {
-      startDerivBroker().then(() => {
-        const broker = getBroker('deriv_cfd');
-        if (broker.isConnected()) {
-          console.log('Broker ready — starting pipeline timer.');
-          startPipelineTimer();
-          setTimeout(() => {
-            runPredictionPipelineAll().catch(err => {
-              console.error('[Pipeline] Initial run error:', err.message);
-            });
-          }, 2000);
-        } else {
-          broker.once('ready', () => {
-            console.log('Broker ready (delayed) — starting pipeline timer.');
-            startPipelineTimer();
-          });
-        }
-      }).catch(err => {
+    // --- Ordered bootstrap: broker first, then candles, then OTIE, then pipeline ---
+    (async () => {
+      let broker;
+      try {
+        await new Promise(r => setTimeout(r, 3000)); // small delay for DB init
+        broker = await startDerivBroker();
+      } catch (err) {
         console.error('startDerivBroker failed:', err.message);
-        startPipelineTimer();
-      });
-    }, 3000);
+        startPipelineTimer(); // fall back — pipeline will no-op on symbol errors
+        return;
+      }
+
+      const ready = await waitForBrokerReady(broker, 30000);
+      if (!ready) {
+        console.warn('[Boot] Broker not fully ready after 30s — proceeding anyway.');
+      }
+
+      try {
+        await candleBootstrapper.bootstrap();
+        console.log('Candle bootstrap complete.');
+      } catch (err) {
+        console.warn('Candle bootstrap failed (non-fatal):', err.message);
+      }
+
+      // Now safe to spin up OTIE (auth + portfolio warm-up will succeed).
+      initOtie();
+
+      console.log('Broker ready — starting pipeline timer.');
+      startPipelineTimer();
+      setTimeout(() => {
+        runPredictionPipelineAll().catch(err => {
+          console.error('[Pipeline] Initial run error:', err.message);
+        });
+      }, 2000);
+    })();
 
     setTimeout(() => {
       console.log('==============================================');
@@ -793,7 +878,7 @@ async function startServer() {
       console.log(`   Predictions:       ${_predictionCache.size} symbol(s)`);
       console.log(`   Opportunities:     ${_opportunityCache.size} symbol(s)`);
       console.log(`   Running bots:      ${botRunner.list().length}`);
-      console.log(`   OTIE observers:    ${otie.observerCount || 0} contract(s)`);
+      console.log(`   OTIE observers:    ${(otie && otie.observerCount) || 0} contract(s)`);
       try { console.log(`   Market cache:      ${marketStateCache._cache.size} symbols`); } catch (_) {}
       console.log(`   Balance guard:     ${balanceGuard.getState().enabled ? 'active' : 'disabled'}`);
       console.log('==============================================');
@@ -815,6 +900,8 @@ async function startServer() {
       const broker = getBroker('deriv_cfd');
       if (broker && broker.disconnect) await broker.disconnect();
     } catch (_) {}
+    try { wss.close(); } catch (_) {}
+    try { server.close(); } catch (_) {}
     process.exit(0);
   }
 
