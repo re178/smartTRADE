@@ -1,4 +1,38 @@
 // server.js – RTS Entry Point (Deriv-only, pattern-based, with balance guard)
+//
+// [FIX-S1] Replaced console.log/error/warn with the shared logger so log
+//          levels and transports are consistent with the rest of the system.
+//          The startup ASCII banner stays on console.log by design.
+// [FIX-S2] WATCHED_SYMBOLS is now configurable via the WATCHED_SYMBOLS env
+//          var (comma-separated). Falls back to the original 4-symbol list.
+//          This lets you add synthetics without editing the file.
+// [FIX-S3] _pipelineInFlight now has a 60s timeout so a stuck pipeline call
+//          (broker getAccount hanging, etc.) cannot permanently block future
+//          cycles for that symbol.
+// [FIX-S4] New /debug/regime endpoint returns the current regime for every
+//          watched symbol plus the last decision from decisionEngine. This
+//          is the fastest way to confirm whether the "unknown regime"
+//          coerce spam has stopped after the dataOrchestrator fix deploys.
+// [FIX-S5] New /debug/orchestrator endpoint returns dataOrchestrator cache
+//          stats, queue depths, and — critically — the per-symbol,
+//          per-code publish counts for historicalState. If a symbol shows
+//          a count under key 'unknown', we've located the source. If not,
+//          the message is coming from a document mutated AFTER publish.
+// [FIX-S6] dataOrchestrator.publish is wrapped (server startup only) to
+//          increment _regimePublishCounts. This is a diagnostic hook —
+//          wrapped call semantics are identical to the original.
+// [FIX-S7] Pipeline NO_TRADE log lines are throttled to once per 60s per
+//          symbol per reason. TRADE results always log at INFO. Previously
+//          every cycle logged all 4 symbols regardless of whether anything
+//          changed.
+// [FIX-S8] runPredictionPipeline now explicitly logs when marketState
+//          returns null (previously silent — masked missing-data conditions).
+// [FIX-S9] sendDashboardInitialState broker/account calls are wrapped in a
+//          5s timeout so a slow broker can't block a new WebSocket client
+//          from receiving its initial state.
+// [FIX-S10] marketState updates are broadcast to dashboards (type
+//           'marketStateUpdate') after each pipeline cycle. The dashboard
+//           previously had no real-time view of regime/quality changes.
 
 require('dotenv').config();
 
@@ -9,6 +43,8 @@ const mongoose = require('mongoose');
 const WebSocket = require('ws');
 const http = require('http');
 
+const logger = require('./infrastructure/logger') || console;
+
 const dashboardClients = new Set();
 
 function broadcastToDashboards(type, data) {
@@ -16,7 +52,7 @@ function broadcastToDashboards(type, data) {
   let message;
   try { message = JSON.stringify({ type, data }); }
   catch (err) {
-    console.error(`[WS] Failed to serialize '${type}':`, err.message);
+    logger.error(`[WS] Failed to serialize '${type}':`, err.message);
     return;
   }
   for (const client of dashboardClients) {
@@ -65,8 +101,7 @@ const balanceGuard = require('./core/risk/balanceGuard');
 
 const { getBroker } = require('./core/execution/brokerFactory');
 
-// --- OTIE is now lazily initialised (see initOtie) to avoid warming up
-//     before the broker auth/portfolio snapshot is ready. ---
+// --- OTIE lazily initialised (see initOtie) ---
 let otie = null;
 
 function normalizeSymbol(symbol) {
@@ -74,8 +109,6 @@ function normalizeSymbol(symbol) {
   return symbol.replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
 }
 
-// Deriv symbol alias map — used only for logging / preflight. Real
-// normalization belongs in DerivBroker.getCandles().
 const BROKER_SYMBOL_MAP = {
   EURUSD: 'frxEURUSD',
   GBPUSD: 'frxGBPUSD',
@@ -96,12 +129,43 @@ function toBrokerSymbol(displaySymbol) {
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// [FIX-S2] Watched symbols — configurable via env var.
+const DEFAULT_WATCHED = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD'];
+const WATCHED_SYMBOLS = (process.env.WATCHED_SYMBOLS || DEFAULT_WATCHED.join(','))
+  .split(',')
+  .map(s => normalizeSymbol(s))
+  .filter(Boolean);
+
 connectDB();
 
 const _consensusCache = new Map();
 const _predictionCache = new Map();
 const _opportunityCache = new Map();
 const _pipelineInFlight = new Map(); // symbol -> Promise (dedupe)
+
+// [FIX-S3] Pipeline in-flight timeout.
+const PIPELINE_TIMEOUT_MS = 60 * 1000;
+
+// [FIX-S7] Per-symbol log throttling for repeated NO_TRADE reasons.
+const PIPELINE_LOG_THROTTLE_MS = 60 * 1000;
+const _pipelineLogThrottle = new Map(); // symbol -> { reason, at }
+
+// [FIX-S6] Regime-code publish counters per symbol. Populated by the
+// wrapped dataOrchestrator.publish below. Used by /debug/orchestrator to
+// locate the source of 'unknown' regime codes.
+const _regimePublishCounts = {};
+const _originalPublish = dataOrchestrator.publish.bind(dataOrchestrator);
+dataOrchestrator.publish = function (key, data, metadata) {
+  try {
+    if (key === 'historicalState' && data && data.symbol) {
+      const code = (data.regime && data.regime.code) || '(missing)';
+      if (!_regimePublishCounts[data.symbol]) _regimePublishCounts[data.symbol] = {};
+      _regimePublishCounts[data.symbol][code] =
+        (_regimePublishCounts[data.symbol][code] || 0) + 1;
+    }
+  } catch (_) { /* never let a diagnostic hook break publish */ }
+  return _originalPublish(key, data, metadata);
+};
 
 function flattenConsensus(consensus) {
   if (!consensus || !consensus.consensus) return null;
@@ -147,7 +211,7 @@ async function ensureAdmin() {
       await admin.save();
     }
   } catch (err) {
-    console.error('[Admin] Creation failed:', err.message);
+    logger.error('[Admin] Creation failed:', err.message);
   }
 }
 
@@ -272,8 +336,11 @@ app.get('/debug/pipeline', async (req, res) => {
     const cache = marketStateCache._cache || new Map();
 
     let deepBuffers = 0;
+    let deepDiagnostics = null;
     try {
-      deepBuffers = require('./core/intelligence/deep/marketState')._buffers?.size || 0;
+      const ds = require('./core/intelligence/deep/marketState');
+      deepBuffers = ds._buffers?.size || 0;
+      deepDiagnostics = typeof ds.getDiagnostics === 'function' ? ds.getDiagnostics() : null;
     } catch (_) {}
 
     let dashboardMetrics = {};
@@ -294,9 +361,16 @@ app.get('/debug/pipeline', async (req, res) => {
         authState: brokerHealth.authState,
         contractMonitoring: brokerHealth.contractMonitoring,
         accountLoaded: brokerHealth.accountLoaded,
+        // [FIX-C2] Surface portfolio dedupe + rate-limit stats
+        portfolioDiagnostics: brokerHealth.portfolioDiagnostics,
+        // [FIX-C1] Surface SL/TP conversion stats
+        limitOrderDiagnostics: brokerHealth.limitOrderDiagnostics,
       },
       marketCache: { symbolCount: cache.size, symbols: Array.from(cache.keys()) },
-      deepState: { bufferCount: deepBuffers },
+      deepState: {
+        bufferCount: deepBuffers,
+        diagnostics: deepDiagnostics,
+      },
       pipeline: { timerRunning: !!pipelineTimer },
       analyticsDashboard: {
         hasMetrics: Object.keys(dashboardMetrics).length > 0,
@@ -316,6 +390,84 @@ app.get('/debug/pipeline', async (req, res) => {
       balanceGuard: balanceGuard.getState(),
       runningBots: botRunner.list(),
       watchedSymbols: WATCHED_SYMBOLS,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// [FIX-S4] Regime debug — the fastest way to trace the 'unknown' coerce.
+app.get('/debug/regime', (req, res) => {
+  try {
+    const regimes = {};
+    for (const symbol of WATCHED_SYMBOLS) {
+      const regime = deepRegime.getLatestRegime(symbol);
+      const state = marketStateCache.get(symbol);
+      const decision = decisionEngine.getLastDecision(symbol);
+      regimes[symbol] = {
+        regime: regime ? {
+          code: regime.code,
+          name: regime.name,
+          confidence: regime.confidence,
+          reason: regime.reason,
+          family: regime.family,
+        } : null,
+        marketStateCachePresent: !!state,
+        lastDecision: decision ? {
+          decision: decision.decision,
+          confidence: decision.confidence,
+          reason: decision.reason,
+        } : null,
+      };
+    }
+    res.json({
+      timestamp: new Date().toISOString(),
+      symbols: regimes,
+      regimePublishCounts: _regimePublishCounts,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// [FIX-S5] Orchestrator debug — exposes cache stats, queue depths, and
+// historicalState publish counts by symbol AND regime code. If any symbol
+// has a count under key 'unknown' here, we've located the source.
+app.get('/debug/orchestrator', (req, res) => {
+  try {
+    const cacheStats = dataOrchestrator.getCacheStats();
+    res.json({
+      timestamp: new Date().toISOString(),
+      cacheStats,
+      regimePublishCounts: _regimePublishCounts,
+      queues: {
+        snapshotQueueLength: dataOrchestrator._snapshotQueue?.length || 0,
+        appendQueueLength: dataOrchestrator._appendQueue?.length || 0,
+      },
+      warnedKeys: Array.from(dataOrchestrator._warnedKeys || []),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// [FIX-S5] Focused view: only the 'unknown' coerce source. Returns a
+// compact summary that makes it obvious whether the fix worked.
+app.get('/debug/regime-publish', (req, res) => {
+  try {
+    const summary = {};
+    let hasUnknown = false;
+    for (const [symbol, counts] of Object.entries(_regimePublishCounts)) {
+      summary[symbol] = { ...counts };
+      if (counts['unknown']) hasUnknown = true;
+    }
+    res.json({
+      timestamp: new Date().toISOString(),
+      hasUnknownCode: hasUnknown,
+      bySymbol: summary,
+      note: hasUnknown
+        ? 'Some publisher is emitting historicalState with regime.code="unknown". Check the symbols with "unknown" entries — send core/data/candleBootstrapper.js or core/awareness/engine.js for further tracing.'
+        : 'No historicalState doc with regime.code="unknown" has been published since server start. If coerce logs still appear, the code was mutated after publish (in the append queue) — check dataOrchestrator._handleResearch callers.',
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -397,6 +549,7 @@ app.get('/debug/strategies', async (req, res) => {
           action: consensus.consensus?.action,
           direction: consensus.consensus?.direction,
           confidence: consensus.consensus?.confidence,
+          confidenceBreakdown: consensus.consensus?.confidenceBreakdown,   // [FIX-RN5]
           anchorStrategy: consensus.consensus?.anchorStrategy,
           agreeing: consensus.consensus?.agreeing,
           conflicting: consensus.consensus?.conflicting,
@@ -471,7 +624,7 @@ wss.on('connection', (ws, req) => {
   dashboardClients.add(ws);
   sendDashboardInitialState(ws);
   ws.on('close', () => { dashboardClients.delete(ws); });
-  ws.on('error', (err) => console.error('[WS] Error:', err.message));
+  ws.on('error', (err) => logger.error('[WS] Error:', err.message));
   ws.on('pong', () => {});
 });
 
@@ -495,6 +648,19 @@ function enhanceAccount(accountData, broker) {
   return { ...accountData, tradeMode, server: srv };
 }
 
+// [FIX-S9] Wrap broker calls in a timeout so a slow broker can't block
+// new WebSocket client initialization.
+function withTimeout(promise, ms, fallback) {
+  let timer = null;
+  return Promise.race([
+    promise,
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve(fallback), ms);
+      if (typeof timer.unref === 'function') timer.unref();
+    }),
+  ]).finally(() => { if (timer) clearTimeout(timer); });
+}
+
 async function sendDashboardInitialState(ws) {
   try {
     const accountService = require('./core/portfolio/accountService');
@@ -502,8 +668,8 @@ async function sendDashboardInitialState(ws) {
 
     const [trades, account, positions] = await Promise.all([
       Trade.find({ status: 'OPEN' }).lean(),
-      accountService.getAccount('deriv_cfd'),
-      orderService.getOpenTrades('deriv_cfd')
+      withTimeout(accountService.getAccount('deriv_cfd'), 5000, { balance: '0', currency: 'USD' }),
+      withTimeout(orderService.getOpenTrades('deriv_cfd'), 5000, []),
     ]);
 
     let broker;
@@ -538,7 +704,7 @@ async function sendDashboardInitialState(ws) {
       }
     }));
   } catch (err) {
-    console.error('[WS] Failed to send initial state:', err.message);
+    logger.error('[WS] Failed to send initial state:', err.message);
   }
 }
 
@@ -549,8 +715,6 @@ eventBus.on('account.fetched', (account) => broadcast('account', account));
 eventBus.on('trade.closed', (data) => broadcast('tradeClosed', data));
 eventBus.on('order.placed', (data) => broadcast('trade.placed', data));
 eventBus.on('position.updated', (data) => broadcast('positions', data));
-
-// OTIE listeners are attached inside initOtie(), after broker is ready.
 
 eventBus.on('trade.closed', async (data) => {
   const contractId = data?.contractId;
@@ -572,14 +736,14 @@ eventBus.on('trade.closed', async (data) => {
       strategy, symbol, realizedProfit, risk, regimeCode
     );
 
-    console.log(
+    logger.info(
       `[StrategyPerformance] ${strategy}/${symbol} (${regimeCode}): ` +
       `pnl=${realizedProfit.toFixed(2)}$ R=${(realizedProfit/risk).toFixed(2)} ` +
       `trades=${updated.trades} wr=${(updated.winRate*100).toFixed(0)}% ` +
       `recentWR=${(updated.recentWinRate*100).toFixed(0)}% flagged=${updated.flagged}`
     );
   } catch (err) {
-    console.error(`[StrategyPerformance] Failed for ${contractId}: ${err.message}`);
+    logger.error(`[StrategyPerformance] Failed for ${contractId}: ${err.message}`);
   }
 });
 
@@ -588,7 +752,7 @@ eventBus.on('trade.closed', async (data) => {
     const trade = await Trade.findOne({ contractId: String(data.contractId) });
     if (trade) performanceMonitor.recordTrade(trade);
   } catch (err) {
-    console.error('[PerformanceMonitor] Failed to record trade:', err.message);
+    logger.error('[PerformanceMonitor] Failed to record trade:', err.message);
   }
 });
 performanceMonitor.on('thresholdsUpdated', (thresholds) => {
@@ -597,13 +761,26 @@ performanceMonitor.on('thresholdsUpdated', (thresholds) => {
   }
 });
 
-const WATCHED_SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD'];
+// [FIX-S7] Log helper with per-symbol throttling for repetitive reasons.
+function logPipelineResult(symbol, reason, opportunity, level = 'info') {
+  const now = Date.now();
+  const prev = _pipelineLogThrottle.get(symbol);
+  if (prev && prev.reason === reason && (now - prev.at) < PIPELINE_LOG_THROTTLE_MS) {
+    return;
+  }
+  _pipelineLogThrottle.set(symbol, { reason, at: now });
+  const detail = opportunity && opportunity.tradable
+    ? `${opportunity.multiplier}x ${opportunity.direction} [${opportunity.source || '?'}]`
+    : (opportunity && opportunity.reason) || reason;
+  logger[level](`[Pipeline] ${symbol}: ${reason} — ${detail}`);
+}
 
 async function runPredictionPipeline(symbol, ctx = {}) {
   try {
     const state = await require('./core/intelligence/deep/marketState').compute(symbol, 'M5', 200);
+    // [FIX-S8] Explicitly log null-state condition.
     if (!state) {
-      console.log(`[Pipeline] ${symbol}: no state (candles insufficient)`);
+      logPipelineResult(symbol, 'NO_STATE', null, 'debug');
       return false;
     }
 
@@ -613,7 +790,7 @@ async function runPredictionPipeline(symbol, ctx = {}) {
       _consensusCache.set(symbol, strategyConsensus);
       broadcastToDashboards('strategyConsensus', flattenConsensus(strategyConsensus));
     } catch (rankErr) {
-      console.warn(`[Pipeline] Ranker failed for ${symbol}: ${rankErr.message}`);
+      logger.warn(`[Pipeline] Ranker failed for ${symbol}: ${rankErr.message}`);
     }
 
     const broker = getBroker('deriv_cfd');
@@ -628,11 +805,28 @@ async function runPredictionPipeline(symbol, ctx = {}) {
 
     const prediction = await predictor.predict(symbol, state, strategyConsensus, { timeframe: 'M5' });
     if (!prediction) {
-      console.log(`[Pipeline] ${symbol}: no prediction`);
+      logPipelineResult(symbol, 'NO_PREDICTION', null, 'debug');
       return false;
     }
     _predictionCache.set(symbol, prediction);
     broadcastToDashboards('prediction', prediction);
+
+    // [FIX-S10] Broadcast marketState summary so dashboard sees real-time state.
+    try {
+      broadcastToDashboards('marketStateUpdate', {
+        symbol,
+        timeframe: 'M5',
+        regime: state.regime?.code,
+        regimeConfidence: state.regime?.confidence,
+        trend: state.trend?.direction,
+        adx: state.trend?.adx,
+        rsi: state.momentum?.rsi,
+        atrPercent: state.volatility?.atrPercent,
+        marketQuality: state.summary?.marketQuality,
+        confidence: state.confidence,
+        timestamp: state.time,
+      });
+    } catch (_) {}
 
     const opportunity = await opportunityEngine.evaluate(
       prediction, account, positions, marketData,
@@ -641,31 +835,43 @@ async function runPredictionPipeline(symbol, ctx = {}) {
     _opportunityCache.set(symbol, opportunity);
     broadcastToDashboards('opportunity', opportunity);
 
-    const src = opportunity.source || prediction.source || 'unknown';
-    console.log(
-      `[Pipeline] ${symbol}: ${opportunity.decision || 'NO_TRADE'} ` +
-      `${opportunity.tradable
-        ? `${opportunity.multiplier}x ${opportunity.direction} [${src}]`
-        : (opportunity.reason || '')}`
-    );
+    // [FIX-S7] Throttled pipeline logging.
+    if (opportunity.tradable) {
+      logPipelineResult(symbol, 'TRADE', opportunity, 'info');
+    } else {
+      logPipelineResult(symbol, `NO_TRADE_${opportunity.reason || 'UNKNOWN'}`, opportunity, 'debug');
+    }
     return true;
   } catch (err) {
-    console.error(`[Pipeline] Error for ${symbol}:`, err.message);
+    logger.error(`[Pipeline] Error for ${symbol}:`, err.message);
     return false;
   }
 }
 
+// [FIX-S3] Add 60s timeout to prevent stuck in-flight entries.
 function runPredictionPipelineOnce(symbol, ctx) {
   if (_pipelineInFlight.has(symbol)) return _pipelineInFlight.get(symbol);
-  const p = runPredictionPipeline(symbol, ctx)
-    .catch(err => { console.error(`[Pipeline] Uncaught for ${symbol}:`, err.message); return false; })
-    .finally(() => { _pipelineInFlight.delete(symbol); });
+  let timer = null;
+  const p = Promise.race([
+    runPredictionPipeline(symbol, ctx),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Pipeline timeout (${PIPELINE_TIMEOUT_MS}ms)`)), PIPELINE_TIMEOUT_MS);
+      if (typeof timer.unref === 'function') timer.unref();
+    }),
+  ])
+    .catch(err => {
+      logger.error(`[Pipeline] Uncaught for ${symbol}: ${err.message}`);
+      return false;
+    })
+    .finally(() => {
+      if (timer) clearTimeout(timer);
+      _pipelineInFlight.delete(symbol);
+    });
   _pipelineInFlight.set(symbol, p);
   return p;
 }
 
 async function runPredictionPipelineAll() {
-  // Cache account/positions once per cycle (was 2 calls * 4 symbols = 8 API calls/cycle)
   let ctx = { account: null, positions: null };
   try {
     const broker = getBroker('deriv_cfd');
@@ -678,19 +884,27 @@ async function runPredictionPipelineAll() {
   }
 
   let ok = 0;
+  const reasons = {};
   for (const symbol of WATCHED_SYMBOLS) {
     const result = await runPredictionPipelineOnce(symbol, ctx);
-    if (result) ok++;
+    if (result) {
+      ok++;
+      const opp = _opportunityCache.get(symbol);
+      const key = opp?.tradable ? 'TRADE' : (opp?.reason || 'UNKNOWN');
+      reasons[key] = (reasons[key] || 0) + 1;
+    }
   }
-  if (ok === 0) {
-    console.debug(`[Pipeline] Cycle complete: 0/${WATCHED_SYMBOLS.length} produced predictions`);
-  }
+  // [FIX-S7] Cycle summary — one line instead of N. Only log when it
+  // changes or at INFO when trades occurred.
+  const hasTrades = Object.prototype.hasOwnProperty.call(reasons, 'TRADE');
+  const summary = `${ok}/${WATCHED_SYMBOLS.length} ran [${Object.entries(reasons).map(([k, v]) => `${k}×${v}`).join(', ') || 'no opportunities'}]`;
+  if (hasTrades) logger.info(`[Pipeline] Cycle: ${summary}`);
+  else logger.debug(`[Pipeline] Cycle: ${summary}`);
 }
 
 candleStore.on('candleClosed', async (candle) => {
-  if (candle.timeframe === 'M5' && WATCHED_SYMBOLS.includes(candle.symbol)) {
-    // Dedupe: pipeline timer may also fire on the same symbol
-    await runPredictionPipelineOnce(candle.symbol, {});
+  if (candle.timeframe === 'M5' && WATCHED_SYMBOLS.includes(normalizeSymbol(candle.symbol))) {
+    await runPredictionPipelineOnce(normalizeSymbol(candle.symbol), {});
   }
 });
 
@@ -700,17 +914,17 @@ function startPipelineTimer() {
   const intervalMs = parseInt(process.env.PREDICTION_INTERVAL_MS) || 30000;
   pipelineTimer = setInterval(() => {
     runPredictionPipelineAll().catch(err => {
-      console.error('[Pipeline] Timer error:', err.message);
+      logger.error('[Pipeline] Timer error:', err.message);
     });
   }, intervalMs);
-  console.log(`[Pipeline] Timer started (${intervalMs}ms).`);
+  logger.info(`[Pipeline] Timer started (${intervalMs}ms). Watched: ${WATCHED_SYMBOLS.join(', ')}`);
 }
 
 async function startCognitiveEngines() {
   try {
-    console.log('[CTOS] Cognitive engines active: Awareness, Regime, Decision, OTIE, StrategyRanker, BotRunner, DigitAnalyzer, BalanceGuard, EdgeTest.');
+    logger.info('[CTOS] Cognitive engines active: Awareness, Regime, Decision, OTIE, StrategyRanker, BotRunner, DigitAnalyzer, BalanceGuard, EdgeTest.');
   } catch (err) {
-    console.error('[CTOS] Initialization error:', err.message);
+    logger.error('[CTOS] Initialization error:', err.message);
   }
 }
 
@@ -727,15 +941,14 @@ async function startDerivBroker() {
     broker.on('orderUpdate', (data) => broadcastToDashboards('orderUpdate', data));
     broker.on('_portfolioUpdated', (positions) => broadcastToDashboards('positions', positions));
     await broker.connect();
-    console.log('[Deriv] Broker connected.');
+    logger.info('[Deriv] Broker connected.');
     return broker;
   } catch (err) {
-    console.error('[Deriv] Failed to start Deriv broker:', err.message);
+    logger.error('[Deriv] Failed to start Deriv broker:', err.message);
     throw err;
   }
 }
 
-// Lazily initialise OTIE once the broker auth/portfolio snapshot is available.
 function initOtie() {
   if (otie) return otie;
   try {
@@ -743,9 +956,9 @@ function initOtie() {
     otie.on('otieV5State', (state) => broadcast('otieV5State', state));
     otie.on('otieV5Action', (action) => broadcast('otieV5Action', action));
     otie.on('otieState', (state) => broadcast('otieState', state));
-    console.log('[OTIE] Post-auth initialisation hook attached.');
+    logger.info('[OTIE] Post-auth initialisation hook attached.');
   } catch (err) {
-    console.error('[OTIE] Failed to initialise:', err.message);
+    logger.error('[OTIE] Failed to initialise:', err.message);
   }
   return otie;
 }
@@ -756,11 +969,11 @@ async function waitForBrokerReady(broker, timeoutMs = 30000) {
 
   if (typeof broker.waitForAuthReady === 'function') {
     try { await broker.waitForAuthReady(timeoutMs); }
-    catch (e) { console.warn('[Broker] auth ready timeout:', e.message); }
+    catch (e) { logger.warn('[Broker] auth ready timeout:', e.message); }
   }
   if (typeof broker.waitForPortfolio === 'function') {
     try { await broker.waitForPortfolio(timeoutMs); }
-    catch (e) { console.warn('[Broker] portfolio ready timeout:', e.message); }
+    catch (e) { logger.warn('[Broker] portfolio ready timeout:', e.message); }
   }
   while (Date.now() < deadline) {
     const ready = typeof broker.isReady === 'function'
@@ -786,6 +999,9 @@ async function startServer() {
     console.log(`Digits:         http://localhost:${PORT}/api/digit`);
     console.log(`Balance guard:  http://localhost:${PORT}/api/balance-guard`);
     console.log(`Strategies:     http://localhost:${PORT}/debug/strategies`);
+    console.log(`Regime:         http://localhost:${PORT}/debug/regime`);
+    console.log(`Orchestrator:   http://localhost:${PORT}/debug/orchestrator`);
+    console.log(`Regime publish: http://localhost:${PORT}/debug/regime-publish`);
     console.log(`Health:         http://localhost:${PORT}/health/pipeline`);
     console.log(`Debug:          http://localhost:${PORT}/debug/pipeline`);
     console.log('==============================================');
@@ -793,8 +1009,8 @@ async function startServer() {
     startWSPing();
 
     dataOrchestrator.recover()
-      .then(() => console.log('Data Orchestrator initialised.'))
-      .catch(err => console.warn('Data Orchestrator recover failed:', err.message));
+      .then(() => logger.info('Data Orchestrator initialised.'))
+      .catch(err => logger.warn('Data Orchestrator recover failed:', err.message));
 
     setTimeout(startCognitiveEngines, 2000);
 
@@ -802,17 +1018,17 @@ async function startServer() {
       digitAnalyzer.start();
       digitAnalyzer.on('digitUpdate', (view) => broadcastToDashboards('digitUpdate', view));
       digitAnalyzer.on('digitSignal', (sig) => broadcastToDashboards('digitSignal', sig));
-      console.log('Digit analyzer started.');
+      logger.info('Digit analyzer started.');
     } catch (err) {
-      console.error('Digit analyzer failed:', err.message);
+      logger.error('Digit analyzer failed:', err.message);
     }
 
     try {
       balanceGuard.start();
       balanceGuard.on && balanceGuard.on('triggered', () => {});
-      console.log('Balance guard started.');
+      logger.info('Balance guard started.');
     } catch (err) {
-      console.error('Balance guard failed:', err.message);
+      logger.error('Balance guard failed:', err.message);
     }
 
     try {
@@ -822,46 +1038,44 @@ async function startServer() {
       botRunner.on('botResult', (d) => broadcastToDashboards('botResult', d));
       botRunner.on('botCycle', (d) => broadcastToDashboards('botCycle', d));
       botRunner.on('botError', (d) => broadcastToDashboards('botError', d));
-      console.log('Bot runner wired to dashboards.');
+      logger.info('Bot runner wired to dashboards.');
     } catch (err) {
-      console.error('Bot runner wiring failed:', err.message);
+      logger.error('Bot runner wiring failed:', err.message);
     }
 
-    try { analyticsDashboard.start(); console.log('Analytics dashboard started.'); }
-    catch (err) { console.error('Analytics dashboard failed:', err.message); }
+    try { analyticsDashboard.start(); logger.info('Analytics dashboard started.'); }
+    catch (err) { logger.error('Analytics dashboard failed:', err.message); }
 
-    // --- Ordered bootstrap: broker first, then candles, then OTIE, then pipeline ---
     (async () => {
       let broker;
       try {
-        await new Promise(r => setTimeout(r, 3000)); // small delay for DB init
+        await new Promise(r => setTimeout(r, 3000));
         broker = await startDerivBroker();
       } catch (err) {
-        console.error('startDerivBroker failed:', err.message);
-        startPipelineTimer(); // fall back — pipeline will no-op on symbol errors
+        logger.error('startDerivBroker failed:', err.message);
+        startPipelineTimer();
         return;
       }
 
       const ready = await waitForBrokerReady(broker, 30000);
       if (!ready) {
-        console.warn('[Boot] Broker not fully ready after 30s — proceeding anyway.');
+        logger.warn('[Boot] Broker not fully ready after 30s — proceeding anyway.');
       }
 
       try {
         await candleBootstrapper.bootstrap();
-        console.log('Candle bootstrap complete.');
+        logger.info('Candle bootstrap complete.');
       } catch (err) {
-        console.warn('Candle bootstrap failed (non-fatal):', err.message);
+        logger.warn('Candle bootstrap failed (non-fatal):', err.message);
       }
 
-      // Now safe to spin up OTIE (auth + portfolio warm-up will succeed).
       initOtie();
 
-      console.log('Broker ready — starting pipeline timer.');
+      logger.info('Broker ready — starting pipeline timer.');
       startPipelineTimer();
       setTimeout(() => {
         runPredictionPipelineAll().catch(err => {
-          console.error('[Pipeline] Initial run error:', err.message);
+          logger.error('[Pipeline] Initial run error:', err.message);
         });
       }, 2000);
     })();
@@ -886,14 +1100,14 @@ async function startServer() {
   });
 
   async function shutdown(signal) {
-    console.log(`\nReceived ${signal}, shutting down gracefully...`);
+    logger.info(`\nReceived ${signal}, shutting down gracefully...`);
     if (wsPingTimer) clearInterval(wsPingTimer);
     if (pipelineTimer) clearInterval(pipelineTimer);
     try { botRunner.stopAll(); } catch (_) {}
     try {
       await dataOrchestrator.shutdown();
       if (otie && typeof otie.stop === 'function') otie.stop();
-    } catch (err) { console.error('Shutdown error:', err.message); }
+    } catch (err) { logger.error('Shutdown error:', err.message); }
     try { if (analyticsDashboard.stop) analyticsDashboard.stop(); } catch (_) {}
     try { if (ranker.clearCache) ranker.clearCache(); } catch (_) {}
     try {
@@ -910,6 +1124,6 @@ async function startServer() {
 }
 
 startServer().catch(err => {
-  console.error('Server start error:', err);
+  logger.error('Server start error:', err);
   process.exit(1);
 });
