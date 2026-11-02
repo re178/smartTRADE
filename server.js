@@ -37,7 +37,7 @@ const http = require('http');
 const os = require('os');                             // [FIX-S13]
 
 const logger = require('./infrastructure/logger') || console;
-const { sendEmail } = require('./shared/emailService'); // [FIX-S13]
+const { sendEmail } = require('./shared/emailProvider'); // [FIX-S13]
 
 const dashboardClients = new Set();
 
