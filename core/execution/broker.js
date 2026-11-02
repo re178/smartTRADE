@@ -5,6 +5,16 @@
 // [FIX-3] Multipliers updated to [200, 400, 600, 800].
 // [FIX-4] placeMarketOrder no longer sends duration_unit: 's' (InvalidExpiry).
 // [FIX-5] Portfolio cache (3s TTL) + invalidation on buy/sell/close.
+// [FIX-A] toDerivSymbol normalizes EURUSD ↔ EUR_USD so ticks_history never
+//         receives a raw 6-char pair (root cause of InvalidSymbol).
+// [FIX-B] _ensureBalanceLoaded and _loadSymbolsWithTimeout use a cancellable
+//         timer; the losing promise can no longer fire late (phantom
+//         "Balance load timeout") or become an unhandled rejection.
+// [FIX-C] _ensureAuthReady re-checks _authState after _connectAuth resolves
+//         to close the authReady-emitted-before-listener race.
+// [FIX-D] Symbol maps seeded from FALLBACK_SYMBOLS + no-underscore aliases,
+//         then overlaid by discovery. Pairs missed by active_symbols keep
+//         their fallback mapping.
 // [FILE-4.4] tick event includes mid. Synthetics in symbol map + watchlist.
 // [FILE-4.1] getCandles uses ticks_history with style='candles'.
 
@@ -54,10 +64,26 @@ function generateClientOrderId() {
   return `ord_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
 }
 
+// [FIX-A] Normalize instrument names to Deriv symbols.
+// Map keys may be either "EUR_USD" or "EURUSD"; callers may pass either form.
+// Without this, symbolMap['EURUSD'] was undefined and toDerivSymbol returned
+// the raw 6-char pair, which Deriv rejects with InvalidSymbol.
 function toDerivSymbol(pair, symbolMap) {
   if (!pair) return null;
   const upper = pair.toUpperCase();
+  // 1. Exact key hit (covers EUR_USD, R_100, etc.)
   if (symbolMap[upper]) return symbolMap[upper];
+  // 2. Insert underscore at 3-char split for 6-char FX pairs (EURUSD → EUR_USD)
+  if (upper.length === 6 && !upper.includes('_')) {
+    const sep = upper.slice(0, 3) + '_' + upper.slice(3);
+    if (symbolMap[sep]) return symbolMap[sep];
+  }
+  // 3. Strip underscore for underscored inputs (EUR_USD → EURUSD alias)
+  if (upper.includes('_')) {
+    const noSep = upper.replace(/_/g, '');
+    if (symbolMap[noSep]) return symbolMap[noSep];
+  }
+  // 4. Pass through unchanged (synthetics / unexpected names)
   return upper;
 }
 
@@ -283,11 +309,9 @@ class DerivBroker extends EventEmitter {
     this._cbFailureCount = 0;
     this._cbOpenedAt = null;
 
-    this.symbolMap = { ...FALLBACK_SYMBOLS };
-    this.reverseMap = {};
-    for (const [k, v] of Object.entries(FALLBACK_SYMBOLS)) this.reverseMap[v] = k;
-    this.spreadMap = {};
-    for (const k of Object.keys(FALLBACK_SYMBOLS)) this.spreadMap[FALLBACK_SYMBOLS[k]] = 0.0001;
+    // [FIX-D] Seed the symbol maps with fallback entries + no-underscore
+    // aliases so any pair not returned by active_symbols still resolves.
+    this._seedSymbolMaps();
     this._symbolsDiscovered = false;
     this._symbolsLoaded = false;
 
@@ -339,11 +363,28 @@ class DerivBroker extends EventEmitter {
     logger.info('[DerivBroker] Configuration validated.');
   }
 
+  // [FIX-D] Seeds symbolMap / reverseMap / spreadMap from FALLBACK_SYMBOLS,
+  // adding both "EUR_USD" and "EURUSD" aliases for every FX pair.
+  _seedSymbolMaps() {
+    this.symbolMap = {};
+    this.reverseMap = {};
+    this.spreadMap = {};
+    for (const [k, v] of Object.entries(FALLBACK_SYMBOLS)) {
+      this.symbolMap[k] = v;
+      const noSep = k.replace(/_/g, '');
+      if (noSep !== k) this.symbolMap[noSep] = v;
+      this.reverseMap[v] = k;
+      this.spreadMap[v] = 0.0001;
+    }
+  }
+
   getLeverage(_symbol) { return 100; }
 
   getSpread(instrument) {
     if (!instrument) return 0;
     let symbol = toDerivSymbol(instrument, this.symbolMap);
+    // [FIX-A] toDerivSymbol now handles both EURUSD and EUR_USD, but keep
+    // this defensive normalization for any future map that omits aliases.
     if (symbol && !symbol.startsWith('frx')) {
       const upper = symbol.toUpperCase();
       if (upper.length === 6 && !upper.includes('_')) {
@@ -449,6 +490,9 @@ class DerivBroker extends EventEmitter {
     this._startTradeReconcileTimer();
   }
 
+  // [FIX-B] Cancellable timeout. Previously sleep(timeoutMs).then(warn) stayed
+  // alive after _accountReady resolved normally, producing a phantom
+  // "Balance load timeout" log 10s later.
   async _ensureBalanceLoaded(timeoutMs = this.config.balanceTimeout) {
     if (this._account && this._account.balance != null) return this._account;
     if (!this._accountReady) {
@@ -456,10 +500,20 @@ class DerivBroker extends EventEmitter {
     }
     try { await this._sendAuthRequest({ balance: 1, subscribe: 1 }); }
     catch (err) { logger.warn('[DerivBroker] Balance subscribe failed:', err.message); }
-    await Promise.race([
-      this._accountReady,
-      sleep(timeoutMs).then(() => logger.warn('[DerivBroker] Balance load timeout.')),
-    ]);
+
+    let timer = null;
+    const timeoutPromise = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        logger.warn('[DerivBroker] Balance load timeout.');
+        resolve();
+      }, timeoutMs);
+      if (typeof timer.unref === 'function') timer.unref();
+    });
+    try {
+      await Promise.race([this._accountReady, timeoutPromise]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
     return this._account;
   }
 
@@ -873,9 +927,14 @@ class DerivBroker extends EventEmitter {
     } catch (e) { logger.error('[In Auth] Parse error:', e.message); }
   }
 
+  // [FIX-C] If _authState transitions to READY during _connectAuth(), the
+  // authReady event has already been emitted before we attach our listener.
+  // Re-check the state after the await so we never wait 30s for a listener
+  // that will never fire.
   async _ensureAuthReady() {
     if (this._authState === STATE.READY) return;
     await this._connectAuth();
+    if (this._authState === STATE.READY) return;
     await new Promise((resolve, reject) => {
       const t = setTimeout(() => reject(new Error('Auth ready timeout')), this.config.readinessTimeout);
       this.once('authReady', () => { clearTimeout(t); resolve(); });
@@ -1177,11 +1236,24 @@ class DerivBroker extends EventEmitter {
     }
   }
 
+  // [FIX-B] Cancellable timeout. Previously the losing sleep(...).then(throw)
+  // became an unhandled rejection when _loadSymbolsInternal won the race.
   async _loadSymbolsWithTimeout() {
-    return Promise.race([
-      this._loadSymbolsInternal(),
-      sleep(this.config.symbolTimeout).then(() => { throw new Error('Symbol load timeout'); }),
-    ]);
+    let timer = null;
+    const timeoutPromise = new Promise((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error('Symbol load timeout')), this.config.symbolTimeout);
+      if (typeof timer.unref === 'function') timer.unref();
+    });
+    const loadPromise = this._loadSymbolsInternal();
+    // If the timeout wins, swallow the eventual outcome of loadPromise so
+    // it doesn't surface as an unhandled rejection. When loadPromise wins,
+    // we clearTimeout below so the timeout callback never fires.
+    loadPromise.catch(() => {});
+    try {
+      return await Promise.race([loadPromise, timeoutPromise]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
   async _loadSymbolsInternal() {
     let symbols = null;
@@ -1202,18 +1274,18 @@ class DerivBroker extends EventEmitter {
       throw new Error('No symbols received');
     }
   }
+  // [FIX-D] Fallback path now seeds from _seedSymbolMaps (which adds the
+  // no-underscore aliases) rather than duplicating the FALLBACK_SYMBOLS body.
   _useFallbackSymbols() {
-    this.symbolMap = { ...FALLBACK_SYMBOLS };
-    this.reverseMap = {};
-    this.spreadMap = {};
-    for (const [k, v] of Object.entries(FALLBACK_SYMBOLS)) {
-      this.reverseMap[v] = k; this.spreadMap[v] = 0.0001;
-    }
+    this._seedSymbolMaps();
     this._symbolsDiscovered = true; this._symbolsLoaded = true;
   }
+  // [FIX-D] Overlay discovered symbols on top of the fallback seed so that
+  // any pair missed by active_symbols keeps its fallback mapping. Both
+  // EUR_USD and EURUSD keys are populated for every FX pair.
   _buildSymbolMaps(symbols) {
+    this._seedSymbolMaps();
     let count = 0;
-    this.symbolMap = {}; this.reverseMap = {}; this.spreadMap = {};
     for (const sym of symbols) {
       const derivSymbol = sym.underlying_symbol ?? sym.symbol;
       const display = sym.underlying_symbol_name ?? sym.display_name ?? '';
@@ -1223,7 +1295,9 @@ class DerivBroker extends EventEmitter {
       const fxMatch = display.match(/([A-Z]{3})\/([A-Z]{3})/);
       if (fxMatch) {
         const ourPair = fxMatch[1] + '_' + fxMatch[2];
+        const noSep = fxMatch[1] + fxMatch[2];
         this.symbolMap[ourPair] = derivSymbol;
+        this.symbolMap[noSep] = derivSymbol; // [FIX-D] alias
         this.reverseMap[derivSymbol] = ourPair;
         this.spreadMap[derivSymbol] = pip * 0.5;
         count++;
@@ -1238,7 +1312,10 @@ class DerivBroker extends EventEmitter {
       }
     }
     this.symbolManager.setSymbols(symbols);
-    logger.info(`[DerivBroker] Symbol map built: ${count} (FX + synthetics)`);
+    logger.info(
+      `[DerivBroker] Symbol map built: ${count} discovered (+ fallback seeded), ` +
+      `total keys=${Object.keys(this.symbolMap).length}`
+    );
     return count;
   }
   async _subscribeDefaultSymbols() {
