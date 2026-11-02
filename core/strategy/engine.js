@@ -9,40 +9,40 @@
 // Risk Scoring & Position Sizing (pip value per instrument),
 // Validation (spread, max positions, daily loss, duplicate trades).
 //
-// [FILE-3] Candle cache: getCandlesOnce() now caches results for 55s.
-//   The StrategyRanker runs all 10 strategies per symbol per pipeline
-//   cycle. Without caching, that's 10 × 4 symbols = 40 REST fetches
-//   per 30s (rate-limited by Deriv). With caching, 4 fetches (one per
-//   symbol per minute). Cache is keyed by symbol::timeframe and TTL'd.
-//   Also adds clearCandleCache() for testing.
+// [FILE-3]  Candle cache: 55s TTL + inflight dedupe.
+// [FILE-4]  EMA exported.
+// [FIX-E]   validateSignal: real checks.
+// [FIX-F]   getSession: non-overlapping ranges.
+// [FIX-G]   detectRegime: throttled 'unknown' logging.
+// [FIX-H]   multiTimeframeAnalysis: HTF-aware cache TTLs.
+// [FIX-I]   strategyAI: result memoized for 60s.
+// [FIX-J]   getCandlesOnce: canonical count + slice on return.
+// [FIX-K]   generateSignal: throttled error logs.
+// [FIX-L]   getCandleCacheStats: reports inflight state.
 //
-// [FILE-4] EMA is now exported (was previously internal-only) so
-//   callers / tests / other modules can reuse the exact same EMA
-//   implementation that the strategies use internally.
+// [FIX-M]   **strategyRSI: EMA(200) → EMA(100).** Deriv caps M5 at
+//           ~177 candles for FX pairs (API hard limit — cannot be
+//           extended via count parameter). EMA(200) requires 200
+//           candles, so the strategy returned null every single cycle —
+//           RSI has never appeared as a generated signal. EMA(100)
+//           needs only 100 candles and works reliably on 177.
+//           Warm-up ratio: 177/100 = 1.77× (marginal but workable;
+//           177/50 = 3.54× would be safer but EMA(100) is a stronger
+//           trend filter and is the conventional choice here).
 //
-// [FIX-E] validateSignal() now performs the checks its header has
-//   always promised (spread, max positions, daily loss, duplicate
-//   suppression). All checks are soft-fail-open: they only block when
-//   the caller actually supplied the data to evaluate them.
-// [FIX-F] getSession() now uses non-overlapping ranges so every hour
-//   maps to exactly one session (previously London/NY and Asia/Sydney
-//   overlapped and the first match won).
-// [FIX-G] detectRegime() logs `regime=unknown` per instrument at
-//   throttled intervals, and calculateConfidence() explicitly handles
-//   the 'unknown' case rather than falling through silently.
-// [FIX-H] multiTimeframeAnalysis() uses HTF-aware cache TTLs (M15=5m,
-//   H1=15m, H4=1h, D=30m) so higher-timeframe candles are not refetched
-//   every pipeline cycle.
-// [FIX-I] strategyAI() memoizes its result for 60s so weightedvote and
-//   the standalone `ai` strategy share one AI call per cycle instead of
-//   firing two.
-// [FIX-J] getCandlesOnce() always fetches a canonical CANDLE_COUNT and
-//   slices to the caller's requested count, so callers with different
-//   count needs (marketState's 200 vs strategy's 500) share one cache
-//   entry without truncation surprises.
-// [FIX-K] Strategy error logging is throttled per (strategy, errorCode)
-//   so transient failures do not flood the log with identical lines.
-// [FIX-L] getCandleCacheStats() now reports inflight state per entry.
+// [FIX-N]   Candle-shortage diagnostic. When RSI/Ichimoku/MACD cannot
+//           fire due to insufficient candle history, log once per 10 min
+//           at DEBUG level. Silent failures become visible. Throttled to
+//           avoid log spam when a symbol is genuinely starved.
+//
+// [FIX-O]   strategyAI: in-flight dedupe. The 60s memo prevents
+//           RE-CALLS after a result, but not CONCURRENT calls in the
+//           same tick. Production logs show 3 identical AI requests
+//           firing simultaneously for EURUSD (different strategies all
+//           calling strategyAI at the same time). With OpenRouter capped
+//           at 2 concurrent, this saturated the provider and cascaded
+//           into "All AI providers failed". Now: first caller starts the
+//           promise, subsequent callers within the same tick join it.
 
 const marketProvider = require('../market/provider');
 const { formatPrice, getPipSize } = require('../../shared/helpers');
@@ -79,16 +79,18 @@ const CONFIG = {
   MAX_DAILY_LOSS_PCT: 5,
   RISK_PER_TRADE_PCT: 1,
   MIN_CONFIDENCE: 60,
-  // [FILE-3] Candle cache
   CANDLE_CACHE_TTL_MS: 55 * 1000,
+  // [FIX-M] RSI trend filter period (was 200 in the EMA call).
+  RSI_TREND_EMA_PERIOD: 100,
 };
 
-// [FIX-E] Validation thresholds. MAX_SPREAD_PIPS defaults to 3 which
-// mirrors opportunityEngine's gate; tighten or loosen in one place.
 const VALIDATION = {
   MAX_SPREAD_PIPS: 3,
   DUPLICATE_WINDOW_MS: 60 * 1000,
 };
+
+// [FIX-N] Candle-shortage throttle.
+const CANDLE_SHORTAGE_LOG_THROTTLE_MS = 10 * 60 * 1000;
 
 // ---------- UTILITY HELPERS ----------
 function roundPrice(price) {
@@ -102,9 +104,6 @@ function getVolume(candles) {
   return { last, avg, ratio: avg > 0 ? last / avg : 1 };
 }
 
-/**
- * Get pip value for a given instrument and account currency.
- */
 function getPipValue(instrument, accountCurrency = 'USD', lotSize = 1) {
   const base = instrument.split('_')[0];
   const quote = instrument.split('_')[1];
@@ -117,28 +116,28 @@ function getPipValue(instrument, accountCurrency = 'USD', lotSize = 1) {
 }
 
 // ============================================================
-// [FILE-3] CANDLE CACHE
+// [FIX-N] Candle-shortage diagnostic
 // ============================================================
-// The StrategyRanker calls generateSignal() for every registered strategy.
-// Each strategy calls getCandlesOnce() internally. Without caching, a
-// single rank cycle = 10 strategies × 4 symbols = 40 REST fetches every
-// 30 seconds → Deriv rate limit.
-//
-// The cache key is `${instrument}::${timeframe}`. TTL is caller-provided
-// (default 55s) so HTF analysis can use longer TTLs without affecting M5
-// freshness. A successful fetch is cached. A failed fetch is NOT cached
-// so the next strategy call retries — prevents cache-poisoning from a
-// transient failure.
-//
-// [FIX-J] Cache always fetches CONFIG.CANDLE_COUNT (500). Callers with
-//         smaller count needs receive a slice. This preserves the cache
-//         invariant that one entry holds one canonical fetch regardless
-//         of how many candles each caller wants.
-// [FIX-H] Callers can pass `{ ttlMs }` to override the default TTL.
-const _candlesCache = new Map();  // key -> { candles, at }
-const _inflightFetches = new Map(); // key -> Promise (dedupe concurrent)
+const _candleShortageLoggedAt = new Map();
 
-// [FIX-H] Higher-timeframe candles change slowly — cache them longer.
+function _logCandleShortage(strategy, instrument, have, need) {
+  const key = `${strategy}::${instrument}`;
+  const now = Date.now();
+  const last = _candleShortageLoggedAt.get(key) || 0;
+  if (now - last < CANDLE_SHORTAGE_LOG_THROTTLE_MS) return;
+  _candleShortageLoggedAt.set(key, now);
+  logger.debug(
+    `[Strategy] ${strategy}/${instrument}: ${have} candles < ${need} required — ` +
+    `cannot fire (throttled ${CANDLE_SHORTAGE_LOG_THROTTLE_MS / 1000}s)`
+  );
+}
+
+// ============================================================
+// CANDLE CACHE
+// ============================================================
+const _candlesCache = new Map();
+const _inflightFetches = new Map();
+
 const HTF_TTL_MS = {
   M1: 60 * 1000,
   M5: 55 * 1000,
@@ -156,17 +155,12 @@ async function getCandlesOnce(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME, 
   const key = `${instrument}::${timeframe}`;
   const now = Date.now();
 
-  // Cache hit — freshness is judged against the CALLER's TTL, not a
-  // cached TTL. A short-TTL caller always gets recent data; a long-TTL
-  // caller can reuse aggressively.
   const cached = _candlesCache.get(key);
   if (cached && (now - cached.at) < ttl) {
     const r = cached.candles;
     return r.length > count ? r.slice(-count) : r;
   }
 
-  // In-flight dedupe: if another strategy is already fetching this key,
-  // await its promise instead of firing a second fetch
   if (_inflightFetches.has(key)) {
     const inflight = await _inflightFetches.get(key);
     return (inflight && inflight.length > count) ? inflight.slice(-count) : inflight;
@@ -174,7 +168,6 @@ async function getCandlesOnce(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME, 
 
   const fetchPromise = (async () => {
     try {
-      // Always fetch canonical count — callers slice on return.
       const candles = await marketProvider.getCandles(instrument, CONFIG.CANDLE_COUNT, timeframe);
       if (candles && candles.length > 0) {
         _candlesCache.set(key, { candles, at: Date.now() });
@@ -190,14 +183,6 @@ async function getCandlesOnce(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME, 
   return (result && result.length > count) ? result.slice(-count) : result;
 }
 
-/**
- * Clear the candle cache. Use when you know a new candle has closed
- * and want the next strategy call to fetch fresh data. Also used by
- * tests to reset state between cases.
- *
- * @param {string} [instrument]  — clear only this instrument, or all if omitted
- * @param {string} [timeframe]   — clear only this timeframe, or all if omitted
- */
 function clearCandleCache(instrument = null, timeframe = null) {
   if (!instrument) {
     _candlesCache.clear();
@@ -212,7 +197,6 @@ function clearCandleCache(instrument = null, timeframe = null) {
   _candlesCache.delete(`${instrument}::${timeframe}`);
 }
 
-// [FIX-L] Report inflight state per entry alongside age/freshness.
 function getCandleCacheStats() {
   const stats = [];
   const now = Date.now();
@@ -234,9 +218,6 @@ function getCandleCacheStats() {
 // TECHNICAL INDICATORS
 // ============================================================
 
-/**
- * Simple Moving Average (SMA)
- */
 function SMA(prices, period) {
   const result = [];
   for (let i = 0; i < prices.length; i++) {
@@ -248,10 +229,6 @@ function SMA(prices, period) {
   return result;
 }
 
-/**
- * Exponential Moving Average (EMA)
- * [FILE-4] Exported for external reuse.
- */
 function EMA(prices, period) {
   const result = [];
   const multiplier = 2 / (period + 1);
@@ -264,16 +241,13 @@ function EMA(prices, period) {
   return result;
 }
 
-/**
- * Average True Range (ATR) – full series
- */
 function ATR(candles, period = CONFIG.ATR_PERIOD) {
   if (candles.length < period + 1) return null;
   const tr = [];
   for (let i = 1; i < candles.length; i++) {
     const high = parseFloat(candles[i].mid.h);
     const low = parseFloat(candles[i].mid.l);
-    const prevClose = parseFloat(candles[i-1].mid.c);
+    const prevClose = parseFloat(candles[i - 1].mid.c);
     tr.push(Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose)));
   }
   const atr = [];
@@ -286,13 +260,10 @@ function ATR(candles, period = CONFIG.ATR_PERIOD) {
   return atr;
 }
 
-/**
- * RSI (Wilder's smoothing)
- */
 function RSI(prices, period = CONFIG.RSI_PERIOD) {
   if (prices.length < period + 1) return null;
   const changes = [];
-  for (let i = 1; i < prices.length; i++) changes.push(prices[i] - prices[i-1]);
+  for (let i = 1; i < prices.length; i++) changes.push(prices[i] - prices[i - 1]);
   let avgGain = 0, avgLoss = 0;
   for (let i = 0; i < period; i++) {
     if (changes[i] >= 0) avgGain += changes[i];
@@ -313,9 +284,6 @@ function RSI(prices, period = CONFIG.RSI_PERIOD) {
   return 100 - (100 / (1 + avgGain / avgLoss));
 }
 
-/**
- * MACD – returns { macd, signal, histogram, ema12, ema26 }
- */
 function MACD(prices, fast = CONFIG.MACD_FAST, slow = CONFIG.MACD_SLOW, signal = CONFIG.MACD_SIGNAL) {
   if (prices.length < slow + signal) return null;
   const emaFast = EMA(prices, fast);
@@ -332,9 +300,6 @@ function MACD(prices, fast = CONFIG.MACD_FAST, slow = CONFIG.MACD_SLOW, signal =
   return result;
 }
 
-/**
- * Bollinger Bands – returns { upper, middle, lower, bandwidth }
- */
 function BollingerBands(prices, period = CONFIG.BOLLINGER_PERIOD, stdDev = CONFIG.BOLLINGER_STD) {
   if (prices.length < period) return null;
   const result = { upper: [], middle: [], lower: [], bandwidth: [] };
@@ -353,9 +318,6 @@ function BollingerBands(prices, period = CONFIG.BOLLINGER_PERIOD, stdDev = CONFI
   return result;
 }
 
-/**
- * ADX – Full Wilder smoothing with plusDI/minusDI
- */
 function ADX(candles, period = CONFIG.ADX_PERIOD) {
   if (candles.length < period * 2) return null;
   const highs = candles.map(c => parseFloat(c.mid.h));
@@ -364,14 +326,14 @@ function ADX(candles, period = CONFIG.ADX_PERIOD) {
   const tr = [];
   for (let i = 1; i < highs.length; i++) {
     const hl = highs[i] - lows[i];
-    const hc = Math.abs(highs[i] - closes[i-1]);
-    const lc = Math.abs(lows[i] - closes[i-1]);
+    const hc = Math.abs(highs[i] - closes[i - 1]);
+    const lc = Math.abs(lows[i] - closes[i - 1]);
     tr.push(Math.max(hl, hc, lc));
   }
   const plusDM = [], minusDM = [];
   for (let i = 1; i < highs.length; i++) {
-    const up = highs[i] - highs[i-1];
-    const down = lows[i-1] - lows[i];
+    const up = highs[i] - highs[i - 1];
+    const down = lows[i - 1] - lows[i];
     plusDM.push(up > down && up > 0 ? up : 0);
     minusDM.push(down > up && down > 0 ? down : 0);
   }
@@ -406,9 +368,6 @@ function ADX(candles, period = CONFIG.ADX_PERIOD) {
   };
 }
 
-/**
- * Choppiness Index
- */
 function ChoppinessIndex(candles, period = CONFIG.CHOPPINESS_PERIOD) {
   if (candles.length < period + 1) return null;
   const highs = candles.map(c => parseFloat(c.mid.h));
@@ -431,9 +390,6 @@ function ChoppinessIndex(candles, period = CONFIG.CHOPPINESS_PERIOD) {
   return Math.min(100, Math.max(0, choppiness));
 }
 
-/**
- * SuperTrend – full iterative state
- */
 function SuperTrend(candles, period = CONFIG.SUPERTREND_PERIOD, multiplier = CONFIG.SUPERTREND_MULTIPLIER) {
   if (candles.length < period + 1) return null;
   const highs = candles.map(c => parseFloat(c.mid.h));
@@ -478,9 +434,6 @@ function SuperTrend(candles, period = CONFIG.SUPERTREND_PERIOD, multiplier = CON
   return { trend: last.trend, value: last.value, upper: last.upper, lower: last.lower };
 }
 
-/**
- * Ichimoku – correct 26-period forward shift
- */
 function Ichimoku(candles) {
   if (candles.length < CONFIG.ICHIMOKU_SENKOUB) return null;
   const highs = candles.map(c => parseFloat(c.mid.h));
@@ -522,9 +475,6 @@ function Ichimoku(candles) {
   };
 }
 
-/**
- * Support/Resistance with clustering
- */
 function findSupportResistance(candles, lookback = 30, clusterRadius = 0.001) {
   if (candles.length < lookback + 2) return { support: null, resistance: null };
   const highs = candles.map(c => parseFloat(c.mid.h));
@@ -534,10 +484,10 @@ function findSupportResistance(candles, lookback = 30, clusterRadius = 0.001) {
   const currentPrice = closes[lastIdx];
   const swingHighs = [], swingLows = [];
   for (let i = 1; i < lastIdx; i++) {
-    if (highs[i] > highs[i-1] && highs[i] > highs[i+1]) {
+    if (highs[i] > highs[i - 1] && highs[i] > highs[i + 1]) {
       swingHighs.push({ price: highs[i], index: i });
     }
-    if (lows[i] < lows[i-1] && lows[i] < lows[i+1]) {
+    if (lows[i] < lows[i - 1] && lows[i] < lows[i + 1]) {
       swingLows.push({ price: lows[i], index: i });
     }
   }
@@ -571,8 +521,6 @@ function findSupportResistance(candles, lookback = 30, clusterRadius = 0.001) {
 }
 
 // ---------- MARKET REGIME ----------
-// [FIX-G] Throttled 'unknown' logging per instrument. `instrument` is
-// optional so internal callers that don't care can omit it.
 const _regimeUnknownLoggedAt = new Map();
 const REGIME_LOG_THROTTLE_MS = 5 * 60 * 1000;
 
@@ -621,15 +569,6 @@ function detectRegime(candles, instrument = null) {
 }
 
 // ---------- SESSION ----------
-// [FIX-F] Non-overlapping ranges so every hour maps to exactly one
-// session. Preserves the effective mappings the old (first-match-wins)
-// code produced but makes the intent explicit and removes the latent
-// London/NY and Asia/Sydney overlaps:
-//   22:00–00:00 Sydney
-//   00:00–07:00 Asia
-//   07:00–15:00 London
-//   15:00–20:00 New York
-//   20:00–22:00 Other
 function getSession() {
   const hour = new Date().getUTCHours();
   if (hour >= 22 || hour < 7) return hour >= 22 ? 'Sydney' : 'Asia';
@@ -644,9 +583,6 @@ async function multiTimeframeAnalysis(instrument, timeframe = CONFIG.DEFAULT_TIM
   const higher = htf[timeframe] || [];
   const trends = {};
   for (const tf of higher) {
-    // [FIX-H] HTF-aware TTL — M15 refreshed every 5 min, H1 every 15 min,
-    // H4 every hour, D every 30 min. Prevents re-fetching slow-moving
-    // higher-timeframe candles on every pipeline cycle.
     const ttlMs = HTF_TTL_MS[tf] ?? CONFIG.CANDLE_CACHE_TTL_MS;
     try {
       const candles = await getCandlesOnce(instrument, tf, { ttlMs });
@@ -654,7 +590,6 @@ async function multiTimeframeAnalysis(instrument, timeframe = CONFIG.DEFAULT_TIM
       const regime = detectRegime(candles, instrument);
       trends[tf] = regime.trend;
     } catch (_) {
-      // HTF is best-effort; a transient failure should not kill the signal.
     }
   }
   return trends;
@@ -676,13 +611,10 @@ function calculateConfidence(signal, indicators, context) {
   }
   if (indicators.volumeRatio !== null && indicators.volumeRatio > 1.2) conf += 5;
   if (indicators.aiConfidence !== null) conf = (conf + indicators.aiConfidence) / 2;
-  // [FIX-G] Explicit regime branches so the 'unknown' case is auditable
-  // instead of relying on implicit fall-through. 'unknown' = no adjustment.
   if (context.regime === 'trending') {
     if (signal.side === 'BUY' && indicators.trendStrength > 0) conf += 10;
     else if (signal.side === 'SELL' && indicators.trendStrength < 0) conf += 10;
   } else if (context.regime === 'unknown') {
-    // No bonus, no penalty — regime could not be determined.
   }
   if (context.htfTrends) {
     const bullish = Object.values(context.htfTrends).filter(t => t === 'bullish').length;
@@ -701,9 +633,6 @@ function calculateRiskScore(signal, indicators, accountCurrency = 'USD') {
   let risk = 0;
   if (indicators.adx && indicators.adx < 20) risk += 20;
   if (indicators.volatility === 'high') risk += 15;
-  // [FIX-G] Regime 'unknown' flows through as volatility === 'normal',
-  // so no special-case branch is needed here. Kept neutral for symmetry
-  // with calculateConfidence().
   const slDistance = Math.abs(signal.entryPrice - signal.stopLoss);
   const atr = indicators.atr || 0.001;
   if (slDistance < atr * 0.5) risk += 20;
@@ -723,17 +652,11 @@ function calculatePositionSize(accountBalance, riskPct, stopLoss, entryPrice, in
 }
 
 // ---------- SIGNAL VALIDATION ----------
-// [FIX-E] Previously a no-op returning true. Now performs four checks.
-// All checks are soft-fail-open: they only block when the caller actually
-// supplied the data to evaluate them (missing fields → check skipped).
-// Return type stays boolean for caller compatibility; warnings are logged
-// internally so decisions are auditable.
-const _recentSignals = new Map(); // key: strategy::pair::side -> timestamp
+const _recentSignals = new Map();
 
 async function validateSignal(signal, account = {}) {
   if (!signal) return false;
 
-  // 1. Spread check — only block if a spread value was actually provided.
   const spreadPips = Number(
     signal.spreadPips ?? signal.spread ?? account.spreadPips ?? account.spread
   );
@@ -745,7 +668,6 @@ async function validateSignal(signal, account = {}) {
     return false;
   }
 
-  // 2. Max concurrent positions.
   const openCount = Number(
     account.openPositions ??
     account.openTrades ??
@@ -760,7 +682,6 @@ async function validateSignal(signal, account = {}) {
     return false;
   }
 
-  // 3. Daily loss cap.
   const balance = Number(
     account.balance ?? account.equity ?? account.accountBalance
   );
@@ -778,7 +699,6 @@ async function validateSignal(signal, account = {}) {
     }
   }
 
-  // 4. Duplicate suppression — same strategy+pair+side within window.
   const dupKey = `${signal.strategy}::${signal.pair}::${signal.side}`;
   const now = Date.now();
   const last = _recentSignals.get(dupKey) || 0;
@@ -791,7 +711,6 @@ async function validateSignal(signal, account = {}) {
   }
   _recentSignals.set(dupKey, now);
 
-  // Periodic cleanup so the map cannot grow unbounded on long uptimes.
   if (_recentSignals.size > 500) {
     const cutoff = now - VALIDATION.DUPLICATE_WINDOW_MS * 5;
     for (const [k, t] of _recentSignals) {
@@ -808,7 +727,10 @@ async function validateSignal(signal, account = {}) {
 
 async function strategySMA(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME, fast = 10, slow = 30) {
   const candles = await getCandlesOnce(instrument, timeframe);
-  if (!candles || candles.length < slow + 1) return null;
+  if (!candles || candles.length < slow + 1) {
+    _logCandleShortage('sma', instrument, candles?.length || 0, slow + 1);
+    return null;
+  }
   const closes = candles.map(c => parseFloat(c.mid.c));
   const smaFast = SMA(closes, fast);
   const smaSlow = SMA(closes, slow);
@@ -840,7 +762,10 @@ async function strategySMA(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME, fas
 
 async function strategyEMA(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME, fast = 9, slow = 21) {
   const candles = await getCandlesOnce(instrument, timeframe);
-  if (!candles || candles.length < slow + 1) return null;
+  if (!candles || candles.length < slow + 1) {
+    _logCandleShortage('ema', instrument, candles?.length || 0, slow + 1);
+    return null;
+  }
   const closes = candles.map(c => parseFloat(c.mid.c));
   const emaFast = EMA(closes, fast);
   const emaSlow = EMA(closes, slow);
@@ -869,17 +794,33 @@ async function strategyEMA(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME, fas
   return { pair: instrument, side, entryPrice: roundPrice(currentPrice), stopLoss: roundPrice(stopLoss), takeProfit: roundPrice(takeProfit), confidence: 78, strategy: 'EMA', timestamp: new Date().toISOString() };
 }
 
+// [FIX-M] strategyRSI now uses EMA(100) instead of EMA(200). Deriv's M5
+// data cap is ~177 candles for FX pairs, so the old 200-candle EMA
+// requirement meant this strategy returned null on every call —
+// RSI has never produced a signal until this fix.
 async function strategyRSI(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME, period = CONFIG.RSI_PERIOD, overbought = 70, oversold = 30) {
   const candles = await getCandlesOnce(instrument, timeframe);
-  if (!candles || candles.length < period + 1) return null;
+  if (!candles || candles.length < period + 1) {
+    _logCandleShortage('rsi', instrument, candles?.length || 0, period + 1);
+    return null;
+  }
   const closes = candles.map(c => parseFloat(c.mid.c));
   const rsi = RSI(closes, period);
   if (rsi === null) return null;
-  const ema200 = EMA(closes, 200);
-  if (ema200.length < 200) return null;
-  const lastEma = ema200[ema200.length - 1];
-  const prevEma = ema200[ema200.length - 2];
+
+  // [FIX-M] Trend filter — EMA(100) instead of EMA(200).
+  // 177 candles > 100 → passes. Warm-up ratio 1.77× is marginal but
+  // acceptable for a binary bullish/bearish trend direction check.
+  const trendEmaPeriod = CONFIG.RSI_TREND_EMA_PERIOD;
+  if (closes.length < trendEmaPeriod) {
+    _logCandleShortage('rsi', instrument, closes.length, trendEmaPeriod);
+    return null;
+  }
+  const trendEma = EMA(closes, trendEmaPeriod);
+  const lastEma = trendEma[trendEma.length - 1];
+  const prevEma = trendEma[trendEma.length - 2];
   const trend = lastEma > prevEma ? 'up' : 'down';
+
   const currentPrice = closes[closes.length - 1];
   const atrArray = ATR(candles, CONFIG.ATR_PERIOD);
   const atr = atrArray ? atrArray[atrArray.length - 1] : 0.0015;
@@ -898,7 +839,11 @@ async function strategyRSI(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME, per
 
 async function strategyMACD(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME, fast = CONFIG.MACD_FAST, slow = CONFIG.MACD_SLOW, signalPeriod = CONFIG.MACD_SIGNAL) {
   const candles = await getCandlesOnce(instrument, timeframe);
-  if (!candles || candles.length < slow + signalPeriod) return null;
+  const need = slow + signalPeriod;
+  if (!candles || candles.length < need) {
+    _logCandleShortage('macd', instrument, candles?.length || 0, need);
+    return null;
+  }
   const closes = candles.map(c => parseFloat(c.mid.c));
   const macd = MACD(closes, fast, slow, signalPeriod);
   if (!macd || macd.macd.length < 2) return null;
@@ -929,7 +874,10 @@ async function strategyMACD(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME, fa
 
 async function strategyBollinger(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME, period = CONFIG.BOLLINGER_PERIOD, stdDev = CONFIG.BOLLINGER_STD) {
   const candles = await getCandlesOnce(instrument, timeframe);
-  if (!candles || candles.length < period + 1) return null;
+  if (!candles || candles.length < period + 1) {
+    _logCandleShortage('bollinger', instrument, candles?.length || 0, period + 1);
+    return null;
+  }
   const closes = candles.map(c => parseFloat(c.mid.c));
   const bb = BollingerBands(closes, period, stdDev);
   if (!bb || bb.upper.length < 2) return null;
@@ -966,7 +914,10 @@ async function strategyBollinger(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAM
 
 async function strategyATRBreakout(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME, atrPeriod = CONFIG.ATR_PERIOD, multiplier = 2) {
   const candles = await getCandlesOnce(instrument, timeframe);
-  if (!candles || candles.length < atrPeriod + 1) return null;
+  if (!candles || candles.length < atrPeriod + 1) {
+    _logCandleShortage('atrbreakout', instrument, candles?.length || 0, atrPeriod + 1);
+    return null;
+  }
   const closes = candles.map(c => parseFloat(c.mid.c));
   const highs = candles.map(c => parseFloat(c.mid.h));
   const lows = candles.map(c => parseFloat(c.mid.l));
@@ -995,7 +946,10 @@ async function strategyATRBreakout(instrument, timeframe = CONFIG.DEFAULT_TIMEFR
 
 async function strategySuperTrend(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME, period = CONFIG.SUPERTREND_PERIOD, multiplier = CONFIG.SUPERTREND_MULTIPLIER) {
   const candles = await getCandlesOnce(instrument, timeframe);
-  if (!candles || candles.length < period + 1) return null;
+  if (!candles || candles.length < period + 1) {
+    _logCandleShortage('supertrend', instrument, candles?.length || 0, period + 1);
+    return null;
+  }
   const st = SuperTrend(candles, period, multiplier);
   if (!st) return null;
   const currentPrice = parseFloat(candles[candles.length - 1].mid.c);
@@ -1019,7 +973,10 @@ async function strategySuperTrend(instrument, timeframe = CONFIG.DEFAULT_TIMEFRA
 
 async function strategyIchimoku(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME) {
   const candles = await getCandlesOnce(instrument, timeframe);
-  if (!candles || candles.length < CONFIG.ICHIMOKU_SENKOUB) return null;
+  if (!candles || candles.length < CONFIG.ICHIMOKU_SENKOUB) {
+    _logCandleShortage('ichimoku', instrument, candles?.length || 0, CONFIG.ICHIMOKU_SENKOUB);
+    return null;
+  }
   const ichi = Ichimoku(candles);
   if (!ichi) return null;
   const currentPrice = parseFloat(candles[candles.length - 1].mid.c);
@@ -1041,97 +998,127 @@ async function strategyIchimoku(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME
   return { pair: instrument, side, entryPrice: roundPrice(currentPrice), stopLoss: roundPrice(stopLoss), takeProfit: roundPrice(takeProfit), confidence: 76, strategy: 'Ichimoku', timestamp: new Date().toISOString() };
 }
 
-// [FIX-I] AI results memoized for 60s per instrument+timeframe so
-// weightedvote and the standalone `ai` strategy share one AI call.
-const _aiSignalMemo = new Map(); // key -> { at, value }
+// [FIX-I] AI result memoized for 60s per instrument+timeframe.
+// [FIX-O] Plus in-flight dedupe so concurrent calls in the same tick
+//         join a single promise instead of each firing their own
+//         request. This is what stops the OpenRouter saturation.
+const _aiSignalMemo = new Map();
+const _aiInflight = new Map();
 const AI_MEMO_TTL_MS = 60 * 1000;
 
 async function strategyAI(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME) {
   if (!getAISignal) return null;
 
   const memoKey = `${instrument}::${timeframe}`;
+
+  // [FIX-I] Memo hit
   const memo = _aiSignalMemo.get(memoKey);
   if (memo && (Date.now() - memo.at) < AI_MEMO_TTL_MS) {
     return memo.value;
   }
 
-  const candles = await getCandlesOnce(instrument, timeframe);
-  if (!candles || candles.length < 50) return null;
-  const closes = candles.map(c => parseFloat(c.mid.c));
-  const highs = candles.map(c => parseFloat(c.mid.h));
-  const lows = candles.map(c => parseFloat(c.mid.l));
-  const sma10 = SMA(closes, 10);
-  const sma20 = SMA(closes, 20);
-  const sma50 = SMA(closes, 50);
-  const ema20 = EMA(closes, 20);
-  const ema50 = EMA(closes, 50);
-  const ema200 = EMA(closes, 200);
-  const rsi14 = RSI(closes, 14);
-  const atrArray = ATR(candles, 14);
-  const atr14 = atrArray ? atrArray[atrArray.length - 1] : null;
-  const bb = BollingerBands(closes, 20, 2);
-  const macd = MACD(closes, 12, 26, 9);
-  const adxData = ADX(candles, 14);
-  const vol = getVolume(candles);
-  const lastIdx = closes.length - 1;
-  const indicators = {
-    price: closes[lastIdx],
-    sma10: sma10[lastIdx],
-    sma20: sma20[lastIdx],
-    sma50: sma50[lastIdx],
-    ema20: ema20[lastIdx],
-    ema50: ema50[lastIdx],
-    ema200: ema200[lastIdx],
-    rsi14,
-    atr14,
-    bbUpper: bb ? bb.upper[bb.upper.length - 1] : null,
-    bbLower: bb ? bb.lower[bb.lower.length - 1] : null,
-    bbMiddle: bb ? bb.middle[bb.middle.length - 1] : null,
-    macdLine: macd ? macd.macd[macd.macd.length - 1] : null,
-    macdSignal: macd ? macd.signal[macd.signal.length - 1] : null,
-    macdHist: macd ? macd.histogram[macd.histogram.length - 1] : null,
-    high: highs[lastIdx],
-    low: lows[lastIdx],
-    adx: adxData ? adxData.adx : null,
-    volume: vol,
-  };
-  const aiSignal = await getAISignal(instrument, candles, indicators);
-  if (!aiSignal) {
-    // Cache negative result briefly so weightdedvote doesn't retry the
-    // same failing call in the same cycle.
-    _aiSignalMemo.set(memoKey, { at: Date.now(), value: null });
-    return null;
+  // [FIX-O] In-flight dedupe — join existing promise if one is running
+  if (_aiInflight.has(memoKey)) {
+    return _aiInflight.get(memoKey);
   }
-  const currentPrice = closes[lastIdx];
-  const stopDistance = atr14 ? atr14 * 1.5 : 0.0015;
-  let sl = aiSignal.stopLoss;
-  let tp = aiSignal.takeProfit;
-  if (!sl) sl = aiSignal.side === 'BUY' ? currentPrice - stopDistance : currentPrice + stopDistance;
-  if (!tp) tp = aiSignal.side === 'BUY' ? currentPrice + stopDistance * 2 : currentPrice - stopDistance * 2;
-  const signal = {
-    pair: instrument,
-    side: aiSignal.side,
-    entryPrice: roundPrice(currentPrice),
-    stopLoss: roundPrice(sl),
-    takeProfit: roundPrice(tp),
-    confidence: aiSignal.confidence || 70,
-    strategy: 'AI',
-    timestamp: new Date().toISOString(),
-    reason: aiSignal.reason || 'AI analysis',
-  };
-  _aiSignalMemo.set(memoKey, { at: Date.now(), value: signal });
-  if (_aiSignalMemo.size > 100) {
-    const cutoff = Date.now() - AI_MEMO_TTL_MS * 2;
-    for (const [k, v] of _aiSignalMemo) {
-      if (v.at < cutoff) _aiSignalMemo.delete(k);
+
+  const promise = (async () => {
+    const candles = await getCandlesOnce(instrument, timeframe);
+    if (!candles || candles.length < 50) {
+      _logCandleShortage('ai', instrument, candles?.length || 0, 50);
+      return null;
     }
+    const closes = candles.map(c => parseFloat(c.mid.c));
+    const highs = candles.map(c => parseFloat(c.mid.h));
+    const lows = candles.map(c => parseFloat(c.mid.l));
+    const sma10 = SMA(closes, 10);
+    const sma20 = SMA(closes, 20);
+    const sma50 = SMA(closes, 50);
+    const ema20 = EMA(closes, 20);
+    const ema50 = EMA(closes, 50);
+    const ema200 = EMA(closes, 200);
+    const rsi14 = RSI(closes, 14);
+    const atrArray = ATR(candles, 14);
+    const atr14 = atrArray ? atrArray[atrArray.length - 1] : null;
+    const bb = BollingerBands(closes, 20, 2);
+    const macd = MACD(closes, 12, 26, 9);
+    const adxData = ADX(candles, 14);
+    const vol = getVolume(candles);
+    const lastIdx = closes.length - 1;
+    const indicators = {
+      price: closes[lastIdx],
+      sma10: sma10[lastIdx],
+      sma20: sma20[lastIdx],
+      sma50: sma50[lastIdx],
+      ema20: ema20[lastIdx],
+      ema50: ema50[lastIdx],
+      ema200: ema200[lastIdx],
+      rsi14,
+      atr14,
+      bbUpper: bb ? bb.upper[bb.upper.length - 1] : null,
+      bbLower: bb ? bb.lower[bb.lower.length - 1] : null,
+      bbMiddle: bb ? bb.middle[bb.middle.length - 1] : null,
+      macdLine: macd ? macd.macd[macd.macd.length - 1] : null,
+      macdSignal: macd ? macd.signal[macd.signal.length - 1] : null,
+      macdHist: macd ? macd.histogram[macd.histogram.length - 1] : null,
+      high: highs[lastIdx],
+      low: lows[lastIdx],
+      adx: adxData ? adxData.adx : null,
+      volume: vol,
+    };
+    let aiSignal;
+    try {
+      aiSignal = await getAISignal(instrument, candles, indicators);
+    } catch (err) {
+      // Negative cache so subsequent cycles within 60s don't retry immediately
+      _aiSignalMemo.set(memoKey, { at: Date.now(), value: null });
+      throw err;
+    }
+    if (!aiSignal) {
+      _aiSignalMemo.set(memoKey, { at: Date.now(), value: null });
+      return null;
+    }
+    const currentPrice = closes[lastIdx];
+    const stopDistance = atr14 ? atr14 * 1.5 : 0.0015;
+    let sl = aiSignal.stopLoss;
+    let tp = aiSignal.takeProfit;
+    if (!sl) sl = aiSignal.side === 'BUY' ? currentPrice - stopDistance : currentPrice + stopDistance;
+    if (!tp) tp = aiSignal.side === 'BUY' ? currentPrice + stopDistance * 2 : currentPrice - stopDistance * 2;
+    const signal = {
+      pair: instrument,
+      side: aiSignal.side,
+      entryPrice: roundPrice(currentPrice),
+      stopLoss: roundPrice(sl),
+      takeProfit: roundPrice(tp),
+      confidence: aiSignal.confidence || 70,
+      strategy: 'AI',
+      timestamp: new Date().toISOString(),
+      reason: aiSignal.reason || 'AI analysis',
+    };
+    _aiSignalMemo.set(memoKey, { at: Date.now(), value: signal });
+    if (_aiSignalMemo.size > 100) {
+      const cutoff = Date.now() - AI_MEMO_TTL_MS * 2;
+      for (const [k, v] of _aiSignalMemo) {
+        if (v.at < cutoff) _aiSignalMemo.delete(k);
+      }
+    }
+    return signal;
+  })();
+
+  _aiInflight.set(memoKey, promise);
+  try {
+    return await promise;
+  } finally {
+    _aiInflight.delete(memoKey);
   }
-  return signal;
 }
 
 async function strategyWeightedVote(instrument, timeframe = CONFIG.DEFAULT_TIMEFRAME) {
   const candles = await getCandlesOnce(instrument, timeframe);
-  if (!candles || candles.length < 100) return null;
+  if (!candles || candles.length < 100) {
+    _logCandleShortage('weightedvote', instrument, candles?.length || 0, 100);
+    return null;
+  }
   const regime = detectRegime(candles, instrument);
   let weights = { SMA: 0.2, EMA: 0.2, RSI: 0.15, MACD: 0.2, AI: 0.25 };
   if (regime.regime === 'trending') {
@@ -1188,8 +1175,8 @@ const STRATEGIES = {
   weightedvote: strategyWeightedVote,
 };
 
-// [FIX-K] Throttled error logger keyed by (strategy, errorCode).
-const _strategyErrorLoggedAt = new Map(); // key -> { at, suppressed }
+// [FIX-K] Throttled error logging.
+const _strategyErrorLoggedAt = new Map();
 const STRATEGY_ERROR_THROTTLE_MS = 60 * 1000;
 
 function _logStrategyError(strategy, error) {
@@ -1273,7 +1260,6 @@ async function generateSignal(instrument, strategy = 'sma', params = {}) {
     logger.info(`[Strategy] ${strategy} generated ${signal.side} for ${instrument} (conf: ${signal.confidence}%)`);
     return signal;
   } catch (error) {
-    // [FIX-K] Throttled so transient failures don't flood the log.
     _logStrategyError(strategy, error);
     return null;
   }
@@ -1284,7 +1270,7 @@ module.exports = {
   generateSignal,
   STRATEGIES,
   SMA,
-  EMA,            // [FILE-4] now exported
+  EMA,
   ADX,
   ATR,
   RSI,
@@ -1299,11 +1285,17 @@ module.exports = {
   calculateConfidence,
   calculatePositionSize,
   validateSignal,
-  // [FILE-3] Cache utilities
   getCandlesOnce,
   clearCandleCache,
   getCandleCacheStats,
-  // [FIX-E] Exposed for testing / debugging validation logic directly.
   _VALIDATION: VALIDATION,
   _clearRecentSignals() { _recentSignals.clear(); },
+  _clearAIMemo() { _aiSignalMemo.clear(); _aiInflight.clear(); },
+  _getAIDebug() {
+    return {
+      memoSize: _aiSignalMemo.size,
+      inflightCount: _aiInflight.size,
+      memoKeys: Array.from(_aiSignalMemo.keys()),
+    };
+  },
 };
