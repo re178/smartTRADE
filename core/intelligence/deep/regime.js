@@ -2,11 +2,47 @@
 // Deep Regime Detection – uses deep market state to classify regimes.
 // Listens to candle closes, emits 'regime' events with confidence, reason, and session context.
 // Publishes regime changes to DataOrchestrator for research/historical logging.
+//
+// [FIX-RG1] Proper EventEmitter inheritance. The original code did
+//           `Object.setPrototypeOf(DeepRegimeDetector.prototype, EventEmitter.prototype)`
+//           without calling `super()` — meaning `_events`, `_eventsCount`, and
+//           `_maxListeners` were never initialized on the instance. `.on()` and
+//           `.emit()` worked by accident in most Node versions (lazy init of
+//           `_events`), but broke edge cases: `.once()`, `.rawListeners()`,
+//           `removeAllListeners()`, error event handling, and any code path
+//           that inspects `_eventsCount` before the first `.on()` call. Now
+//           uses `class ... extends EventEmitter` + `super()`.
+// [FIX-RG2] Symbol keys are canonicalized (uppercase, no separators, no
+//           'frx' prefix) before storing in `_latestRegime` / `_lastRegimeCode`.
+//           `getLatestRegime()` normalizes the lookup key too. Fixes a latent
+//           miss when callers mixed 'EURUSD' with 'EUR_USD'.
+// [FIX-RG3] `_onCandleClose` now logs failures (throttled per symbol to once
+//           per 5 min) instead of swallowing them silently. Previously any
+//           exception inside regime classification made regime detection
+//           stop for that symbol without a trace.
+// [FIX-RG4] regimeChange publishes are rate-limited to once per 30s per
+//           symbol. Prevents oscillation spam when a symbol flips between
+//           NEUTRAL and WEAK_TREND every candle.
+// [FIX-RG5] Defensive canonicalization of the regime code before publish.
+//           `_classifyRegime` always returns a valid code, but this guards
+//           against future modifications accidentally introducing an
+//           out-of-list value.
+// [FIX-RG6] Guards against malformed candle input — `candle.symbol` and
+//           `candle.timeframe` are now validated before processing.
+// [FIX-RG7] The dead `deepMarketState.on('stateDeveloping', ...)` listener
+//           is removed. `deepMarketState` never emits that event — this was
+//           placeholder code that never fired.
+// [FIX-RG8] The regimeChange publish now includes `riskMultiplier`,
+//           `maxPositions`, and `idealStrategies` (they were computed in
+//           `_classifyRegime` but not propagated). Downstream consumers can
+//           now read them without a separate `getLatestRegime()` call.
 
+const EventEmitter = require('events');
 const candleStore = require('../../data/candleStore');
 const deepMarketState = require('./marketState');
 const session = require('../session');
 const { dataOrchestrator, DATA_CLASSES } = require('../../data/dataOrchestrator');
+const logger = require('../../../infrastructure/logger') || console;
 
 // Regime definitions (matching the master prompt)
 const REGIME_TYPES = {
@@ -33,22 +69,36 @@ const IDEAL_STRATEGIES = {
   NEUTRAL: ['WeightedVote', 'AI'],
 };
 
-class DeepRegimeDetector {
+// [FIX-RG3] Throttle window for per-symbol error logs.
+const ERROR_LOG_THROTTLE_MS = 5 * 60 * 1000;
+
+// [FIX-RG4] Minimum time between regimeChange publishes for the same symbol.
+const REGIME_CHANGE_MIN_INTERVAL_MS = 30 * 1000;
+
+// [FIX-RG1] Proper inheritance.
+class DeepRegimeDetector extends EventEmitter {
   constructor() {
+    // [FIX-RG1] super() MUST be first — initializes _events, _eventsCount,
+    // _maxListeners on the instance before any other code runs.
+    super();
+
     // Listen to candle closes from the candle builder/store
     candleStore.on('candleClosed', (candle) => {
       this._onCandleClose(candle);
     });
 
-    // Also listen to developing state from deepMarketState (incremental)
-    deepMarketState.on('stateDeveloping', (state) => {
-      // We can emit a 'regimeDeveloping' event if needed.
-      // For now, we'll just use it internally.
-    });
+    // [FIX-RG7] Removed dead listener: deepMarketState never emits
+    // 'stateDeveloping' (see marketState.js — the only emit is 'candleClosed'
+    // from candleStore, and no 'stateDeveloping' emit exists). If that
+    // event is added later, re-add this listener then.
 
-    // Store latest regime per symbol
+    // Store latest regime per symbol (canonical keys — [FIX-RG2])
     this._latestRegime = {};
     this._lastRegimeCode = {}; // For tracking changes
+    // [FIX-RG3] Per-symbol throttle for error logs.
+    this._errorLoggedAt = {};
+    // [FIX-RG4] Per-symbol last-publish timestamps for regimeChange.
+    this._lastRegimeChangeAt = {};
 
     // ---- Register with DataOrchestrator ----
     dataOrchestrator.register('regimeChange', DATA_CLASSES.RESEARCH, {
@@ -57,7 +107,26 @@ class DeepRegimeDetector {
     });
   }
 
+  // [FIX-RG2] Canonical symbol normalization — matches what
+  // deepMarketState._normalizeSymbol produces.
+  _normalizeSymbol(symbol) {
+    if (!symbol) return '';
+    return String(symbol).replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
+  }
+
+  // [FIX-RG3] Throttled error logging.
+  _logErrorOnce(symbol, message) {
+    const key = symbol || '?';
+    const now = Date.now();
+    const last = this._errorLoggedAt[key] || 0;
+    if (now - last < ERROR_LOG_THROTTLE_MS) return;
+    this._errorLoggedAt[key] = now;
+    logger.warn(`[DeepRegime] ${key}: ${message} (throttled ${ERROR_LOG_THROTTLE_MS / 1000}s)`);
+  }
+
   async _onCandleClose(candle) {
+    // [FIX-RG6] Guard against malformed candle input.
+    if (!candle || !candle.symbol || !candle.timeframe) return;
     const { symbol, timeframe } = candle;
 
     // Only process primary timeframes (M5, M15, H1)
@@ -77,7 +146,7 @@ class DeepRegimeDetector {
       // Calculate confidence
       regime.confidence = this._calculateConfidence(state, regime);
 
-      // Add reasoning (human‑readable)
+      // Add reasoning (human-readable)
       regime.reason = this._buildReason(state, regime);
 
       // Add session context
@@ -93,8 +162,11 @@ class DeepRegimeDetector {
         };
       }
 
-      // Store latest
-      this._latestRegime[symbol] = regime;
+      // [FIX-RG2] Canonical symbol for internal maps.
+      const canonical = this._normalizeSymbol(symbol);
+
+      // Store latest (canonical key)
+      this._latestRegime[canonical] = regime;
 
       // Emit regime event
       this.emit('regime', {
@@ -105,37 +177,64 @@ class DeepRegimeDetector {
       });
 
       // ---- PUBLISH TO DATAORCHESTRATOR (if regime changed) ----
-      const prevCode = this._lastRegimeCode[symbol] || null;
-      if (prevCode !== regime.code) {
-        this._lastRegimeCode[symbol] = regime.code;
-        dataOrchestrator.publish('regimeChange', {
-          symbol,
-          timeframe,
-          timestamp: new Date().toISOString(),
-          regime: {
-            code: regime.code,
-            name: regime.name,
-            confidence: regime.confidence,
-            description: regime.description,
-            family: regime.family,
-          },
-          previousRegime: prevCode,
-          state: {
-            price: state.price,
-            trend: state.trend,
-            momentum: state.momentum,
-            volatility: state.volatility,
-            structure: state.structure,
-            session: state.session,
-            summary: state.summary,
-            awareness: state.awareness || {},
-          },
-          reason: regime.reason,
-          source: 'deepRegimeDetector',
-        }, { source: 'regimeChange' });
+      const prevCode = this._lastRegimeCode[canonical] || null;
+
+      // [FIX-RG4] Rate limit — skip if same code, OR if we published very
+      // recently for this symbol (guards against oscillation).
+      if (prevCode === regime.code) {
+        return;
       }
+      const lastPublishAt = this._lastRegimeChangeAt[canonical] || 0;
+      if (Date.now() - lastPublishAt < REGIME_CHANGE_MIN_INTERVAL_MS) {
+        // Code differs but we published too recently — update the tracked
+        // code so we don't re-trigger on the next candle, but skip the publish.
+        this._lastRegimeCode[canonical] = regime.code;
+        return;
+      }
+
+      this._lastRegimeCode[canonical] = regime.code;
+      this._lastRegimeChangeAt[canonical] = Date.now();
+
+      // [FIX-RG5] Defensive canonicalization — regime.code always comes from
+      // _classifyRegime which only returns valid codes, but this guard
+      // prevents future changes from silently publishing an invalid value.
+      const publishCode = Object.prototype.hasOwnProperty.call(REGIME_TYPES, regime.code)
+        ? regime.code
+        : 'NEUTRAL';
+
+      dataOrchestrator.publish('regimeChange', {
+        symbol: canonical,
+        timeframe,
+        timestamp: new Date().toISOString(),
+        regime: {
+          code: publishCode,
+          name: regime.name,
+          confidence: regime.confidence,
+          description: regime.description,
+          family: regime.family,
+          // [FIX-RG8] Include the fields computed in _classifyRegime that
+          // downstream consumers may need.
+          riskMultiplier: regime.riskMultiplier,
+          maxPositions: regime.maxPositions,
+          idealStrategies: regime.idealStrategies,
+        },
+        previousRegime: prevCode,
+        state: {
+          price: state.price,
+          trend: state.trend,
+          momentum: state.momentum,
+          volatility: state.volatility,
+          structure: state.structure,
+          session: state.session,
+          summary: state.summary,
+          awareness: state.awareness || {},
+        },
+        reason: regime.reason,
+        source: 'deepRegimeDetector',
+      }, { source: 'regimeChange' });
     } catch (err) {
-      return;
+      // [FIX-RG3] Log instead of silent drop.
+      this._logErrorOnce(symbol, `_onCandleClose error: ${err.message}`);
     }
   }
 
@@ -296,10 +395,11 @@ class DeepRegimeDetector {
       case 'BREAKOUT':
         confidence = 65 + (bbWidth * 10);
         break;
-      case 'REVERSAL':
+      case 'REVERSAL': {
         const rsiExtreme = Math.abs(rsi - 50) / 50;
         confidence = 60 + rsiExtreme * 20;
         break;
+      }
       case 'WEAK_TREND':
         confidence = 55 + (adx - 20) * 0.5;
         break;
@@ -330,7 +430,7 @@ class DeepRegimeDetector {
   }
 
   /**
-   * Build a human‑readable reason for the regime classification.
+   * Build a human-readable reason for the regime classification.
    */
   _buildReason(state, regime) {
     const parts = [];
@@ -349,15 +449,15 @@ class DeepRegimeDetector {
   }
 
   /**
-   * Get the latest regime for a symbol.
+   * [FIX-RG2] Get the latest regime for a symbol.
+   * Canonicalizes the lookup key so 'EURUSD' and 'EUR_USD' both work.
    */
   getLatestRegime(symbol) {
-    return this._latestRegime[symbol] || null;
+    const canonical = this._normalizeSymbol(symbol);
+    return this._latestRegime[canonical]
+        || this._latestRegime[symbol]
+        || null;
   }
 }
-
-// Add EventEmitter methods
-const EventEmitter = require('events');
-Object.setPrototypeOf(DeepRegimeDetector.prototype, EventEmitter.prototype);
 
 module.exports = new DeepRegimeDetector();
