@@ -27,6 +27,31 @@
 //     appropriately down-weighted during ranging markets
 //   • Deterministic — same inputs always produce same output (no randomness)
 //   • Idempotent — safe to call repeatedly; cache handles repeats
+//
+// [FIX-RN1] Consensus confidence now blends the anchor's actual signal
+//           strength (60-90 from the indicator) with its historical edge
+//           (0.5 baseline for untested, measured win rate for tested).
+//           The blend is weighted by history depth so fresh strategies are
+//           judged primarily on their current signal, and seasoned strategies
+//           primarily on their track record. This is what fixes the "every
+//           signal is conf=55%" pattern in logs: the old formula was
+//           `(effectiveWinRate × 100) + 5×(agreeing-1)`, which with all-untested
+//           strategies (winRate=0.5) and exactly 2 agreers produced exactly 55
+//           every time — discarding the strategy's own confidence entirely.
+// [FIX-RN2] Flagged strategies no longer leak into the `agreeing` and
+//           `conflicting` arrays. Previously a flagged strategy with a
+//           fired signal still counted as "agreeing" for the confidence
+//           boost, even though its weight was excluded from buyWeight/
+//           sellWeight. Now `signalSide` is nulled for flagged rows so
+//           they behave like SILENT for all consensus aggregation.
+// [FIX-RN3] Richer log line for SIGNAL actions shows the confidence
+//           breakdown (sig=, hist=, n=, +agree) so the "why 73%" question
+//           is answerable from the log alone.
+// [FIX-RN4] Cache returns deep-cloned consensus so downstream mutation
+//           cannot corrupt the cache entry.
+// [FIX-RN5] Exposes `confidenceBreakdown` on the consensus object so
+//           downstream consumers (dashboard, debug endpoints) can inspect
+//           exactly how the confidence number was derived.
 
 'use strict';
 
@@ -54,9 +79,18 @@ const CONFIG = {
   CONFIDENCE_BOOST_PER_AGREE: 5,
   MAX_CONFIDENCE: 90,
   MIN_CONFIDENCE: 0,
+
+  // [FIX-RN1] Confidence blend parameters. For untested strategies the
+  // signal confidence dominates (because historical edge is just a 0.5
+  // prior). As trade count grows, historical edge takes over.
+  CONF_HIST_WEIGHT_FLOOR: 0.20,     // trades=0   → 80% signal, 20% history
+  CONF_HIST_WEIGHT_CEIL: 0.70,      // trades>=40→ 30% signal, 70% history
+  CONF_HIST_WEIGHT_RAMP_TRADES: 40, // trades at which hist weight hits ceiling
+  CONF_MAX_AGREEMENT_BONUS_FRESH: 10, // cap when anchor has 0 trades
+  CONF_MAX_AGREEMENT_BONUS_SEASONED: 20, // cap when anchor has many trades
+  CONF_AGREEMENT_BONUS_RAMP_TRADES: 20, // trades at which seasoned cap applies
+
   // Meta-strategies that combine others — skip to avoid double-counting.
-  // If you want to test weightedvote as a standalone strategy, remove it
-  // from this list. It's skipped by default.
   SKIP_STRATEGIES: ['weightedvote'],
 };
 
@@ -88,41 +122,28 @@ function effectiveAvgR(perf) {
 
 /**
  * Compute a weight in [0.05, 1.0] for a strategy's current-cycle signal.
- *
- * Weight reflects historical edge. Higher weight = stronger signal.
- *
- * @param {Object} perf        — StrategyPerformance doc (or undefined)
- * @param {string} regimeCode  — current regime
- * @returns {number}           — weight 0.05 to 1.0
  */
 function computeWeight(perf, regimeCode) {
-  // Untested — baseline small weight
   if (!perf || !perf.trades) {
     return CONFIG.UNTESTED_WEIGHT;
   }
 
-  // Underperforming — near-excluded
   if (perf.flagged) {
     return CONFIG.FLAGGED_WEIGHT;
   }
 
-  // Start from effective win rate
   let wr = effectiveWinRate(perf);
 
-  // Regime-specific adjustment
   const regimePerf = regimeCode ? perf.byRegime?.[regimeCode] : null;
   if (regimePerf && regimePerf.trades >= CONFIG.MIN_REGIME_SAMPLES) {
     wr = (wr * CONFIG.WEIGHT_BLEND_OVERALL_VS_REGIME)
        + (regimePerf.winRate * (1 - CONFIG.WEIGHT_BLEND_OVERALL_VS_REGIME));
   }
 
-  // Recent-performance blend — catches degradation faster than cumulative
   const recent = (typeof perf.recentWinRate === 'number') ? perf.recentWinRate : wr;
   wr = (wr * CONFIG.WEIGHT_BLEND_OVERALL_VS_RECENT)
      + (recent * (1 - CONFIG.WEIGHT_BLEND_OVERALL_VS_RECENT));
 
-  // Transform win rate into weight.
-  // 0.45 → floor, 0.55 → ~0.25, 0.65 → ~0.50, 0.75 → ~0.75, 0.85 → ceiling
   const raw = (wr - CONFIG.WEIGHT_BASE_OFFSET) * CONFIG.WEIGHT_SCALE;
 
   return Math.max(CONFIG.WEIGHT_FLOOR, Math.min(CONFIG.WEIGHT_CEILING, raw));
@@ -130,16 +151,10 @@ function computeWeight(perf, regimeCode) {
 
 /**
  * Signal quality factor — how much to trust THIS specific signal from
- * this strategy this cycle. A strong strategy with a marginal signal
- * contributes less than the same strategy with a clean signal.
- *
- * @param {Object} signal — strategy output { side, confidence, ... }
- * @returns {number}      — 0.3 to 1.0 multiplier
+ * this strategy this cycle.
  */
 function signalConfidenceFactor(signal) {
   if (!signal || typeof signal.confidence !== 'number') return 0.5;
-  // Signal confidence is typically 60-90. 75 is "solid".
-  // Below 50 → 0.5x, above 85 → 1.0x
   return Math.max(0.30, Math.min(1.0, signal.confidence / 75));
 }
 
@@ -161,27 +176,73 @@ function normalizeSignal(raw, strategyName) {
   };
 }
 
+/**
+ * [FIX-RN1] Compute consensus confidence by blending the anchor's
+ * current signal strength with its historical edge, weighted by how
+ * much history the anchor actually has.
+ *
+ * Examples (with 2 agreeing strategies → +5 bonus):
+ *   Untested anchor, signal conf=73 → 0.80×0.73 + 0.20×0.50 + 0.05 = 73%
+ *   Untested anchor, signal conf=67 → 0.80×0.67 + 0.20×0.50 + 0.05 = 69%
+ *   Tested anchor (10 trades, 65%), signal conf=70 → 0.25×0.70 + 0.75×0.65 + 0.05 ≈ 71%
+ *   Tested anchor (40 trades, 70%), signal conf=55 → 0.70×0.70 + 0.30×0.55 + 0.05 ≈ 71%
+ *
+ * @returns {{confidence:number, breakdown:object}}
+ */
+function computeConsensusConfidence(anchorRow, agreeingRows) {
+  if (!anchorRow) return { confidence: 0, breakdown: null };
+
+  const trades = anchorRow.trades || 0;
+  const signalConf = (anchorRow.signal?.confidence ?? 60) / 100;   // typically 0.60-0.90
+  const historyConf = anchorRow.effectiveWinRate ?? 0.5;           // 0.5 for untested
+
+  // Blend weight ramps from floor (untested) to ceiling (seasoned) over
+  // CONF_HIST_WEIGHT_RAMP_TRADES trades.
+  const ramp = Math.min(1, trades / CONFIG.CONF_HIST_WEIGHT_RAMP_TRADES);
+  const histWeight = CONFIG.CONF_HIST_WEIGHT_FLOOR
+    + ramp * (CONFIG.CONF_HIST_WEIGHT_CEIL - CONFIG.CONF_HIST_WEIGHT_FLOOR);
+  const sigWeight = 1 - histWeight;
+
+  const baseConf = sigWeight * signalConf + histWeight * historyConf;
+
+  // Agreement bonus — capped tighter for fresh strategies so an untested
+  // strategy can't accidentally report 90% just because many others align.
+  const agreeBonusRamp = Math.min(1, trades / CONFIG.CONF_AGREEMENT_BONUS_RAMP_TRADES);
+  const maxAgreementBonus = CONFIG.CONF_MAX_AGREEMENT_BONUS_FRESH
+    + agreeBonusRamp * (CONFIG.CONF_MAX_AGREEMENT_BONUS_SEASONED - CONFIG.CONF_MAX_AGREEMENT_BONUS_FRESH);
+  const rawAgreementBonus = Math.max(0, (agreeingRows.length - 1)) * CONFIG.CONFIDENCE_BOOST_PER_AGREE;
+  const agreementBonus = Math.min(maxAgreementBonus, rawAgreementBonus) / 100;
+
+  const raw = (baseConf + agreementBonus) * 100;
+  const confidence = Math.round(Math.max(CONFIG.MIN_CONFIDENCE, Math.min(CONFIG.MAX_CONFIDENCE, raw)));
+
+  return {
+    confidence,
+    breakdown: {
+      signalConfidence: Math.round(signalConf * 100),
+      historicalEdge: Math.round(historyConf * 100),
+      historyTrades: trades,
+      signalWeight: Number(sigWeight.toFixed(2)),
+      historyWeight: Number(histWeight.toFixed(2)),
+      baseConfidence: Math.round(baseConf * 100),
+      agreementBonus: Math.round(agreementBonus * 100),
+      agreeingCount: agreeingRows.length,
+      maxAgreementBonus: Math.round(maxAgreementBonus),
+      finalConfidence: confidence,
+    },
+  };
+}
+
 // ========================================================================
 // StrategyRanker
 // ========================================================================
 class StrategyRanker {
   constructor(options = {}) {
-    // symbol::timeframe -> { consensus, at }
     this._cache = new Map();
     this._cacheTTL = options.cacheTTL || CONFIG.CACHE_TTL_MS;
-    // Override the strategy list (for testing or selective disabling)
     this._strategyNames = options.strategies || null;
   }
 
-  /**
-   * Run every strategy for the symbol, rank by historical edge, produce
-   * weighted consensus.
-   *
-   * @param {Object} state    — market state from deepMarketState.compute()
-   * @param {string} symbol   — canonical symbol 'EURUSD'
-   * @param {Object} options  — { timeframe, product, forceRefresh }
-   * @returns {Promise<Object>} — consensus object (see structure below)
-   */
   async rank(state, symbol, options = {}) {
     const timeframe = options.timeframe || 'M5';
     const product = options.product || 'deriv_cfd';
@@ -192,14 +253,14 @@ class StrategyRanker {
     if (!forceRefresh) {
       const cached = this._cache.get(cacheKey);
       if (cached && (Date.now() - cached.at) < this._cacheTTL) {
-        return { ...cached.consensus, cached: true };
+        // [FIX-RN4] Deep clone so downstream mutation cannot corrupt cache.
+        return { ...JSON.parse(JSON.stringify(cached.consensus)), cached: true };
       }
     }
 
     const t0 = Date.now();
     const regimeCode = state?.regime?.code || 'NEUTRAL';
 
-    // ---- Load performance for this symbol ----
     let performanceMap;
     try {
       performanceMap = await StrategyPerformance.loadForSymbol(symbol);
@@ -208,12 +269,10 @@ class StrategyRanker {
       performanceMap = new Map();
     }
 
-    // ---- Determine which strategies to run ----
     const allStrategyNames = Object.keys(strategyEngine.STRATEGIES || {});
     const namesToRun = (this._strategyNames || allStrategyNames)
       .filter(n => !CONFIG.SKIP_STRATEGIES.includes(n));
 
-    // ---- Run all strategies in parallel ----
     const rawSignals = await Promise.all(
       namesToRun.map(async (name) => {
         try {
@@ -226,7 +285,6 @@ class StrategyRanker {
       })
     );
 
-    // ---- Build per-strategy rows ----
     const rows = [];
     let buyWeight = 0, sellWeight = 0;
     let buyCount = 0, sellCount = 0;
@@ -257,13 +315,19 @@ class StrategyRanker {
         recentWinRate: perf?.recentWinRate ?? 0.5,
         avgR: effR,
         flagged: !!perf?.flagged,
-        status: 'SILENT',  // updated below
+        status: 'SILENT',
       };
 
       if (perf?.flagged) {
         flaggedCount++;
         row.status = 'FLAGGED';
         silentCount++;
+        // [FIX-RN2] Exclude flagged strategies from all consensus aggregation.
+        // Previously the row still carried signalSide, which leaked it into
+        // the `agreeing` array even though its weight was excluded from
+        // buyWeight/sellWeight. Nulling here makes it behave like SILENT for
+        // all downstream filters (agreeing/conflicting/status updates).
+        row.signalSide = null;
       } else if (!signal) {
         silentCount++;
         row.status = 'SILENT';
@@ -296,7 +360,6 @@ class StrategyRanker {
     if (bothAboveConflict) {
       action = 'CONFLICT';
       direction = null;
-      // Mark rows in both directions as conflicting
       for (const row of rows) {
         if (row.signalSide) row.status = 'CONFLICT';
       }
@@ -326,7 +389,6 @@ class StrategyRanker {
         else if (row.signalSide === 'BUY') row.status = 'CONFLICT';
       }
     } else {
-      // Below threshold on both sides — no trade
       action = 'NEUTRAL';
       direction = null;
       for (const row of rows) {
@@ -351,42 +413,46 @@ class StrategyRanker {
       }
     }
 
-    // ---- Compute final confidence ----
+    // ---- [FIX-RN1] Compute final confidence ----
     let confidence = 0;
+    let confidenceBreakdown = null;
     let anchorSignal = null;
     let anchorStrategy = null;
     if (action === 'SIGNAL' && anchorRow) {
-      const baseConf = (anchorRow.effectiveWinRate || 0.5) * 100;
-      const boost = Math.max(0, agreeing.length - 1) * CONFIG.CONFIDENCE_BOOST_PER_AGREE;
-      confidence = Math.max(CONFIG.MIN_CONFIDENCE, Math.min(CONFIG.MAX_CONFIDENCE, baseConf + boost));
-      confidence = Math.round(confidence);
+      const agreeingRows = rows.filter(r => r.signalSide === direction);
+      const result = computeConsensusConfidence(anchorRow, agreeingRows);
+      confidence = result.confidence;
+      confidenceBreakdown = result.breakdown;
       anchorSignal = anchorRow.signal;
       anchorStrategy = anchorRow.name;
     }
 
-    // ---- Build reason strings for dashboard ----
+    // ---- Reason strings ----
     const reasons = [];
     if (action === 'SIGNAL') {
       reasons.push(`${agreeing.length} strateg${agreeing.length === 1 ? 'y' : 'ies'} agree on ${direction}: ${agreeing.join(', ')}`);
       if (conflicting.length > 0) reasons.push(`Ignoring opposing: ${conflicting.join(', ')}`);
       if (flaggedCount > 0) reasons.push(`${flaggedCount} strategy(ies) excluded (underperforming)`);
-      reasons.push(`Anchor: ${anchorStrategy} (${(anchorRow.effectiveWinRate * 100).toFixed(0)}% historical win rate, ${anchorRow.trades} trades)`);
+      reasons.push(
+        `Anchor: ${anchorStrategy} (signal ${anchorRow.signal.confidence}%, ` +
+        `${(anchorRow.effectiveWinRate * 100).toFixed(0)}% historical win rate, ` +
+        `${anchorRow.trades} trades)`
+      );
     } else if (action === 'CONFLICT') {
       reasons.push(`Conflict: BUY from [${rows.filter(r => r.signalSide === 'BUY').map(r => r.name).join(', ')}] vs SELL from [${rows.filter(r => r.signalSide === 'SELL').map(r => r.name).join(', ')}]`);
     } else {
       reasons.push(`No consensus: ${activeCount} strategy(ies) fired but total weight ${(direction === 'BUY' ? buyWeight : sellWeight).toFixed(2)} is below threshold`);
     }
 
-    // ---- Sort rows for dashboard: AGREE, CONFLICT, BELOW_THRESHOLD, SILENT, FLAGGED ----
+    // ---- Sort rows for dashboard ----
     const statusOrder = { AGREE: 0, CONFLICT: 1, BELOW_THRESHOLD: 2, SILENT: 3, FLAGGED: 4 };
     const sortedRows = [...rows].sort((a, b) => {
       const so = (statusOrder[a.status] ?? 9) - (statusOrder[b.status] ?? 9);
       if (so !== 0) return so;
-      // Within same status, sort by weight desc
       return (b.contributionWeight || b.weight || 0) - (a.contributionWeight || a.weight || 0);
     });
 
-    // ---- Assemble consensus object ----
+    // ---- [FIX-RN5] Consensus object with breakdown ----
     const consensus = {
       symbol,
       timeframe,
@@ -396,9 +462,10 @@ class StrategyRanker {
       cached: false,
       strategies: sortedRows,
       consensus: {
-        action,                 // 'SIGNAL' | 'NEUTRAL' | 'CONFLICT'
-        direction,              // 'BUY' | 'SELL' | null
-        confidence,             // 0-100
+        action,
+        direction,
+        confidence,
+        confidenceBreakdown,
         buyWeight: Number(buyWeight.toFixed(3)),
         sellWeight: Number(sellWeight.toFixed(3)),
         buyCount,
@@ -418,10 +485,15 @@ class StrategyRanker {
     // ---- Cache ----
     this._cache.set(cacheKey, { consensus, at: Date.now() });
 
+    // ---- [FIX-RN3] Richer log ----
     if (action === 'SIGNAL') {
+      const b = confidenceBreakdown;
       logger.info(
         `[StrategyRanker] ${symbol} ${timeframe}: ${direction} ` +
-        `conf=${confidence}% anchor=${anchorStrategy} ` +
+        `conf=${confidence}% ` +
+        `[sig=${b.signalConfidence} hist=${b.historicalEdge} n=${b.historyTrades} ` +
+        `+${b.agreementBonus}agree] ` +
+        `anchor=${anchorStrategy} ` +
         `agree=[${agreeing.join(',')}] ` +
         `(buyW=${buyWeight.toFixed(2)} sellW=${sellWeight.toFixed(2)}) ` +
         `elapsed=${consensus.elapsedMs}ms`
@@ -443,36 +515,27 @@ class StrategyRanker {
     return consensus;
   }
 
-  /**
-   * Get the most recent cached consensus for a symbol without running
-   * strategies. Returns null if no cache.
-   */
   getLastConsensus(symbol, timeframe = 'M5') {
     const cached = this._cache.get(`${symbol}::${timeframe}`);
-    return cached ? cached.consensus : null;
+    return cached ? JSON.parse(JSON.stringify(cached.consensus)) : null;
   }
 
-  /**
-   * Return all cached consensus objects — for /debug/strategies.
-   */
   getAllCachedConsensus() {
     const out = {};
     for (const [key, entry] of this._cache) {
+      const c = entry.consensus;
       out[key] = {
-        ...entry.consensus.consensus,
-        symbol: entry.consensus.symbol,
-        timeframe: entry.consensus.timeframe,
-        regime: entry.consensus.regime,
-        evaluatedAt: entry.consensus.evaluatedAt,
+        ...c.consensus,
+        symbol: c.symbol,
+        timeframe: c.timeframe,
+        regime: c.regime,
+        evaluatedAt: c.evaluatedAt,
         ageMs: Date.now() - entry.at,
       };
     }
     return out;
   }
 
-  /**
-   * Clear cache — for testing or after config changes.
-   */
   clearCache() {
     this._cache.clear();
   }
@@ -491,4 +554,5 @@ module.exports._internal = {
   computeWeight,
   signalConfidenceFactor,
   normalizeSignal,
+  computeConsensusConfidence, // [FIX-RN1] exposed for testing
 };
