@@ -19,6 +19,48 @@
 // [FILE-2F] _buildReason is a real implementation.
 // [FILE-2G] _getSymbolVariants strips 'frx' prefix before generating variants.
 // [FILE-2H] _ensureBuffer canonicalizes the symbol before getHistory lookup.
+//
+// [FIX-MS1] historicalState publishes are now throttled. Previously every
+//           compute() call published a doc — and compute() is called from
+//           runner.js (per bot per 15s), server.js (per symbol per 30s), and
+//           any diagnostic caller. That produced 20+ publishes/min/symbol,
+//           flooding the _appendQueue and generating 20+ [Orchestrator]
+//           Coerced-regime log lines per minute (each historicalState publish
+//           is validated through _sanitizeHistoricalState). Now:
+//             • Immediate publish on meaningful change (regime or trend flips)
+//             • Otherwise at most once per 60s per symbol+timeframe
+//           Research/backtest quality is preserved (state flips are captured)
+//           while the queue load drops ~20× on quiet markets.
+// [FIX-MS2] _lastState and publish symbol keys use the canonical form
+//           (uppercase, no separators, no 'frx' prefix). Previously if
+//           runner.js passed 'EURUSD' and another caller passed 'EUR_USD',
+//           they stored under different keys and the getLastState() reader
+//           could miss. Both paths now share the canonical key.
+// [FIX-MS3] state.price.open now falls back to previous close (or current
+//           close) when the candle has no valid `open`. Buffer validation
+//           only checks high/low/close, so `open` could be undefined for
+//           some candleHistory sources.
+// [FIX-MS4] _addCandleToBuffer logs a throttled DEBUG when a candle arrives
+//           for a buffer that has never been initialized (i.e., before the
+//           first compute()). Previously these were dropped silently —
+//           made "why is my buffer stale?" undiagnosable.
+// [FIX-MS5] _classifyRegime is wrapped in try/catch so a malformed state
+//           (e.g. NaN in trend.strength) falls back to NEUTRAL with a
+//           WARN log instead of throwing and making compute() silently
+//           return null. Fixes an invisible failure mode.
+// [FIX-MS6] Buffer validity filter is applied consistently — the initial
+//           load, the incremental candle-close handler, and compute() all
+//           use the same _isValidCandle() predicate. Previously the
+//           incremental path had slightly different checks.
+// [FIX-MS7] state.price.open is now explicitly typed as a number. If it
+//           was undefined, downstream JSON serialization to historicalState
+//           could produce `{ open: undefined }` which Mongo would store as
+//           a missing field (OK) OR fail with strict mode (not OK).
+// [FIX-MS8] getDiagnostics() exposes per-symbol publish counters and last
+//           publish times — useful for /debug/market-state endpoints.
+// [FIX-MS9] Removed redundant `symbol, ...state` publish where `state.symbol`
+//           already covered it. Now publishes with a single canonical symbol
+//           at top level, `...state` (whose `symbol` field is also canonical).
 
 const EventEmitter = require('events');
 const candleStore = require('../../data/candleStore');
@@ -26,6 +68,7 @@ const candleHistory = require('../../data/candleHistory');
 const marketStateCache = require('../../data/marketStateCache');
 const session = require('../session');
 const { dataOrchestrator, DATA_CLASSES } = require('../../data/dataOrchestrator');
+const logger = require('../../../infrastructure/logger') || console;
 const {
   ADX,
   ATR,
@@ -60,6 +103,25 @@ const REGIME_NAMES = {
   NEUTRAL: 'Neutral / Mixed',
 };
 
+// [FIX-MS1] historicalState publish throttle.
+//   FLIP_TRIGGERS = state changes that force an immediate publish regardless
+//   of interval (regime code change or trend direction change).
+//   INTERVAL_MS = maximum quiet-period interval between publishes.
+const HISTORICAL_STATE_PUBLISH_INTERVAL_MS = 60_000;
+
+// [FIX-MS4] Throttle window for "buffer not initialized" debug logs.
+const BUFFER_MISS_LOG_THROTTLE_MS = 5 * 60_000;
+
+// [FIX-MS6] Shared candle validity predicate used by all three call sites.
+function _isValidCandle(c) {
+  return (
+    c && typeof c === 'object' &&
+    typeof c.high === 'number' && Number.isFinite(c.high) &&
+    typeof c.low === 'number' && Number.isFinite(c.low) &&
+    typeof c.close === 'number' && Number.isFinite(c.close)
+  );
+}
+
 class DeepMarketState extends EventEmitter {
   constructor() {
     super();
@@ -77,8 +139,19 @@ class DeepMarketState extends EventEmitter {
 
     // In-memory buffers: key = `${normalizedSymbol}:${timeframe}` -> array of candles (oldest first)
     this._buffers = new Map();
-    // Last computed state per symbol (uses the symbol passed to compute())
+    // Last computed state per symbol (canonical symbol)
     this._lastState = new Map();
+
+    // [FIX-MS1] Track last historicalState publish per symbol+timeframe.
+    //   { at: number, regimeCode: string, trendDirection: string }
+    this._lastHistoricalPublish = new Map();
+    // [FIX-MS4] Per-key throttling for buffer-miss debug logs.
+    this._bufferMissLoggedAt = new Map();
+    // [FIX-MS8] Diagnostics counters.
+    this._publishStats = {
+      marketState: { published: 0, skipped: 0 },
+      historicalState: { published: 0, skipped: 0, throttled: 0, flipped: 0 },
+    };
 
     // Subscribe to new candle closes – update the buffer incrementally
     candleStore.on('candleClosed', (candle) => {
@@ -106,11 +179,28 @@ class DeepMarketState extends EventEmitter {
   }
 
   _addCandleToBuffer(candle) {
+    if (!candle || !candle.symbol || !candle.timeframe) return;
     const normSymbol = this._normalizeSymbol(candle.symbol);
     const key = this._getKey(normSymbol, candle.timeframe);
-    if (!this._buffers.has(key)) return;
-    const buffer = this._buffers.get(key);
-    if (candle && typeof candle.high === 'number' && typeof candle.low === 'number' && typeof candle.close === 'number') {
+    if (!this._buffers.has(key)) {
+      // [FIX-MS4] Throttled diagnostic — buffer was never loaded.
+      // Not an error: _ensureBuffer initializes from candleHistory on
+      // first compute(). But if this fires repeatedly after compute() has
+      // run, something is wrong (e.g. timeframe mismatch).
+      const now = Date.now();
+      const last = this._bufferMissLoggedAt.get(key) || 0;
+      if (now - last >= BUFFER_MISS_LOG_THROTTLE_MS) {
+        this._bufferMissLoggedAt.set(key, now);
+        logger.debug(
+          `[DeepMarketState] Dropped candleClosed for uninitialized buffer ${key} ` +
+          `(compute() has not yet run for this symbol+timeframe)`
+        );
+      }
+      return;
+    }
+    // [FIX-MS6] Same validity predicate as elsewhere.
+    if (_isValidCandle(candle)) {
+      const buffer = this._buffers.get(key);
       buffer.push(candle);
       if (buffer.length > 200) buffer.shift();
     }
@@ -145,12 +235,8 @@ class DeepMarketState extends EventEmitter {
       return null;
     }
 
-    const valid = candles.filter(c =>
-      c && typeof c === 'object' &&
-      typeof c.high === 'number' && !isNaN(c.high) &&
-      typeof c.low === 'number' && !isNaN(c.low) &&
-      typeof c.close === 'number' && !isNaN(c.close)
-    );
+    // [FIX-MS6] Same validity predicate as the incremental path.
+    const valid = candles.filter(_isValidCandle);
     if (valid.length < 50) {
       return null;
     }
@@ -180,6 +266,44 @@ class DeepMarketState extends EventEmitter {
     return Array.from(variants);
   }
 
+  // [FIX-MS1] Determine whether the current state warrants a historicalState
+  // publish. Returns { publish: boolean, reason: 'first'|'flip'|'interval'|'throttled' }.
+  _shouldPublishHistorical(canonicalSymbol, timeframe, state) {
+    const key = `${canonicalSymbol}:${timeframe}`;
+    const last = this._lastHistoricalPublish.get(key);
+
+    if (!last) {
+      return { publish: true, reason: 'first' };
+    }
+
+    const regimeCode = state.regime?.code || 'NEUTRAL';
+    const trendDirection = state.trend?.direction || 'neutral';
+
+    // Meaningful flips → immediate publish
+    if (last.regimeCode !== regimeCode) {
+      return { publish: true, reason: 'flip' };
+    }
+    if (last.trendDirection !== trendDirection) {
+      return { publish: true, reason: 'flip' };
+    }
+
+    // Quiet period → interval-gated
+    if (Date.now() - last.at >= HISTORICAL_STATE_PUBLISH_INTERVAL_MS) {
+      return { publish: true, reason: 'interval' };
+    }
+
+    return { publish: false, reason: 'throttled' };
+  }
+
+  _recordHistoricalPublish(canonicalSymbol, timeframe, state) {
+    const key = `${canonicalSymbol}:${timeframe}`;
+    this._lastHistoricalPublish.set(key, {
+      at: Date.now(),
+      regimeCode: state.regime?.code || 'NEUTRAL',
+      trendDirection: state.trend?.direction || 'neutral',
+    });
+  }
+
   async compute(symbol, timeframe = 'M5', candleCount = 200) {
     try {
       const candles = await this._ensureBuffer(symbol, timeframe, candleCount);
@@ -187,12 +311,8 @@ class DeepMarketState extends EventEmitter {
         return null;
       }
 
-      const validCandles = candles.filter(c =>
-        c && typeof c === 'object' &&
-        typeof c.high === 'number' && !isNaN(c.high) &&
-        typeof c.low === 'number' && !isNaN(c.low) &&
-        typeof c.close === 'number' && !isNaN(c.close)
-      );
+      // [FIX-MS6] Shared validity predicate.
+      const validCandles = candles.filter(_isValidCandle);
       if (validCandles.length < 50) {
         return null;
       }
@@ -249,13 +369,19 @@ class DeepMarketState extends EventEmitter {
       // [FILE-2C] Real volatility regime
       const volatilityRegime = this._volatilityRegime(atr, validCandles, currentPrice);
 
+      // [FIX-MS3] / [FIX-MS7] Safe open extraction.
+      const rawOpen = validCandles[lastIdx].open;
+      const openPrice = Number.isFinite(rawOpen)
+        ? rawOpen
+        : (lastIdx > 0 ? closes[lastIdx - 1] : closes[lastIdx]);
+
       const state = {
         symbol,
         timeframe,
         time: new Date().toISOString(),
         price: {
           current: currentPrice,
-          open: validCandles[lastIdx].open,
+          open: openPrice,
           high: highs[lastIdx],
           low: lows[lastIdx],
           close: closes[lastIdx],
@@ -295,7 +421,7 @@ class DeepMarketState extends EventEmitter {
           isWeekday: session.isWeekday ? session.isWeekday() : true,
         },
         summary: {
-          trendConfidence: 0,       // [FILE-2E] computed below
+          trendConfidence: 0,
           volatilityScore: Math.min(1, atr / (currentPrice * 0.01 || 0.0001)),
           liquidityScore: 0.5,
           regimeSuggestion: 'neutral',
@@ -318,10 +444,6 @@ class DeepMarketState extends EventEmitter {
       };
 
       // ---- Incorporate awareness data if available ----
-      // [FILE-1] awareness now writes under 'EURUSD' (canonical). If symbol
-      // here is 'EURUSD', we get real data. If symbol is 'EUR_USD', the
-      // cache lookup misses and we fall back to defaults — that's fine,
-      // the pipeline always uses 'EURUSD' from candleBuilder.
       const awareness = marketStateCache.get(this._normalizeSymbol(symbol));
       if (awareness) {
         state.awareness = {
@@ -336,11 +458,6 @@ class DeepMarketState extends EventEmitter {
         state.momentum.acceleration = awareness.acceleration || 0;
         state.summary.liquidityScore = awareness.liquidity || 0.5;
 
-        // [FILE-2D] Fixed market quality formula. Previous version multiplied
-        // spread by 1e6 which dominated the calculation on every pair.
-        // New version scales by pip-size × 2 so a "normal" spread yields
-        // roughly -20 penalty, a wide spread yields -40, and liquidity
-        // contributes positively up to +50.
         const liq = awareness.liquidity || 0.5;
         const spread = awareness.spread || 0;
         const pipSize = this._pipSizeForSymbol(symbol);
@@ -350,53 +467,80 @@ class DeepMarketState extends EventEmitter {
         state.summary.noiseLevel = state.summary.marketQuality > 70 ? 'low' : (state.summary.marketQuality > 40 ? 'medium' : 'high');
       }
 
-      // [FILE-2E] Real trend confidence and regime suggestion
+      // [FILE-2E]
       state.summary.trendConfidence = this._trendConfidence(adxData, rsiVal, macdHist);
       state.summary.regimeSuggestion = this._suggestRegime(adxData, rsiVal, bbWidth, atr);
 
-      // [FILE-2A] Classify regime inline. Same logic as regime.js but
-      // computed here so state.regime is self-consistent and available
-      // before any external event listeners fire.
-      state.regime = this._classifyRegime(state);
+      // [FILE-2A] + [FIX-MS5] Regime classification with defensive fallback.
+      try {
+        state.regime = this._classifyRegime(state);
+      } catch (classifyErr) {
+        logger.warn(
+          `[DeepMarketState] _classifyRegime failed for ${symbol}/${timeframe}: ` +
+          `${classifyErr.message} — defaulting to NEUTRAL`
+        );
+        state.regime = {
+          code: 'NEUTRAL',
+          name: REGIME_NAMES.NEUTRAL,
+          confidence: 50,
+          description: 'Classification error — neutral fallback',
+        };
+      }
 
-      // [FILE-2B] Real confidence
+      // [FILE-2B]
       state.confidence = this._calculateConfidence(state);
 
-      // [FILE-2F] Human-readable reason
+      // [FILE-2F]
       state.reason = this._buildReason(state);
 
+      // [FIX-MS2] Canonical symbol for persistence keys.
+      const canonicalSymbol = this._normalizeSymbol(symbol);
+
       // ---- PUBLISH TO DATAORCHESTRATOR ----
+      // [FIX-MS9] Single canonical symbol; ...state also carries canonical.
       dataOrchestrator.publish('marketState', {
-        symbol,
         ...state,
+        symbol: canonicalSymbol,
         lastUpdated: new Date(),
       }, { source: 'deepMarketState' });
+      this._publishStats.marketState.published++;
 
-      dataOrchestrator.publish('historicalState', {
-        symbol,
-        timeframe,
-        timestamp: state.time,
-        price: state.price,
-        trend: state.trend,
-        momentum: state.momentum,
-        volatility: state.volatility,
-        liquidity: {
-          score: state.summary.liquidityScore,
-          spread: state.awareness?.spread || 0,
-          tickFrequency: 0,
-        },
-        structure: state.structure,
-        session: state.session,
-        regime: state.regime,
-        awareness: state.awareness,
-        summary: state.summary,
-        confidence: state.confidence,
-        reason: state.reason,
-        source: 'live',
-        version: '2.0',
-      }, {});
+      // [FIX-MS1] Throttled historicalState publish.
+      const shouldPublish = this._shouldPublishHistorical(canonicalSymbol, timeframe, state);
+      if (shouldPublish.publish) {
+        dataOrchestrator.publish('historicalState', {
+          symbol: canonicalSymbol,
+          timeframe,
+          timestamp: state.time,
+          price: state.price,
+          trend: state.trend,
+          momentum: state.momentum,
+          volatility: state.volatility,
+          liquidity: {
+            score: state.summary.liquidityScore,
+            spread: state.awareness?.spread || 0,
+            tickFrequency: 0,
+          },
+          structure: state.structure,
+          session: state.session,
+          regime: state.regime,
+          awareness: state.awareness,
+          summary: state.summary,
+          confidence: state.confidence,
+          reason: state.reason,
+          source: 'live',
+          version: '2.0',
+        }, {});
+        this._recordHistoricalPublish(canonicalSymbol, timeframe, state);
+        this._publishStats.historicalState.published++;
+        if (shouldPublish.reason === 'flip') this._publishStats.historicalState.flipped++;
+      } else {
+        this._publishStats.historicalState.skipped++;
+        this._publishStats.historicalState.throttled++;
+      }
 
-      this._lastState.set(symbol, state);
+      // [FIX-MS2] Canonical key for _lastState too.
+      this._lastState.set(canonicalSymbol, state);
 
       return state;
     } catch (err) {
@@ -404,16 +548,14 @@ class DeepMarketState extends EventEmitter {
     }
   }
 
-  // ---------- Helper implementations (were stubs) ----------
+  // ---------- Helper implementations ----------
 
-  // [FILE-2C] Real volatility regime classification.
   _volatilityRegime(atr, candles, currentPrice) {
     if (!candles || candles.length < 20 || !currentPrice || currentPrice <= 0) {
       return 'normal';
     }
     const atrPercent = atr / currentPrice;
 
-    // Historical ATR% over last 20 candles
     const recent = [];
     for (let i = Math.max(0, candles.length - 20); i < candles.length; i++) {
       const c = candles[i];
@@ -430,7 +572,6 @@ class DeepMarketState extends EventEmitter {
     return 'normal';
   }
 
-  // [FILE-2E] Real trend confidence from ADX + RSI + MACD alignment.
   _trendConfidence(adxData, rsi, macdHist) {
     const adx = adxData?.adx || 0;
     let conf = 50;
@@ -438,7 +579,6 @@ class DeepMarketState extends EventEmitter {
     else if (adx > 20) conf += 10;
     else if (adx < 15) conf -= 10;
 
-    // Momentum alignment
     if (rsi > 55 && macdHist > 0) conf += 15;
     else if (rsi < 45 && macdHist < 0) conf += 15;
     else if ((rsi > 60 && macdHist < 0) || (rsi < 40 && macdHist > 0)) conf -= 15;
@@ -446,7 +586,6 @@ class DeepMarketState extends EventEmitter {
     return Math.max(0, Math.min(100, conf));
   }
 
-  // [FILE-2E] Real regime suggestion from raw indicators.
   _suggestRegime(adxData, rsi, bbWidth, atr) {
     const adx = adxData?.adx || 0;
     if (adx > 30) return 'trending';
@@ -456,9 +595,6 @@ class DeepMarketState extends EventEmitter {
     return 'weak_trend';
   }
 
-  // [FILE-2A] Regime classification inline. Same decision tree as
-  // regime.js._classifyRegime, kept here so state.regime is available
-  // on every compute() call without waiting for a regime event.
   _classifyRegime(state) {
     const { trend, momentum, volatility, structure } = state;
     const adx = trend.strength;
@@ -468,7 +604,6 @@ class DeepMarketState extends EventEmitter {
     const isAtSupport = structure.isAtSupport;
     const isAtResistance = structure.isAtResistance;
 
-    // 1. Strong trend
     if (adx > 30 && trend.direction === 'bullish') {
       return {
         code: 'STRONG_TREND_BULL',
@@ -486,7 +621,6 @@ class DeepMarketState extends EventEmitter {
       };
     }
 
-    // 2. Breakout
     if ((isAtSupport || isAtResistance) && bbWidth > 0.1) {
       return {
         code: 'BREAKOUT',
@@ -496,7 +630,6 @@ class DeepMarketState extends EventEmitter {
       };
     }
 
-    // 3. High volatility
     if (volatility.regime === 'high' && atrPercent > 0.005) {
       return {
         code: 'HIGH_VOLATILITY',
@@ -506,7 +639,6 @@ class DeepMarketState extends EventEmitter {
       };
     }
 
-    // 4. Low volatility
     if (volatility.regime === 'low' && atrPercent < 0.001) {
       return {
         code: 'LOW_VOLATILITY',
@@ -516,7 +648,6 @@ class DeepMarketState extends EventEmitter {
       };
     }
 
-    // 5. Ranging
     if (adx < 20 && bbWidth < 0.15) {
       return {
         code: 'RANGING',
@@ -526,7 +657,6 @@ class DeepMarketState extends EventEmitter {
       };
     }
 
-    // 6. Reversal zone
     if ((rsi > 70 || rsi < 30) && (isAtSupport || isAtResistance)) {
       return {
         code: 'REVERSAL',
@@ -536,7 +666,6 @@ class DeepMarketState extends EventEmitter {
       };
     }
 
-    // 7. Weak trend
     if (adx >= 20 && adx < 30) {
       return {
         code: 'WEAK_TREND',
@@ -546,7 +675,6 @@ class DeepMarketState extends EventEmitter {
       };
     }
 
-    // 8. Neutral
     return {
       code: 'NEUTRAL',
       name: REGIME_NAMES.NEUTRAL,
@@ -555,34 +683,27 @@ class DeepMarketState extends EventEmitter {
     };
   }
 
-  // [FILE-2B] Real confidence from multi-factor alignment.
   _calculateConfidence(state) {
     let conf = 50;
     const { trend, momentum, volatility, structure, summary } = state;
 
-    // Trend strength
     if (trend.strength > 30) conf += 15;
     else if (trend.strength > 20) conf += 8;
     else if (trend.strength < 15) conf -= 10;
 
-    // Momentum alignment (not overbought/oversold in trend direction)
     if (momentum.rsi > 40 && momentum.rsi < 60) conf += 5;
     else if (momentum.rsi > 70 || momentum.rsi < 30) conf -= 5;
 
-    // Volatility normal is best
     if (volatility.regime === 'high') conf -= 5;
     else if (volatility.regime === 'low') conf += 5;
 
-    // Structure gives extra conviction
     if (structure.isAtSupport || structure.isAtResistance) conf += 10;
 
-    // Market quality contributes
     conf += ((summary.marketQuality || 50) - 50) * 0.2;
 
     return Math.round(Math.max(0, Math.min(100, conf)));
   }
 
-  // [FILE-2F] Human-readable reason.
   _buildReason(state) {
     const parts = [];
     const { trend, momentum, volatility, structure, session: sess, regime } = state;
@@ -597,7 +718,6 @@ class DeepMarketState extends EventEmitter {
     return parts.join(' | ');
   }
 
-  // ---------- Pip size for spread scaling ----------
   _pipSizeForSymbol(symbol) {
     const clean = this._normalizeSymbol(symbol);
     const mapping = {
@@ -613,11 +733,36 @@ class DeepMarketState extends EventEmitter {
   // ---------- Public API ----------
   updateIncremental(tick) {
     // Reserved for future use — currently no-op.
-    // [FILE-2] Do not remove; called by any legacy code path.
   }
 
+  // [FIX-MS2] Normalize the symbol for getLastState so callers passing
+  // 'EUR_USD' and callers passing 'EURUSD' hit the same entry.
   getLastState(symbol) {
-    return this._lastState.get(symbol) || null;
+    const canonical = this._normalizeSymbol(symbol);
+    return this._lastState.get(canonical) || this._lastState.get(symbol) || null;
+  }
+
+  // [FIX-MS8] Diagnostic counters for /debug/market-state endpoints.
+  getDiagnostics() {
+    const entries = [];
+    for (const [key, val] of this._lastHistoricalPublish) {
+      entries.push({
+        key,
+        lastPublishAt: val.at,
+        ageMs: Date.now() - val.at,
+        regimeCode: val.regimeCode,
+        trendDirection: val.trendDirection,
+      });
+    }
+    return {
+      buffers: Array.from(this._buffers.entries()).map(([key, buf]) => ({
+        key,
+        candles: buf.length,
+      })),
+      lastState: Array.from(this._lastState.keys()),
+      historicalPublish: entries,
+      counters: { ...this._publishStats },
+    };
   }
 }
 
