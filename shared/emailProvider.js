@@ -1,6 +1,6 @@
-// services/emailService.js - VIRALOOP Email System (Production Ready)
+// services/emailService.js - VIRALOOP Email System (Production Ready - Brevo Only)
 
-const nodemailer = require('nodemailer');
+const nodemailer = require('nodemailer'); // kept for API compatibility; not used for sending
 const axios = require('axios');
 
 /* =========================================================
@@ -11,30 +11,12 @@ const APP_NAME = 'VIRALOOP';
 const APP_URL = process.env.APP_URL || 'https://voxtraapp.com';
 const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || 'support@voxtraapp.com';
 
-const EMAIL_PROVIDER = process.env.EMAIL_PROVIDER || 'auto';
 const BREVO_API_KEY = process.env.BREVO_API_KEY;
 
-/* =========================================================
-   GMAIL TRANSPORTER
-========================================================= */
-
-const gmailTransporter = nodemailer.createTransport({
-    host: "smtp.gmail.com",
-    port: 465,
-    secure: true,
-    auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS
-    },
-    pool: true,
-    maxConnections: 5,
-    maxMessages: 100
-});
-
-// verify Gmail connection on startup
-gmailTransporter.verify()
-    .then(() => console.log("📧 Gmail SMTP ready"))
-    .catch(err => console.error("❌ Gmail SMTP error:", err.message));
+// Warn early if Brevo is not configured (does not crash the app)
+if (!BREVO_API_KEY) {
+    console.error("❌ BREVO_API_KEY is not set. Emails will fail until it is configured.");
+}
 
 /* =========================================================
    EMAIL WRAPPER
@@ -78,83 +60,23 @@ body { font-family: Arial, sans-serif; background:#f5f5f5; margin:0; padding:0; 
 }
 
 /* =========================================================
-   CORE EMAIL SENDER
+   CORE EMAIL SENDER (BREVO ONLY)
 ========================================================= */
 
 async function sendEmail(to, subject, htmlContent) {
     const html = getEmailWrapper(htmlContent, subject);
 
     try {
-        // AUTO MODE
-        if (EMAIL_PROVIDER === 'auto') {
-
-            // TRY BREVO FIRST
-            if (BREVO_API_KEY) {
-                try {
-                    await sendViaBrevo(to, subject, html);
-                    console.log(`📧 Email sent via Brevo to ${to}`);
-                    return { success: true, provider: 'brevo' };
-                } catch (err) {
-                    console.error("⚠️ Brevo failed:", err.message);
-                }
-            }
-
-            // FALLBACK TO GMAIL
-            const info = await gmailTransporter.sendMail({
-                from: `"${APP_NAME}" <${process.env.EMAIL_USER}>`,
-                to,
-                subject,
-                html
-            });
-
-            console.log(`📧 Email sent via Gmail to ${to}`);
-            return {
-                success: true,
-                provider: 'gmail',
-                messageId: info.messageId
-            };
+        if (!BREVO_API_KEY) {
+            throw new Error('BREVO_API_KEY is not configured');
         }
 
-        // FORCED GMAIL
-        if (EMAIL_PROVIDER === 'gmail') {
-            const info = await gmailTransporter.sendMail({
-                from: `"${APP_NAME}" <${process.env.EMAIL_USER}>`,
-                to,
-                subject,
-                html
-            });
-
-            return { success: true, provider: 'gmail', messageId: info.messageId };
-        }
-
-        // FORCED BREVO
-        if (EMAIL_PROVIDER === 'brevo') {
-            await sendViaBrevo(to, subject, html);
-            return { success: true, provider: 'brevo' };
-        }
-
-        return { success: false, error: 'Invalid EMAIL_PROVIDER' };
-
+        const data = await sendViaBrevo(to, subject, html);
+        console.log(`📧 Email sent via Brevo to ${to}`);
+        return { success: true, provider: 'brevo', data };
     } catch (error) {
         console.error("❌ Email send failed:", error.message);
-
-        // FINAL FALLBACK
-        try {
-            const info = await gmailTransporter.sendMail({
-                from: `"${APP_NAME}" <${process.env.EMAIL_USER}>`,
-                to,
-                subject,
-                html
-            });
-
-            return {
-                success: true,
-                provider: 'gmail-fallback',
-                messageId: info.messageId
-            };
-        } catch (finalErr) {
-            return { success: false, error: finalErr.message };
-        }
+        return { success: false, provider: 'brevo', error: error.message };
     }
 }
 
