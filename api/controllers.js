@@ -1,4 +1,26 @@
 // api/controllers.js – Complete Request Handlers (with defensive candles + resilient close)
+//
+// [FIX-STRAT] placeOrder / autoTrade / executeSignal now destructure and
+//   pass through `strategy`, `regimeCode`, and `entryThesis` to
+//   orderService.placeMarketOrder. Previously these were silently dropped
+//   from req.body, so Trade.strategy was null for every manual and
+//   live-signal trade — breaking strategy performance attribution.
+//
+// [FIX-BROKER-ERR] handleOrderError is now async and reconciles before
+//   returning BROKER_ERROR. On any non-validation broker error, it:
+//     1. Waits RECONCILE_GRACE_MS (2s) for Deriv to settle.
+//     2. Busts the broker portfolio cache.
+//     3. Fetches open contracts.
+//     4. Matches against {symbol, side, purchasePrice within $0.01,
+//        openTime within lookback window}.
+//     5. On match → returns CONFIRMED_RECORD_FAILED (accurate).
+//     6. On no match → returns BROKER_ERROR (accurate).
+//   The frontend's "purchase may have completed" warning now only
+//   fires when no contract actually exists.
+//
+// All callers of handleOrderError now pass a `context` object with
+// { product, symbol, side, stake, lookbackMs } so reconciliation has
+// the criteria to match against.
 
 const Trade = require('../models/Trade');
 const Order = require('../models/Order');
@@ -17,6 +39,12 @@ const logger = require('../infrastructure/logger') || console;
 
 const { generateReport } = require('../core/reporting/reportGenerator');
 const { broadcastToDashboards } = require('../server');
+
+// [FIX-BROKER-ERR] Reconcile parameters — mirror broker.js and
+// contractService.js so all three reconcilers are in lockstep.
+const RECONCILE_GRACE_MS = 2000;
+const RECONCILE_LOOKBACK_MS = 60_000;
+const RECONCILE_STAKE_TOLERANCE = 0.01;
 
 const portfolioManager = new PortfolioManager({
   maxOpenTrades: parseInt(process.env.MAX_OPEN_TRADES) || 5,
@@ -80,15 +108,114 @@ function respondConfirmedButUnrecorded(res, contractId, details, reason) {
   });
 }
 
-function handleOrderError(res, error, logTag) {
-  logger.error(`[${logTag}] Error:`, error.message);
-  if (error.executionConfirmed === true || error.contractId) {
-    return respondConfirmedButUnrecorded(res, error.contractId || null, {}, error.message);
+// [FIX-BROKER-ERR] Reconcile a post-buy error against the live portfolio.
+// Match criteria (identical to broker._reconcileOrphanBuy and
+// contractService._reconcileBuy):
+//   • same normalized symbol
+//   • same side (BUY/SELL), if determinable
+//   • purchasePrice within $0.01 of intended stake
+//   • openTime >= (Date.now() - lookbackMs)
+// Returns the matching normalized position, or null.
+async function _reconcilePostBuyError(context) {
+  const { product, symbol, side, stake, lookbackMs = RECONCILE_LOOKBACK_MS } = context;
+  if (!symbol) return null;
+
+  // Give Deriv time to settle a possibly-succeeded buy.
+  await new Promise(r => setTimeout(r, RECONCILE_GRACE_MS));
+
+  let broker;
+  try { broker = getBroker(product); }
+  catch (err) {
+    logger.warn(`[controllers] reconcile: broker lookup failed: ${err.message}`);
+    return null;
   }
+
+  // Bust the cache so we see the post-buy portfolio, not a 3s-stale snapshot.
+  if (broker._portfolioCache) broker._portfolioCache.at = 0;
+
+  let positions;
+  try { positions = await broker.getOpenTrades(); }
+  catch (err) {
+    logger.warn(`[controllers] reconcile: portfolio fetch failed: ${err.message}`);
+    return null;
+  }
+
+  const targetSymbol = String(symbol).replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
+  const expectedSide = (side === 'BUY' || side === 'SELL') ? side : null;
+  const stakeNum = Math.abs(Number(stake));
+  const minOpenTime = Date.now() - lookbackMs;
+
+  const candidates = positions.filter(p => {
+    const pSym = String(p.instrument || '').replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
+    if (pSym !== targetSymbol) return false;
+
+    if (expectedSide && p.side && p.side !== 'UNKNOWN' && p.side !== expectedSide) return false;
+
+    if (Number.isFinite(stakeNum) && stakeNum > 0 && p.purchasePrice != null) {
+      if (Math.abs(Number(p.purchasePrice) - stakeNum) > RECONCILE_STAKE_TOLERANCE) return false;
+    }
+
+    if (p.openTime && p.openTime < minOpenTime) return false;
+    return true;
+  });
+
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => (b.openTime || 0) - (a.openTime || 0));
+  return candidates[0];
+}
+
+// [FIX-BROKER-ERR] handleOrderError is async and reconciles before
+// returning BROKER_ERROR. The reconciliation only runs for errors that
+// are neither pre-purchase validation nor already-confirmed execution —
+// those two categories have known outcomes and don't need the check.
+async function handleOrderError(res, error, logTag, context = {}) {
+  logger.error(`[${logTag}] Error:`, error.message);
+
+  // 1. Execution already confirmed — respond immediately.
+  if (error.executionConfirmed === true || error.contractId) {
+    return respondConfirmedButUnrecorded(res, error.contractId || null, {
+      strategy: context.strategy || null,
+      regimeCode: context.regimeCode || null,
+    }, error.message);
+  }
+
+  // 2. Pre-purchase validation — safe to retry after correcting input.
   const isValidation = PRE_PURCHASE_VALIDATION_PATTERNS.some(re => re.test(error.message || ''));
   if (isValidation) {
-    return res.status(400).json({ success: false, status: 'REJECTED', error: error.message, canRetry: true });
+    return res.status(400).json({
+      success: false, status: 'REJECTED',
+      error: error.message, canRetry: true,
+    });
   }
+
+  // 3. Post-purchase ambiguity — reconcile before declaring broker failure.
+  if (context.symbol && context.stake) {
+    try {
+      const recovered = await _reconcilePostBuyError(context);
+      if (recovered) {
+        logger.warn(
+          `[${logTag}] Recovered contract ${recovered.id} despite error "${error.message}" ` +
+          `— returning CONFIRMED_RECORD_FAILED (not BROKER_ERROR)`
+        );
+        return res.status(200).json({
+          success: true,
+          status: 'CONFIRMED_RECORD_FAILED',
+          contractId: String(recovered.id),
+          entryPrice: recovered.entryPrice,
+          purchasePrice: recovered.purchasePrice,
+          strategy: context.strategy || null,
+          regimeCode: context.regimeCode || null,
+          recovered: true,
+          originalError: error.message,
+          warning: 'Purchase confirmed by portfolio reconciliation. DO NOT retry.',
+        });
+      }
+    } catch (recErr) {
+      logger.warn(`[${logTag}] Reconcile attempt failed: ${recErr.message}`);
+    }
+  }
+
+  // 4. No recovery — genuine broker error.
   return res.status(500).json({
     success: false, status: 'BROKER_ERROR', error: error.message, canRetry: false,
     warning: 'The broker returned an error. Check open positions before retrying.',
@@ -316,11 +443,18 @@ exports.placeOrder = async (req, res) => {
   const {
     pair, side, lotSize, stopLoss, takeProfit, stake, multiplier,
     duration, knockoutLevel, takeProfitLevel, product: overrideProduct,
+    // [FIX-STRAT]
+    strategy, regimeCode, entryThesis,
   } = req.body;
 
+  // [FIX-BROKER-ERR] Pre-compute product and instrument so the catch
+  // block can pass them as reconcile context. Guarded against missing
+  // `pair` — the original validation inside `try` still surfaces the
+  // correct REJECTED error.
+  const product = overrideProduct || getProduct(req);
+  const instrument = (typeof pair === 'string' && pair.length > 0) ? pair.toUpperCase() : null;
+
   try {
-    const product = overrideProduct || getProduct(req);
-    const instrument = pair.toUpperCase();
     const isMultiplier = stake !== undefined && stake !== null && stake > 0;
     const isCFD = lotSize !== undefined && lotSize !== null && lotSize > 0;
 
@@ -328,6 +462,14 @@ exports.placeOrder = async (req, res) => {
       return res.status(400).json({
         success: false, status: 'REJECTED',
         error: 'Either stake (Multiplier) or lotSize (CFD) must be provided.',
+        canRetry: true,
+      });
+    }
+
+    if (!instrument) {
+      return res.status(400).json({
+        success: false, status: 'REJECTED',
+        error: 'pair is required',
         canRetry: true,
       });
     }
@@ -340,6 +482,8 @@ exports.placeOrder = async (req, res) => {
         knockoutLevel: knockoutLevel || null,
         takeProfitLevel: takeProfitLevel || null,
         product,
+        // [FIX-STRAT]
+        strategy, regimeCode, entryThesis,
       });
     } else {
       const currentPrice = await marketProvider.getCurrentPrice(instrument, product);
@@ -361,6 +505,8 @@ exports.placeOrder = async (req, res) => {
       orderResult = await orderService.placeMarketOrder({
         instrument, side, lotSize,
         stopLoss: stopLoss || null, takeProfit: takeProfit || null, product,
+        // [FIX-STRAT]
+        strategy, regimeCode, entryThesis,
       });
     }
 
@@ -371,6 +517,9 @@ exports.placeOrder = async (req, res) => {
       return respondConfirmedButUnrecorded(res, contractId, {
         entryPrice: orderResult.entryPrice, purchasePrice: orderResult.purchasePrice,
         recording: orderResult.recording, raw: orderResult,
+        // [FIX-STRAT]
+        strategy: orderResult.strategy || strategy || null,
+        regimeCode: orderResult.regimeCode || regimeCode || null,
       }, (orderResult.recording?.order?.error || orderResult.recording?.trade?.error || 'unknown'));
     }
 
@@ -390,9 +539,21 @@ exports.placeOrder = async (req, res) => {
       success: true, status: 'FILLED', contractId,
       entryPrice: orderResult.entryPrice, purchasePrice: orderResult.purchasePrice,
       trade, raw: orderResult,
+      // [FIX-STRAT] echo back so the frontend can confirm
+      strategy: orderResult.strategy || strategy || null,
+      regimeCode: orderResult.regimeCode || regimeCode || null,
     });
   } catch (error) {
-    return handleOrderError(res, error, 'placeOrder');
+    return handleOrderError(res, error, 'placeOrder', {
+      product,
+      symbol: instrument,
+      side,
+      stake,
+      lookbackMs: RECONCILE_LOOKBACK_MS,
+      // [FIX-STRAT]
+      strategy,
+      regimeCode,
+    });
   }
 };
 
@@ -530,16 +691,30 @@ exports.getSignal = async (req, res) => {
 };
 
 exports.autoTrade = async (req, res) => {
-  const { pair, riskPercent = 1, strategy = 'sma', ...params } = req.body;
-  if (!pair) return res.status(400).json({ error: 'pair required' });
+  const {
+    pair, riskPercent = 1, strategy: stratParam = 'sma', ...params
+  } = req.body;
+
+  // [FIX-BROKER-ERR] Pre-compute for reconcile context.
+  const product = getProduct(req);
+  const instrument = (typeof pair === 'string' && pair.length > 0) ? pair.toUpperCase() : null;
+
+  // [FIX-STRAT] Destructure the attribution fields from req.body.
+  const {
+    stake, multiplier, duration, knockoutLevel, takeProfitLevel,
+    strategy: bodyStrategy, regimeCode, entryThesis,
+  } = req.body;
+  // Prefer explicit body.strategy (attribution) over stratParam (engine selector).
+  const attributionStrategy = bodyStrategy || null;
+
   try {
-    const product = getProduct(req);
-    const instrument = pair.toUpperCase();
-    const signal = await strategyEngine.generateSignal(instrument, strategy, { ...params, product });
+    if (!instrument) {
+      return res.status(400).json({ error: 'pair required' });
+    }
+    const signal = await strategyEngine.generateSignal(instrument, stratParam, { ...params, product });
     if (!signal) return res.json({ success: false, status: 'NO_SIGNAL', message: 'No trading signal' });
 
     const currentPrice = signal.entryPrice;
-    const { stake, multiplier, duration, knockoutLevel, takeProfitLevel } = req.body;
     const isMultiplier = stake !== undefined && stake !== null && stake > 0;
 
     let orderResult;
@@ -548,6 +723,8 @@ exports.autoTrade = async (req, res) => {
         instrument, side: signal.side, stake, multiplier, duration,
         knockoutLevel: knockoutLevel || null, takeProfitLevel: takeProfitLevel || null,
         product, decisionId: null, autoTrade: true,
+        // [FIX-STRAT]
+        strategy: attributionStrategy, regimeCode, entryThesis,
       });
     } else {
       const validation = validateOrderInput({
@@ -572,6 +749,8 @@ exports.autoTrade = async (req, res) => {
         instrument, side: signal.side, lotSize,
         stopLoss: signal.stopLoss || null, takeProfit: signal.takeProfit || null,
         product, decisionId: null, autoTrade: true,
+        // [FIX-STRAT]
+        strategy: attributionStrategy, regimeCode, entryThesis,
       });
     }
 
@@ -581,6 +760,8 @@ exports.autoTrade = async (req, res) => {
       return respondConfirmedButUnrecorded(res, contractId, {
         signal, entryPrice: orderResult.entryPrice, purchasePrice: orderResult.purchasePrice,
         recording: orderResult.recording, raw: orderResult,
+        strategy: orderResult.strategy || attributionStrategy || null,
+        regimeCode: orderResult.regimeCode || regimeCode || null,
       }, (orderResult.recording?.order?.error || orderResult.recording?.trade?.error || 'unknown'));
     }
     const trade = await Trade.findOne({ contractId: String(contractId) });
@@ -592,9 +773,21 @@ exports.autoTrade = async (req, res) => {
     const broker = getBroker(product);
     const account = await broker.getAccount();
     notifyTrade('OPENED', trade, account).catch(() => {});
-    return res.status(200).json({ success: true, status: 'FILLED', contractId, signal, trade, raw: orderResult });
+    return res.status(200).json({
+      success: true, status: 'FILLED', contractId, signal, trade, raw: orderResult,
+      strategy: orderResult.strategy || attributionStrategy || null,
+      regimeCode: orderResult.regimeCode || regimeCode || null,
+    });
   } catch (error) {
-    return handleOrderError(res, error, 'autoTrade');
+    return handleOrderError(res, error, 'autoTrade', {
+      product,
+      symbol: instrument,
+      side: null,   // side comes from the signal, unknown at catch time
+      stake,
+      lookbackMs: RECONCILE_LOOKBACK_MS,
+      strategy: attributionStrategy,
+      regimeCode,
+    });
   }
 };
 
@@ -602,15 +795,19 @@ exports.executeSignal = async (req, res) => {
   const {
     pair, side, entryPrice, stopLoss, takeProfit, lotSize,
     stake, multiplier, duration, knockoutLevel, takeProfitLevel,
+    // [FIX-STRAT]
+    strategy, regimeCode, entryThesis,
   } = req.body;
 
-  if (!pair || !side) return res.status(400).json({ error: 'pair and side are required' });
-  const formattedPair = formatSymbol(pair);
-  const cleanSide = side.toUpperCase().trim();
-  if (!['BUY', 'SELL'].includes(cleanSide)) return res.status(400).json({ error: 'Side must be BUY or SELL' });
+  // [FIX-BROKER-ERR] Pre-compute for reconcile context.
+  const product = getProduct(req);
+  const formattedPair = pair ? formatSymbol(pair) : null;
+  const cleanSide = (typeof side === 'string') ? side.toUpperCase().trim() : null;
 
   try {
-    const product = getProduct(req);
+    if (!formattedPair || !cleanSide) return res.status(400).json({ error: 'pair and side are required' });
+    if (!['BUY', 'SELL'].includes(cleanSide)) return res.status(400).json({ error: 'Side must be BUY or SELL' });
+
     const instrument = formattedPair;
     const currentPrice = entryPrice || await marketProvider.getCurrentPrice(instrument, product);
     const isMultiplier = stake !== undefined && stake !== null && stake > 0;
@@ -620,6 +817,8 @@ exports.executeSignal = async (req, res) => {
       orderResult = await orderService.placeMarketOrder({
         instrument, side: cleanSide, stake, multiplier, duration,
         knockoutLevel: knockoutLevel || null, takeProfitLevel: takeProfitLevel || null, product,
+        // [FIX-STRAT]
+        strategy, regimeCode, entryThesis,
       });
     } else {
       if (!lotSize || lotSize <= 0) {
@@ -635,6 +834,8 @@ exports.executeSignal = async (req, res) => {
       orderResult = await orderService.placeMarketOrder({
         instrument, side: cleanSide, lotSize: parseFloat(lotSize),
         stopLoss: stopLoss || null, takeProfit: takeProfit || null, product,
+        // [FIX-STRAT]
+        strategy, regimeCode, entryThesis,
       });
     }
 
@@ -644,6 +845,8 @@ exports.executeSignal = async (req, res) => {
       return respondConfirmedButUnrecorded(res, contractId, {
         entryPrice: orderResult.entryPrice, purchasePrice: orderResult.purchasePrice,
         recording: orderResult.recording, raw: orderResult,
+        strategy: orderResult.strategy || strategy || null,
+        regimeCode: orderResult.regimeCode || regimeCode || null,
       }, (orderResult.recording?.order?.error || orderResult.recording?.trade?.error || 'unknown'));
     }
     const trade = await Trade.findOne({ contractId: String(contractId) });
@@ -658,9 +861,19 @@ exports.executeSignal = async (req, res) => {
     return res.status(200).json({
       success: true, status: 'FILLED', contractId,
       entryPrice: orderResult.entryPrice, purchasePrice: orderResult.purchasePrice, trade, raw: orderResult,
+      strategy: orderResult.strategy || strategy || null,
+      regimeCode: orderResult.regimeCode || regimeCode || null,
     });
   } catch (error) {
-    return handleOrderError(res, error, 'executeSignal');
+    return handleOrderError(res, error, 'executeSignal', {
+      product,
+      symbol: formattedPair,
+      side: cleanSide,
+      stake,
+      lookbackMs: RECONCILE_LOOKBACK_MS,
+      strategy,
+      regimeCode,
+    });
   }
 };
 
