@@ -15,16 +15,25 @@
 //           MongoDB is disconnected
 // [FIX-S13] RTS startup email notification. After server.listen succeeds
 //           (which requires the awaited MongoDB connection from S11), an
-//           email is sent to esilesirayland@gmail.com listing every
-//           private LAN IPv4 address the laptop is reachable on, so the
-//           phone can connect from the same network. Reuses the existing
-//           services/emailService.js sendEmail() — no new dependencies.
-//           Failures are logged but never crash startup: the notification
-//           is a convenience, not a critical path.
+//           email is sent listing every private LAN IPv4 address the laptop
+//           is reachable on, so the phone can connect from the same network.
+//           Uses services/emailService.js (Brevo-only, self-loading .env,
+//           send-time key read, HTTP-status surfaced on failure).
+//           Recipient is taken from env (RTS_NOTIFY_EMAIL / ALERT_EMAIL /
+//           SUPPORT_EMAIL). Failures are logged with the exact Brevo cause
+//           but never crash startup: the notification is a convenience,
+//           not a critical path.
 // [FIX-S14] Notification is fired inside server.listen() callback so it
 //           only runs after the port is actually bound. Combined with S11,
 //           this guarantees the email only goes out when MongoDB AND
 //           Express AND broker bootstrap have all succeeded.
+// [FIX-S15] Switched email provider from ./shared/emailProvider to
+//           ./services/emailService. The old module read BREVO_API_KEY at
+//           module-load time (before dotenv ran) and fell back to a dead
+//           Gmail transporter, which caused silent "email failed" logs.
+//           services/emailService.js loads .env itself, reads the key at
+//           send-time, and returns { success, provider, error, httpStatus,
+//           diagnostics } so failures are now diagnosable.
 
 require('dotenv').config();
 
@@ -37,7 +46,7 @@ const http = require('http');
 const os = require('os');                             // [FIX-S13]
 
 const logger = require('./infrastructure/logger') || console;
-const { sendEmail } = require('./shared/emailProvider'); // [FIX-S13]
+const { sendEmail } = require('./services/emailService'); // [FIX-S13/S15]
 
 const dashboardClients = new Set();
 
@@ -191,8 +200,8 @@ function getRTSLanAddresses(port) {
 }
 
 /**
- * Send the RTS startup email to esilesirayland@gmail.com.
- * Non-throwing — failures are logged but never interrupt startup.
+ * Send the RTS startup email. Non-throwing — failures are logged with
+ * the exact Brevo cause but never interrupt startup.
  * Called from inside server.listen() callback in startServer().
  */
 async function sendRTSStartupNotification(port) {
@@ -232,20 +241,69 @@ async function sendRTSStartupNotification(port) {
     <p>RTS Automatic Startup Notification</p>
   `;
 
+  // [FIX-S15] Recipient from env, not hardcoded.
+  const to =
+    process.env.RTS_NOTIFY_EMAIL ||
+    process.env.ALERT_EMAIL ||
+    process.env.SUPPORT_EMAIL;
+
+  if (!to) {
+    logger.error(
+      '[Notify] No recipient configured. Set RTS_NOTIFY_EMAIL ' +
+      '(or ALERT_EMAIL / SUPPORT_EMAIL) in .env'
+    );
+    return;
+  }
+
+  const keyPresent = !!process.env.BREVO_API_KEY;
+  const sender     = process.env.SUPPORT_EMAIL || 'support@voxtraapp.com';
+
+  logger.info(
+    `[Notify] Sending startup email -> to=${to} sender=${sender} ` +
+    `keyPresent=${keyPresent} keyLength=${(process.env.BREVO_API_KEY || '').length}`
+  );
+
+  if (!keyPresent) {
+    logger.error(
+      '[Notify] BREVO_API_KEY missing in .env. Startup email skipped. ' +
+      'Add BREVO_API_KEY=xkeysib-... and restart.'
+    );
+    return;
+  }
+
   try {
     const result = await sendEmail(
-      'esilesirayland@gmail.com',
+      to,
       'RTS is ONLINE - Laptop Startup Notification',
       html
     );
 
-    if (result.success) {
-      logger.info(`[Notify] RTS startup email sent via ${result.provider || 'unknown'}`);
-    } else {
-      logger.error(`[Notify] RTS startup email failed: ${result.error || 'unknown error'}`);
+    if (result && result.success) {
+      logger.info(
+        `[Notify] Startup email SENT via ${result.provider || 'unknown'} ` +
+        `(messageId=${result.messageId || 'n/a'}) to ${to}`
+      );
+      return;
+    }
+
+    const status = (result && result.httpStatus) || '';
+    const errMsg = (result && result.error) || 'unknown error';
+    logger.error(`[Notify] Startup email FAILED: ${errMsg}`);
+
+    if (status === 401 || status === 403) {
+      logger.error('[Notify] => BREVO_API_KEY is wrong or revoked. Regenerate in Brevo dashboard.');
+    } else if (status === 400) {
+      logger.error(
+        `[Notify] => Sender "${sender}" is not verified in Brevo. ` +
+        'Verify at https://app.brevo.com/sender'
+      );
+    } else if (/ENOTFOUND|ECONNREFUSED|ETIMEDOUT|timeout/i.test(errMsg)) {
+      logger.error('[Notify] => Cannot reach api.brevo.com. Check firewall / DNS / internet.');
+    } else if (result && result.diagnostics) {
+      logger.error(`[Notify] Diagnostics: ${JSON.stringify(result.diagnostics)}`);
     }
   } catch (error) {
-    logger.error(`[Notify] RTS notification error: ${error.message}`);
+    logger.error(`[Notify] Startup email threw: ${error.message}`);
   }
 }
 
