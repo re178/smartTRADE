@@ -31,6 +31,29 @@
 //          verification stops re-polling the same 13 IDs every 60s.
 // [FILE-4.4] tick event includes mid. Synthetics in symbol map + watchlist.
 // [FILE-4.1] getCandles uses ticks_history with style='candles'.
+//
+// [FIX-ICP] **ROOT CAUSE FIX for InvalidContractProposal + "purchase may
+//           have completed" warnings.** `_sendAuthRequest` now detects
+//           `payload.buy` and clamps retries to 1. Proposal IDs are
+//           single-use: if the first buy succeeds on Deriv but the client
+//           times out, a retry with the same proposal ID fails with
+//           InvalidContractProposal — misleadingly suggesting the trade
+//           didn't happen. InvalidContractProposal is also added to
+//           isPermanentApiError for defense-in-depth.
+//
+// [FIX-RECON-BUY] placeMarketOrder now wraps the buy call with portfolio
+//           reconciliation. If the buy throws (timeout, InvalidContractProposal,
+//           network drop), _reconcileOrphanBuy checks portfolio for a
+//           matching contract created within the last 60s. On match, the
+//           contract is returned as if the buy succeeded — no retry, no
+//           silent loss.
+//
+// [FIX-ORPHAN] Periodic _sweepOrphanContracts in the reconcile timer
+//           compares live portfolio against Trade records. Any contract
+//           live at Deriv with no Trade doc is adopted: a Trade record is
+//           created, the contract is subscribed, and trade.adopted is
+//           emitted. This catches survivors of every other safety net
+//           (process restart during a buy, WS death mid-flight, etc.).
 
 const WebSocket = require('ws');
 const axios = require('axios');
@@ -79,6 +102,11 @@ const VERIFY_BACKOFF_BASE_MS = 60_000;
 const VERIFY_BACKOFF_MAX_MS = 15 * 60_000;
 // [FIX-C1] Deriv min SL/TP amount in account currency for Multiplier contracts.
 const MIN_LIMIT_ORDER_AMOUNT = 0.01;
+
+// [FIX-RECON-BUY] How far back to look when reconciling an orphaned buy.
+const RECONCILE_BUY_LOOKBACK_MS = 60_000;
+// [FIX-RECON-BUY] Grace period before reconciling so Deriv can settle.
+const RECONCILE_BUY_GRACE_MS = 2000;
 
 function generateRequestId() { return ++_requestCounter; }
 
@@ -139,7 +167,11 @@ function isPermanentApiError(err) {
   const msg = String(err.message);
   return (msg.includes('InputValidationFailed') || msg.includes('InvalidSymbol') ||
     msg.includes('ContractCreationFailure') || msg.includes('AuthorizationRequired') ||
-    msg.includes('InvalidToken') || msg.includes('PermissionDenied') || msg.includes('InvalidExpiry'));
+    msg.includes('InvalidToken') || msg.includes('PermissionDenied') || msg.includes('InvalidExpiry') ||
+    // [FIX-ICP] Never retry — proposal ID is already consumed. Retrying
+    // would just generate the same error again and mask the "purchase may
+    // have completed" state.
+    msg.includes('InvalidContractProposal'));
 }
 
 // [FIX-C2] Detect Deriv rate-limit errors from either thrown errors or raw
@@ -362,6 +394,8 @@ class DerivBroker extends EventEmitter {
     this._verifyUnknownCounts = new Map();
     this._closedEmitted = new Set();
     this._tradeReconcileTimer = null;
+    // [FIX-ORPHAN] Last sweep timestamp for diagnostics.
+    this._lastOrphanSweepAt = null;
 
     this.metrics = {
       connectedSince: null, requestsSent: 0, requestsFailed: 0, reconnections: 0,
@@ -378,6 +412,10 @@ class DerivBroker extends EventEmitter {
       limitOrderConverted: 0, limitOrderSkippedWrongSide: 0,
       // [FIX-M5] Diagnostics
       verifyBackoffHits: 0,
+      // [FIX-RECON-BUY] Recovery diagnostics
+      buyReconcileAttempts: 0, buyReconcileRecovered: 0,
+      // [FIX-ORPHAN] Adoption diagnostics
+      orphansAdopted: 0,
     };
 
     this.capabilities = { ...BROKER_CAPABILITIES };
@@ -863,12 +901,22 @@ class DerivBroker extends EventEmitter {
 
   // [FIX-C2] RateLimit → hard stop (no inline retry) + shared cooldown.
   // Non-rate-limit retryable errors still use exponential backoff.
+  // [FIX-ICP] Buy requests are single-shot — never retried.
   async _sendAuthRequest(payload, timeoutMs = 15000, signal = null) {
     await this._rateLimiter.acquire();
     if (this._authState !== STATE.READY) await this._connectAuth();
     if (!this._authSocket || this._authSocket.readyState !== WebSocket.OPEN) throw new Error('Auth WS not open');
+
+    // [FIX-ICP] Buy is state-changing and non-idempotent: proposal IDs are
+    // single-use. If the first buy succeeds on Deriv but the client sees a
+    // timeout, retrying with the same proposal ID will fail with
+    // InvalidContractProposal — masking the fact that a contract was
+    // created. Therefore buy requests are attempted exactly once.
+    const isBuyRequest = payload && payload.buy != null;
+    const maxAttempts = isBuyRequest ? 1 : this.config.maxRetries;
+
     let lastErr = null;
-    for (let attempt = 1; attempt <= this.config.maxRetries; attempt++) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         if (signal?.aborted) throw new Error('Request cancelled');
         return await this._sendAuthRawRequest(payload, timeoutMs, signal);
@@ -880,7 +928,7 @@ class DerivBroker extends EventEmitter {
           throw err;
         }
         if (isPermanentApiError(err)) break;
-        if (attempt < this.config.maxRetries) {
+        if (attempt < maxAttempts) {
           await sleep(this._getReconnectDelay(attempt));
           if (this._authState !== STATE.READY) await this._connectAuth();
         }
@@ -1189,10 +1237,124 @@ class DerivBroker extends EventEmitter {
 
   _startTradeReconcileTimer() {
     if (this._tradeReconcileTimer) clearInterval(this._tradeReconcileTimer);
-    this._tradeReconcileTimer = setInterval(() => {
-      this._reconcileTradeStatus().catch(() => {});
+    // [FIX-ORPHAN] Run both status reconcile and orphan sweep on each tick.
+    this._tradeReconcileTimer = setInterval(async () => {
+      await this._reconcileTradeStatus().catch(() => {});
+      await this._sweepOrphanContracts().catch(() => {});
     }, this.config.tradeReconcileIntervalMs);
     if (typeof this._tradeReconcileTimer.unref === 'function') this._tradeReconcileTimer.unref();
+  }
+
+  // [FIX-ORPHAN] Adopt any contract that is live in the portfolio but has
+  // no corresponding Trade document. This catches the case where a buy
+  // succeeded on Deriv but the client never received the response —
+  // no Trade doc, no subscription, and no eventual trade.closed event.
+  async _sweepOrphanContracts() {
+    if (this._authState !== STATE.READY) return;
+    if (this._isInRateLimitCooldown()) return;
+
+    let positions;
+    try { positions = await this.getOpenTrades(); }
+    catch (_) { return; }
+    if (!positions.length) { this._lastOrphanSweepAt = new Date(); return; }
+
+    const ids = positions.map(p => String(p.id)).filter(Boolean);
+    if (!ids.length) { this._lastOrphanSweepAt = new Date(); return; }
+
+    let existing = [];
+    try { existing = await Trade.find({ contractId: { $in: ids } }).lean(); }
+    catch (_) { return; }
+    const known = new Set(existing.map(t => String(t.contractId)));
+
+    this._lastOrphanSweepAt = new Date();
+
+    for (const pos of positions) {
+      const cid = String(pos.id);
+      if (!cid || known.has(cid)) continue;
+
+      logger.warn(
+        `[DerivBroker] ORPHAN CONTRACT DETECTED: ${cid} is live on Deriv but ` +
+        `has no Trade record — adopting (buy succeeded, response was lost).`
+      );
+
+      try {
+        await Trade.create({
+          contractId: cid,
+          instrument: pos.instrument,
+          side: (pos.side || 'BUY').toLowerCase(),
+          lotSize: pos.units || 0,
+          openPrice: pos.entryPrice || 0,
+          status: 'OPEN',
+          openTime: new Date(pos.openTime || Date.now()),
+          product: 'deriv_digital',
+          currentPrice: pos.currentPrice || pos.entryPrice || 0,
+          floatingProfit: pos.unrealizedPL || 0,
+          purchasePrice: pos.purchasePrice || null,
+          stake: pos.purchasePrice || null,
+          entryThesis: { adopted: true, reason: 'orphan_sweep' },
+        });
+        this.metrics.orphansAdopted++;
+      } catch (err) {
+        if (err.code !== 11000) {
+          logger.warn(`[DerivBroker] Orphan Trade create failed for ${cid}: ${err.message}`);
+          continue;
+        }
+        // Duplicate (race with another path) — treat as already handled.
+      }
+
+      this._subscribeOpenContract(cid).catch(() => {});
+      if (this._portfolioCache) this._portfolioCache.at = 0;
+
+      try {
+        eventBus.emit('trade.adopted', {
+          contractId: cid, instrument: pos.instrument,
+          entryPrice: pos.entryPrice, stake: pos.purchasePrice,
+          side: pos.side, timestamp: new Date().toISOString(),
+        });
+      } catch (_) {}
+    }
+  }
+
+  // [FIX-RECON-BUY] After a buy error, check whether the contract actually
+  // landed in the portfolio despite the client-side error. Match criteria:
+  //   • same underlying_symbol as the intended trade
+  //   • same side (BUY/SELL) as the intended direction
+  //   • purchase_price within $0.01 of the intended stake
+  //   • openTime >= (submittedAt - RECONCILE_BUY_LOOKBACK_MS)
+  // Returns the most recently opened match, or null if none.
+  async _reconcileOrphanBuy(derivSymbol, direction, stake, submittedAt) {
+    this.metrics.buyReconcileAttempts++;
+    // Give Deriv a beat to settle the (possibly-succeeded) buy.
+    await sleep(RECONCILE_BUY_GRACE_MS);
+
+    let positions;
+    try { positions = await this.getOpenTrades(); }
+    catch (err) {
+      logger.warn(`[DerivBroker] _reconcileOrphanBuy: portfolio fetch failed: ${err.message}`);
+      return null;
+    }
+
+    const expectedSide = direction === 'MULTUP' ? 'BUY' : direction === 'MULTDOWN' ? 'SELL' : null;
+    const stakeNum = Math.abs(Number(stake));
+    const minOpenTime = submittedAt - RECONCILE_BUY_LOOKBACK_MS;
+
+    const candidates = [];
+    for (const p of positions) {
+      const raw = p.raw || {};
+      const pSymbol = raw.underlying_symbol || raw.underlying || '';
+      if (pSymbol !== derivSymbol) continue;
+      if (expectedSide && p.side !== expectedSide) continue;
+      const pPrice = Number(p.purchasePrice || raw.buy_price || 0);
+      if (Number.isFinite(pPrice) && Math.abs(pPrice - stakeNum) > 0.01) continue;
+      const openTime = Number(p.openTime || 0);
+      if (openTime && openTime < minOpenTime) continue;
+      candidates.push(p);
+    }
+
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => (b.openTime || 0) - (a.openTime || 0));
+    this.metrics.buyReconcileRecovered++;
+    return candidates[0];
   }
 
   async _subscribeOpenContract(contractId) {
@@ -1783,7 +1945,39 @@ class DerivBroker extends EventEmitter {
     if (!proposal?.id) throw new Error(`Proposal missing: ${JSON.stringify(proposalResp)}`);
     const askPrice = Number(proposal.ask_price);
     if (!Number.isFinite(askPrice) || askPrice <= 0) throw new Error(`Invalid ask price.`);
-    const buyResp = await this._sendAuthRequest({ buy: proposal.id, price: askPrice });
+
+    // [FIX-RECON-BUY] Wrap the buy call so a client-side failure doesn't
+    // silently leave a live contract behind. If buy throws, reconcile
+    // against portfolio before re-throwing.
+    const buySubmittedAt = Date.now();
+    let buyResp;
+    try {
+      buyResp = await this._sendAuthRequest({ buy: proposal.id, price: askPrice });
+    } catch (buyErr) {
+      logger.warn(
+        `[DerivBroker] placeMarketOrder: buy failed for ${symbol} ${direction} ` +
+        `stake=${amount} (${buyErr.message}). Reconciling against portfolio...`
+      );
+      const recovered = await this._reconcileOrphanBuy(symbol, direction, amount, buySubmittedAt);
+      if (recovered) {
+        logger.warn(
+          `[DerivBroker] RECOVERED contract ${recovered.id} from portfolio after buy error. ` +
+          `Treating as success — do NOT retry.`
+        );
+        if (this._portfolioCache) this._portfolioCache.at = 0;
+        this._subscribeOpenContract(recovered.id).catch(() => {});
+        return {
+          contractId: recovered.id,
+          tradeID: recovered.id,
+          ticket: recovered.id,
+          purchasePrice: recovered.purchasePrice,
+          entryPrice: recovered.entryPrice,
+          price: recovered.entryPrice,
+          raw: { reconciled: true, originalError: buyErr.message },
+        };
+      }
+      throw buyErr;
+    }
     const buy = buyResp.buy;
     const contractId = String(buy?.contract_id ?? '');
     const purchasePrice = Number(buy?.buy_price ?? buy?.price);
@@ -1889,6 +2083,13 @@ class DerivBroker extends EventEmitter {
         skippedFresh: this.metrics.reconcileSkippedFresh,
         skippedFetchError: this.metrics.reconcileSkippedFetchError,
         skippedFalseAlarm: this.metrics.reconcileSkippedFalseAlarm,
+      },
+      // [FIX-ORPHAN] + [FIX-RECON-BUY] diagnostics
+      orphanRecovery: {
+        buyReconcileAttempts: this.metrics.buyReconcileAttempts,
+        buyReconcileRecovered: this.metrics.buyReconcileRecovered,
+        orphansAdopted: this.metrics.orphansAdopted,
+        lastOrphanSweepAt: this._lastOrphanSweepAt ? this._lastOrphanSweepAt.toISOString() : null,
       },
       portfolioDiagnostics: {
         emptyResponses: this.metrics.portfolioEmptyResponses,
