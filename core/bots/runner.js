@@ -43,6 +43,19 @@ const SYMBOL_LOCK_TAIL_MS = 5_000;
 // retry every cycle (FX bots cycle every 15s, synthetics every 5s).
 const ENTRY_FAILURE_BACKOFF_MS = 30_000;
 
+// [FIX-R4] Buy-recovery grace period — mirrors broker/contractService.
+const RECONCILE_POSITION_GRACE_MS = 2500;
+const RECONCILE_POSITION_LOOKBACK_MS = 60_000;
+
+// [FIX-R4] Contract-type → side mapping for reconciliation matching.
+// Kept in lockstep with contractService SIDE_BUY_TYPES / SIDE_SELL_TYPES.
+const BUY_CONTRACT_TYPES = new Set([
+  'MULTUP', 'CALL', 'DIGITEVEN', 'DIGITOVER', 'DIGITMATCH', 'ONETOUCH',
+]);
+const SELL_CONTRACT_TYPES = new Set([
+  'MULTDOWN', 'PUT', 'DIGITODD', 'DIGITUNDER', 'DIGITDIFF', 'NOTOUCH',
+]);
+
 class BotRunner extends EventEmitter {
   constructor() {
     super();
@@ -50,6 +63,13 @@ class BotRunner extends EventEmitter {
     this._nextInstanceId = 1;
     // [FIX-M4] symbol → { instanceId, acquiredAt, expiresAt }
     this._symbolLocks = new Map();
+    // [FIX-R4] Recovery metrics for health checks / dashboards.
+    this._metrics = {
+      reconcilePositionAttempts: 0,
+      reconcilePositionRecovered: 0,
+      lastReconciledAt: null,
+      lastOriginalError: null,
+    };
   }
 
   start(botId, config = {}) {
@@ -121,6 +141,20 @@ class BotRunner extends EventEmitter {
 
   list() { return Array.from(this._instances.values()).map(i => this._summarize(i)); }
   get(instanceId) { const i = this._instances.get(instanceId); return i ? this._summarize(i) : null; }
+
+  // [FIX-R4] Exposure for health checks / dashboards.
+  getStats() {
+    return {
+      reconcilePosition: {
+        attempts: this._metrics.reconcilePositionAttempts,
+        recovered: this._metrics.reconcilePositionRecovered,
+        lastReconciledAt: this._metrics.lastReconciledAt,
+        lastOriginalError: this._metrics.lastOriginalError,
+      },
+      runningInstances: this._instances.size,
+      symbolLocks: this._symbolLocks.size,
+    };
+  }
 
   // ─────────────────────────────────────────────────────────────
   //  [FIX-M4] SYMBOL LOCK — prevents two bots opening positions on
@@ -392,14 +426,20 @@ class BotRunner extends EventEmitter {
       return { ok: false, reason: `Invalid stake: ${stake}` };
     }
     const rawMax = instance.config.maxStake;
-    if (rawMax != null && rawMax !== '' && Number(rawMax) !== 0) {
-      const cap = Number(rawMax);
-      if (!Number.isFinite(cap) || cap <= 0) {
-        return { ok: false, reason: `Invalid maxStake config: ${rawMax}` };
-      }
-      if (requested > cap) {
-        return { ok: false, reason: `Stake ${requested} exceeds maxStake ${cap}` };
-      }
+    // [FIX-STAKE] Explicit "no cap" cases.
+    if (rawMax == null || rawMax === '') return { ok: true, stake: requested };
+    const cap = Number(rawMax);
+    if (cap === 0) {
+      logger.warn(
+        `[BotRunner] ${instance.instanceId}: maxStake=0 treated as "no cap" — verify this is intended`
+      );
+      return { ok: true, stake: requested };
+    }
+    if (!Number.isFinite(cap) || cap < 0) {
+      return { ok: false, reason: `Invalid maxStake config: ${rawMax}` };
+    }
+    if (requested > cap) {
+      return { ok: false, reason: `Stake ${requested} exceeds maxStake ${cap}` };
     }
     return { ok: true, stake: requested };
   }
@@ -524,13 +564,116 @@ class BotRunner extends EventEmitter {
     };
   }
 
+  // [FIX-R4] Is this error ambiguous (buy may have succeeded despite the
+  // client-side failure)? Only these errors trigger reconciliation.
+  _isAmbiguousError(err) {
+    if (!err || !err.message) return false;
+    const msg = String(err.message);
+    return (
+      msg.includes('InvalidContractProposal') ||
+      msg.includes('timeout') ||
+      msg.includes('Timeout') ||
+      msg.includes('Auth closed') ||
+      msg.includes('Public closed') ||
+      msg.includes('Buy failed') ||
+      msg.includes('Request cancelled') ||
+      msg.includes('WebSocket')
+    );
+  }
+
+  // [FIX-R4] Third-layer recovery — matches contractService._reconcileBuy
+  // and broker._reconcileOrphanBuy criteria, but only has the instance's
+  // symbol, expected side, and intended stake to match against.
+  async _reconcileOrphanPosition(instance, symbol, expectedSide, intendedStake) {
+    this._metrics.reconcilePositionAttempts++;
+
+    // Give Deriv time to settle a possibly-succeeded buy.
+    await new Promise(r => setTimeout(r, RECONCILE_POSITION_GRACE_MS));
+
+    const broker = getBroker('deriv_cfd');
+    const targetSymbol = normalizeSymbol(symbol);
+    const submittedBefore = Date.now() - RECONCILE_POSITION_LOOKBACK_MS;
+    const stakeNum = Math.abs(Number(intendedStake));
+
+    // Force a fresh portfolio fetch — the buy may have succeeded server-side
+    // but the 3s cache still reflects state from before the attempt.
+    if (broker._portfolioCache) broker._portfolioCache.at = 0;
+
+    let positions;
+    try { positions = await broker.getOpenTrades(); }
+    catch (err) {
+      logger.warn(`[BotRunner] _reconcileOrphanPosition: portfolio fetch failed: ${err.message}`);
+      return null;
+    }
+
+    const candidates = positions.filter(p => {
+      if (normalizeSymbol(p.instrument) !== targetSymbol) return false;
+      if (expectedSide && p.side && p.side !== 'UNKNOWN' && p.side !== expectedSide) return false;
+      if (Number.isFinite(stakeNum) && stakeNum > 0 && p.purchasePrice != null) {
+        if (Math.abs(Number(p.purchasePrice) - stakeNum) > 0.01) return false;
+      }
+      if (p.openTime && p.openTime < submittedBefore) return false;
+      return true;
+    });
+
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => (b.openTime || 0) - (a.openTime || 0));
+
+    this._metrics.reconcilePositionRecovered++;
+    this._metrics.lastReconciledAt = new Date().toISOString();
+
+    logger.warn(
+      `[BotRunner] _reconcileOrphanPosition: RECOVERED contract ${candidates[0].id} ` +
+      `for ${instance.botId}/${instance.instanceId} — treating entry as success`
+    );
+
+    return candidates[0];
+  }
+
+  // [FIX-R4] Extracted from _execute so both success path and recovery path
+  // share one implementation. Persists a BotRun record so _onTradeClosed
+  // can match the settlement event to this instance.
+  async _persistBotRun(instance, result, tradeParams, direction, stakeCheck, reasons, entryThesis, currentRegime, currentSession) {
+    try {
+      await BotRun.create({
+        botId: instance.botId, instanceId: instance.instanceId, contractId: String(result.contractId),
+        symbol: normalizeSymbol(instance.config.symbol), side: tradeParams.contractType || direction,
+        contractType: tradeParams.contractType || null, stake: Number(stakeCheck.stake),
+        multiplier: tradeParams.multiplier || null, duration: tradeParams.duration || null,
+        durationUnit: tradeParams.durationUnit || null, barrier: tradeParams.barrier != null ? String(tradeParams.barrier) : null,
+        entryPrice: result.entryPrice, takeProfitLevel: tradeParams.takeProfitLevel != null ? Number(tradeParams.takeProfitLevel) : null,
+        knockoutLevel: tradeParams.knockoutLevel != null ? Number(tradeParams.knockoutLevel) : null,
+        reasons: reasons || [], openedAt: new Date(), status: 'OPEN',
+        isEdgeTest: !!instance.config._edgeTest,
+        regimeCode: currentRegime,
+        session: currentSession,
+        entryThesis,
+      });
+    } catch (persistErr) {
+      logger.error(
+        `[BotRunner] BotRun persist failed for ${result.contractId} ` +
+        `(${instance.botId}/${instance.instanceId}): ${persistErr.message}`
+      );
+      // Trade is live — don't abort. _onTradeClosed will warn if it can't match.
+    }
+  }
+
   async _execute(instance, signal, ctx) {
     const { tradeParams, direction, reasons } = signal;
     // [FIX-M4] Lock key — falls back to the instance's configured symbol if
     // the bot's tradeParams doesn't specify one.
     const lockSymbol = normalizeSymbol(tradeParams.symbol || instance.symbol);
 
-    const stakeCheck = this._validateStake(instance, tradeParams.stake);
+    // [FIX-STAKE] Prefer instance.config.stake (editable in dashboard form)
+    // over the bot's computed tradeParams.stake. This is what makes the
+    // "stake: 1" default in defaultConfig actually take effect per trade.
+    const configStake = instance.config.stake;
+    const hasConfigStake =
+      configStake != null && configStake !== '' &&
+      Number.isFinite(Number(configStake)) && Number(configStake) > 0;
+    const effectiveStake = hasConfigStake ? Number(configStake) : tradeParams.stake;
+
+    const stakeCheck = this._validateStake(instance, effectiveStake);
     if (!stakeCheck.ok) {
       instance.lastReason = `Execution blocked: ${stakeCheck.reason}`;
       logger.warn(`[BotRunner] ${instance.instanceId} — ${instance.lastReason}`);
@@ -559,6 +702,15 @@ class BotRunner extends EventEmitter {
     const isEdgeTest = !!instance.config._edgeTest;
     const currentSession = detectSession();
     const currentRegime = ctx && ctx.state && ctx.state.regime ? ctx.state.regime.code : null;
+
+    // [FIX-R4] Resolve expected side for recovery matching.
+    let expectedSide = direction;
+    if (!expectedSide && tradeParams.direction) expectedSide = tradeParams.direction;
+    if (!expectedSide && tradeParams.contractType) {
+      const ct = String(tradeParams.contractType).toUpperCase();
+      if (BUY_CONTRACT_TYPES.has(ct)) expectedSide = 'BUY';
+      else if (SELL_CONTRACT_TYPES.has(ct)) expectedSide = 'SELL';
+    }
 
     try {
       // [FIX-M4] Re-check positions now that we hold the lock. This catches
@@ -598,37 +750,88 @@ class BotRunner extends EventEmitter {
       // [FIX-R2] Successful entry clears any pending failure backoff.
       instance._entryFailureBackoffUntil = 0;
 
-      // [FIX-R3] Persist BotRun with proper error handling. If persist fails
-      // we log at ERROR (not swallow) because _onTradeClosed won't find it.
-      try {
-        await BotRun.create({
-          botId: instance.botId, instanceId: instance.instanceId, contractId: String(result.contractId),
-          symbol: normalizeSymbol(instance.config.symbol), side: tradeParams.contractType || direction,
-          contractType: tradeParams.contractType || null, stake: Number(stakeCheck.stake),
-          multiplier: tradeParams.multiplier || null, duration: tradeParams.duration || null,
-          durationUnit: tradeParams.durationUnit || null, barrier: tradeParams.barrier != null ? String(tradeParams.barrier) : null,
-          entryPrice: result.entryPrice, takeProfitLevel: tradeParams.takeProfitLevel != null ? Number(tradeParams.takeProfitLevel) : null,
-          knockoutLevel: tradeParams.knockoutLevel != null ? Number(tradeParams.knockoutLevel) : null,
-          reasons: reasons || [], openedAt: new Date(), status: 'OPEN',
-          isEdgeTest,
-          regimeCode: currentRegime,
-          session: currentSession,
-          entryThesis,
-        });
-      } catch (persistErr) {
-        logger.error(
-          `[BotRunner] BotRun persist failed for ${result.contractId} ` +
-          `(${instance.botId}/${instance.instanceId}): ${persistErr.message}`
-        );
-        // Trade is live — don't abort. _onTradeClosed will warn if it can't match.
-      }
+      // [FIX-R3] Persist BotRun with proper error handling.
+      await this._persistBotRun(instance, result, tradeParams, direction, stakeCheck, reasons, entryThesis, currentRegime, currentSession);
 
-      this.emit('botEntry', { instanceId: instance.instanceId, botId: instance.botId, contractId: String(result.contractId), symbol: instance.config.symbol, side: tradeParams.contractType || direction, entryPrice: result.entryPrice, stake: stakeCheck.stake, reasons, flipped: instance.stats.flipped, timestamp: new Date().toISOString() });
+      this.emit('botEntry', {
+        instanceId: instance.instanceId, botId: instance.botId,
+        contractId: String(result.contractId), symbol: instance.config.symbol,
+        side: tradeParams.contractType || direction, entryPrice: result.entryPrice,
+        stake: stakeCheck.stake, reasons, flipped: instance.stats.flipped,
+        timestamp: new Date().toISOString(),
+      });
 
       // [FIX-M4] Success → shorten the lock TTL. After ~5s the position is
       // visible in portfolio, so other bots can rely on the position check.
       this._shortenSymbolLock(lockSymbol, instance.instanceId, SYMBOL_LOCK_TAIL_MS);
     } catch (err) {
+      // [FIX-R4] Before declaring failure, attempt reconciliation if the
+      // error is ambiguous (buy may have succeeded server-side).
+      if (this._isAmbiguousError(err)) {
+        this._metrics.lastOriginalError = err.message;
+        logger.warn(
+          `[BotRunner] ${instance.botId}/${instance.instanceId} entry threw ` +
+          `"${err.message}" — attempting recovery before declaring failure`
+        );
+
+        let recovered = null;
+        try {
+          recovered = await this._reconcileOrphanPosition(
+            instance, lockSymbol, expectedSide, stakeCheck.stake
+          );
+        } catch (recErr) {
+          logger.warn(`[BotRunner] Recovery attempt failed: ${recErr.message}`);
+        }
+
+        if (recovered) {
+          logger.warn(
+            `[BotRunner] ${instance.botId}/${instance.instanceId}: RECOVERED ` +
+            `contract ${recovered.id} — treating as SUCCESS (no retry).`
+          );
+          instance.stats.entries++;
+          instance._lastEntryTime = Date.now();
+          instance.lastReason = 'TRADE PLACED (recovered)';
+          instance._entryFailureBackoffUntil = 0;
+
+          // Ensure subscription so the settlement event fires and
+          // _onTradeClosed can update stats.
+          const broker = getBroker('deriv_cfd');
+          broker._subscribeOpenContract(recovered.id).catch(() => {});
+
+          // Persist BotRun for the recovered contract.
+          await this._persistBotRun(
+            instance,
+            {
+              contractId: recovered.id,
+              entryPrice: recovered.entryPrice,
+              purchasePrice: recovered.purchasePrice,
+            },
+            tradeParams, direction, stakeCheck, reasons, entryThesis,
+            currentRegime, currentSession
+          );
+
+          this.emit('botEntry', {
+            instanceId: instance.instanceId, botId: instance.botId,
+            contractId: String(recovered.id), symbol: instance.config.symbol,
+            side: recovered.side || expectedSide || direction,
+            entryPrice: recovered.entryPrice,
+            stake: stakeCheck.stake, reasons, flipped: instance.stats.flipped,
+            reconciled: true,
+            originalError: err.message,
+            timestamp: new Date().toISOString(),
+          });
+
+          // [FIX-M4] Shorten lock — the recovered position is now visible.
+          this._shortenSymbolLock(lockSymbol, instance.instanceId, SYMBOL_LOCK_TAIL_MS);
+          return;
+        }
+
+        logger.warn(
+          `[BotRunner] ${instance.botId}/${instance.instanceId}: recovery ` +
+          `found no matching contract — treating as genuine failure`
+        );
+      }
+
       // [FIX-R2] Set failure backoff so the bot doesn't retry immediately
       // next cycle with the same bad payload / network condition.
       instance._entryFailureBackoffUntil = Date.now() + ENTRY_FAILURE_BACKOFF_MS;
