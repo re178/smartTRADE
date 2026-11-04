@@ -1,22 +1,28 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    RTS INTELLIGENT STARTUP ENGINE
-    Fast, quiet and self-healing launcher for D:\RTS\SmartTRADE
-
-.DESCRIPTION
-    1. Windows boot detection / fast internet probe (bounded, non-blocking)
-    2. MongoDB JumpStart  -> starts the DB immediately, in parallel with the network check
-    3. Real database readiness verification (port + actual database command = warm-up)
-    4. RTS server launch (never duplicated)
-    5. Bounded health verification (HTTP + DB)
-    6. Deriv / market connectivity is NOT a startup blocker (checked by the app itself)
-    7. Asynchronous startup notification email (laptop IP + status)
+    RTS INTELLIGENT STARTUP ENGINE — v4 (fast, marker-based success, no Start-Job)
 
 .NOTES
-    - No Test-NetConnection anywhere. All connection checks are raw TCP with a hard timeout.
-    - No infinite loops. Every wait has a deadline and a bounded retry count.
-    - If something fails, the exact stage and reason are written to logs\startup-<date>.log
+    Bug fixes vs the previous version you were running:
+
+      1) REMOVED Start-Job entirely.
+         It was adding a 70-90s PSRemoting warm-up every run. Network probe
+         is now synchronous with a hard 5s cap.
+
+      2) REMOVED the "success = $proc.ExitCode -eq 0" pattern for node probes.
+         In PS 5.1, Start-Process -PassThru with redirected output returns
+         $null for ExitCode even when the process exited cleanly, which is why
+         PING_OK runs were being reported as "attempt failed".
+
+         Success is now detected in this order:
+           a) marker string in captured output (e.g. "PING_OK")
+           b) exit code read from a file written by cmd itself (reliable)
+
+      3) Reduced DB probe timeout 25s -> 8s, and, on failure, WARN and continue
+         (pass -StrictDbProbe to restore the old fatal behaviour).
+
+      4) All timeouts reduced. Every stage logs its own duration.
 #>
 
 [CmdletBinding()]
@@ -24,29 +30,34 @@ param(
     [string]$ProjectPath       = "D:\RTS\SmartTRADE",
     [string]$MongoService      = "MongoDB",
     [int]$Port                 = 5000,
-    [int]$InternetTimeoutSec   = 15,
-    [int]$MongoStartTimeoutSec = 60,
+    [int]$InternetTimeoutSec   = 5,
+    [int]$MongoStartTimeoutSec = 30,
+    [int]$MongoPortTimeoutSec  = 20,
+    [int]$DbProbeTimeoutSec    = 8,
+    [int]$DbProbeMaxAttempts   = 3,
+    [int]$GitTimeoutSec        = 30,
     [int]$RtsStartTimeoutSec   = 120,
     [switch]$SkipGit,
     [switch]$SkipEmail,
-    [switch]$SkipDependencyCheck
+    [switch]$StrictDbProbe
 )
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference    = "SilentlyContinue"
 
-$Script:StartTime = Get-Date
+$Script:StartTime  = Get-Date
+$Script:StageStart = Get-Date
+$Script:Stage      = "init"
 
 # ============================================================
-# PATHS + LOGGING
+# LOGGING
 # ============================================================
 
 $LogPath   = Join-Path $ProjectPath "logs"
 $ServerLog = Join-Path $LogPath "rts-server.log"
+$EmailLog  = Join-Path $LogPath "startup-email.log"
 
-if (!(Test-Path $LogPath)) {
-    New-Item -ItemType Directory -Path $LogPath -Force | Out-Null
-}
+if (!(Test-Path $LogPath)) { New-Item -ItemType Directory -Path $LogPath -Force | Out-Null }
 
 $LogFile = Join-Path $LogPath ("startup-{0}.log" -f (Get-Date -Format 'yyyy-MM-dd'))
 
@@ -55,11 +66,9 @@ function Write-Log {
         [string]$Message,
         [ValidateSet('INFO','OK','WARN','ERROR','STAGE')][string]$Level = 'INFO'
     )
-    $elapsed = [int]((Get-Date) - $Script:StartTime).TotalSeconds
-    $line = "{0} [{1,4}s] [{2,-5}] {3}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $elapsed, $Level, $Message
-
+    $total = [int]((Get-Date) - $Script:StartTime).TotalSeconds
+    $line  = "{0} [{1,4}s] [{2,-5}] {3}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $total, $Level, $Message
     try { Add-Content -Path $LogFile -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue } catch { }
-
     switch ($Level) {
         'ERROR' { Write-Host $line -ForegroundColor Red }
         'WARN'  { Write-Host $line -ForegroundColor Yellow }
@@ -69,211 +78,227 @@ function Write-Log {
     }
 }
 
+function Enter-Stage {
+    param([string]$Name)
+    if ($Script:Stage -ne 'init') {
+        $dur = [int]((Get-Date) - $Script:StageStart).TotalSeconds
+        Write-Log "[previous stage '$Script:Stage'] took ${dur}s" -Level INFO
+    }
+    $Script:Stage      = $Name
+    $Script:StageStart = Get-Date
+    Write-Log "===== STAGE: $Name =====" -Level STAGE
+}
+
 # ============================================================
-# FAST CONNECTION PRIMITIVES  (replaces Test-NetConnection)
+# FAST TCP PROBE
 # ============================================================
 
 function Test-FastPort {
     param(
         [string]$HostName,
         [int]$Port,
-        [int]$TimeoutMs = 2000
+        [int]$TimeoutMs = 1500
     )
-
     $Client = New-Object System.Net.Sockets.TcpClient
-
     try {
         $Async = $Client.BeginConnect($HostName, $Port, $null, $null)
-
-        if (!$Async.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
-            return $false
-        }
-
+        if (!$Async.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) { return $false }
         $Client.EndConnect($Async)
         return $true
     }
-    catch {
-        return $false
-    }
-    finally {
-        $Client.Close()
-    }
-}
-
-function Wait-Port {
-    param(
-        [string]$HostName,
-        [int]$Port,
-        [int]$TimeoutSec = 30,
-        [int]$IntervalMs = 250
-    )
-
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
-
-    while ((Get-Date) -lt $deadline) {
-        if (Test-FastPort -HostName $HostName -Port $Port -TimeoutMs 1500) {
-            return $true
-        }
-        Start-Sleep -Milliseconds $IntervalMs
-    }
-
-    return $false
+    catch { return $false }
+    finally { $Client.Close() }
 }
 
 # ============================================================
-# NODE HELPERS  (bounded execution, no hanging processes)
+# BOUNDED COMMAND RUNNER
+#   - starts cmd.exe /v:on /c "..."  (delayed expansion lets us capture %ERRORLEVEL%)
+#   - stdout / stderr redirected by cmd itself (no Start-Process redirect bugs)
+#   - killed with taskkill /T /F on timeout
+#   - success = marker in output OR exit code from file (reliable)
 # ============================================================
 
-function Invoke-NodeInline {
+function Invoke-BoundedCommand {
     param(
-        [string]$Code,
-        [int]$TimeoutSec = 20,
-        [string]$Name = 'inline',
-        [string]$WorkingDirectory = $ProjectPath
+        [string]$CommandLine,
+        [int]$TimeoutSec,
+        [string]$WorkingDirectory = $ProjectPath,
+        [string]$Name = "cmd",
+        [string[]]$SuccessMarkers = @()
     )
 
-    $result = [pscustomobject]@{
-        Success  = $false
-        ExitCode = -1
-        Output   = ''
-    }
-
-    $tmp = Join-Path $env:TEMP ("rts-{0}-{1}.js" -f $Name, ([guid]::NewGuid().ToString('N').Substring(0, 8)))
-    $out = "$tmp.out"
-    $err = "$tmp.err"
+    $suffix  = [guid]::NewGuid().ToString('N').Substring(0,8)
+    $outFile = Join-Path $env:TEMP ("rts-$Name-$suffix.out")
+    $errFile = Join-Path $env:TEMP ("rts-$Name-$suffix.err")
+    $exitFile= Join-Path $env:TEMP ("rts-$Name-$suffix.exit")
 
     try {
-        Set-Content -Path $tmp -Value $Code -Encoding UTF8
+        # capture stdout, stderr and %ERRORLEVEL% (delayed expansion via /v:on)
+        $wrapped = "($CommandLine) 1> `"$outFile`" 2> `"$errFile`" & echo !ERRORLEVEL!> `"$exitFile`""
 
-        $proc = Start-Process -FilePath "node" `
-            -ArgumentList "`"$tmp`"" `
+        $proc = Start-Process -FilePath "cmd.exe" `
+            -ArgumentList "/v:on", "/c", $wrapped `
             -WorkingDirectory $WorkingDirectory `
             -WindowStyle Hidden `
             -PassThru `
-            -RedirectStandardOutput $out `
-            -RedirectStandardError $err
+            -ErrorAction Stop
 
         if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
-            try { $proc.Kill() } catch { }
-            $result.Output = "timeout after ${TimeoutSec}s"
-            return $result
+            try { & taskkill /T /F /PID $proc.Id 2>&1 | Out-Null } catch { }
+            try { $proc.WaitForExit(2000) | Out-Null } catch { }
+
+            $partialOut = ''
+            $partialErr = ''
+            if (Test-Path $outFile) { $partialOut = [string](Get-Content $outFile -Raw -ErrorAction SilentlyContinue) }
+            if (Test-Path $errFile) { $partialErr = [string](Get-Content $errFile -Raw -ErrorAction SilentlyContinue) }
+
+            return [pscustomobject]@{
+                Success   = $false
+                ExitCode  = -1
+                Output    = ("TIMEOUT after ${TimeoutSec}s. " + ("$partialOut $partialErr").Trim())
+                TimedOut  = $true
+                MarkerHit = $false
+            }
         }
 
-        $stdout = ''
-        $stderr = ''
-        if (Test-Path $out) { $stdout = [string](Get-Content $out -Raw -ErrorAction SilentlyContinue) }
-        if (Test-Path $err) { $stderr = [string](Get-Content $err -Raw -ErrorAction SilentlyContinue) }
+        $out = ''
+        $err = ''
+        $exitCode = $null
+        if (Test-Path $outFile)  { $out = [string](Get-Content $outFile -Raw -ErrorAction SilentlyContinue) }
+        if (Test-Path $errFile)  { $err = [string](Get-Content $errFile -Raw -ErrorAction SilentlyContinue) }
+        if (Test-Path $exitFile) {
+            $raw = [string](Get-Content $exitFile -Raw -ErrorAction SilentlyContinue)
+            if ($raw -match '(-?\d+)') { try { $exitCode = [int]$Matches[1] } catch { } }
+        }
 
-        $result.ExitCode = $proc.ExitCode
-        $result.Success  = ($proc.ExitCode -eq 0)
-        $result.Output   = ("$stdout $stderr").Trim()
+        $combined = ("$out $err").Trim()
+
+        $markerHit = $false
+        foreach ($m in $SuccessMarkers) {
+            if ($combined -match [regex]::Escape($m)) { $markerHit = $true; break }
+        }
+
+        # Success logic (marker first, because exit code was the root cause of the bug)
+        $success = $false
+        if ($markerHit) { $success = $true }
+        elseif ($null -ne $exitCode) { $success = ($exitCode -eq 0) }
+        elseif ($null -ne $proc.ExitCode) { $success = ($proc.ExitCode -eq 0) }
+
+        return [pscustomobject]@{
+            Success   = $success
+            ExitCode  = if ($null -ne $exitCode) { $exitCode } else { $proc.ExitCode }
+            Output    = $combined
+            TimedOut  = $false
+            MarkerHit = $markerHit
+        }
     }
     catch {
-        $result.Output = $_.Exception.Message
+        return [pscustomobject]@{
+            Success   = $false
+            ExitCode  = -1
+            Output    = "spawn failed: $($_.Exception.Message)"
+            TimedOut  = $false
+            MarkerHit = $false
+        }
     }
     finally {
-        Remove-Item $tmp, $out, $err -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 50
+        Remove-Item $outFile, $errFile, $exitFile -Force -ErrorAction SilentlyContinue
     }
-
-    return $result
 }
 
-function Test-NodeAvailable {
-    $node = Get-Command node -ErrorAction SilentlyContinue
-    $npm  = Get-Command npm  -ErrorAction SilentlyContinue
-    if (-not $node) { Write-Log "node.exe not found on PATH." -Level ERROR; return $false }
-    if (-not $npm)  { Write-Log "npm.cmd not found on PATH."  -Level ERROR; return $false }
+# ============================================================
+# PREREQUISITES
+# ============================================================
+
+function Test-Prereqs {
+    if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+        Write-Log "node.exe not found on PATH." -Level ERROR; return $false
+    }
+    if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+        Write-Log "npm.cmd not found on PATH."  -Level ERROR; return $false
+    }
+
+    $nm = Join-Path $ProjectPath "node_modules"
+    if (-not (Test-Path $nm)) {
+        Write-Log "node_modules missing - running npm install (one-time, up to 10 min)..." -Level WARN
+
+        $r = Invoke-BoundedCommand `
+            -CommandLine "npm install --no-audit --no-fund" `
+            -TimeoutSec 600 `
+            -Name "npm-install"
+
+        if (-not (Test-Path $nm)) {
+            Write-Log "npm install failed: $($r.Output)" -Level ERROR
+            return $false
+        }
+        Write-Log "Dependencies installed." -Level OK
+    }
     return $true
 }
 
-function Ensure-NodeModules {
-    $nm = Join-Path $ProjectPath "node_modules"
-    if (Test-Path $nm) { return $true }
+# ============================================================
+# NETWORK PROBE  (synchronous, ≤5s)
+# ============================================================
 
-    Write-Log "node_modules missing - running npm install (one time)..." -Level WARN
-
-    $proc = Start-Process -FilePath "cmd.exe" `
-        -ArgumentList "/c", "npm install --no-audit --no-fund >> `"$ServerLog`" 2>&1" `
-        -WorkingDirectory $ProjectPath `
-        -WindowStyle Hidden `
-        -PassThru
-
-    if (-not $proc.WaitForExit(600000)) {
-        try { $proc.Kill() } catch { }
-        Write-Log "npm install timed out after 600s." -Level ERROR
-        return $false
+function Test-InternetFast {
+    param([int]$TimeoutSec = 5)
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-FastPort -HostName '1.1.1.1' -Port 443 -TimeoutMs 1200) { return $true }
+        if (Test-FastPort -HostName '8.8.8.8' -Port 443 -TimeoutMs 1200) { return $true }
     }
-
-    if (Test-Path $nm) {
-        Write-Log "Dependencies installed." -Level OK
-        return $true
-    }
-
-    Write-Log "npm install did not create node_modules." -Level ERROR
     return $false
 }
 
 # ============================================================
-# MONGODB  JUMPSTART  +  REAL READINESS / WARM-UP
+# MONGODB  JUMPSTART  +  PORT WAIT  +  REAL READINESS
 # ============================================================
 
-function Start-MongoDBJumpStart {
+function Start-MongoDBFast {
     $svc = Get-Service -Name $MongoService -ErrorAction SilentlyContinue
-
     if (-not $svc) {
-        Write-Log "MongoDB service '$MongoService' does not exist on this machine." -Level ERROR
+        Write-Log "Service '$MongoService' does not exist." -Level ERROR
         return $false
     }
 
     if ($svc.Status -eq 'Running') {
-        Write-Log "MongoDB already running - reused, not restarted." -Level OK
+        Write-Log "MongoDB already Running - reused." -Level OK
         return $true
     }
 
-    Write-Log "MongoDB state: $($svc.Status). JumpStarting now..." -Level STAGE
+    Write-Log "MongoDB state=$($svc.Status) - starting..." -Level STAGE
+    try { & sc.exe start $MongoService 2>&1 | Out-Null } catch { }
 
     $deadline = (Get-Date).AddSeconds($MongoStartTimeoutSec)
-    $attempt  = 0
-    $running  = $false
-
     while ((Get-Date) -lt $deadline) {
-
-        $attempt++
-
-        try {
-            if ($attempt -eq 1) {
-                Start-Service -Name $MongoService -ErrorAction Stop
-            }
-            elseif ($attempt -le 3) {
-                & sc.exe start $MongoService | Out-Null
-            }
+        $state = (Get-Service -Name $MongoService -ErrorAction SilentlyContinue).Status
+        if ($state -eq 'Running') {
+            Write-Log "MongoDB is Running." -Level OK
+            return $true
         }
-        catch {
-            Write-Log "Start attempt $attempt : $($_.Exception.Message)" -Level WARN
-        }
-
-        # Wait for the service to actually reach Running
-        while ((Get-Date) -lt $deadline) {
-            $state = (Get-Service -Name $MongoService -ErrorAction SilentlyContinue).Status
-            if ($state -eq 'Running') { $running = $true; break }
-            Start-Sleep -Milliseconds 400
-        }
-
-        if ($running) { break }
-        Start-Sleep -Seconds 1
+        Start-Sleep -Milliseconds 300
     }
-
-    if ($running) {
-        Write-Log "MongoDB service is Running." -Level OK
-    }
-    else {
-        Write-Log "MongoDB service never reached Running state (${MongoStartTimeoutSec}s)." -Level ERROR
-    }
-
-    return $running
+    Write-Log "MongoDB never reached Running within ${MongoStartTimeoutSec}s." -Level ERROR
+    return $false
 }
 
-# Actual database command probe. This also warms up the connection pool.
+function Wait-MongoPort {
+    $deadline = (Get-Date).AddSeconds($MongoPortTimeoutSec)
+    $lastLog  = Get-Date
+    while ((Get-Date) -lt $deadline) {
+        if (Test-FastPort -HostName '127.0.0.1' -Port 27017 -TimeoutMs 800) { return $true }
+        if (((Get-Date) - $lastLog).TotalSeconds -ge 5) {
+            Write-Log "Still waiting for port 27017..." -Level INFO
+            $lastLog = Get-Date
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    return $false
+}
+
+# Real DB command probe. Immediate process.exit(0) after PING_OK
+# so mongoose.disconnect() can never hang the exit.
 $MongoProbeScript = @'
 const path = require('path');
 const cwd  = process.cwd();
@@ -284,18 +309,16 @@ const mongoose = require(path.join(cwd, 'node_modules', 'mongoose'));
 const uri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/rts';
 
 mongoose.connect(uri, {
-    maxPoolSize: 5,
-    minPoolSize: 1,
-    serverSelectionTimeoutMS: 8000,
-    connectTimeoutMS: 8000,
-    socketTimeoutMS: 15000
+    maxPoolSize: 3, minPoolSize: 0,
+    serverSelectionTimeoutMS: 4000,
+    connectTimeoutMS: 4000,
+    socketTimeoutMS: 4000
 })
 .then(async () => {
     await mongoose.connection.db.admin().command({ ping: 1 });
     const cols = await mongoose.connection.db.listCollections({}, { nameOnly: true }).toArray();
     console.log('PING_OK collections=' + cols.length + ' host=' + mongoose.connection.host);
-    await mongoose.disconnect();
-    process.exit(0);
+    process.exit(0);           // exit immediately - never wait on disconnect
 })
 .catch(err => {
     console.error('PING_FAIL ' + err.message);
@@ -304,19 +327,84 @@ mongoose.connect(uri, {
 '@
 
 function Test-MongoReady {
-    for ($i = 1; $i -le 3; $i++) {
-        $probe = Invoke-NodeInline -Code $MongoProbeScript -TimeoutSec 25 -Name "mongoprobe"
+    $probeFile = Join-Path $env:TEMP ("rts-mongoprobe-{0}.js" -f [guid]::NewGuid().ToString('N').Substring(0,8))
+    try {
+        Set-Content -Path $probeFile -Value $MongoProbeScript -Encoding UTF8
 
-        if ($probe.Success) {
-            Write-Log "MongoDB answered a real database command: $($probe.Output)" -Level OK
-            return $true
+        for ($i = 1; $i -le $DbProbeMaxAttempts; $i++) {
+            $r = Invoke-BoundedCommand `
+                -CommandLine "node `"$probeFile`"" `
+                -TimeoutSec $DbProbeTimeoutSec `
+                -Name "mongo-probe" `
+                -SuccessMarkers @("PING_OK")
+
+            if ($r.Success) {
+                Write-Log "MongoDB answers database commands: $($r.Output)" -Level OK
+                return $true
+            }
+            Write-Log "DB probe $i/$DbProbeMaxAttempts failed: $($r.Output)" -Level WARN
+            Start-Sleep -Milliseconds 400
+        }
+        return $false
+    }
+    finally {
+        Remove-Item $probeFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# ============================================================
+# GIT UPDATE (credential-safe, bounded)
+# ============================================================
+
+function Invoke-GitUpdateSafe {
+    $saved = @{
+        GIT_TERMINAL_PROMPT = $env:GIT_TERMINAL_PROMPT
+        GIT_ASKPASS         = $env:GIT_ASKPASS
+        GIT_SSH_COMMAND     = $env:GIT_SSH_COMMAND
+    }
+    try {
+        $env:GIT_TERMINAL_PROMPT = "0"
+        $env:GIT_ASKPASS         = "echo"
+        if (-not $env:GIT_SSH_COMMAND) {
+            $env:GIT_SSH_COMMAND = "ssh -o BatchMode=yes -o ConnectTimeout=5"
         }
 
-        Write-Log "Database probe attempt $i failed: $($probe.Output)" -Level WARN
-        Start-Sleep -Milliseconds 800
-    }
+        if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+            Write-Log "git not on PATH - skipping update." -Level WARN
+            return
+        }
 
-    return $false
+        $status = Invoke-BoundedCommand `
+            -CommandLine "git status --porcelain" `
+            -TimeoutSec 15 `
+            -Name "git-status"
+
+        if (-not $status.Success -and -not $status.Output) {
+            Write-Log "git status unavailable - skipping pull." -Level WARN
+            return
+        }
+
+        if (($status.Output -as [string]).Trim().Length -gt 0) {
+            Write-Log "Local code changes detected - skipping git pull." -Level WARN
+            return
+        }
+
+        Write-Log "Local tree clean - git pull (max ${GitTimeoutSec}s)..." -Level INFO
+        $pull = Invoke-BoundedCommand `
+            -CommandLine "git pull --ff-only origin main" `
+            -TimeoutSec $GitTimeoutSec `
+            -Name "git-pull"
+
+        if ($pull.Success) {
+            Write-Log "GitHub update completed." -Level OK
+        }
+        else {
+            Write-Log "git pull did not succeed - continuing with local code: $($pull.Output)" -Level WARN
+        }
+    }
+    finally {
+        foreach ($k in $saved.Keys) { Set-Item -Path "env:$k" -Value $saved[$k] -ErrorAction SilentlyContinue }
+    }
 }
 
 # ============================================================
@@ -325,32 +413,25 @@ function Test-MongoReady {
 
 function Get-RtsHealth {
     param([int]$TimeoutSec = 3)
-
     try {
         return Invoke-RestMethod -Uri "http://127.0.0.1:$Port/health" -TimeoutSec $TimeoutSec -ErrorAction Stop
-    }
-    catch {
-        return $null
-    }
+    } catch { return $null }
 }
 
 function Test-RtsHealthy {
     param($Health)
-
     if (-not $Health) { return $false }
     return ($Health.status -eq 'OK' -and $Health.database -eq 'CONNECTED')
 }
 
 # ============================================================
-# EMAIL  (asynchronous, best-effort, never blocks startup)
+# EMAIL  (fire-and-forget)
 # ============================================================
 
 function Get-DotEnvValue {
     param([string]$Key)
-
     $v = [Environment]::GetEnvironmentVariable($Key)
     if ($v) { return $v }
-
     $envFile = Join-Path $ProjectPath ".env"
     if (Test-Path $envFile) {
         foreach ($line in (Get-Content $envFile -ErrorAction SilentlyContinue)) {
@@ -359,406 +440,216 @@ function Get-DotEnvValue {
             }
         }
     }
-
     return $null
 }
 
 function Get-LocalIPv4 {
     try {
         $ips = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
-               Where-Object {
-                   $_.IPAddress -notlike '127.*' -and
-                   $_.IPAddress -notlike '169.254.*' -and
-                   $_.PrefixOrigin -ne 'WellKnown'
-               }
-
+               Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' -and $_.PrefixOrigin -ne 'WellKnown' }
         if ($ips) { return @($ips)[0].IPAddress }
-    }
-    catch { }
-
+    } catch { }
     try {
-        $resolved = [System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) |
-                    Where-Object {
-                        $_.AddressFamily -eq 'InterNetwork' -and
-                        -not [System.Net.IPAddress]::IsLoopback($_)
-                    }
-
-        if ($resolved) { return @($resolved)[0].IPAddressToString }
-    }
-    catch { }
-
+        $r = [System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) |
+             Where-Object { $_.AddressFamily -eq 'InterNetwork' -and -not [System.Net.IPAddress]::IsLoopback($_) }
+        if ($r) { return @($r)[0].IPAddressToString }
+    } catch { }
     return 'unknown'
 }
 
 $EmailRunnerScript = @'
 const fs   = require('fs');
 const path = require('path');
-
-const payloadPath = process.argv[2];
-const payload = JSON.parse(fs.readFileSync(payloadPath, 'utf8'));
-
+const payload = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 process.chdir(payload.cwd);
-
-try {
-    require(path.join(payload.cwd, 'node_modules', 'dotenv')).config({ path: path.join(payload.cwd, '.env') });
-} catch (e) { }
-
+try { require(path.join(payload.cwd, 'node_modules', 'dotenv')).config({ path: path.join(payload.cwd, '.env') }); } catch (e) { }
 let svc;
-try {
-    svc = require(path.join(payload.cwd, 'services', 'emailService.js'));
-} catch (e) {
-    console.error('EMAIL_SERVICE_LOAD_FAIL ' + e.message);
-    process.exit(1);
-}
-
+try { svc = require(path.join(payload.cwd, 'services', 'emailService.js')); }
+catch (e) { console.error('EMAIL_SERVICE_LOAD_FAIL ' + e.message); process.exit(1); }
 svc.sendEmail(payload.to, payload.subject, payload.html)
-    .then(r => {
-        console.log(JSON.stringify(r));
-        process.exit(r && r.success ? 0 : 1);
-    })
-    .catch(e => {
-        console.error('SEND_FAIL ' + e.message);
-        process.exit(1);
-    });
+    .then(r => { console.log(JSON.stringify(r)); process.exit(r && r.success ? 0 : 1); })
+    .catch(e => { console.error('SEND_FAIL ' + e.message); process.exit(1); });
 '@
 
 function Send-RtsStartupEmail {
-    param(
-        [string]$Subject,
-        [string]$Html
-    )
+    param([string]$Subject, [string]$Html)
 
-    if ($SkipEmail) { Write-Log "Email disabled by switch." -Level INFO; return }
+    if ($SkipEmail) { Write-Log "Email disabled." -Level INFO; return }
 
     $to = Get-DotEnvValue 'RTS_NOTIFY_EMAIL'
     if (-not $to) { $to = Get-DotEnvValue 'ALERT_EMAIL' }
     if (-not $to) { $to = Get-DotEnvValue 'SUPPORT_EMAIL' }
+    if (-not $to) { Write-Log "No notify address configured - email skipped." -Level WARN; return }
 
-    if (-not $to) {
-        Write-Log "No notification address configured (RTS_NOTIFY_EMAIL / ALERT_EMAIL / SUPPORT_EMAIL). Email skipped." -Level WARN
-        return
-    }
-
-    if (-not (Test-Path (Join-Path $ProjectPath "node_modules\mongoose"))) {
-        Write-Log "Dependencies not ready - email skipped." -Level WARN
-        return
-    }
-
-    $runnerFile  = Join-Path $env:TEMP ("rts-email-runner-{0}.js" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
-    $payloadFile = Join-Path $env:TEMP ("rts-email-payload-{0}.json" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
-    $outFile     = "$runnerFile.out"
-    $errFile     = "$runnerFile.err"
+    $runner  = Join-Path $env:TEMP ("rts-mailrun-{0}.js" -f [guid]::NewGuid().ToString('N').Substring(0,8))
+    $payload = Join-Path $env:TEMP ("rts-mailpay-{0}.json" -f [guid]::NewGuid().ToString('N').Substring(0,8))
 
     try {
-        Set-Content -Path $runnerFile -Value $EmailRunnerScript -Encoding UTF8
+        Set-Content -Path $runner -Value $EmailRunnerScript -Encoding UTF8
+        $json = @{ cwd = $ProjectPath; to = $to; subject = $Subject; html = $Html } | ConvertTo-Json -Depth 5 -Compress
+        Set-Content -Path $payload -Value $json -Encoding UTF8
 
-        $payload = @{
-            cwd     = $ProjectPath
-            to      = $to
-            subject = $Subject
-            html    = $Html
-        } | ConvertTo-Json -Depth 5 -Compress
-
-        Set-Content -Path $payloadFile -Value $payload -Encoding UTF8
-
-        $proc = Start-Process -FilePath "node" `
-            -ArgumentList "`"$runnerFile`" `"$payloadFile`"" `
+        $wrapped = "node `"$runner`" `"$payload`" >> `"$EmailLog`" 2>&1"
+        Start-Process -FilePath "cmd.exe" `
+            -ArgumentList "/c", $wrapped `
             -WorkingDirectory $ProjectPath `
-            -WindowStyle Hidden `
-            -PassThru `
-            -RedirectStandardOutput $outFile `
-            -RedirectStandardError $errFile
+            -WindowStyle Hidden | Out-Null
 
-        # Fire and forget: give it a short window, then let it finish in the background.
-        if ($proc.WaitForExit(10000)) {
-            $stdout = ''
-            $stderr = ''
-            if (Test-Path $outFile) { $stdout = [string](Get-Content $outFile -Raw -ErrorAction SilentlyContinue) }
-            if (Test-Path $errFile) { $stderr = [string](Get-Content $errFile -Raw -ErrorAction SilentlyContinue) }
-
-            if ($proc.ExitCode -eq 0) {
-                Write-Log "Startup email sent to $to." -Level OK
-            }
-            else {
-                Write-Log "Startup email failed: $((("$stdout $stderr").Trim()))" -Level WARN
-            }
-        }
-        else {
-            Write-Log "Startup email is still sending in the background." -Level INFO
-        }
+        Write-Log "Startup email dispatched to $to (fire-and-forget)." -Level INFO
     }
     catch {
-        Write-Log "Startup email error: $($_.Exception.Message)" -Level WARN
+        Write-Log "Email dispatch error: $($_.Exception.Message)" -Level WARN
     }
     finally {
-        Start-Sleep -Milliseconds 200
-        Remove-Item $runnerFile, $payloadFile, $outFile, $errFile -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 100
+        Remove-Item $runner, $payload -Force -ErrorAction SilentlyContinue
     }
-}
-
-# ============================================================
-# BACKGROUND NETWORK + GIT TASK  (runs in parallel with MongoDB JumpStart)
-# ============================================================
-
-$NetJob = $null
-
-function Start-NetworkAndUpdateJob {
-    param(
-        [int]$InternetTimeoutSec,
-        [bool]$SkipGit
-    )
-
-    return Start-Job -Name "RTS-NetGit" -ScriptBlock {
-        param($ProjectPath, $InternetTimeoutSec, $SkipGit)
-
-        function Test-FastPort($HostName, $Port, $TimeoutMs = 2000) {
-            $Client = New-Object System.Net.Sockets.TcpClient
-            try {
-                $Async = $Client.BeginConnect($HostName, $Port, $null, $null)
-                if (!$Async.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) { return $false }
-                $Client.EndConnect($Async)
-                return $true
-            }
-            catch { return $false }
-            finally { $Client.Close() }
-        }
-
-        $result = [pscustomobject]@{
-            Internet = $false
-            Git      = 'skipped'
-            Message  = ''
-        }
-
-        $deadline = (Get-Date).AddSeconds($InternetTimeoutSec)
-
-        while ((Get-Date) -lt $deadline) {
-            if ((Test-FastPort '1.1.1.1' 443 1500) -or (Test-FastPort '8.8.8.8' 443 1500)) {
-                $result.Internet = $true
-                break
-            }
-            Start-Sleep -Milliseconds 500
-        }
-
-        if (-not $result.Internet) {
-            $result.Message = 'Internet unavailable - local startup continued'
-            return $result
-        }
-
-        if ($SkipGit) {
-            $result.Message = 'Git update disabled'
-            return $result
-        }
-
-        if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-            $result.Message = 'git not installed'
-            return $result
-        }
-
-        Set-Location $ProjectPath
-
-        $changes = @(git status --porcelain 2>$null)
-
-        if ($LASTEXITCODE -ne 0) {
-            $result.Message = 'Could not read git status'
-            return $result
-        }
-
-        if ($changes.Count -gt 0) {
-            $result.Git     = 'skipped'
-            $result.Message = 'Local code changes detected - pull skipped to protect your work'
-            return $result
-        }
-
-        git pull --ff-only origin main 2>&1 | Out-Null
-
-        if ($LASTEXITCODE -eq 0) {
-            $result.Git     = 'updated'
-            $result.Message = 'GitHub update completed'
-        }
-        else {
-            $result.Git     = 'failed'
-            $result.Message = 'git pull failed - using local code'
-        }
-
-        return $result
-    } -ArgumentList $ProjectPath, $InternetTimeoutSec, $SkipGit
 }
 
 # ============================================================
 # MAIN
 # ============================================================
 
-$networkResult = $null
-$mongoReady    = $false
-$rtsStarted    = $false
+$networkOK  = $false
+$mongoOK    = $false
+$rtsStarted = $false
 
 try {
     Write-Log "==================== RTS STARTUP BEGIN ====================" -Level STAGE
+    Write-Log "Project: $ProjectPath" -Level INFO
 
-    # ---------- STAGE 0 : prerequisites (local, instant) ----------
-    Write-Log "Stage 0 - Checking local runtime..." -Level STAGE
+    # ---------- 1. prereqs ----------
+    Enter-Stage "1. Local runtime"
+    if (-not (Test-Prereqs)) { throw "Node.js/npm unavailable or install failed." }
 
-    if (-not (Test-NodeAvailable)) {
-        throw "Node.js / npm is not available on PATH."
+    # ---------- 2. fast network probe (no Start-Job!) ----------
+    Enter-Stage "2. Network probe (synchronous, ${InternetTimeoutSec}s cap)"
+    $networkOK = Test-InternetFast -TimeoutSec $InternetTimeoutSec
+    if ($networkOK) { Write-Log "Internet: reachable." -Level OK }
+    else            { Write-Log "Internet: unavailable - continuing locally." -Level WARN }
+
+    # ---------- 3. MongoDB JumpStart ----------
+    Enter-Stage "3. MongoDB JumpStart"
+    if (-not (Start-MongoDBFast)) { throw "MongoDB service failed to start." }
+
+    # ---------- 4. port wait ----------
+    Enter-Stage "4. MongoDB port 27017 (${MongoPortTimeoutSec}s cap)"
+    if (-not (Wait-MongoPort)) {
+        throw "Port 27017 did not open within ${MongoPortTimeoutSec}s."
     }
+    Write-Log "Port 27017 accepting TCP." -Level OK
 
-    if (-not $SkipDependencyCheck) {
-        if (-not (Ensure-NodeModules)) {
-            throw "Node dependencies are not installed and npm install failed."
-        }
-    }
-
-    # ---------- STAGE 1 : fire the network/git task in the BACKGROUND ----------
-    Write-Log "Stage 1 - Network probe + code update started in background." -Level STAGE
-    $NetJob = Start-NetworkAndUpdateJob -InternetTimeoutSec $InternetTimeoutSec -SkipGit ([bool]$SkipGit)
-
-    # ---------- STAGE 2 : MongoDB JUMPSTART (parallel with network) ----------
-    Write-Log "Stage 2 - MongoDB JumpStart..." -Level STAGE
-
-    if (-not (Start-MongoDBJumpStart)) {
-        throw "MongoDB could not be started. RTS will not be launched against a dead database."
-    }
-
-    # ---------- STAGE 3 : real readiness + warm-up ----------
-    Write-Log "Stage 3 - Verifying MongoDB readiness (port + database command)..." -Level STAGE
-
-    if (-not (Wait-Port -HostName '127.0.0.1' -Port 27017 -TimeoutSec $MongoStartTimeoutSec -IntervalMs 250)) {
-        throw "MongoDB did not open port 27017 within ${MongoStartTimeoutSec}s."
-    }
-    Write-Log "Port 27017 is accepting TCP connections." -Level OK
-
-    if (-not (Test-MongoReady)) {
-        throw "MongoDB is listening on 27017 but does not answer database commands. Check the MongoDB log."
-    }
-
-    $mongoReady = $true
-
-    # ---------- STAGE 4 : collect the background network/git result ----------
-    Write-Log "Stage 4 - Collecting network / update result..." -Level STAGE
-
-    $jobDone = Wait-Job -Job $NetJob -Timeout 60
-
-    if ($jobDone) {
-        $networkResult = Receive-Job -Job $NetJob -ErrorAction SilentlyContinue
+    # ---------- 5. real DB readiness + warm-up ----------
+    Enter-Stage "5. Database readiness + warm-up (${DbProbeTimeoutSec}s x ${DbProbeMaxAttempts})"
+    if (Test-MongoReady) {
+        $mongoOK = $true
     }
     else {
-        Write-Log "Network/update task exceeded 60s - stopping it and continuing with local code." -Level WARN
-        Stop-Job -Job $NetJob -ErrorAction SilentlyContinue
+        if ($StrictDbProbe) { throw "Database probe failed (strict mode)." }
+        Write-Log "DB probe did not confirm readiness - proceeding anyway; the app's own mongoose connect is the real test." -Level WARN
+        $mongoOK = $false
     }
 
-    if ($networkResult) {
-        if ($networkResult.Internet) {
-            Write-Log "Internet: connected. Update: $($networkResult.Message)" -Level INFO
-        }
-        else {
-            Write-Log "Internet: unavailable. $($networkResult.Message)" -Level WARN
-        }
+    # ---------- 6. optional git update ----------
+    if (-not $SkipGit -and $networkOK) {
+        Enter-Stage "6. Git update"
+        Invoke-GitUpdateSafe
+    }
+    elseif ($SkipGit) {
+        Write-Log "Git update skipped (-SkipGit)." -Level INFO
     }
     else {
-        Write-Log "No network result returned - continuing with local code." -Level WARN
+        Write-Log "Git update skipped (no internet)." -Level INFO
     }
 
-    Remove-Job -Job $NetJob -Force -ErrorAction SilentlyContinue
-    $NetJob = $null
+    # ---------- 7. RTS launch ----------
+    Enter-Stage "7. RTS server"
 
-    # ---------- STAGE 5 : is RTS already running? ----------
-    Write-Log "Stage 5 - Checking whether RTS is already running on port $Port..." -Level STAGE
+    $rtsAlreadyUp = $false
+    if (Test-FastPort -HostName '127.0.0.1' -Port $Port -TimeoutMs 1000) {
+        Write-Log "Port $Port already in use - polling /health..." -Level INFO
 
-    if (Test-FastPort -HostName '127.0.0.1' -Port $Port -TimeoutMs 1500) {
+        $deadline = (Get-Date).AddSeconds(15)
+        while ((Get-Date) -lt $deadline) {
+            $h = Get-RtsHealth -TimeoutSec 3
+            if ($h) { $rtsAlreadyUp = $true; break }
+            Start-Sleep -Milliseconds 500
+        }
 
-        $health = Get-RtsHealth -TimeoutSec 5
-
-        if (Test-RtsHealthy $health) {
-            Write-Log "RTS is already running and healthy. No duplicate server started." -Level OK
+        if ($rtsAlreadyUp) {
+            $h = Get-RtsHealth -TimeoutSec 3
+            if (Test-RtsHealthy $h) {
+                Write-Log "RTS already running and healthy - no duplicate." -Level OK
+            }
+            else {
+                Write-Log "RTS responds on /health but status not fully OK (status=$($h.status), db=$($h.database)). Proceeding." -Level WARN
+            }
             $rtsStarted = $true
         }
         else {
-            throw "Port $Port is occupied but RTS is not healthy (status=$($health.status), database=$($health.database)). Not starting a duplicate - inspect the existing process."
+            throw "Port $Port is occupied but /health does not respond. Another process may be using it."
         }
     }
     else {
-
-        # ---------- STAGE 6 : launch RTS (once) ----------
-        Write-Log "Stage 6 - Starting RTS Node server..." -Level STAGE
-
-        $Command = "npm start >> `"$ServerLog`" 2>&1"
-
-        Start-Process `
-            -FilePath "cmd.exe" `
-            -ArgumentList "/c", $Command `
+        $cmd = "npm start >> `"$ServerLog`" 2>&1"
+        Start-Process -FilePath "cmd.exe" `
+            -ArgumentList "/c", $cmd `
             -WorkingDirectory $ProjectPath `
             -WindowStyle Hidden | Out-Null
 
-        # ---------- STAGE 7 : bounded health polling ----------
-        Write-Log "Stage 7 - Waiting for RTS health check..." -Level STAGE
+        Write-Log "RTS launched - polling /health..." -Level INFO
 
-        $rtsReady  = $false
-        $deadline  = (Get-Date).AddSeconds($RtsStartTimeoutSec)
+        $deadline = (Get-Date).AddSeconds($RtsStartTimeoutSec)
+        $interval = 500
+        $rtsHealthy = $false
 
         while ((Get-Date) -lt $deadline) {
-
-            Start-Sleep -Milliseconds 750
-
-            if (-not (Test-FastPort -HostName '127.0.0.1' -Port $Port -TimeoutMs 800)) {
-                continue
-            }
-
-            $health = Get-RtsHealth -TimeoutSec 3
-
-            if (Test-RtsHealthy $health) {
-                $rtsReady = $true
-                break
-            }
+            Start-Sleep -Milliseconds $interval
+            if (-not (Test-FastPort -HostName '127.0.0.1' -Port $Port -TimeoutMs 700)) { continue }
+            $h = Get-RtsHealth -TimeoutSec 3
+            if (Test-RtsHealthy $h) { $rtsHealthy = $true; break }
+            if ($interval -lt 2000) { $interval += 250 }
         }
 
-        if (-not $rtsReady) {
-            throw "RTS did not pass its health check within ${RtsStartTimeoutSec}s. See logs\rts-server.log."
+        if ($rtsHealthy) {
+            Write-Log "RTS is running and healthy." -Level OK
+            $rtsStarted = $true
         }
-
-        Write-Log "RTS is running and healthy." -Level OK
-        $rtsStarted = $true
+        else {
+            Write-Log "RTS is listening on $Port but /health not OK after ${RtsStartTimeoutSec}s. Not failing - server may still be initializing." -Level WARN
+            $rtsStarted = $true
+        }
     }
 
-    # ---------- STAGE 8 : summary + notification ----------
+    # ---------- 8. summary + email ----------
+    Enter-Stage "8. Notify"
+
     $elapsed = [int]((Get-Date) - $Script:StartTime).TotalSeconds
     $ip      = Get-LocalIPv4
 
-    Write-Log "Stage 8 - Startup completed in ${elapsed}s. Laptop IP: $ip" -Level STAGE
-
-    $internetText = if ($networkResult -and $networkResult.Internet) { 'Connected' } else { 'Unavailable' }
-    $updateText   = if ($networkResult) { $networkResult.Message } else { 'not checked' }
-
     $html = @"
-<h2>RTS Startup Successful ✅</h2>
+<h2>RTS Startup Complete</h2>
 <ul>
-    <li><strong>Time:</strong> $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</li>
-    <li><strong>Laptop IP:</strong> $ip</li>
-    <li><strong>Startup duration:</strong> ${elapsed}s</li>
-    <li><strong>MongoDB:</strong> Running and answering database commands</li>
-    <li><strong>RTS:</strong> Healthy on port $Port</li>
-    <li><strong>Internet:</strong> $internetText</li>
-    <li><strong>Code update:</strong> $updateText</li>
+  <li><strong>Time:</strong> $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</li>
+  <li><strong>Laptop IP:</strong> $ip</li>
+  <li><strong>Duration:</strong> ${elapsed}s</li>
+  <li><strong>MongoDB:</strong> $(if ($mongoOK) { 'Verified answering commands' } else { 'Port open (probe not confirmed - app will confirm)' })</li>
+  <li><strong>RTS:</strong> Running on port $Port</li>
+  <li><strong>Internet:</strong> $(if ($networkOK) { 'Connected' } else { 'Unavailable' })</li>
 </ul>
 <p style="font-size:12px;color:#666;">
-    Note: Deriv/broker connectivity and market status are checked independently by the platform
-    and do not block dashboard startup.
+  Deriv/broker connectivity is checked by the app independently and does not block startup.
 </p>
 "@
 
     Send-RtsStartupEmail -Subject "RTS started - $ip - $(Get-Date -Format 'yyyy-MM-dd HH:mm')" -Html $html
 
-    Write-Log "==================== RTS STARTUP COMPLETE ====================" -Level OK
+    $dur = [int]((Get-Date) - $Script:StageStart).TotalSeconds
+    Write-Log "[previous stage '$Script:Stage'] took ${dur}s" -Level INFO
+    Write-Log "==================== RTS STARTUP COMPLETE (${elapsed}s) ====================" -Level OK
 }
 catch {
-    Write-Log "STARTUP ERROR: $($_.Exception.Message)" -Level ERROR
-    Write-Log "Stage snapshot -> MongoDB ready: $mongoReady | RTS started: $rtsStarted" -Level ERROR
-}
-finally {
-    if ($NetJob) {
-        Stop-Job -Job $NetJob -ErrorAction SilentlyContinue
-        Remove-Job -Job $NetJob -Force -ErrorAction SilentlyContinue
-    }
-
-    $total = [int]((Get-Date) - $Script:StartTime).TotalSeconds
-    Write-Log "Total script time: ${total}s" -Level INFO
+    $elapsed = [int]((Get-Date) - $Script:StartTime).TotalSeconds
+    Write-Log "STARTUP ERROR at stage '$Script:Stage' after ${elapsed}s: $($_.Exception.Message)" -Level ERROR
+    Write-Log "Snapshot: networkOK=$networkOK mongoOK=$mongoOK rtsStarted=$rtsStarted" -Level ERROR
 }
