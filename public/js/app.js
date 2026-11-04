@@ -1,5 +1,18 @@
 // public/js/app.js – Dashboard logic
 // Renders all widgets. Live updates come from live.js.
+//
+// [FIX-STAKE-EDIT] `executeLiveSignal` now uses `prompt()` instead of
+//   `confirm()`, showing the opportunity's proposed stake (which defaults
+//   to $1 via STAKE_MODE=fixed in opportunityEngine.js) as an editable
+//   default. The edited value is what gets sent to /api/trade.
+//
+// [FIX-BROKER-ERR-FE] `showOrderOutcome` is async. On BROKER_ERROR (or
+//   HTTP 5xx), it refreshes positions first and checks whether the
+//   contract exists in the portfolio. If it does, shows an accurate
+//   "Contract is LIVE" alert (different from "purchase may have completed").
+//   Also handles `recovered: true` on CONFIRMED_RECORD_FAILED responses.
+//
+// All rendering logic, widgets, and event wiring preserved.
 
 'use strict';
 
@@ -412,9 +425,10 @@ function renderOpportunityWidget() {
     </div>`;
     return;
   }
+  const stakeEditable = o.stakeEditable ? ' <span class="badge bg-info ms-1" title="Stake is editable in the confirmation dialog">editable</span>' : '';
   panel.innerHTML = `<div class="alert alert-success mb-0">
     <h6 class="mb-1"><i class="fas fa-check-circle"></i> TRADE OPPORTUNITY (${o.source || 'analogue'})</h6>
-    <p class="mb-1 small"><strong>${o.direction}</strong> | Stake: $${(o.stake || 0).toFixed(2)} | Mult: ${o.multiplier}x | Dur: ${o.duration}s</p>
+    <p class="mb-1 small"><strong>${o.direction}</strong> | Stake: $${(o.stake || 0).toFixed(2)}${stakeEditable} | Mult: ${o.multiplier}x | Dur: ${o.duration}s</p>
     <p class="mb-1 small">Entry: ${formatPrice(o.entryPrice)} | KO: ${formatPrice(o.knockoutLevel)} | TP: ${formatPrice(o.takeProfitLevel)}</p>
     <p class="mb-0 small">EV: $${(o.tradeEconomics?.ev || 0).toFixed(2)} | P(TP): ${((o.tradeEconomics?.probTP || 0) * 100).toFixed(0)}% | P(SL): ${((o.tradeEconomics?.probSL || 0) * 100).toFixed(0)}%</p>
   </div>`;
@@ -516,10 +530,13 @@ function renderSignalCard(sym, consensus, prediction, opportunity) {
   let opportunityBlock = '';
   if (isTradable) {
     const eco = o.tradeEconomics || {};
+    const stakeTag = o.stakeEditable
+      ? `<strong>Stake:</strong> $${(o.stake || 0).toFixed(2)} <span class="badge bg-info" title="Editable in the confirmation prompt">edit</span>`
+      : `<strong>Stake:</strong> $${(o.stake || 0).toFixed(2)}`;
     opportunityBlock = `<div class="mt-3 p-3 rounded" style="background:rgba(255,255,255,0.7); border:1px solid #bbf7d0;">
       <div class="row small">
         <div class="col-md-6"><div><strong>Trade:</strong> ${o.direction} ${symbolToDisplay(sym)}</div><div><strong>Entry:</strong> ${formatPrice(o.entryPrice)}</div><div><strong>Stop:</strong> ${formatPrice(o.knockoutLevel)}</div><div><strong>Target:</strong> ${formatPrice(o.takeProfitLevel)}</div></div>
-        <div class="col-md-6"><div><strong>Stake:</strong> $${(o.stake || 0).toFixed(2)}</div><div><strong>Multiplier:</strong> ${o.multiplier}x</div><div><strong>Duration:</strong> ${o.duration}s</div><div><strong>Source:</strong> <span class="badge bg-info">${o.source || 'analogue'}</span></div></div>
+        <div class="col-md-6"><div>${stakeTag}</div><div><strong>Multiplier:</strong> ${o.multiplier}x</div><div><strong>Duration:</strong> ${o.duration}s</div><div><strong>Source:</strong> <span class="badge bg-info">${o.source || 'analogue'}</span></div></div>
       </div>
       <div class="row small mt-2"><div class="col-4">P(TP): <strong>${((eco.probTP || 0) * 100).toFixed(0)}%</strong></div><div class="col-4">P(SL): <strong>${((eco.probSL || 0) * 100).toFixed(0)}%</strong></div><div class="col-4">EV: <strong>$${(eco.ev || 0).toFixed(2)}</strong></div></div>
       <div class="mt-2"><button class="btn btn-sm btn-success" onclick="window.executeLiveSignal('${sym}')"><i class="fas fa-play"></i> Execute Trade</button><button class="btn btn-sm btn-outline-secondary ms-2" onclick="window.dismissSignal('${sym}')">Dismiss</button></div>
@@ -539,21 +556,66 @@ function renderSignalCard(sym, consensus, prediction, opportunity) {
   </div>`;
 }
 
+// [FIX-STAKE-EDIT] Replace confirm() with prompt() so the user can edit
+// the stake per trade. The default comes from opportunity.stake, which is
+// $1 via STAKE_MODE=fixed in opportunityEngine.js. The edited value is
+// what gets sent to /api/trade — no more "calculated stake can't be
+// changed" problem.
 window.executeLiveSignal = async function (symbol) {
   const sym = formatSymbol(symbol);
   const opportunity = dashboardState.signalOpportunities[sym];
   const consensus = dashboardState.strategyConsensus[sym];
   if (!opportunity || !opportunity.tradable) { alert('No tradable opportunity for ' + symbol); return; }
+
   const stratInfo = opportunity.strategyInfo || {};
   const strategy = stratInfo.anchorStrategy || opportunity.prediction?.strategyConsensus?.anchorStrategy || consensus?.anchorStrategy || null;
   const regimeCode = opportunity.prediction?.regime || consensus?.regime || null;
-  const confirmMsg = `Execute ${opportunity.direction} ${symbolToDisplay(sym)}?\n\nEntry: ${formatPrice(opportunity.entryPrice)}\nStop: ${formatPrice(opportunity.knockoutLevel)}\nTarget: ${formatPrice(opportunity.takeProfitLevel)}\nStake: $${(opportunity.stake || 0).toFixed(2)}\nMult: ${opportunity.multiplier}x\nDur: ${opportunity.duration}s\nSource: ${opportunity.source || 'analogue'}\n${strategy ? `Strategy: ${strategy}\n` : ''}${regimeCode ? `Regime: ${regimeCode}\n` : ''}`;
-  if (!confirm(confirmMsg)) return;
 
-  const body = { pair: symbol.replace(/_/g, '/'), side: opportunity.direction, stake: opportunity.stake, multiplier: opportunity.multiplier, duration: opportunity.duration, knockoutLevel: opportunity.knockoutLevel, takeProfitLevel: opportunity.takeProfitLevel, product: 'deriv_cfd', strategy, regimeCode };
+  // Default stake: prefer opportunity.stake (which is $1 from File 2),
+  // fall back to 1 if missing/invalid.
+  const defaultStake = Number(opportunity.stake) > 0 ? Number(opportunity.stake) : 1;
+
+  // Compose the prompt message. `prompt()` gives us a single-line text
+  // input with this as the default — the user can edit it in place.
+  const promptMsg =
+    `Execute ${opportunity.direction} ${symbolToDisplay(sym)}?\n\n` +
+    `Entry:  ${formatPrice(opportunity.entryPrice)}\n` +
+    `Stop:   ${formatPrice(opportunity.knockoutLevel)}\n` +
+    `Target: ${formatPrice(opportunity.takeProfitLevel)}\n` +
+    `Mult:   ${opportunity.multiplier}x · Dur: ${opportunity.duration}s\n` +
+    `Source: ${opportunity.source || 'analogue'}` +
+    (strategy ? `\nStrategy: ${strategy}` : '') +
+    (regimeCode ? `\nRegime: ${regimeCode}` : '') +
+    `\n\nStake (USD) — edit if needed:`;
+
+  const stakeInput = prompt(promptMsg, String(defaultStake));
+  if (stakeInput === null) return;      // user cancelled
+  const stake = parseFloat(stakeInput);
+  if (!Number.isFinite(stake) || stake <= 0) {
+    alert('Invalid stake — no trade placed.');
+    return;
+  }
+
+  const body = {
+    pair: symbol.replace(/_/g, '/'),
+    side: opportunity.direction,
+    stake,                                // <-- EDITED stake goes to server
+    multiplier: opportunity.multiplier,
+    duration: opportunity.duration,
+    knockoutLevel: opportunity.knockoutLevel,
+    takeProfitLevel: opportunity.takeProfitLevel,
+    product: 'deriv_cfd',
+    strategy,
+    regimeCode,
+  };
+
   const result = await placeOrderFetch('/api/trade', body);
-  showOrderOutcome(result);
-  if (result.body?.success && (result.body?.status === 'FILLED' || result.body?.status === 'CONFIRMED_RECORD_FAILED')) { delete dashboardState.signalOpportunities[sym]; renderLiveSignalPanel(); }
+  await showOrderOutcome(result);
+
+  if (result.body?.success && (result.body?.status === 'FILLED' || result.body?.status === 'CONFIRMED_RECORD_FAILED')) {
+    delete dashboardState.signalOpportunities[sym];
+    renderLiveSignalPanel();
+  }
 };
 
 window.dismissSignal = function (symbol) { delete dashboardState.signalOpportunities[formatSymbol(symbol)]; renderLiveSignalPanel(); };
@@ -742,30 +804,66 @@ async function cancelPending(orderId) {
 }
 
 // ================================================================
-// Trade form — status-aware
+// Order outcome — reconcile-aware
 // ================================================================
-function showOrderOutcome(result) {
+// [FIX-BROKER-ERR-FE] This is now async: on BROKER_ERROR (or HTTP 5xx) it
+// refreshes positions first, then checks whether the contract exists in
+// the portfolio. If it does, shows a "contract is LIVE" message (accurate).
+// If it doesn't, shows the "no contract found, safe to retry" message.
+async function showOrderOutcome(result) {
   const status = result.body?.status;
   const contractId = result.body?.contractId ? String(result.body.contractId) : null;
+  const recovered = result.body?.recovered === true;
 
   if (status === 'FILLED' || (result.body?.success && status !== 'CONFIRMED_RECORD_FAILED')) {
     SoundManager.tradeOpen();
     alert(`✅ Trade placed\n\nContract: ${contractId || '?'}\nEntry: ${result.body?.entryPrice ?? '—'}\nPurchase: ${result.body?.purchasePrice ?? '—'}\nStrategy: ${result.body?.strategy ?? '(none)'}\n\nLive P/L will appear in Open Positions.`);
     refreshAllData();
-  } else if (status === 'CONFIRMED_RECORD_FAILED') {
+    return;
+  }
+
+  if (status === 'CONFIRMED_RECORD_FAILED') {
     SoundManager.danger();
-    alert(`⚠️ Purchase CONFIRMED but record save failed.\n\nContract: ${contractId}\n\nDO NOT RETRY — the contract is live at Deriv and will be picked up by reconciliation.`);
+    if (recovered) {
+      alert(`✅ Recovered — contract is LIVE at Deriv.\n\nContract: ${contractId}\nEntry: ${result.body?.entryPrice ?? '—'}\nPurchase: ${result.body?.purchasePrice ?? '—'}\n\nThe trade was recovered from the portfolio after a buy-side error.\nIt will be managed in Open Positions. DO NOT retry.`);
+    } else {
+      alert(`⚠️ Purchase CONFIRMED but record save failed.\n\nContract: ${contractId}\n\nDO NOT RETRY — the contract is live at Deriv and will be picked up by reconciliation.`);
+    }
     refreshAllData();
-  } else if (status === 'REJECTED') {
+    return;
+  }
+
+  if (status === 'REJECTED') {
     SoundManager.reject();
     alert(`❌ Order rejected\n\n${result.body?.error || 'No reason'}\n\nSafe to retry after correcting the input.`);
-  } else if (status === 'BROKER_ERROR' || result.httpStatus >= 500) {
-    SoundManager.danger();
-    alert(`❗ Broker error — purchase may have completed.\n\n${result.body?.error || ''}\n\nDO NOT click Place Trade again without first checking Open Positions.`);
-  } else {
-    SoundManager.danger();
-    alert(`❓ Unexpected response (HTTP ${result.httpStatus}):\n${JSON.stringify(result.body)}\n\nCheck Open Positions before retrying.`);
+    return;
   }
+
+  if (status === 'BROKER_ERROR' || result.httpStatus >= 500) {
+    SoundManager.danger();
+    // Refresh positions so we can check whether the contract landed
+    // despite the error. Backend now reconciles too, but older
+    // deployments may still return raw BROKER_ERROR.
+    await refreshAllData();
+    const positions = dashboardState.positions || [];
+    const suspectedLive = contractId
+      ? positions.find(p => String(p.id ?? p.contractId) === contractId)
+      : null;
+
+    if (suspectedLive) {
+      alert(`✅ Contract is LIVE despite the error.\n\nContract: ${suspectedLive.id ?? suspectedLive.contractId}\nEntry: ${formatPrice(suspectedLive.entryPrice)}\nP/L: ${Number(suspectedLive.unrealizedPL || 0).toFixed(2)}\n\nIt will be managed in Open Positions. DO NOT place a new trade for this setup.`);
+      return;
+    }
+
+    // No matching contract — genuinely ambiguous. Server-side reconcile
+    // already ran (per File 6); if it found nothing, there really is
+    // nothing. But give the user one more chance to check manually.
+    alert(`❗ Broker error — purchase may NOT have completed.\n\n${result.body?.error || ''}\n\nNo matching contract was found in Open Positions.\nWait 10s, refresh, and check again before retrying.`);
+    return;
+  }
+
+  SoundManager.danger();
+  alert(`❓ Unexpected response (HTTP ${result.httpStatus}):\n${JSON.stringify(result.body)}\n\nCheck Open Positions before retrying.`);
 }
 
 // ================================================================
@@ -807,6 +905,10 @@ window.updateAccountBadge = function (acc) {
   }
 };
 
+// [NOTE] `executeSignalFromCard` is defined but currently unreachable —
+// it references #tradePair, #tradeSide, #tradeStake, which don't exist
+// in index.html. Kept for backward compatibility with any external
+// integration that may call window.executeSignalFromCard.
 window.executeSignalFromCard = function (btn) {
   const card = btn.closest('.live-signal-card');
   if (!card) return;
@@ -819,7 +921,7 @@ window.executeSignalFromCard = function (btn) {
   if (!pair || !sideSel) { alert('Trade form not available.'); return; }
   pair.value = sym;
   sideSel.value = side === 'SELL' ? 'SELL' : 'BUY';
-  if (stakeIn && !stakeIn.value) stakeIn.value = '10';
+  if (stakeIn && !stakeIn.value) stakeIn.value = '1';   // default to 1 USD
   const tab = document.querySelector('.sidebar-nav .nav-item[data-section="trading"]');
   if (tab) tab.click();
 };
@@ -856,6 +958,10 @@ document.addEventListener('DOMContentLoaded', async function () {
     } catch (e) { alert('Error: ' + e.message); }
   });
 
+  // [NOTE] The trade form below references DOM elements that don't exist
+  // in the current index.html (#tradeForm, #tradePair, #tradeStake, etc.).
+  // The optional chaining means it silently no-ops. Preserved in case the
+  // form is reintroduced.
   document.getElementById('tradeForm')?.addEventListener('submit', async function (e) {
     e.preventDefault();
     if (isSubmitting) return;
@@ -869,7 +975,7 @@ document.addEventListener('DOMContentLoaded', async function () {
     const tp = parseFloat(document.getElementById('tradeTP').value) || null;
     if (!pair || !stake || stake <= 0 || !multiplier || !duration) { alert('Fill in all required fields.'); isSubmitting = false; return; }
     const result = await placeOrderFetch('/api/trade', { pair, side, stake, multiplier, duration, knockoutLevel: ko, takeProfitLevel: tp, product: document.getElementById('currentProduct')?.textContent || 'deriv_cfd' });
-    showOrderOutcome(result);
+    await showOrderOutcome(result);
     isSubmitting = false;
   });
 
@@ -886,7 +992,7 @@ document.addEventListener('DOMContentLoaded', async function () {
     if (status === 'FILLED' || (result.body?.success && status !== 'CONFIRMED_RECORD_FAILED')) { SoundManager.tradeOpen(); alert(`✅ Auto-trade placed\nContract: ${result.body?.contractId || '?'}`); refreshAllData(); }
     else if (status === 'CONFIRMED_RECORD_FAILED') { SoundManager.danger(); alert(`⚠️ Confirmed ${result.body?.contractId} but record failed. DO NOT retry.`); }
     else if (status === 'REJECTED' || status === 'NO_SIGNAL') { SoundManager.reject(); alert(`Not placed: ${result.body?.message || result.body?.error || 'No signal'}`); }
-    else { SoundManager.danger(); alert(`❗ Broker error — check positions before retrying.\n${result.body?.error || ''}`); }
+    else { SoundManager.danger(); alert(`❗ Broker error — check positions before retrying.\n${result.body?.error || ''}`); refreshAllData(); }
     isAutoSubmitting = false;
   });
 
@@ -919,4 +1025,4 @@ document.addEventListener('DOMContentLoaded', async function () {
   renderLiveSignalPanel();
 });
 
-console.log('✅ app.js loaded — Live Signal Engine + OTIE V6 trajectory panel active.');
+console.log('✅ app.js loaded — Live Signal Engine + OTIE V6 trajectory panel active (with editable stake + reconcile-aware error handling).');
