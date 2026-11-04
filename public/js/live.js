@@ -2,6 +2,27 @@
 // All state updates flow through window.updateDashboardState (app.js).
 // contractUpdate / otieState / price / positions / account use targeted
 // repaint hooks so live ticks don't rerender every widget.
+//
+// [FIX-AUTO-VIS] Auto-execute outcomes are now VISIBLE. Previously, when
+//   Auto was ON, a FILLED trade just played a sound and a BROKER_ERROR
+//   only appeared in the console — invisible to the user. Now:
+//     • Every outcome dispatches a non-blocking toast (top-right)
+//     • Pre-flight validation rejects garbage payloads before sending
+//     • _autoExecuting has a 30s safety timeout (fixes hang-forever lock)
+//     • On BROKER_ERROR, positions are refreshed and checked before
+//       declaring failure (matches app.js showOrderOutcome accuracy)
+//     • Recovery responses (recovered: true) get a distinct success toast
+//     • Actual stake and multiplier are logged so $1 default is visible
+//
+// [FIX-INIT] init handler defensively initializes s.digitViews and
+//   s.strategyConsensus before Object.assign. Previously
+//   Object.assign(s.digitViews, ...) would throw "Cannot convert
+//   undefined or null to object" because dashboardState.digitViews
+//   was never initialized in app.js.
+//
+// [FIX-LIVE-DEFAULT] init handler renders the Live Signal panel after
+//   applying strategyConsensus so the UI reflects the initial state
+//   immediately instead of waiting for the next 30s cycle.
 
 (function () {
   'use strict';
@@ -9,6 +30,13 @@
   const WS_RECONNECT_DELAY = 2000;
   const WS_MAX_RECONNECT_DELAY = 30000;
   const HEARTBEAT_INTERVAL = 25000;
+
+  // [FIX-AUTO-VIS] Safety release window for the auto-execute lock.
+  const AUTO_EXEC_SAFETY_MS = 30_000;
+
+  // [FIX-AUTO-VIS] Multiplier whitelist — must match orderService +
+  // contractService + broker. Reject before hitting the network.
+  const AUTO_VALID_MULTIPLIERS = [200, 400, 600, 800];
 
   let reconnectAttempts = 0;
   let ws = null;
@@ -43,6 +71,43 @@
   }
 
   function state() { return window.dashboardState || null; }
+
+  // ============================================================
+  //  [FIX-AUTO-VIS] Toast notification system
+  // ============================================================
+  function _toast(message, kind) {
+    const k = kind || 'info';
+    let container = document.getElementById('rtsToastContainer');
+    if (!container) {
+      container = document.createElement('div');
+      container.id = 'rtsToastContainer';
+      container.style.cssText =
+        'position:fixed; top:16px; right:16px; z-index:99999; display:flex; ' +
+        'flex-direction:column; gap:8px; max-width:380px; pointer-events:none;';
+      document.body.appendChild(container);
+    }
+    const palette = {
+      success: { bg: '#ecfdf5', fg: '#065f46', bd: '#a7f3d0' },
+      warn:    { bg: '#fef3c7', fg: '#92400e', bd: '#fde68a' },
+      error:   { bg: '#fef2f2', fg: '#991b1b', bd: '#fecaca' },
+      info:    { bg: '#eff6ff', fg: '#1e40af', bd: '#bfdbfe' },
+    };
+    const p = palette[k] || palette.info;
+    const div = document.createElement('div');
+    div.style.cssText =
+      `background:${p.bg}; color:${p.fg}; border:1px solid ${p.bd}; ` +
+      'padding:10px 14px; border-radius:8px; ' +
+      'box-shadow:0 4px 12px rgba(0,0,0,0.1); ' +
+      'font-size:0.85rem; font-weight:500; pointer-events:auto; ' +
+      'opacity:0; transition: opacity 0.2s ease; white-space:pre-wrap;';
+    div.textContent = message;
+    container.appendChild(div);
+    requestAnimationFrame(() => { div.style.opacity = '1'; });
+    setTimeout(() => {
+      div.style.opacity = '0';
+      setTimeout(() => div.remove(), 250);
+    }, 6000);
+  }
 
   function connectWebSocket() {
     if (ws && ws.readyState === WebSocket.OPEN) return;
@@ -268,6 +333,7 @@
       case 'init': {
         const s = state();
         if (!s) break;
+
         s.account = msg.data.account || s.account;
         if (Array.isArray(msg.data.positions)) s.positions = msg.data.positions;
 
@@ -278,11 +344,25 @@
           }
         }
 
-        if (msg.data.strategyConsensus) Object.assign(s.strategyConsensus, msg.data.strategyConsensus);
+        // [FIX-INIT] Defensive initialization — previously
+        // `Object.assign(s.strategyConsensus, ...)` and
+        // `Object.assign(s.digitViews, ...)` would throw if the target
+        // object was undefined (dashboardState.digitViews was never
+        // initialized in app.js).
+        if (msg.data.strategyConsensus) {
+          if (!s.strategyConsensus) s.strategyConsensus = {};
+          Object.assign(s.strategyConsensus, msg.data.strategyConsensus);
+        }
+        if (msg.data.digitViews) {
+          if (!s.digitViews) s.digitViews = {};
+          Object.assign(s.digitViews, msg.data.digitViews);
+        }
         if (msg.data.runningBots) s.runningBots = msg.data.runningBots;
-        if (msg.data.digitViews) Object.assign(s.digitViews, msg.data.digitViews);
 
         if (typeof window.renderAllWidgets === 'function') window.renderAllWidgets();
+        // [FIX-LIVE-DEFAULT] Immediately reflect the initial consensus
+        // state in the Live Signal panel instead of waiting 30s.
+        if (typeof window.renderLiveSignalPanel === 'function') window.renderLiveSignalPanel();
         break;
       }
 
@@ -336,52 +416,138 @@
   }
 
   // ============================================================
-  //  Auto-execute — status-aware, never retries on error
+  //  [FIX-AUTO-VIS] Auto-execute — visible outcomes, hard validation,
+  //  safety lock release, and portfolio reconciliation on broker error.
   // ============================================================
-  function maybeAutoExecute(opp) {
+  async function maybeAutoExecute(opp) {
     if (!opp || !opp.tradable) return;
+
     const toggle = document.getElementById('autoExecuteToggle');
     if (!toggle || !toggle.checked) return;
     if (_autoExecuting) return;
 
-    _autoExecuting = true;
-    console.log('[Live] Auto-executing opportunity:', opp.direction, opp.prediction?.symbol);
+    // ---- Pre-flight validation ----
+    const symbol = opp.prediction?.symbol;
+    const stakeNum = Number(opp.stake);
+    const multNum = Number(opp.multiplier);
 
-    fetch((CONFIG.API_BASE || '') + '/api/trade', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        pair: opp.prediction?.symbol || 'EUR_USD',
-        side: opp.direction,
-        stake: opp.stake,
-        multiplier: opp.multiplier,
-        duration: opp.duration,
-        knockoutLevel: opp.knockoutLevel,
-        takeProfitLevel: opp.takeProfitLevel,
-        product: 'deriv_cfd',
-        strategy: opp.strategyInfo?.anchorStrategy || null,
-        regimeCode: opp.prediction?.regime || null,
-      }),
-    })
-      .then(r => r.json().then(b => ({ status: r.status, body: b })).catch(() => ({ status: r.status, body: {} })))
-      .then(({ status, body }) => {
-        if (body.status === 'FILLED') {
+    if (!symbol || typeof symbol !== 'string') {
+      console.warn('[Live] Auto-execute skipped: no symbol in opportunity');
+      _toast('Auto-skip: opportunity has no symbol', 'warn');
+      return;
+    }
+    if (!Number.isFinite(stakeNum) || stakeNum <= 0) {
+      console.warn('[Live] Auto-execute skipped: invalid stake', opp.stake);
+      _toast(`Auto-skip: invalid stake (${opp.stake})`, 'warn');
+      return;
+    }
+    if (!Number.isFinite(multNum) || AUTO_VALID_MULTIPLIERS.indexOf(multNum) === -1) {
+      console.warn('[Live] Auto-execute skipped: invalid multiplier', opp.multiplier);
+      _toast(`Auto-skip: invalid multiplier (${opp.multiplier}x)`, 'warn');
+      return;
+    }
+
+    _autoExecuting = true;
+
+    // [FIX-AUTO-VIS] Safety release — if /api/trade hangs, unlock after 30s.
+    const safetyTimer = setTimeout(() => {
+      if (_autoExecuting) {
+        console.warn('[Live] Auto-execute lock released by safety timeout');
+        _autoExecuting = false;
+      }
+    }, AUTO_EXEC_SAFETY_MS);
+
+    const strategy = opp.strategyInfo?.anchorStrategy
+      || opp.prediction?.strategyConsensus?.anchorStrategy
+      || null;
+    const regimeCode = opp.prediction?.regime || null;
+
+    console.log(
+      `[Live] Auto-executing: ${opp.direction} ${symbol} ` +
+      `stake=$${stakeNum} mult=${multNum}x` +
+      (strategy ? ` strategy=${strategy}` : '')
+    );
+
+    try {
+      const res = await fetch((CONFIG.API_BASE || '') + '/api/trade', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          pair: symbol,
+          side: opp.direction,
+          stake: stakeNum,
+          multiplier: multNum,
+          duration: opp.duration,
+          knockoutLevel: opp.knockoutLevel,
+          takeProfitLevel: opp.takeProfitLevel,
+          product: 'deriv_cfd',
+          strategy,
+          regimeCode,
+        }),
+      });
+
+      let body = {};
+      try { body = await res.json(); } catch (_) { body = {}; }
+
+      const status = body.status;
+      const contractId = body.contractId ? String(body.contractId) : null;
+      const recovered = body.recovered === true;
+
+      // ---- Outcome dispatch (all visible) ----
+      if (status === 'FILLED' || (body.success && status !== 'CONFIRMED_RECORD_FAILED')) {
+        playSound('tradeOpen');
+        _toast(`✅ Auto: ${opp.direction} ${symbol} $${stakeNum} → ${contractId || '?'}`, 'success');
+        console.log('[Live] Auto-trade placed:', contractId);
+        if (typeof window.refreshDashboard === 'function') window.refreshDashboard();
+
+      } else if (status === 'CONFIRMED_RECORD_FAILED') {
+        if (recovered) {
           playSound('tradeOpen');
-          console.log('[Live] Auto-trade placed:', body.contractId);
-        } else if (body.status === 'CONFIRMED_RECORD_FAILED') {
-          console.warn('[Live] Auto-trade confirmed but not recorded:', body.contractId);
-        } else if (body.status === 'REJECTED') {
-          playSound('reject');
-          console.log('[Live] Auto-trade rejected:', body.error);
+          _toast(`✅ Auto RECOVERED: ${contractId} is LIVE at Deriv`, 'success');
         } else {
-          console.error('[Live] Auto-trade broker error — do not retry:', body.error || status);
+          playSound('danger');
+          _toast(`⚠️ Auto: ${contractId || '?'} confirmed but not recorded — DO NOT RETRY`, 'warn');
         }
-      })
-      .catch(err => {
-        console.error('[Live] Auto-trade network error — do not retry:', err);
+        console.warn('[Live] Auto-trade confirmed but not recorded:', contractId);
+        if (typeof window.refreshDashboard === 'function') window.refreshDashboard();
+
+      } else if (status === 'REJECTED') {
         playSound('reject');
-      })
-      .finally(() => { _autoExecuting = false; });
+        _toast(`❌ Auto rejected: ${body.error || 'No reason'}`, 'error');
+        console.log('[Live] Auto-trade rejected:', body.error);
+
+      } else if (status === 'BROKER_ERROR' || res.status >= 500) {
+        // [FIX-AUTO-VIS] Refresh positions and check before declaring failure.
+        playSound('danger');
+        if (typeof window.refreshDashboard === 'function') {
+          try { await window.refreshDashboard(); } catch (_) {}
+        }
+        const positions = (window.dashboardState && window.dashboardState.positions) || [];
+        const found = contractId && positions.find(
+          p => String(p.id ?? p.contractId) === String(contractId)
+        );
+        if (found) {
+          _toast(`✅ Auto contract ${contractId} is LIVE despite the error`, 'success');
+          console.warn('[Live] Auto-trade error but contract found in portfolio:', contractId);
+        } else {
+          _toast(`❗ Auto broker error — check positions.\n${body.error || ''}`, 'error');
+          console.error('[Live] Auto-trade broker error — do not retry:', body.error || res.status);
+        }
+
+      } else {
+        playSound('danger');
+        _toast(`❓ Auto unexpected: HTTP ${res.status}`, 'error');
+        console.error('[Live] Auto-trade unexpected:', res.status, body);
+      }
+
+    } catch (err) {
+      console.error('[Live] Auto-trade network error — do not retry:', err);
+      playSound('reject');
+      _toast(`❌ Auto network error: ${err.message}`, 'error');
+    } finally {
+      clearTimeout(safetyTimer);
+      _autoExecuting = false;
+    }
   }
 
   // ============================================================
@@ -452,4 +618,7 @@
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     connectWebSocket();
   };
+
+  // [FIX-AUTO-VIS] Expose for testing / manual invocation.
+  window._liveToast = _toast;
 })();
