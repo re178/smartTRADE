@@ -39,6 +39,46 @@
 //          (CONFIDENCE_DRIFT_GAIN=0.35 default). Increase to accept more
 //          trades, decrease to accept fewer. No code change required to
 //          tune this in production.
+//
+// [FIX-O9] CANDIDATE_MULTIPLIERS aligned to [200, 400, 600, 800].
+//          Deriv deprecated 100/300/500. Previously the engine would
+//          suggest 100/300/500, which orderService rejected at the broker
+//          layer — silently discarding ~40% of tradeable opportunities.
+//          400/600 were never even tried. Now every candidate is
+//          executable end-to-end.
+//
+// [FIX-O10] All gates (EV, probSL, evOverStake) applied INSIDE the
+//          candidate loop, matching evaluateStrategyOnly. Previously
+//          `utility` was the only selection criterion; a utility-winner
+//          could then be rejected post-loop for evOverStake — losing a
+//          trade that a different multiplier would have passed. Now the
+//          gate is applied before selection.
+//
+// [FIX-O11] STAKE_MODE / DEFAULT_STAKE_USD config. Default 'fixed' at
+//          $1.00 so every opportunity proposes a small editable stake.
+//          Return objects now carry `stakeEditable` and `stakeSource`
+//          so the frontend can render an input field. Legacy 'risk_pct'
+//          mode available via STAKE_MODE=risk_pct env var.
+//
+// [FIX-O12] `probabilities.up/down` field semantics corrected for SELL.
+//          Previously up=probTP (probability of hitting take-profit —
+//          which for a SELL is a DOWNWARD move). Downstream consumers
+//          (dashboard widget, predictor fusion) read these as literal
+//          up-move / down-move probabilities. Now direction-aware.
+//
+// [FIX-O13] `MIN_SAMPLE_SIZE` and `MAX_MAE_RATIO` promoted from inline
+//          magic numbers to CONFIG for observability and tunability.
+//
+// [FIX-O14] Warning added when `prediction.strategyLevels` is present but
+//          invalid (wrong-side stops, NaN values, etc.). Previously the
+//          code silently fell back to ATR distances — the warn makes the
+//          fallback visible in the pipeline log.
+//
+// [FIX-O15] Optional `rng` parameter threaded through `evaluate` →
+//          `evaluateWithPaths` so tests can pass a seeded PRNG. Production
+//          callers omit it and get Math.random as before. This is a
+//          backward-compatible signature change (6th arg, defaults to
+//          Math.random).
 
 'use strict';
 
@@ -46,17 +86,22 @@ const riskEngine = require('../risk/riskEngine');
 const { getPipSize } = require('../../shared/helpers');
 const logger = require('../../infrastructure/logger') || console;
 
+function makeDefaultRng() { return Math.random; }
+
 const CONFIG = {
   MIN_CONFIDENCE: 55,
   MIN_EV: 0.0,
   MIN_EV_OVER_STAKE: 0.005,
+  MIN_SAMPLE_SIZE: 20,               // [FIX-O13] promoted from inline
   MIN_EFFECTIVE_SAMPLE: 15,
   MIN_QUALIFIED_COUNT: 20,
   MAX_WEIGHTED_DISTANCE: 2.5,
   MIN_MARKET_QUALITY: 30,
   MAX_SPREAD_PIPS: 3.0,
+  MAX_MAE_RATIO: 0.8,                // [FIX-O13] promoted from inline
 
-  CANDIDATE_MULTIPLIERS: [100, 200, 300, 500, 800],
+  // [FIX-O9] Match orderService + broker + Deriv's current offering.
+  CANDIDATE_MULTIPLIERS: [200, 400, 600, 800],
   MAX_KNOCKOUT_PROBABILITY: 0.50,
   MAX_KNOCKOUT_PROBABILITY_COMBINED: 0.45,
   TP_MULTIPLIER: 1.5,
@@ -75,6 +120,14 @@ const CONFIG = {
 
   // [FIX-O6] Directional drift gain. See file header for calibration table.
   CONFIDENCE_DRIFT_GAIN: parseFloat(process.env.CONFIDENCE_DRIFT_GAIN) || 0.35,
+
+  // [FIX-O11] Stake suggestion mode.
+  //   'fixed'    → always suggest DEFAULT_STAKE_USD (1.00). Recommended
+  //                when the dashboard confirmation step lets the user
+  //                edit stake per trade.
+  //   'risk_pct' → legacy behaviour (balance × riskPerTrade%).
+  STAKE_MODE: (process.env.STAKE_MODE || 'fixed').toLowerCase(),
+  DEFAULT_STAKE_USD: parseFloat(process.env.DEFAULT_STAKE_USD) || 1.0,
 };
 
 const NO_TRADE_REASONS = {
@@ -106,9 +159,24 @@ const NO_TRADE_REASONS = {
 };
 
 // ========================================================================
+// Stake helper — [FIX-O11]
+// Centralises the fixed-vs-pct choice so evaluateWithPaths and
+// evaluateStrategyOnly stay in lockstep.
+// ========================================================================
+function computeStakeSuggestion(account, riskConfig, capPct) {
+  if (CONFIG.STAKE_MODE === 'fixed') {
+    return CONFIG.DEFAULT_STAKE_USD;
+  }
+  const balance = account?.balance ? parseFloat(account.balance) : 10000;
+  const riskPerTrade = riskConfig?.riskPerTradePct || 1.0;
+  const cap = capPct != null ? capPct : 0.05;
+  return Math.max(0.5, Math.min(balance * (riskPerTrade / 100), balance * cap));
+}
+
+// ========================================================================
 // Main entry
 // ========================================================================
-async function evaluate(prediction, account, openPositions, marketData, riskConfig = {}) {
+async function evaluate(prediction, account, openPositions, marketData, riskConfig = {}, rng = makeDefaultRng) {
   if (!prediction) {
     return createNoTradeResponse(NO_TRADE_REASONS.NO_DATA, 'No prediction provided.');
   }
@@ -170,7 +238,8 @@ async function evaluate(prediction, account, openPositions, marketData, riskConf
 
   return evaluateWithPaths(
     prediction, account, openPositions, marketData, riskConfig,
-    modeLabel === 'combined' ? 'combined' : 'analogue'
+    modeLabel === 'combined' ? 'combined' : 'analogue',
+    rng
   );
 }
 
@@ -240,7 +309,7 @@ function preCheckCommon(prediction, account, marketData) {
 }
 
 // ========================================================================
-// Strategy-only path (unchanged — self-contained deterministic math)
+// Strategy-only path (self-contained deterministic math)
 // ========================================================================
 async function evaluateStrategyOnly(prediction, account, openPositions, marketData, riskConfig) {
   const consensus = prediction.strategyConsensus;
@@ -284,15 +353,8 @@ async function evaluateStrategyOnly(prediction, account, openPositions, marketDa
     );
   }
 
-  const balance = account?.balance ? parseFloat(account.balance) : 10000;
-  const riskPerTrade = riskConfig.riskPerTradePct || 1.0;
-  const stake = Math.max(
-    0.5,
-    Math.min(
-      balance * (riskPerTrade / 100),
-      balance * CONFIG.STRATEGY_ONLY_MAX_STAKE_PCT
-    )
-  );
+  // [FIX-O11] Centralised stake helper.
+  const stake = computeStakeSuggestion(account, riskConfig, CONFIG.STRATEGY_ONLY_MAX_STAKE_PCT);
 
   const probTPRaw = Math.max(
     CONFIG.STRATEGY_ONLY_CONFIDENCE_FLOOR,
@@ -384,12 +446,20 @@ async function evaluateStrategyOnly(prediction, account, openPositions, marketDa
     prediction,
     direction,
     stake,
+    // [FIX-O11] signal to the UI whether stake is editable
+    stakeEditable: CONFIG.STAKE_MODE === 'fixed',
+    stakeSource: CONFIG.STAKE_MODE,
     multiplier: bestMultiplier,
     duration,
     entryPrice: entry,
     knockoutLevel: stop,
     takeProfitLevel: target,
-    probabilities: { up: probTP, down: probSL, neutral: probNeutral },
+    // [FIX-O12] direction-aware probabilities
+    probabilities: {
+      up:   direction === 'BUY' ? probTP : probSL,
+      down: direction === 'BUY' ? probSL : probTP,
+      neutral: probNeutral,
+    },
     source: 'strategy_only',
     tradeEconomics: {
       probTP,
@@ -419,7 +489,7 @@ async function evaluateStrategyOnly(prediction, account, openPositions, marketDa
 // ========================================================================
 // [FIX-O6] ATR-based path evaluation with directional drift
 // ========================================================================
-async function evaluateWithPaths(prediction, account, openPositions, marketData, riskConfig, mode) {
+async function evaluateWithPaths(prediction, account, openPositions, marketData, riskConfig, mode, rng = makeDefaultRng) {
   const {
     symbol = 'UNKNOWN',
     direction = 'NEUTRAL',
@@ -429,7 +499,8 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
   const isCombined = mode === 'combined';
 
   const sampleSize = prediction.sampleSize || 0;
-  if (sampleSize < 20) {
+  // [FIX-O13] use CONFIG.MIN_SAMPLE_SIZE
+  if (sampleSize < CONFIG.MIN_SAMPLE_SIZE) {
     logger.info(`[Opportunity] ${symbol} NO_TRADE LOW_SAMPLE_SIZE — ${sampleSize} candles`);
     return createNoTradeResponse(
       NO_TRADE_REASONS.LOW_SAMPLE_SIZE,
@@ -461,10 +532,11 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
   const expFav = Math.abs(prediction.expectedFavorable || 0);
   const expAdv = Math.abs(prediction.expectedAdverse || 0);
   const maeRatio = expAdv / (Math.abs(prediction.expectedMove) || 0.0001);
-  if (maeRatio > 0.8) {
+  // [FIX-O13] use CONFIG.MAX_MAE_RATIO
+  if (maeRatio > CONFIG.MAX_MAE_RATIO) {
     return createNoTradeResponse(
       NO_TRADE_REASONS.HIGH_MAE_RATIO,
-      `maeRatio ${maeRatio.toFixed(2)} above 0.8`,
+      `maeRatio ${maeRatio.toFixed(2)} above ${CONFIG.MAX_MAE_RATIO}`,
       prediction
     );
   }
@@ -493,15 +565,16 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
   );
 
   // ---- [FIX-O6] Generate paths with directional drift ----
+  // [FIX-O15] uses injected rng() instead of Math.random()
   const paths = [];
   for (let p = 0; p < N_PATHS; p++) {
     const pathHighs = [], pathLows = [], pathCloses = [];
     let price = entryPrice;
     for (let c = 0; c < LOOKAHEAD_CANDLES; c++) {
       // Random component (unchanged) + directional drift (new)
-      const body = (Math.random() - 0.5) * atr * 1.2 + driftPerCandle;
-      const wickUp = Math.random() * atr * 0.4;
-      const wickDown = Math.random() * atr * 0.4;
+      const body = (rng() - 0.5) * atr * 1.2 + driftPerCandle;
+      const wickUp = rng() * atr * 0.4;
+      const wickDown = rng() * atr * 0.4;
       const open = price;
       const close = open + body;
       pathHighs.push(Math.max(open, close) + wickUp);
@@ -523,6 +596,13 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
       tpDist = Math.abs(lv.target - entry);
       slDist = Math.abs(lv.stop - entry);
       usingStrategyLevels = true;
+    } else {
+      // [FIX-O14] surface invalid strategyLevels in the log
+      logger.warn(
+        `[Opportunity] ${symbol} strategyLevels present but invalid ` +
+        `(dir=${direction}, entry=${entry}, stop=${lv.stop}, target=${lv.target}) — ` +
+        `falling back to ATR-based TP/SL`
+      );
     }
   }
 
@@ -549,9 +629,8 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
     knockoutLevel = entryPrice + slDist;
   }
 
-  const balance = account?.balance ? parseFloat(account.balance) : 10000;
-  const riskPerTrade = riskConfig.riskPerTradePct || 1.0;
-  const stake = Math.max(0.5, Math.min(balance * (riskPerTrade / 100), balance * 0.05));
+  // [FIX-O11] Centralised stake helper.
+  const stake = computeStakeSuggestion(account, riskConfig, 0.05);
 
   const maxProbSL = isCombined
     ? CONFIG.MAX_KNOCKOUT_PROBABILITY_COMBINED
@@ -598,15 +677,22 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
     const avgLossOnSLHit = weightedHitsSL > 0 ? (weightedSLLoss / weightedHitsSL) : 0;
 
     const ev = avgProfit;
+    const evOverStake = ev / stake;
     const utility = ev - CONFIG.RISK_AVERSION * probSL * avgLossOnSLHit;
 
-    if (ev > CONFIG.MIN_EV && probSL < maxProbSL && utility > bestUtility) {
+    // [FIX-O10] All gates applied BEFORE the utility comparison, matching
+    // evaluateStrategyOnly. A utility-winner is no longer discarded
+    // post-loop for evOverStake.
+    if (ev <= CONFIG.MIN_EV) continue;
+    if (probSL >= maxProbSL) continue;
+    if (evOverStake < CONFIG.MIN_EV_OVER_STAKE) continue;
+
+    if (utility > bestUtility) {
       bestUtility = utility;
       bestMultiplier = mult;
       bestMetrics = {
         probTP, probSL, probOther: 1 - probTP - probSL,
-        avgProfit, avgLossOnSLHit, ev,
-        evOverStake: ev / stake,
+        avgProfit, avgLossOnSLHit, ev, evOverStake,
         utility,
       };
     }
@@ -618,11 +704,14 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
       NO_TRADE_REASONS.NO_VALID_MULTIPLIER,
       `No multiplier yielded positive EV with acceptable KO probability ` +
       `(conf=${clampedConf.toFixed(0)}%, drift=${(driftPerCandle/atr).toFixed(3)} ATR/candle, ` +
-      `probSL_limit=${(maxProbSL*100).toFixed(0)}%)`,
+      `probSL_limit=${(maxProbSL*100).toFixed(0)}%, evOverStake_min=${(CONFIG.MIN_EV_OVER_STAKE*100).toFixed(2)}%)`,
       prediction
     );
   }
 
+  // [FIX-O10] Defensive double-check. Should never fire because evOverStake
+  // is now filtered inside the loop — kept as a safety net in case someone
+  // later changes the loop logic.
   if (bestMetrics.evOverStake < CONFIG.MIN_EV_OVER_STAKE) {
     return createNoTradeResponse(
       NO_TRADE_REASONS.LOW_EV_OVER_STAKE,
@@ -680,14 +769,18 @@ async function evaluateWithPaths(prediction, account, openPositions, marketData,
     prediction,
     direction,
     stake,
+    // [FIX-O11] signal to the UI whether stake is editable
+    stakeEditable: CONFIG.STAKE_MODE === 'fixed',
+    stakeSource: CONFIG.STAKE_MODE,
     multiplier: bestMultiplier,
     duration,
     entryPrice,
     knockoutLevel,
     takeProfitLevel,
+    // [FIX-O12] direction-aware probabilities fallback
     probabilities: prediction.probabilities || {
-      up: bestMetrics.probTP,
-      down: bestMetrics.probSL,
+      up:   direction === 'BUY' ? bestMetrics.probTP : bestMetrics.probSL,
+      down: direction === 'BUY' ? bestMetrics.probSL : bestMetrics.probTP,
       neutral: bestMetrics.probOther,
     },
     source: mode,
@@ -739,6 +832,9 @@ function createNoTradeResponse(reason, message, prediction = null) {
     decision: 'NO_TRADE',
     timestamp: new Date().toISOString(),
     stake: 0, multiplier: 0, duration: 0,
+    // [FIX-O11] consistent shape for downstream UI even on NO_TRADE
+    stakeEditable: CONFIG.STAKE_MODE === 'fixed',
+    stakeSource: CONFIG.STAKE_MODE,
     entryPrice: null, knockoutLevel: null, takeProfitLevel: null,
     source: prediction?.source || null,
     tradeEconomics: { probTP: 0, probSL: 0, probOther: 0, expectedProfit: 0, expectedLoss: 0, ev: 0, evOverStake: 0 },
