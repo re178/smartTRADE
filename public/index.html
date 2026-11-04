@@ -26,6 +26,35 @@
     body { background: #f5f7fa; margin: 0; padding: 0; overflow-x: hidden; color: #1e2a41; }
 
     /* ============================================================ */
+    /* [FIX-TOAST-MOUNT] Toast container styles (pre-mounted in body) */
+    /* ============================================================ */
+    #rtsToastContainer {
+      position: fixed; top: 16px; right: 16px; z-index: 99999;
+      display: flex; flex-direction: column; gap: 8px;
+      max-width: 380px; pointer-events: none;
+    }
+
+    /* ============================================================ */
+    /* [FIX-AUTO-SAFETY] Auto-execute danger visuals                 */
+    /* ============================================================ */
+    #autoExecuteToggle:checked {
+      background-color: var(--danger) !important;
+      border-color: var(--danger) !important;
+    }
+    .form-check-label.auto-on {
+      color: var(--danger) !important;
+      font-weight: 700 !important;
+    }
+    #autoExecuteBanner {
+      background: #fef2f2; border: 1px solid #fecaca; color: #991b1b;
+      padding: 12px 18px; border-radius: 10px; margin-bottom: 20px;
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+      font-size: 0.88rem; font-weight: 500;
+    }
+    #autoExecuteBanner.d-none { display: none; }
+    #autoExecuteBanner i { color: var(--danger); font-size: 1.1rem; }
+
+    /* ============================================================ */
     /* SIDEBAR & MOBILE OVERLAY                                      */
     /* ============================================================ */
     .sidebar-overlay {
@@ -250,6 +279,9 @@
 </head>
 <body>
 
+<!-- [FIX-TOAST-MOUNT] Pre-mounted toast container -->
+<div id="rtsToastContainer"></div>
+
 <!-- Mobile Overlay for Sidebar -->
 <div class="sidebar-overlay" id="sidebarOverlay"></div>
 
@@ -296,6 +328,15 @@
 <!-- Main Content -->
 <div class="main-content">
 
+  <!-- [FIX-AUTO-SAFETY] Persistent banner shown while Auto is on -->
+  <div id="autoExecuteBanner" class="d-none">
+    <i class="fas fa-exclamation-triangle"></i>
+    <strong>AUTO-EXECUTE IS ON</strong> — trades will be placed without confirmation.
+    <button class="btn btn-sm btn-outline-danger ms-auto" onclick="window._disableAutoExecute && window._disableAutoExecute();">
+      <i class="fas fa-stop"></i> Disable
+    </button>
+  </div>
+
   <header class="top-header">
     <div>
       <button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar"><i class="fas fa-bars"></i></button>
@@ -313,8 +354,10 @@
       </div>
 
       <div class="form-check form-switch d-inline-flex align-items-center gap-2">
-        <input class="form-check-input" type="checkbox" id="autoExecuteToggle" style="width:2.4rem; height:1.25rem;">
-        <label class="form-check-label fw-600" for="autoExecuteToggle" style="font-size:0.82rem;">
+        <input class="form-check-input" type="checkbox" id="autoExecuteToggle"
+               style="width:2.4rem; height:1.25rem;"
+               title="⚠️ Fires trades WITHOUT confirmation. Only enable if you are actively monitoring the dashboard.">
+        <label class="form-check-label fw-600" for="autoExecuteToggle" id="autoExecuteLabel" style="font-size:0.82rem;">
           <i class="fas fa-robot"></i> Auto
         </label>
       </div>
@@ -908,14 +951,14 @@
 <script src="js/edge.js"></script>
 
 <!-- ============================================================ -->
-<!-- INLINE: NAVIGATION & MOBILE SIDEBAR LOGIC                     -->
+<!-- INLINE: NAVIGATION, MOBILE SIDEBAR, AUTO-EXECUTE SAFETY       -->
 <!-- ============================================================ -->
 <script>
 (function () {
   const sidebar = document.getElementById('sidebar');
   const overlay = document.getElementById('sidebarOverlay');
   const toggleBtn = document.getElementById('sidebarToggle');
-  
+
   function toggleSidebar() {
     sidebar.classList.toggle('open');
     if (sidebar.classList.contains('open')) {
@@ -928,6 +971,62 @@
   if (toggleBtn) toggleBtn.addEventListener('click', toggleSidebar);
   if (overlay) overlay.addEventListener('click', toggleSidebar);
 
+  // ============================================================
+  // [FIX-AUTO-SAFETY] Auto-execute toggle — confirmation + banner
+  // ============================================================
+  const autoToggle = document.getElementById('autoExecuteToggle');
+  const autoLabel = document.getElementById('autoExecuteLabel');
+  const autoBanner = document.getElementById('autoExecuteBanner');
+
+  function setAutoVisualState(on) {
+    if (autoLabel) {
+      if (on) {
+        autoLabel.classList.add('auto-on');
+        autoLabel.innerHTML = '<i class="fas fa-robot"></i> Auto (LIVE)';
+      } else {
+        autoLabel.classList.remove('auto-on');
+        autoLabel.innerHTML = '<i class="fas fa-robot"></i> Auto';
+      }
+    }
+    if (autoBanner) {
+      autoBanner.classList.toggle('d-none', !on);
+    }
+  }
+
+  // Initial state — always OFF on page load (no persistence)
+  if (autoToggle) {
+    setAutoVisualState(autoToggle.checked);
+    autoToggle.addEventListener('change', function () {
+      if (this.checked) {
+        const ok = confirm(
+          '⚠️ AUTO-EXECUTE will place real trades WITHOUT confirmation.\n\n' +
+          'Every opportunity the engine publishes will be sent to the broker automatically.\n\n' +
+          'Only enable this if you are actively monitoring the dashboard.\n\n' +
+          'Enable Auto-execute?'
+        );
+        if (!ok) {
+          this.checked = false;
+          setAutoVisualState(false);
+          return;
+        }
+        setAutoVisualState(true);
+      } else {
+        setAutoVisualState(false);
+      }
+    });
+  }
+
+  // Exposed for the "Disable" button inside the banner
+  window._disableAutoExecute = function () {
+    if (autoToggle) {
+      autoToggle.checked = false;
+      setAutoVisualState(false);
+    }
+  };
+
+  // ============================================================
+  // Navigation between sections
+  // ============================================================
   const navItems = document.querySelectorAll('.sidebar-nav .nav-item[data-section]');
   const sections = {
     tradingview: document.getElementById('section-tradingview'),
@@ -957,15 +1056,15 @@
       const sec = this.dataset.section;
       navItems.forEach(n => n.classList.remove('active'));
       this.classList.add('active');
-      
+
       Object.keys(sections).forEach(k => {
         if (sections[k]) sections[k].style.display = k === sec ? 'block' : 'none';
       });
-      
+
       if (pageTitle) pageTitle.textContent = titles[sec] || sec;
-      
+
       if (window.innerWidth <= 992) toggleSidebar();
-      
+
       window.scrollTo({ top: 0, behavior: 'smooth' });
 
       if ((sec === 'digits' || sec === 'risefall' || sec === 'evenodd')) {
@@ -986,22 +1085,16 @@
     });
   });
 
-  document.getElementById('exportCSVBtn')?.addEventListener('click', function () {
-    const h = (window.dashboardState && window.dashboardState.history) || [];
-    if (h.length === 0) { alert('No history to export.'); return; }
-    let csv = 'Pair,Side,Entry,Exit,Stake,PnL,Status,Date\n';
-    h.forEach(t => {
-      csv += `${t.pair},${t.side},${t.entryPrice ?? ''},${t.exitPrice ?? ''},${t.lotSize ?? ''},${t.pnl ?? ''},${t.status},${new Date(t.date).toISOString()}\n`;
-    });
-    const blob = new Blob([csv], { type: 'text/csv' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `history_${new Date().toISOString().slice(0,10)}.csv`;
-    a.click(); URL.revokeObjectURL(a.href);
-  });
+  // [FIX-EXPORT-DUP] Duplicate exportCSVBtn handler REMOVED.
+  // The handler in app.js (via window.exportHistoryCSV) is now the
+  // single source of truth. Previously BOTH this inline handler AND
+  // app.js's handler fired on click → two CSV downloads per click,
+  // two "No history to export" alerts when empty.
 
   document.getElementById('reportModalBtn')?.addEventListener('click', function () {
-    alert('Report generation: use POST /api/report with {from, to}');
+    // The POST /api/report endpoint exists (controllers.generateReport)
+    // but isn't routed. This handler stays as-is until the route is wired.
+    alert('Report generation: the backend handler exists at POST /api/report.\nAsk your maintainer to register the route to enable PDF reports.');
   });
 })();
 </script>
