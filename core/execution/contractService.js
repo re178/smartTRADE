@@ -67,6 +67,22 @@
 //               • If base proposal fails (rate limit), proceeds without limit_order
 //                 and logs WARN — OTIE watchdog is the backstop
 //             All conversions log at INFO so the amount values are visible.
+//
+// [FIX-CS-C3] **Bot-path buy recovery.** Bots bypass broker.placeMarketOrder
+//             and call broker._sendAuthRequest({ buy }) directly, so the
+//             recovery logic added to broker.placeMarketOrder in FIX-RECON-BUY
+//             does not protect them. This file now wraps _buyProposal:
+//               1. On any thrown error (timeout, InvalidContractProposal,
+//                  network drop), waits RECONCILE_BUY_GRACE_MS then fetches
+//                  the portfolio.
+//               2. Matches a contract created within the lookback window
+//                  against the intended symbol, side, stake, and open time.
+//               3. On match, returns a synthetic `buy` object so the caller
+//                  sees success and no retry is attempted.
+//               4. On no match, re-throws the original error.
+//             This makes bot entries as resilient to the buy-timeout problem
+//             as manual/live-signal entries are after FIX-RECON-BUY in
+//             broker.js. Metrics tracked and exposed via getStats().
 
 'use strict';
 
@@ -101,6 +117,12 @@ const MIN_LIMIT_ORDER_AMOUNT = 0.01;
 // base proposal. 5s is well within any normal market-data subscription gap.
 const CACHE_PRICE_MAX_AGE_MS = 5000;
 
+// [FIX-CS-C3] Reconcile-buy parameters — must match broker.js.
+// Grace period lets Deriv settle a possibly-succeeded buy before we check.
+const RECONCILE_BUY_GRACE_MS = 2000;
+// How far back in portfolio history to look for a matching contract.
+const RECONCILE_BUY_LOOKBACK_MS = 60_000;
+
 const SIDE_BUY_TYPES = new Set([
   'MULTUP', 'CALL',
   'DIGITEVEN', 'DIGITOVER', 'DIGITMATCH',
@@ -111,6 +133,14 @@ const SIDE_SELL_TYPES = new Set([
   'DIGITODD', 'DIGITUNDER', 'DIGITDIFF',
   'NOTOUCH',
 ]);
+
+// [FIX-CS-C3] Reconcile metrics — surfaced via getStats().
+const _reconcileMetrics = {
+  attempts: 0,
+  recovered: 0,
+  lastRecoveredAt: null,
+  lastOriginalError: null,
+};
 
 function _normalizeSide(contractTypeOrSide) {
   if (!contractTypeOrSide) return 'BUY';
@@ -167,17 +197,128 @@ async function _fetchProposal(broker, params) {
   return proposal;
 }
 
-async function _buyProposal(broker, proposal) {
+// ============================================================
+// [FIX-CS-C3] Buy + reconcile
+// ============================================================
+
+/**
+ * Reconcile a failed buy against the live portfolio.
+ *
+ * Matches the same criteria as broker._reconcileOrphanBuy so the two
+ * recovery paths stay consistent:
+ *   • same underlying_symbol as the intended trade
+ *   • same side (BUY/SELL) as the intended direction
+ *   • purchase_price within $0.01 of the intended stake
+ *   • openTime >= (submittedAt - RECONCILE_BUY_LOOKBACK_MS)
+ *
+ * Returns a synthetic `buy` object or null if no match.
+ */
+async function _reconcileBuy(broker, context, submittedAt) {
+  _reconcileMetrics.attempts++;
+
+  // Give Deriv a beat to settle the (possibly-succeeded) buy.
+  await new Promise(r => setTimeout(r, RECONCILE_BUY_GRACE_MS));
+
+  const derivSymbol = toDerivSymbol(context.symbol, broker);
+  const expectedSide = _normalizeSide(context.direction || context.contractType);
+  const stakeNum = Math.abs(Number(context.stake));
+  const minOpenTime = submittedAt - RECONCILE_BUY_LOOKBACK_MS;
+
+  let positions;
+  try {
+    positions = await broker.getOpenTrades();
+  } catch (err) {
+    logger.warn(`[contractService] _reconcileBuy: portfolio fetch failed: ${err.message}`);
+    return null;
+  }
+
+  const candidates = [];
+  for (const p of positions) {
+    const raw = p.raw || {};
+    const pSymbol = raw.underlying_symbol || raw.underlying || '';
+    if (pSymbol !== derivSymbol) continue;
+    if (expectedSide && p.side && p.side !== 'UNKNOWN' && p.side !== expectedSide) continue;
+
+    const pPrice = Number(p.purchasePrice || raw.buy_price || 0);
+    if (Number.isFinite(pPrice) && Number.isFinite(stakeNum) && stakeNum > 0) {
+      if (Math.abs(pPrice - stakeNum) > 0.01) continue;
+    }
+
+    const openTime = Number(p.openTime || 0);
+    if (openTime && openTime < minOpenTime) continue;
+
+    candidates.push(p);
+  }
+
+  if (candidates.length === 0) return null;
+
+  // Prefer the most recently opened candidate.
+  candidates.sort((a, b) => (b.openTime || 0) - (a.openTime || 0));
+  const match = candidates[0];
+
+  _reconcileMetrics.recovered++;
+  _reconcileMetrics.lastRecoveredAt = new Date().toISOString();
+
+  logger.warn(
+    `[contractService] _reconcileBuy: RECOVERED contract ${match.id} ` +
+    `for ${context.symbol} ${expectedSide} stake=${stakeNum} ` +
+    `(original error: ${_reconcileMetrics.lastOriginalError || 'unknown'})`
+  );
+
+  // Return a buy-shaped object so callers see it as a successful buy.
+  return {
+    contract_id: match.id,
+    buy_price: match.purchasePrice,
+    entry_spot: match.entryPrice,
+    _reconciled: true,
+  };
+}
+
+/**
+ * Wrapped buy. On any thrown error, attempts portfolio reconciliation
+ * before re-throwing.
+ *
+ * `context` should contain { symbol, direction?, contractType?, stake }.
+ * If context is missing, no reconciliation is attempted (same behaviour
+ * as before FIX-CS-C3).
+ */
+async function _buyProposal(broker, proposal, context) {
   const askPrice = Number(proposal.ask_price);
   if (!Number.isFinite(askPrice) || askPrice <= 0) {
     throw new Error(`Invalid ask price: ${proposal.ask_price}`);
   }
-  const resp = await broker._sendAuthRequest({ buy: proposal.id, price: askPrice }, 15000);
-  const buy = resp && resp.buy;
-  if (!buy || !buy.contract_id) {
-    throw new Error(`Buy failed: ${JSON.stringify(resp && resp.error || resp)}`);
+
+  const submittedAt = Date.now();
+  try {
+    const resp = await broker._sendAuthRequest({ buy: proposal.id, price: askPrice }, 15000);
+    const buy = resp && resp.buy;
+    if (!buy || !buy.contract_id) {
+      throw new Error(`Buy failed: ${JSON.stringify(resp && resp.error || resp)}`);
+    }
+    return buy;
+  } catch (buyErr) {
+    // [FIX-CS-C3] Attempt recovery if context was supplied.
+    if (context && context.symbol && context.stake) {
+      _reconcileMetrics.lastOriginalError = buyErr.message;
+      logger.warn(
+        `[contractService] _buyProposal failed for ${context.symbol} ` +
+        `(${context.direction || context.contractType || '?'}) ` +
+        `stake=${context.stake}: ${buyErr.message}. Reconciling against portfolio...`
+      );
+
+      let recovered = null;
+      try {
+        recovered = await _reconcileBuy(broker, context, submittedAt);
+      } catch (recErr) {
+        logger.warn(`[contractService] _reconcileBuy threw: ${recErr.message}`);
+      }
+
+      if (recovered) return recovered;
+    }
+
+    // No recovery — propagate the original error.
+    throw buyErr;
   }
-  return buy;
 }
 
 // ============================================================
@@ -468,8 +609,15 @@ async function placeMultiplier(params) {
   }
 
   const proposal = await _fetchProposal(broker, proposalParams);
-  const buy = await _buyProposal(broker, proposal);
+
+  // [FIX-CS-C3] Pass context so _buyProposal can reconcile on failure.
+  const buy = await _buyProposal(broker, proposal, {
+    symbol, direction, stake: stakeNum,
+  });
   const contractId = String(buy.contract_id);
+  if (!contractId || contractId === 'undefined') {
+    throw new Error(`Buy returned no contract_id: ${JSON.stringify(buy)}`);
+  }
 
   broker._subscribeOpenContract(contractId).catch(err => {
     logger.warn(`[contractService] Subscribe failed for ${contractId}: ${err.message}`);
@@ -540,8 +688,16 @@ async function placeDigitOrBinary(params) {
   if (barrier != null) proposalParams.barrier = String(barrier);
 
   const proposal = await _fetchProposal(broker, proposalParams);
-  const buy = await _buyProposal(broker, proposal);
+
+  // [FIX-CS-C3] Pass context so _buyProposal can reconcile on failure.
+  // Side is derived from contractType inside _reconcileBuy.
+  const buy = await _buyProposal(broker, proposal, {
+    symbol, contractType, stake: stakeNum,
+  });
   const contractId = String(buy.contract_id);
+  if (!contractId || contractId === 'undefined') {
+    throw new Error(`Buy returned no contract_id: ${JSON.stringify(buy)}`);
+  }
 
   broker._subscribeOpenContract(contractId).catch(() => {});
 
@@ -576,6 +732,18 @@ async function placeContract(params) {
   throw new Error('placeContract requires either multiplier or contractType');
 }
 
+// [FIX-CS-C3] Expose reconcile metrics for health checks / dashboards.
+function getStats() {
+  return {
+    reconcile: {
+      attempts: _reconcileMetrics.attempts,
+      recovered: _reconcileMetrics.recovered,
+      lastRecoveredAt: _reconcileMetrics.lastRecoveredAt,
+      lastOriginalError: _reconcileMetrics.lastOriginalError,
+    },
+  };
+}
+
 module.exports = {
   CONTRACT_TYPES,
   ACCEPTED_MULTIPLIERS,
@@ -584,9 +752,12 @@ module.exports = {
   placeMultiplier,
   placeDigitOrBinary,
   roundPrice,
+  getStats,
   _fetchProposal,
   _buyProposal,
   // [FIX-CS-C1] exposed for testing
   _buildMultiplierLimitOrder,
   _resolveReferenceEntry,
+  // [FIX-CS-C3] exposed for testing
+  _reconcileBuy,
 };
