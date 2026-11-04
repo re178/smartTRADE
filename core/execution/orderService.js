@@ -1,5 +1,14 @@
 // core/execution/orderService.js – Order Management with Multiplier Support
 //
+// [FIX-MULT] ACCEPTED_MULTIPLIERS aligned to [200, 400, 600, 800].
+//   Deriv deprecated 100/300/500. Previously this file accepted
+//   [100,200,300,500,800] (superset of what broker.js allows),
+//   which meant:
+//     • 100/300/500 passed orderService but failed at broker.js
+//     • 400/600 were rejected here before reaching broker
+//   Net effect: only {200, 800} worked end-to-end. Now all four
+//   accepted multipliers work through every layer.
+//
 // [FILE-ORDERFIX-1] Robust current-price fetch before SL/TP validation.
 //   (See prior revision notes — retained unchanged.)
 // [FILE-4] Strategy attribution:
@@ -30,7 +39,10 @@ const logger = require('../../infrastructure/logger') || console;
 const executionAnalytics = new ExecutionAnalytics({ slippageTolerance: 1 });
 const MIN_CONFIDENCE = 60;
 const MIN_EDGE = 0.2;
-const ACCEPTED_MULTIPLIERS = [100, 200, 300, 500, 800];
+// [FIX-MULT] Match broker.js + contractService.js + Deriv's current offering.
+// Deriv deprecated 100, 300, 500 — sending them is rejected at the broker
+// layer. Accepting them here would just push the failure downstream.
+const ACCEPTED_MULTIPLIERS = [200, 400, 600, 800];
 
 // ---- Pip size lookup ----
 function getPipSize(symbol) {
