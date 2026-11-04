@@ -1,6 +1,12 @@
-// services/emailService.js - VIRALOOP Email System (Production Ready - Brevo Only)
+// services/emailService.js - VIRALOOP Email System (Brevo-only, self-loading, diagnostic)
 
-const nodemailer = require('nodemailer'); // kept for API compatibility; not used for sending
+const path = require('path');
+
+// Load .env from project root, no matter who requires this file
+try {
+    require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+} catch (_) { /* dotenv optional; env can be injected externally */ }
+
 const axios = require('axios');
 
 /* =========================================================
@@ -11,15 +17,13 @@ const APP_NAME = 'VIRALOOP';
 const APP_URL = process.env.APP_URL || 'https://voxtraapp.com';
 const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || 'support@voxtraapp.com';
 
-const BREVO_API_KEY = process.env.BREVO_API_KEY;
-
-// Warn early if Brevo is not configured (does not crash the app)
-if (!BREVO_API_KEY) {
-    console.error("❌ BREVO_API_KEY is not set. Emails will fail until it is configured.");
+// Read at send-time, not module-load-time, so late env injection works
+function getBrevoKey() {
+    return process.env.BREVO_API_KEY || '';
 }
 
 /* =========================================================
-   EMAIL WRAPPER
+   EMAIL WRAPPER  (unchanged)
 ========================================================= */
 
 function getEmailWrapper(content, title) {
@@ -60,56 +64,110 @@ body { font-family: Arial, sans-serif; background:#f5f5f5; margin:0; padding:0; 
 }
 
 /* =========================================================
-   CORE EMAIL SENDER (BREVO ONLY)
+   BREVO SENDER  (surface HTTP status + body on error)
 ========================================================= */
 
-async function sendEmail(to, subject, htmlContent) {
-    const html = getEmailWrapper(htmlContent, subject);
+async function sendViaBrevo(to, subject, html) {
+    const key = getBrevoKey();
+
+    if (!key) {
+        const err = new Error('BREVO_API_KEY is not set. Add BREVO_API_KEY=xkeysib-... to .env');
+        err.httpStatus = 'NO_KEY';
+        throw err;
+    }
 
     try {
-        if (!BREVO_API_KEY) {
-            throw new Error('BREVO_API_KEY is not configured');
+        const response = await axios.post(
+            'https://api.brevo.com/v3/smtp/email',
+            {
+                sender: {
+                    name: APP_NAME,
+                    email: SUPPORT_EMAIL
+                },
+                to: [{ email: to }],
+                subject,
+                htmlContent: html
+            },
+            {
+                headers: {
+                    'api-key': key,
+                    'Content-Type': 'application/json'
+                },
+                timeout: 15000
+            }
+        );
+        return response.data;
+    } catch (err) {
+        if (err.response) {
+            const body = err.response.data;
+            const detail = (typeof body === 'string') ? body : JSON.stringify(body);
+            const wrapped = new Error(`Brevo HTTP ${err.response.status}: ${detail}`);
+            wrapped.httpStatus = err.response.status;
+            wrapped.brevoBody = body;
+            throw wrapped;
         }
-
-        const data = await sendViaBrevo(to, subject, html);
-        console.log(`📧 Email sent via Brevo to ${to}`);
-        return { success: true, provider: 'brevo', data };
-    } catch (error) {
-        console.error("❌ Email send failed:", error.message);
-        return { success: false, provider: 'brevo', error: error.message };
+        throw err;
     }
 }
 
 /* =========================================================
-   BREVO SENDER
+   CORE EMAIL SENDER  (Brevo only, with diagnostics)
 ========================================================= */
 
-async function sendViaBrevo(to, subject, html) {
-    const response = await axios.post(
-        'https://api.brevo.com/v3/smtp/email',
-        {
-            sender: {
-                name: APP_NAME,
-                email: SUPPORT_EMAIL
-            },
-            to: [{ email: to }],
-            subject,
-            htmlContent: html
-        },
-        {
-            headers: {
-                'api-key': BREVO_API_KEY,
-                'Content-Type': 'application/json'
-            },
-            timeout: 10000
-        }
-    );
+async function sendEmail(to, subject, htmlContent) {
+    const html = getEmailWrapper(htmlContent, subject);
+    const key = getBrevoKey();
 
-    return response.data;
+    const diagnostics = {
+        provider: 'brevo',
+        sender: SUPPORT_EMAIL,
+        recipient: to,
+        keyPresent: !!key,
+        keyPrefix: key ? (key.slice(0, 8) + '...') : '(none)',
+        keyLength: key.length
+    };
+
+    if (!key) {
+        const msg = 'BREVO_API_KEY is not set. Add BREVO_API_KEY=xkeysib-... to .env';
+        console.error(`❌ ${msg}`);
+        console.error(`   Diagnostics: ${JSON.stringify(diagnostics)}`);
+        return { success: false, provider: 'brevo', error: msg, diagnostics };
+    }
+
+    try {
+        const data = await sendViaBrevo(to, subject, html);
+        console.log(`📧 Email sent via Brevo to ${to} (messageId=${data.messageId || 'n/a'})`);
+        return { success: true, provider: 'brevo', messageId: data.messageId, diagnostics };
+    } catch (err) {
+        const status = err.httpStatus || '';
+        console.error(`❌ Email send failed to ${to}: ${err.message}`);
+        console.error(`   Diagnostics: ${JSON.stringify(diagnostics)}`);
+
+        if (status === 401 || status === 403) {
+            console.error('   => BREVO_API_KEY is wrong or revoked. Regenerate it in Brevo dashboard.');
+        }
+        if (status === 400) {
+            console.error('   => Common causes: SUPPORT_EMAIL sender is not verified in Brevo, invalid recipient, or account limit hit.');
+        }
+        if (status === 'NO_KEY') {
+            console.error('   => Add BREVO_API_KEY to D:\\RTS\\SmartTRADE\\.env');
+        }
+        if (/ENOTFOUND|ECONNREFUSED|ETIMEDOUT|timeout/i.test(err.message)) {
+            console.error('   => Cannot reach api.brevo.com. Check firewall / DNS / internet.');
+        }
+
+        return {
+            success: false,
+            provider: 'brevo',
+            error: err.message,
+            httpStatus: status,
+            diagnostics
+        };
+    }
 }
 
 /* =========================================================
-   VERIFICATION EMAIL (WITH SPAM FOLDER WARNING)
+   TEMPLATED EMAILS  (unchanged)
 ========================================================= */
 
 async function sendVerificationEmail(email, token) {
@@ -132,10 +190,6 @@ async function sendVerificationEmail(email, token) {
     `);
 }
 
-/* =========================================================
-   WELCOME EMAIL (AFTER VERIFICATION)
-========================================================= */
-
 async function sendWelcomeEmail(email, name) {
     return sendEmail(email, `Welcome to ${APP_NAME}! 🎉`, `
         <h2>Welcome ${name || 'there'}! 👋</h2>
@@ -155,10 +209,6 @@ async function sendWelcomeEmail(email, name) {
         </p>
     `);
 }
-
-/* =========================================================
-   PASSWORD RESET EMAIL
-========================================================= */
 
 async function sendPasswordResetEmail(email, token) {
     const url = `${APP_URL}/reset-password?token=${token}`;
