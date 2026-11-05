@@ -27,14 +27,9 @@
 //         for every digit/binary contract. Three root causes:
 //           1. side was stored as 'CALL'/'call'/'DIGITEVEN'/'digiteven'/etc.
 //              which violated both enums (Order: BUY/SELL; Trade: buy/sell).
-//              Now normalized: BUY for "positive bet" contracts (CALL, MULTUP,
-//              DIGITEVEN/OVER/MATCH, ONETOUCH), SELL for "negative bet"
-//              contracts (PUT, MULTDOWN, DIGITODD/UNDER/DIFF, NOTOUCH).
-//              The specific contract type is stored in contractType.
 //           2. Order.units and Order.clientOrderId were required but never
-//              populated. Now set from stake and contractId respectively.
+//              populated.
 //           3. Trade.side was lowercased from an already-invalid value.
-//              Now normalized once via _normalizeSide() and reused.
 //
 // [FIX-DIGIT-PERSIST-2] Persist contractType, barrier, durationUnit, product,
 //              and entryThesis on BOTH Order and Trade.
@@ -42,89 +37,41 @@
 // [FIX-CS-C1] **ROOT CAUSE FIX for ContractBuyValidationError on FX multipliers.**
 //             Deriv's Multiplier contracts expect `limit_order.stop_loss` and
 //             `limit_order.take_profit` as CURRENCY AMOUNTS (2 decimals), NOT
-//             PRICE LEVELS. The previous code sent `1.12044` / `1.12249` as
-//             if they were prices — Deriv interprets them as $1.12 / $1.12
-//             and rejects with "Only 2 decimal places allowed."
-//
-//             Now placeMultiplier() does:
-//               1. Resolves a reference entry price (streaming cache if fresh,
-//                  otherwise a base proposal without limit_order).
-//               2. Converts price levels to amounts:
-//                    notional   = stake × multiplier
-//                    priceDiff  = |level - entry|
-//                    amount     = notional × priceDiff / entry
-//                  Result rounded to 2 decimals.
-//               3. Sends the AMOUNT to Deriv, but persists the original
-//                  PRICE LEVELS in Order.knockoutLevel / Trade.knockoutLevel
-//                  (schemas expect prices, and this preserves intent).
-//
-//             This is the fix that unblocks FX bot entries. The C1 fix in
-//             broker.js still applies for callers that use broker.placeMarketOrder
-//             (e.g. modifySLTP, closeTrade), but bot entries go through
-//             contractService directly and needed their own conversion.
+//             PRICE LEVELS. Conversion is done inside placeMultiplier.
 //
 // [FIX-CS-C2] Defensive guards on the SL/TP conversion:
-//               • Skips SL/TP amounts below $0.01 (stake too small / SL too tight)
-//               • Caps SL amount at stake (can't lose more than stake on Multiplier)
-//               • Skips SL/TP on wrong side of entry (with WARN — the runner's
-//                 [FIX-M4c] should have already rejected, but double-check here)
-//               • If base proposal fails (rate limit), proceeds without limit_order
-//                 and logs WARN — OTIE watchdog is the backstop
-//             All conversions log at INFO so the amount values are visible.
+//               • Skips SL/TP amounts below $0.01
+//               • Caps SL amount at stake
+//               • Skips SL/TP on wrong side of entry (WARN)
+//               • If base proposal fails, proceeds without limit_order
 //
 // [FIX-CS-C3] **Bot-path buy recovery.** Bots bypass broker.placeMarketOrder
-//             and call broker._sendAuthRequest({ buy }) directly, so the
-//             recovery logic added to broker.placeMarketOrder in FIX-RECON-BUY
-//             does not protect them. This file now wraps _buyProposal:
-//               1. On any thrown error (timeout, InvalidContractProposal,
-//                  network drop), waits RECONCILE_BUY_GRACE_MS then fetches
-//                  the portfolio.
-//               2. Matches a contract created within the lookback window
-//                  against the intended symbol, side, stake, and open time.
-//               3. On match, returns a synthetic `buy` object so the caller
-//                  sees success and no retry is attempted.
-//               4. On no match, re-throws the original error.
-//             This makes bot entries as resilient to the buy-timeout problem
-//             as manual/live-signal entries are after FIX-RECON-BUY in
-//             broker.js. Metrics tracked and exposed via getStats().
+//             and call broker._sendAuthRequest({ buy }) directly. This file
+//             wraps _buyProposal: on any thrown error, waits
+//             RECONCILE_BUY_GRACE_MS, fetches the portfolio, and matches a
+//             contract created within the lookback window against the
+//             intended symbol, side, stake, and open time. On match, returns
+//             a synthetic `buy` object so the caller sees success and no
+//             retry is attempted. On no match, re-throws the original error.
 //
 // [FIX-HIGH-PAYOUT] **Four new contract classes for high-payout bots.**
-//             Adds placement functions for the four Deriv contract types
-//             that pay significantly more than fixed-payout digit/CALL-PUT
-//             contracts:
+//             Touch/No Touch, Vanilla, Turbo, Accumulator placement
+//             functions. All reuse _buyProposal (reconcile) and _persist
+//             (Order + Trade docs). Metadata fields (payoutPerPoint,
+//             growthRate, strikePrice, touchBarrier, touchDirection) are
+//             returned in the result object so runner._persistBotRun can
+//             record them on BotRun.
 //
-//               • Touch/No Touch (ONETOUCH / NOTOUCH)
-//                   Payout = fixed, but barrier-dependent. Far barriers
-//                   (2 ATR+) pay 200–350%+. Used by touch_hunter bot.
-//                   Requires: barrier (relative string "+X.XX" / "-X.XX")
-//
-//               • Vanilla (VANILLALONGCALL / VANILLALONGPUT)
-//                   Payout = payout_per_point × (final − strike). Uncapped.
-//                   Used by vanilla_trend bot. Requires: barrier (strike,
-//                   relative string; "+0.00" = at-the-money).
-//
-//               • Turbo (TURBOSLONG / TURBOSSHORT)
-//                   Payout = payout_per_point × distance from barrier.
-//                   Knockout if barrier breached. Used by turbo_breakout.
-//                   Requires: barrier (relative), optional take_profit.
-//
-//               • Accumulator (ACCU)
-//                   Payout compounds at growth_rate per tick while price
-//                   stays in range. 5% × 30 ticks ≈ 4.3× stake.
-//                   Used by accumulator_scalper. Requires: growth_rate
-//                   (0.01–0.05), duration in ticks.
-//
-//             All four reuse _buyProposal (reconcile) and _persist (Order +
-//             Trade docs). The new metadata fields (payoutPerPoint, growthRate,
-//             strikePrice, touchBarrier, touchDirection) are returned in the
-//             result object so runner._persistBotRun can record them on
-//             BotRun. Mongoose silently ignores unknown fields on Trade/Order
-//             schemas, so _persist needs no schema migration.
-//
-//             _checkContractAvailability caches contracts_for per symbol for
-//             5 minutes and throws a clear error if the requested type is
-//             not offered on that symbol (e.g. Vanilla on EURUSD requires
-//             1-day minimum duration in some regions).
+// [FIX-ACCU-EXPIRY] **Accumulator InvalidExpiry fix.**
+//             Deriv's ACCU contract accepts ONLY `growth_rate` — no
+//             duration, no duration_unit. The contract runs until it
+//             knocks out or hits the symbol's max tick count (60 for 5%).
+//             Sending `duration: 30, duration_unit: 't'` triggered
+//             InvalidExpiry on every attempt. Now:
+//               • proposal payload omits duration/duration_unit entirely
+//               • persistence still records intended max ticks for audit
+//               • optional limit_order.take_profit for early exit still works
+//             Tested against Deriv docs (accumulator contract payload).
 
 'use strict';
 
@@ -152,22 +99,14 @@ const CONTRACT_TYPES = {
 const ACCEPTED_MULTIPLIERS = [200, 400, 600, 800];
 const DEFAULT_MULTIPLIER = 200;
 
-// [FIX-CS-C1] Minimum amount for a limit_order field (Deriv rejects 0.00).
 const MIN_LIMIT_ORDER_AMOUNT = 0.01;
-
-// [FIX-CS-C1] Max age of streaming-cache price before we prefer a fresh
-// base proposal. 5s is well within any normal market-data subscription gap.
 const CACHE_PRICE_MAX_AGE_MS = 5000;
 
-// [FIX-CS-C3] Reconcile-buy parameters — must match broker.js.
-// Grace period lets Deriv settle a possibly-succeeded buy before we check.
 const RECONCILE_BUY_GRACE_MS = 2000;
-// How far back in portfolio history to look for a matching contract.
 const RECONCILE_BUY_LOOKBACK_MS = 60_000;
 
-// [FIX-HIGH-PAYOUT] Contract availability cache (5 min TTL per symbol).
 const CONTRACT_AVAILABILITY_TTL_MS = 5 * 60_000;
-const _contractAvailabilityCache = new Map();  // symbol → { types, at }
+const _contractAvailabilityCache = new Map();
 
 const SIDE_BUY_TYPES = new Set([
   'MULTUP', 'CALL',
@@ -185,7 +124,6 @@ const SIDE_SELL_TYPES = new Set([
   'TURBOSSHORT',
 ]);
 
-// [FIX-CS-C3] Reconcile metrics — surfaced via getStats().
 const _reconcileMetrics = {
   attempts: 0,
   recovered: 0,
@@ -249,15 +187,8 @@ async function _fetchProposal(broker, params) {
 }
 
 // ============================================================
-// [FIX-HIGH-PAYOUT] Contract availability check
+// Contract availability check
 // ============================================================
-/**
- * Query contracts_for once per symbol (5-min cache) and confirm the
- * requested contract type is available.
- *
- * Throws a clear error if not available — the runner will surface it
- * as instance.lastReason and skip the entry cleanly.
- */
 async function _checkContractAvailability(broker, derivSymbol, contractType) {
   const now = Date.now();
   const cached = _contractAvailabilityCache.get(derivSymbol);
@@ -280,14 +211,13 @@ async function _checkContractAvailability(broker, derivSymbol, contractType) {
       `[contractService] contracts_for(${derivSymbol}) failed: ${err.message} — ` +
       `skipping availability check for ${contractType}`
     );
-    return true;  // fail-open: let proposal surface the real error
+    return true;
   }
 
   const contracts = (resp && resp.contracts_for && resp.contracts_for.available) || [];
   const types = new Set();
   for (const c of contracts) {
     if (c.contract_type) types.add(c.contract_type);
-    // Some entries list contract_category; check both
     if (c.contract_category) types.add(c.contract_category);
   }
 
@@ -305,7 +235,7 @@ async function _checkContractAvailability(broker, derivSymbol, contractType) {
 }
 
 // ============================================================
-// [FIX-CS-C3] Buy + reconcile
+// Buy + reconcile
 // ============================================================
 async function _reconcileBuy(broker, context, submittedAt) {
   _reconcileMetrics.attempts++;
@@ -403,7 +333,7 @@ async function _buyProposal(broker, proposal, context) {
 }
 
 // ============================================================
-// [FIX-CS-C1] Multiplier limit_order conversion
+// Multiplier limit_order conversion
 // ============================================================
 async function _resolveReferenceEntry(broker, derivSymbol, baseProposalParams) {
   try {
@@ -498,7 +428,6 @@ async function _persist(params) {
     contractId, symbol, side, stake, multiplier, duration, durationUnit,
     entryPrice, purchasePrice, knockoutLevel, takeProfitLevel, barrier,
     contractType, product, strategy, regimeCode, entryThesis,
-    // [FIX-HIGH-PAYOUT] new metadata fields
     payoutPerPoint, growthRate, strikePrice, touchBarrier, touchDirection,
   } = params;
 
@@ -513,8 +442,6 @@ async function _persist(params) {
     ? entryThesis
     : null;
 
-  // Mongoose silently ignores fields not in the Order/Trade schemas, so
-  // passing the new fields is safe (they're preserved in the return object).
   const orderDoc = await Order.create({
     clientOrderId: String(contractId),
     instrument: normalizeSymbol(symbol),
@@ -582,9 +509,6 @@ async function _persist(params) {
     return null;
   });
 
-  // [FIX-HIGH-PAYOUT] Return the raw metadata so the caller (runner) can
-  // pass it to BotRun. Mongoose ignores unknown fields above, so we
-  // re-include them here explicitly.
   return {
     order: orderDoc,
     trade: tradeDoc,
@@ -787,7 +711,7 @@ async function placeDigitOrBinary(params) {
 }
 
 // ============================================================
-// [FIX-HIGH-PAYOUT] Touch/No Touch contract
+// Touch/No Touch contract
 // ============================================================
 async function placeTouchContract(params) {
   const {
@@ -843,7 +767,6 @@ async function placeTouchContract(params) {
 
   const entryPrice = Number(buy.entry_spot || proposal.spot || 0);
   const purchasePrice = Number(buy.buy_price || proposal.ask_price);
-  // Barrier is relative; compute the absolute touch price for logging/BotRun.
   const touchBarrierAbs = roundPrice(symbol, entryPrice + Number(barrier));
 
   logger.info(
@@ -883,7 +806,7 @@ async function placeTouchContract(params) {
 }
 
 // ============================================================
-// [FIX-HIGH-PAYOUT] Vanilla Call/Put contract
+// Vanilla Call/Put contract
 // ============================================================
 async function placeVanillaContract(params) {
   const {
@@ -979,13 +902,13 @@ async function placeVanillaContract(params) {
 }
 
 // ============================================================
-// [FIX-HIGH-PAYOUT] Turbo Long/Short contract
+// Turbo Long/Short contract
 // ============================================================
 async function placeTurboContract(params) {
   const {
     symbol, direction, barrier, stake,
     duration, durationUnit = 'm',
-    takeProfit = null,     // optional currency amount (e.g. 150 = $150 TP)
+    takeProfit = null,
     strategy = null, regimeCode = null, entryThesis = null,
   } = params;
 
@@ -1081,14 +1004,14 @@ async function placeTurboContract(params) {
 }
 
 // ============================================================
-// [FIX-HIGH-PAYOUT] Accumulator contract
+// Accumulator contract
 // ============================================================
 async function placeAccumulatorContract(params) {
   const {
     symbol, stake,
-    growthRate = 0.03,     // 0.01–0.05 (1%–5%)
-    duration = 30,         // ticks
-    takeProfit = null,     // optional currency amount
+    growthRate = 0.03,
+    duration = 30,
+    takeProfit = null,
     strategy = null, regimeCode = null, entryThesis = null,
   } = params;
 
@@ -1112,6 +1035,12 @@ async function placeAccumulatorContract(params) {
 
   await _checkContractAvailability(broker, derivSymbol, contractType);
 
+  // [FIX-ACCU-EXPIRY] ACCU does NOT accept duration or duration_unit.
+  // The contract runs until it knocks out or hits the symbol's max tick
+  // count (60 ticks at 5% growth for R_100). Sending `duration: 30,
+  // duration_unit: 't'` triggered InvalidExpiry on every attempt.
+  // The `durNum` is still passed to _persist for audit, but MUST NOT
+  // appear in the proposal payload.
   const proposalParams = {
     amount: stakeNum,
     basis: 'stake',
@@ -1119,8 +1048,7 @@ async function placeAccumulatorContract(params) {
     currency: broker.accountCurrency || 'USD',
     underlying_symbol: derivSymbol,
     growth_rate: gr,
-    duration: durNum,
-    duration_unit: 't',
+    // NO duration, NO duration_unit — Deriv computes from growth_rate
   };
 
   if (takeProfit != null && Number(takeProfit) > 0) {
@@ -1145,11 +1073,13 @@ async function placeAccumulatorContract(params) {
   logger.info(
     `[contractService] ${symbol} ACCU placed: ` +
     `entry=${entryPrice} stake=$${stakeNum} ` +
-    `growth=${(gr * 100).toFixed(1)}% dur=${durNum}t` +
+    `growth=${(gr * 100).toFixed(1)}%/tick` +
     (takeProfit != null ? ` TP=$${takeProfit}` : '') +
-    ` (max payout at full run ≈ $${(stakeNum * Math.pow(1 + gr, durNum)).toFixed(2)})`
+    ` (contract runs to max ticks or knockout)`
   );
 
+  // Persist the intended tick count for audit — the actual duration is
+  // decided by Deriv (max 60 ticks or knockout).
   const persisted = await _persist({
     contractId, symbol, side: 'ACCU', stake: stakeNum, multiplier: null,
     duration: durNum, durationUnit: 't', entryPrice, purchasePrice,
@@ -1181,9 +1111,6 @@ async function placeAccumulatorContract(params) {
 // Router
 // ============================================================
 async function placeContract(params) {
-  // [FIX-HIGH-PAYOUT] New contract classes — checked BEFORE placeDigitOrBinary
-  // so ONETOUCH/NOTOUCH/VANILLA/TURBO/ACCU don't fall through to the digit
-  // handler (which would reject them as unknown CONTRACT_TYPES).
   const ct = String(params.contractType || '').toUpperCase();
 
   if (params.contractClass === 'touch' || ct === 'ONETOUCH' || ct === 'NOTOUCH') {
@@ -1199,13 +1126,11 @@ async function placeContract(params) {
     return placeAccumulatorContract(params);
   }
 
-  // Existing classes — unchanged
   if (params.multiplier != null) return placeMultiplier(params);
   if (params.contractType) return placeDigitOrBinary(params);
   throw new Error('placeContract requires multiplier, contractType, or contractClass');
 }
 
-// [FIX-CS-C3] Expose reconcile metrics for health checks / dashboards.
 function getStats() {
   return {
     reconcile: {
@@ -1225,7 +1150,6 @@ module.exports = {
   placeContract,
   placeMultiplier,
   placeDigitOrBinary,
-  // [FIX-HIGH-PAYOUT] new placement functions
   placeTouchContract,
   placeVanillaContract,
   placeTurboContract,
@@ -1237,6 +1161,5 @@ module.exports = {
   _buildMultiplierLimitOrder,
   _resolveReferenceEntry,
   _reconcileBuy,
-  // [FIX-HIGH-PAYOUT] exposed for tests
   _checkContractAvailability,
 };
