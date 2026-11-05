@@ -6,6 +6,39 @@
 //   never placed a single trade. Now uses CALL/PUT based on directional
 //   bias (same signal, valid contract type, no barrier needed).
 //   The bias thresholds (0.72 / 0.45) are preserved.
+//
+// [FIX-DIGIT-DYN] **Digit bots now use statistical significance (z-scores)
+//   instead of fixed percentage thresholds.**
+//
+//   The previous thresholds were mathematically unreachable on a fair RNG:
+//     • even_odd:   ≥62% (5σ event, ~1-in-10M)
+//     • over_under: ≤5% (5.5σ event)
+//     • matches:    ≤3% (5.5σ event)
+//     • hot_cold:   ≤3% (5.5σ event)
+//     • streak:     ≥8   (only 0.8% of the time by chance)
+//
+//   Result: 87+ cycles, 0 trades — every digit bot was frozen.
+//
+//   Now each bot compares a z-score against a configurable zThreshold
+//   (default 1.5, ~7% firing probability per cycle per bot). At N=200:
+//     • even/odd fires when even% ≥ 55.3% or ≤ 44.7%
+//     • over 8 / under 1 fires when % ≤ 6.8% or ≥ 13.2%
+//     • target digit fires when % ≤ 6.8% or ≥ 13.2%
+//     • streak fires when streak ≥ ceil(log2(N)+0.33)+extra
+//   These thresholds are statistically meaningful AND reachable.
+//
+// [FIX-UNDER-BARRIER] Fixed barrier value for DIGITUNDER contracts.
+//   Previous code sent barrier=0 for "under 1", meaning "digit < 0" —
+//   mathematically impossible to win. Now correctly sends barrier=1
+//   ("digit < 1", i.e. digit 0 only, ~10% win chance).
+//
+// [FIX-SHADOW-CFG] `shadowWinsRequired` added to defaultConfig of the
+//   five synthetic binary bots (Rise/Fall ×3 + Volatility ×2). Range 0-10,
+//   default 3. Bots fire real trades only after N consecutive shadow wins;
+//   after a real loss, the gate tightens by +1 (capped at 10) and never
+//   loosens. Digit bots and FX bots have shadowWinsRequired=0 (disabled) —
+//   their entry quality is governed by their own evaluate() rules.
+//   RISK_DEFAULTS.shadowWinsRequired: 0 acts as default-off.
 
 'use strict';
 
@@ -162,7 +195,7 @@ function enterBinary(contractType, config, reason) {
 const BOTS = {
 
   // ============================================================
-  // FX MULTIPLIER BOTS (7)
+  // FX MULTIPLIER BOTS (7) — UNCHANGED
   // ============================================================
 
   trend_rider: {
@@ -428,185 +461,255 @@ const BOTS = {
   },
 
   // ============================================================
-  // SYNTHETIC DIGIT BOTS (5)
+  // SYNTHETIC DIGIT BOTS (5) — REWRITTEN WITH Z-SCORES
   // ============================================================
 
   even_odd_trader: {
     id: 'even_odd_trader', name: 'Even/Odd Trader',
-    description: 'Synthetic digit. EVEN/ODD on extreme edge. Flip NOT recommended (50/50).',
+    description: 'Synthetic digit. EVEN/ODD on statistical extreme (|z| >= threshold). Flip NOT recommended (50/50).',
     assetClass: 'synthetic_digit', contractClass: 'digit',
     baseRate: 0.50,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5, minSamples: 50,
+      // [FIX-DIGIT-DYN] z-score threshold: 1.5 ≈ 7% fire rate on fair RNG
+      zThreshold: 1.5,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
       const dv = sanitizeDigitView(ctx.digitView);
       if (!dv) return wait('Corrupt or missing digit data');
       if (dv.sampleSize < ctx.config.minSamples) return wait('Not enough samples');
+      const zs = dv.zStats;
+      if (!zs) return wait(`Not enough data for z-scores (${dv.sampleSize} ticks, need 30+)`);
+
+      const zThreshold = Number(ctx.config.zThreshold) || 1.5;
       const { config, stats } = ctx;
-      const even = dv.evenPct;
-      const odd = dv.oddPct;
-      let normalDir = null;
-      if (even >= 62) normalDir = 'DIGITEVEN';
-      else if (odd >= 62) normalDir = 'DIGITODD';
-      if (!normalDir) return wait(`Even ${even.toFixed(1)}% / Odd ${odd.toFixed(1)}% (Need >=62%)`);
+
+      let normalDir = null, zUsed = 0;
+      if (zs.evenZ >= zThreshold) { normalDir = 'DIGITEVEN'; zUsed = zs.evenZ; }
+      else if (zs.evenZ <= -zThreshold) { normalDir = 'DIGITODD'; zUsed = -zs.evenZ; }
+
+      if (!normalDir) {
+        return wait(`evenZ=${zs.evenZ.toFixed(2)} (need |z| >= ${zThreshold}, N=${zs.windowSize})`);
+      }
+
       const flip = shouldFlip(config, stats);
       const finalDir = flip
         ? (normalDir === 'DIGITEVEN' ? 'DIGITODD' : 'DIGITEVEN')
         : normalDir;
       const reason = flip
-        ? `${normalDir} FLIPPED → ${finalDir}`
-        : `${normalDir.replace('DIGIT','')} ${(normalDir === 'DIGITEVEN' ? even : odd).toFixed(1)}%`;
+        ? `${normalDir} FLIPPED → ${finalDir} (z=${zUsed.toFixed(2)})`
+        : `${normalDir.replace('DIGIT','')} z=${zUsed.toFixed(2)} N=${zs.windowSize}`;
       return enterDigit(finalDir, config, reason);
     },
   },
 
   over_under_trader: {
     id: 'over_under_trader', name: 'Over/Under Trader',
-    description: 'Synthetic digit. OVER/UNDER on rare digit. Flip changes barrier (review before enabling).',
+    description: 'Synthetic digit. OVER/UNDER on statistical extreme (z-score). Flip changes barrier.',
     assetClass: 'synthetic_digit', contractClass: 'digit',
     baseRate: 0.10,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5, threshold: 8, minSamples: 100,
+      // [FIX-DIGIT-DYN] z-score threshold: 1.5 ≈ 7% fire rate on fair RNG
+      zThreshold: 1.5,
       flipEnabled: false, flipBelowPct: 8, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
       const dv = sanitizeDigitView(ctx.digitView);
       if (!dv) return wait('Corrupt or missing digit data');
       if (dv.sampleSize < ctx.config.minSamples) return wait('Not enough samples');
-      const { config, stats } = ctx;
-      const freq = dv.digitFreq;
-      const total = dv.sampleSize;
-      const th = config.threshold;
-      const overCount = freq.slice(th + 1).reduce((a, b) => a + b, 0);
-      const overPct = (overCount / total) * 100;
-      const underCount = freq.slice(0, 1).reduce((a, b) => a + b, 0);
-      const underPct = (underCount / total) * 100;
-      let normalDir = null, barrier = null;
-      if (overPct <= 5.0) { normalDir = 'DIGITOVER'; barrier = th; }
-      else if (underPct <= 5.0) { normalDir = 'DIGITUNDER'; barrier = 0; }
-      if (!normalDir) return wait(`Over ${th}: ${overPct.toFixed(1)}% / Under 1: ${underPct.toFixed(1)}% (Need <=5%)`);
-      const flip = shouldFlip(config, stats);
+      const zs = dv.zStats;
+      if (!zs) return wait(`Not enough data for z-scores (${dv.sampleSize} ticks, need 30+)`);
+
+      const zThreshold = Number(ctx.config.zThreshold) || 1.5;
+      const th = Number(ctx.config.threshold) || 8;
+
+      // [FIX-UNDER-BARRIER] overZ[th] uses barrier=th; underZ[1] uses barrier=1
+      // (was 0, which meant "digit < 0" — impossible).
+      const overZ = zs.overZ[th];
+      const underZ = zs.underZ[1];
+
+      let normalDir = null, barrier = null, zUsed = 0;
+      // Mean reversion: fire when the rare event has been happening LESS
+      // than expected (z strongly negative) → expect it to catch up.
+      if (overZ <= -zThreshold) { normalDir = 'DIGITOVER'; barrier = th; zUsed = overZ; }
+      else if (underZ <= -zThreshold) { normalDir = 'DIGITUNDER'; barrier = 1; zUsed = underZ; }
+
+      if (!normalDir) {
+        return wait(
+          `overZ[${th}]=${overZ.toFixed(2)} underZ[1]=${underZ.toFixed(2)} ` +
+          `(need <= -${zThreshold}, N=${zs.windowSize})`
+        );
+      }
+
+      const flip = shouldFlip(ctx.config, ctx.stats);
       let finalDir = normalDir;
       if (flip) {
         finalDir = normalDir === 'DIGITOVER' ? 'DIGITUNDER' : 'DIGITOVER';
-        barrier = finalDir === 'DIGITOVER' ? th : 0;
+        // [FIX-UNDER-BARRIER] barrier=1 not 0 for UNDER
+        barrier = finalDir === 'DIGITOVER' ? th : 1;
       }
       const reason = flip
-        ? `${normalDir} FLIPPED → ${finalDir}`
-        : `Over ${th} (${overPct.toFixed(1)}%) / Under 1 (${underPct.toFixed(1)}%)`;
-      return enterDigitBarrier(finalDir, barrier, config, reason);
+        ? `${normalDir} FLIPPED → ${finalDir} (z=${zUsed.toFixed(2)})`
+        : `${normalDir} barrier=${barrier} z=${zUsed.toFixed(2)} N=${zs.windowSize}`;
+      return enterDigitBarrier(finalDir, barrier, ctx.config, reason);
     },
   },
 
   matches_differs_trader: {
     id: 'matches_differs_trader', name: 'Matches/Differs Trader',
-    description: 'Synthetic digit. MATCH/DIFF — flip is MATHEMATICALLY VALID (complementary bets).',
+    description: 'Synthetic digit. MATCH/DIFF on cold target digit (z-score). Flip is MATHEMATICALLY VALID (complementary bets).',
     assetClass: 'synthetic_digit', contractClass: 'digit',
     baseRate: 0.10,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5, targetDigit: 5, minSamples: 100,
+      // [FIX-DIGIT-DYN] z-score threshold: 1.5 ≈ 7% fire rate on fair RNG
+      zThreshold: 1.5,
       flipEnabled: true, flipBelowPct: 8, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
       const dv = sanitizeDigitView(ctx.digitView);
       if (!dv) return wait('Corrupt or missing digit data');
       if (dv.sampleSize < ctx.config.minSamples) return wait('Not enough samples');
-      const { config, stats } = ctx;
-      const freq = dv.digitFreq;
-      const total = dv.sampleSize;
-      const target = config.targetDigit;
-      const targetPct = (freq[target] / total) * 100;
-      const neighbor = (target + 1) % 10;
-      const neighborPct = (freq[neighbor] / total) * 100;
-      if (targetPct > 3.0) return wait(`Digit ${target} at ${targetPct.toFixed(1)}% (Need <=3%)`);
-      if (neighborPct > 8.0) return wait(`Digit ${target} cold but neighbor ${neighbor} at ${neighborPct.toFixed(1)}%`);
-      const flip = shouldFlip(config, stats);
+      const zs = dv.zStats;
+      if (!zs) return wait(`Not enough data for z-scores (${dv.sampleSize} ticks, need 30+)`);
+
+      const zThreshold = Number(ctx.config.zThreshold) || 1.5;
+      const target = Number(ctx.config.targetDigit) || 5;
+      const targetZ = zs.digitZ[target];
+
+      // Mean reversion: target digit cold (z strongly negative) → bet MATCH
+      if (targetZ > -zThreshold) {
+        return wait(`digit ${target} z=${targetZ.toFixed(2)} (need <= -${zThreshold}, N=${zs.windowSize})`);
+      }
+
+      const flip = shouldFlip(ctx.config, ctx.stats);
       const finalDir = flip ? 'DIGITDIFF' : 'DIGITMATCH';
       const reason = flip
-        ? `Digits ${target}/${neighbor} cold FLIPPED → DIGITDIFF`
-        : `Digits ${target}(${targetPct.toFixed(1)}%) & ${neighbor}(${neighborPct.toFixed(1)}%) both cold — MATCH`;
-      return enterDigitBarrier(finalDir, target, config, reason);
+        ? `digit ${target} cold z=${targetZ.toFixed(2)} FLIPPED → DIGITDIFF`
+        : `digit ${target} cold z=${targetZ.toFixed(2)} N=${zs.windowSize} → MATCH`;
+      return enterDigitBarrier(finalDir, target, ctx.config, reason);
     },
   },
 
   digit_streak_fade: {
     id: 'digit_streak_fade', name: 'Digit Streak Fade',
-    description: 'Synthetic digit. Fades even/odd streaks. Flip NOT recommended (symmetric).',
+    description: 'Synthetic digit. Fades even/odd streaks beyond expected maximum. Flip NOT recommended (symmetric).',
     assetClass: 'synthetic_digit', contractClass: 'digit',
     baseRate: 0.50,
     defaultConfig: {
-      symbol: 'R_100', stake: 1, durationTicks: 5, minStreak: 8,
+      symbol: 'R_100', stake: 1, durationTicks: 5,
+      // Fallback when zStats unavailable (very early in session)
+      minStreak: 8,
+      // [FIX-DIGIT-DYN] Dynamic threshold = ceil(expectedMaxStreak) + extra.
+      // At N=200: 8+0=8; at N=500: 10+0=10; at N=1000: 11+0=11.
+      // Set extra=-1 to fire more often, +1 to fire less often.
+      streakExtra: 0,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
       const dv = sanitizeDigitView(ctx.digitView);
       if (!dv) return wait('Corrupt or missing digit data');
-      const { config, stats } = ctx;
+
+      const zs = dv.zStats;
       const evenStreak = dv.evenStreak || 0;
       const oddStreak = dv.oddStreak || 0;
-      const required = config.minStreak;
+
+      // [FIX-DIGIT-DYN] Dynamic threshold from expectedMaxStreak.
+      let required = Number(ctx.config.minStreak) || 8;
+      let expectedMax = null;
+      if (zs && Number.isFinite(zs.expectedMaxStreak)) {
+        expectedMax = zs.expectedMaxStreak;
+        required = Math.ceil(expectedMax) + (Number(ctx.config.streakExtra) || 0);
+      }
+
       let normalDir = null;
       if (evenStreak >= required) normalDir = 'DIGITODD';
       else if (oddStreak >= required) normalDir = 'DIGITEVEN';
-      if (!normalDir) return wait(`Streak: even=${evenStreak} odd=${oddStreak} (Need ${required})`);
-      const flip = shouldFlip(config, stats);
+
+      if (!normalDir) {
+        return wait(
+          `Streak: even=${evenStreak} odd=${oddStreak} ` +
+          `(need ${required}${expectedMax != null ? `, expectedMax=${expectedMax.toFixed(1)}` : ''})`
+        );
+      }
+
+      const flip = shouldFlip(ctx.config, ctx.stats);
       const finalDir = flip
         ? (normalDir === 'DIGITEVEN' ? 'DIGITODD' : 'DIGITEVEN')
         : normalDir;
       const reason = flip
         ? `${normalDir} fade FLIPPED → ${finalDir}`
         : `${Math.max(evenStreak, oddStreak)}-streak — fade to ${finalDir.replace('DIGIT','')}`;
-      return enterDigit(finalDir, config, reason);
+      return enterDigit(finalDir, ctx.config, reason);
     },
   },
 
   digit_hot_cold: {
     id: 'digit_hot_cold', name: 'Digit Hot/Cold',
-    description: 'Synthetic digit. Extreme OVER 8 / UNDER 0. Flip changes barrier (review before enabling).',
+    description: 'Synthetic digit. OVER 8 / UNDER 1 on extreme z-score (more selective than Over/Under Trader). Flip changes barrier.',
     assetClass: 'synthetic_digit', contractClass: 'digit',
     baseRate: 0.10,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5, minSamples: 150,
+      // [FIX-DIGIT-DYN] 2.0 is more selective than over_under (1.5). At N=200,
+      // fires when over% ≤ 5.6% or ≥ 14.4% (rare extremes only).
+      zThreshold: 2.0,
       flipEnabled: false, flipBelowPct: 8, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
       const dv = sanitizeDigitView(ctx.digitView);
       if (!dv) return wait('Corrupt or missing digit data');
       if (dv.sampleSize < ctx.config.minSamples) return wait('Not enough samples');
-      const { config, stats } = ctx;
-      const freq = dv.digitFreq;
-      const total = dv.sampleSize;
-      const over8 = (freq.slice(9).reduce((a, b) => a + b, 0) / total) * 100;
-      const under1 = (freq.slice(0, 1).reduce((a, b) => a + b, 0) / total) * 100;
-      let normalDir = null;
-      if (over8 <= 3.0) normalDir = 'DIGITOVER';
-      else if (under1 <= 3.0) normalDir = 'DIGITUNDER';
-      if (!normalDir) return wait(`Over 8: ${over8.toFixed(1)}% / Under 1: ${under1.toFixed(1)}% (Need <=3%)`);
-      const flip = shouldFlip(config, stats);
-      const finalDir = flip
-        ? (normalDir === 'DIGITOVER' ? 'DIGITUNDER' : 'DIGITOVER')
-        : normalDir;
-      const barrier = finalDir === 'DIGITOVER' ? 8 : 0;
+      const zs = dv.zStats;
+      if (!zs) return wait(`Not enough data for z-scores (${dv.sampleSize} ticks, need 30+)`);
+
+      const zThreshold = Number(ctx.config.zThreshold) || 2.0;
+      // [FIX-UNDER-BARRIER] barrier=8 for OVER 8 (correct); barrier=1 for
+      // UNDER 1 (was 0 — impossible).
+      const over8Z = zs.overZ[8];
+      const under1Z = zs.underZ[1];
+
+      let normalDir = null, barrier = null, zUsed = 0;
+      if (over8Z <= -zThreshold) { normalDir = 'DIGITOVER'; barrier = 8; zUsed = over8Z; }
+      else if (under1Z <= -zThreshold) { normalDir = 'DIGITUNDER'; barrier = 1; zUsed = under1Z; }
+
+      if (!normalDir) {
+        return wait(
+          `over8Z=${over8Z.toFixed(2)} under1Z=${under1Z.toFixed(2)} ` +
+          `(need <= -${zThreshold}, N=${zs.windowSize})`
+        );
+      }
+
+      const flip = shouldFlip(ctx.config, ctx.stats);
+      let finalDir = normalDir;
+      if (flip) {
+        finalDir = normalDir === 'DIGITOVER' ? 'DIGITUNDER' : 'DIGITOVER';
+        // [FIX-UNDER-BARRIER] barrier=1 not 0
+        barrier = finalDir === 'DIGITOVER' ? 8 : 1;
+      }
       const reason = flip
-        ? `${normalDir} FLIPPED → ${finalDir}`
-        : `Over 8=${over8.toFixed(1)}% / Under 1=${under1.toFixed(1)}%`;
-      return enterDigitBarrier(finalDir, barrier, config, reason);
+        ? `${normalDir} FLIPPED → ${finalDir} (z=${zUsed.toFixed(2)})`
+        : `${normalDir} barrier=${barrier} z=${zUsed.toFixed(2)} N=${zs.windowSize}`;
+      return enterDigitBarrier(finalDir, barrier, ctx.config, reason);
     },
   },
 
   // ============================================================
-  // SYNTHETIC BINARY BOTS (3)
+  // SYNTHETIC BINARY BOTS (3) — shadow gate added
   // ============================================================
 
   rise_fall_momentum: {
     id: 'rise_fall_momentum', name: 'Rise/Fall Momentum',
-    description: 'Synthetic CALL/PUT. Flip NOT recommended (50/50).',
+    description: 'Synthetic CALL/PUT. Flip NOT recommended (50/50). Shadow-gated.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5, minBias: 0.62, minSamples: 100,
+      // [FIX-SHADOW-CFG] Shadow gate: require N consecutive shadow wins before
+      // firing a real trade. 0 disables shadow. Default 3.
+      shadowWinsRequired: 3,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
@@ -633,11 +736,13 @@ const BOTS = {
 
   rise_fall_streak: {
     id: 'rise_fall_streak', name: 'Rise/Fall Streak Fade',
-    description: 'Synthetic CALL/PUT. Flip NOT recommended (50/50).',
+    description: 'Synthetic CALL/PUT. Flip NOT recommended (50/50). Shadow-gated.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5, minStreak: 7,
+      // [FIX-SHADOW-CFG] Shadow gate
+      shadowWinsRequired: 3,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
@@ -666,11 +771,13 @@ const BOTS = {
 
   rise_fall_breakout: {
     id: 'rise_fall_breakout', name: 'Rise/Fall Breakout',
-    description: 'Synthetic CALL/PUT. Flip NOT recommended (50/50).',
+    description: 'Synthetic CALL/PUT. Flip NOT recommended (50/50). Shadow-gated.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5, lookbackTicks: 10, minMovePct: 0.08,
+      // [FIX-SHADOW-CFG] Shadow gate
+      shadowWinsRequired: 3,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
@@ -695,7 +802,7 @@ const BOTS = {
   },
 
   // ============================================================
-  // SYNTHETIC VOLATILITY BOTS (2)
+  // SYNTHETIC VOLATILITY BOTS (2) — shadow gate added
   // ============================================================
 
   // [FIX-VOLHL] Was emitting ONETOUCH/NOTOUCH with no barrier.
@@ -703,11 +810,13 @@ const BOTS = {
   // Same thresholds preserved (0.72 strong-up → CALL, 0.45 bias < 0.45 → PUT).
   vol_high_low: {
     id: 'vol_high_low', name: 'Volatility High/Low',
-    description: 'Synthetic CALL/PUT on directional bias. Flip review before enabling.',
+    description: 'Synthetic CALL/PUT on directional bias. Flip review before enabling. Shadow-gated.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5, barrierPips: 10,
+      // [FIX-SHADOW-CFG] Shadow gate
+      shadowWinsRequired: 3,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
@@ -739,11 +848,13 @@ const BOTS = {
 
   vol_scalper: {
     id: 'vol_scalper', name: 'Volatility Scalper',
-    description: 'Synthetic CALL/PUT. Flip NOT recommended (50/50).',
+    description: 'Synthetic CALL/PUT. Flip NOT recommended (50/50). Shadow-gated.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5,
+      // [FIX-SHADOW-CFG] Shadow gate
+      shadowWinsRequired: 3,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
@@ -769,6 +880,11 @@ const BOTS = {
 };
 
 // ── Session-level risk defaults ─────────────────────────────────
+// [FIX-SHADOW-CFG] `shadowWinsRequired: 0` is the default-off gate —
+// only the 5 synthetic binary bots override it to 3. Digit and FX bots
+// see shadowWinsRequired=0 and fire immediately (their own evaluate()
+// rules are the quality gate; shadow would double-gate them with no
+// benefit since their entry logic is already z-score/consensus driven).
 const RISK_DEFAULTS = {
   botTakeProfit: 20,
   botStopLoss: 10,
@@ -783,6 +899,7 @@ const RISK_DEFAULTS = {
   flipBelowPct: 10,
   flipMinTrades: 20,
   flipStableTrades: 20,
+  shadowWinsRequired: 0,     // [FIX-SHADOW-CFG] default OFF; per-bot overrides
 };
 
 for (const id in BOTS) {
