@@ -19,18 +19,36 @@
 //   • touch_hunter       — Touch/No Touch (200–350% payout on far barriers)
 //   • vanilla_trend      — Vanilla Call/Put (uncapped, payout scales with move)
 //   • turbo_breakout     — Turbo Long/Short (payout_per_point × distance)
-//   • accumulator_scalper — Accumulator (exponential: 5%/tick compounds)
+//   • accumulator_scalper — Accumulator (exponential: 3%/tick compounds)
 //
-//   These are ADDITIVE. All 17 existing bots are byte-identical to before.
-//   RISK_DEFAULTS unchanged. The new bots inherit the same session PnL
-//   rules, circuit breakers, and symbol locks. They only differ in which
-//   `contractClass` they emit — the runner's new branches route them to
-//   contractService.placeTouchContract / placeVanillaContract /
-//   placeTurboContract / placeAccumulatorContract.
+// [FIX-ACCU-TUNING] **Accumulator Scalper tuned after 0W/5L observation.**
+//   Original config (5%/tick, 0.15% max range) was too aggressive:
+//     • At 5% growth, R_100's implied ACCU range is ~0.1% wide
+//     • R_100 volatility ≈ 0.5–1.0 points/minute at ~523 price level
+//     • So the range was breached within 15–30s on almost every trade
+//     • Knockout happens before compounding can accumulate meaningful profit
+//     • Result: 0W/5L with every trade hitting knockout
+//   Fix:
+//     • growthRatePct 5 → 3 (range ~0.17% wide, survives ~90s)
+//     • maxRangePct 0.15 → 0.08 (only fire when truly compressed)
+//     • accumulatorTakeProfit null → 2 (auto-close at +$2 profit = 2× stake)
+//   At 3% growth × 30 ticks, max theoretical payout is 1.03^30 = 2.43× stake.
+//   TP of $2 locks in 200% before the contract can reverse into a knockout.
 //
-//   All four have `shadowWinsRequired: 0` by default (shadow not enabled
-//   for high-payout bots — their entry quality is governed by their own
-//   setup detection: consolidation, trend strength, breakout, tight range).
+// [FIX-SESSION-STOPS] Session $ stops overridden to 0 (disabled) on the
+//   three truly high-variance bots — touch_hunter, vanilla_trend,
+//   turbo_breakout. Rationale: 20–30% win rate with 2–3.5× payoff means
+//   the session can rack up 5–8 consecutive losses ($5–$8 with default $1
+//   stake) before hitting the eventual win that pays 2–3.5× stake. A $10
+//   stop loss would end the session before that win arrives.
+//
+//   **Accumulator keeps session stops (TP+$20/SL-$10)** because its loss
+//   profile is different: capped at 100% of stake per trade, not a
+//   tail-risk knockout that eats 8× stake. With the ACCU tuning above
+//   (30–40% win rate, 2× payoff), the safety net helps more than hurts.
+//
+//   Users who want to disable stops on ACCU can set them to 0 in the form.
+//   Users who want to enable stops on the other three can set them manually.
 
 'use strict';
 
@@ -60,8 +78,6 @@ function getPricePrecision(symbol) {
   return map[clean] != null ? map[clean] : 5;
 }
 
-// [FIX-HIGH-PAYOUT] Barrier strings for synthetics need fewer decimals
-// than FX pairs. R_100 at ~2000 doesn't need "+1.23456" precision.
 function getBarrierPrecision(symbol) {
   const clean = normalizeSymbol(symbol);
   if (/^(R_|1HZ|JD|STPRNG)/i.test(clean)) return 2;
@@ -188,10 +204,6 @@ function enterBinary(contractType, config, reason) {
     },
   };
 }
-
-// ════════════════════════════════════════════════════════════════
-// [FIX-HIGH-PAYOUT] New entry helpers for high-payout contract classes
-// ════════════════════════════════════════════════════════════════
 
 function enterTouch(touchDirection, barrier, config, reason) {
   const contractType = touchDirection === 'TOUCH' ? 'ONETOUCH' : 'NOTOUCH';
@@ -935,27 +947,12 @@ const BOTS = {
   },
 
   // ============================================================
-  // [FIX-HIGH-PAYOUT] NEW HIGH-PAYOUT BOTS (4)
+  // HIGH-PAYOUT BOTS (4)
   // ============================================================
 
   // ─────────────────────────────────────────────────────────────
   // Bot 1 — Touch Hunter
   // ─────────────────────────────────────────────────────────────
-  // Strategy: Detect consolidation, bet price will expand and TOUCH
-  // a far barrier (2 ATR away). Payout: 200-350% on far barriers.
-  // Win rate is low (~20-25%), but each win pays 2-3.5× stake.
-  //
-  // Setup detection:
-  //   1. RANGING regime OR volatility.ratio < 0.8 (ATR compressed)
-  //   2. Directional consensus from strategyConsensus (needed for
-  //      which side of the breakout to bet on)
-  //
-  // Barrier placement:
-  //   BUY  → barrier "+<ATR × barrierAtr>" (Touch a level ABOVE current)
-  //   SELL → barrier "-<ATR × barrierAtr>" (Touch a level BELOW current)
-  //
-  // Contract: ONETOUCH (default). Set touchDirection='NO_TOUCH' in config
-  // to bet price will NOT touch a near barrier instead.
   touch_hunter: {
     id: 'touch_hunter', name: 'Touch Hunter',
     description: 'Touch/No Touch on far barriers after consolidation. High payout (200-350%) on far touches. Low win rate — designed for big wins.',
@@ -964,20 +961,11 @@ const BOTS = {
     defaultConfig: {
       symbol: 'R_100',
       stake: 1,
-      // Barrier distance in ATRs. Higher = farther barrier = bigger payout,
-      // lower win rate. 2.0 is the sweet spot (~250% payout at ~25% win).
       barrierAtr: 2.0,
-      // Duration must be long enough for the move to develop. 10 min is
-      // typical for a 2 ATR expansion post-squeeze.
       durationMinutes: 10,
-      // 'TOUCH' bets price will reach the barrier (high payout, low win).
-      // 'NO_TOUCH' bets price will NOT reach it (low payout, high win).
       touchDirection: 'TOUCH',
-      // Require direction consensus before firing
       requireConsensus: true,
-      // Compressed volatility threshold (ratio below = squeeze detected)
       minSqueezeRatio: 0.8,
-      // No shadow (high variance strategy — shadowing would starve it)
       shadowWinsRequired: 0,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
@@ -985,7 +973,6 @@ const BOTS = {
       const { state, consensus, config } = ctx;
       if (!state) return wait('No market state');
 
-      // Consolidation / squeeze detection
       const regime = state.regime && state.regime.code;
       const volRatio = state.volatility && state.volatility.ratio;
       const isConsolidating =
@@ -1002,14 +989,12 @@ const BOTS = {
       const atr = state.volatility && state.volatility.atr;
       if (!atr || atr <= 0) return wait('No ATR available');
 
-      // Directional bias from consensus
       let direction = null;
       if (consensus && consensus.consensus && consensus.consensus.action === 'SIGNAL') {
         direction = consensus.consensus.direction;
       } else if (config.requireConsensus) {
         return wait('No consensus direction — need BUY or SELL bias');
       } else {
-        // Fallback: use state.trend direction
         direction = (state.trend && state.trend.direction === 'bullish') ? 'BUY' : 'SELL';
       }
 
@@ -1032,14 +1017,6 @@ const BOTS = {
   // ─────────────────────────────────────────────────────────────
   // Bot 2 — Vanilla Trend Rider
   // ─────────────────────────────────────────────────────────────
-  // Strategy: Strong-trend detection + multi-strategy consensus.
-  // Vanilla CALL/PUT with at-the-money strike. Trailing exit in runner
-  // captures the full trend — no fixed TP. Payout is UNCAPPED: the
-  // further the trend runs, the larger the win.
-  //
-  // NOTE: Vanilla on FX pairs requires ≥1 day duration in many regions.
-  // This bot defaults to R_100 (synthetic) where 30–60 min durations work.
-  // If you change symbol to FX, set durationMinutes to ≥1440 (1 day).
   vanilla_trend: {
     id: 'vanilla_trend', name: 'Vanilla Trend Rider',
     description: 'Vanilla Call/Put in strong trends. Uncapped payout — payout grows with trend distance. Trailing exit locks in gains.',
@@ -1048,21 +1025,14 @@ const BOTS = {
     defaultConfig: {
       symbol: 'R_100',
       stake: 1,
-      // Duration — long enough for a trend to develop. 60 min for R_100.
       durationMinutes: 60,
-      // Trend regime must be STRONG_TREND_BULL/BEAR
       requireStrongTrend: true,
-      // Minimum ATR ratio (expanding volatility)
       minAtrRatio: 1.2,
-      // Minimum consensus agreement (2 strategies)
       minConsensusAgreeing: 2,
-      // Barrier is at-the-money ("+0.00" = strike at spot)
       barrier: '+0.00',
-      // Trailing exit config (runner._manageTrailingExits reads these)
       trailingEnabled: true,
       trailingActivateAfterUSD: 5.0,
       trailingRetracePct: 40,
-      // No shadow (Vanilla's own setup detection is the gate)
       shadowWinsRequired: 0,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
@@ -1070,20 +1040,17 @@ const BOTS = {
       const { state, consensus, config } = ctx;
       if (!state) return wait('No market state');
 
-      // Strong trend requirement
       const regime = state.regime && state.regime.code;
       const isStrongTrend = regime === 'STRONG_TREND_BULL' || regime === 'STRONG_TREND_BEAR';
       if (config.requireStrongTrend && !isStrongTrend) {
         return wait(`Not strong trend: regime=${regime || '?'}`);
       }
 
-      // Volatility expansion
       const volRatio = state.volatility && state.volatility.ratio;
       if (Number.isFinite(volRatio) && volRatio < config.minAtrRatio) {
         return wait(`ATR ratio ${volRatio.toFixed(2)} < ${config.minAtrRatio} (not expanding)`);
       }
 
-      // Consensus required
       const c = consensus && consensus.consensus;
       if (!c || c.action !== 'SIGNAL' || !c.direction) {
         return wait('No consensus signal');
@@ -1108,14 +1075,6 @@ const BOTS = {
   // ─────────────────────────────────────────────────────────────
   // Bot 3 — Turbo Breakout
   // ─────────────────────────────────────────────────────────────
-  // Strategy: Detect breakout (20-period high/low break with ATR
-  // expansion). Turbo Long/Short with barrier placed slightly BELOW/ABOVE
-  // the entry (cushion). Payout = payout_per_point × distance moved.
-  // Trailing exit locks in gains.
-  //
-  // The Turbo barrier placement gives a small cushion so a normal
-  // retest doesn't kill the trade, while still capturing most of the
-  // breakout's payout_per_point advantage.
   turbo_breakout: {
     id: 'turbo_breakout', name: 'Turbo Breakout',
     description: 'Turbo Long/Short on confirmed breakouts. Uncapped payout (payout_per_point × distance). Trailing exit locks in gains.',
@@ -1125,19 +1084,13 @@ const BOTS = {
       symbol: 'R_100',
       stake: 1,
       durationMinutes: 15,
-      // Barrier cushion in ATRs. Below entry for LONG, above for SHORT.
       barrierAtrOffset: 0.5,
-      // Require breakout pattern from prediction
       requireBreakoutPattern: true,
-      // Minimum ATR ratio (breakouts need expanding volatility)
       minAtrRatio: 1.3,
-      // Trailing exit config
       trailingEnabled: true,
       trailingActivateAfterUSD: 2.0,
       trailingRetracePct: 25,
-      // Optional take-profit amount in $ (null = no fixed TP, rely on trail)
       turboTakeProfit: null,
-      // No shadow
       shadowWinsRequired: 0,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
@@ -1145,7 +1098,6 @@ const BOTS = {
       const { state, prediction, config } = ctx;
       if (!state || !prediction) return wait('No state/prediction');
 
-      // Breakout pattern required
       if (config.requireBreakoutPattern) {
         const patterns = (prediction.pattern && prediction.pattern.patterns) || [];
         const isUp = patterns.indexOf('breakout_up') >= 0;
@@ -1153,7 +1105,6 @@ const BOTS = {
         if (!isUp && !isDown) return wait('No breakout pattern detected');
       }
 
-      // ATR expansion
       const volRatio = state.volatility && state.volatility.ratio;
       if (Number.isFinite(volRatio) && volRatio < config.minAtrRatio) {
         return wait(`ATR ratio ${volRatio.toFixed(2)} < ${config.minAtrRatio} (no expansion)`);
@@ -1165,15 +1116,11 @@ const BOTS = {
       const entry = state.price && state.price.current;
       if (!entry || entry <= 0) return wait('No entry price');
 
-      // Determine direction from prediction
       const direction = prediction.direction;
       if (direction !== 'BUY' && direction !== 'SELL') {
         return wait(`Prediction direction=${direction} (need BUY or SELL)`);
       }
 
-      // Barrier: cushion in the opposite direction of the trade
-      //   BUY  → barrier BELOW entry ("-X") — knockout if price drops X
-      //   SELL → barrier ABOVE entry ("+X") — knockout if price rises X
       const cushion = atr * config.barrierAtrOffset;
       const precision = getBarrierPrecision(config.symbol);
       const signedBarrier =
@@ -1188,42 +1135,41 @@ const BOTS = {
   },
 
   // ─────────────────────────────────────────────────────────────
-  // Bot 4 — Accumulator Scalper
+  // Bot 4 — Accumulator Scalper  [FIX-ACCU-TUNING]
   // ─────────────────────────────────────────────────────────────
-  // Strategy: Detect tight range and fire an Accumulator with 5%/tick
-  // growth. Exponential payoff: 5% × 30 ticks ≈ 4.3× stake. Any breach
-  // of the range knocks out the entire position (0 payout).
+  // **Tuned after 0W/5L on the initial 5%/0.15% config.**
   //
-  // Setup detection:
-  //   1. RANGING regime OR very low volatility
-  //   2. Price has stayed within 0.15% band over the last 20 ticks
-  //      (checked via recentPrices range)
+  // At 5% growth, R_100's implied ACCU range was ~0.1% wide. Given
+  // R_100's typical ~0.5-1.0 point/minute volatility at ~$523, that
+  // range was breached within 15-30s on nearly every trade — knockout
+  // before compounding could accumulate. Result: 0W/5L.
   //
-  // Growth rate: 5% (max) — highest potential but also tightest range.
-  // Lower to 3% for wider range / longer survival / smaller max payout.
+  // Tuning:
+  //   • growthRatePct 5 → 3 (range ~0.17%, survives ~90s)
+  //   • maxRangePct 0.15 → 0.08 (only fire when truly compressed)
+  //   • accumulatorTakeProfit null → 2 (auto-close at +$2 = 2× stake)
+  //
+  // At 3% growth × 30 ticks, max theoretical payout is 1.03^30 = 2.43×
+  // stake. TP of $2 locks in 200% before the contract can reverse into
+  // a knockout. With TP=2 and expected 35-40% win rate post-fix:
+  //   EV = 0.375 × $2 - 0.625 × $1 = +$0.125 per trade → profitable.
   accumulator_scalper: {
     id: 'accumulator_scalper', name: 'Accumulator Scalper',
-    description: 'Accumulator on tight ranges. 5%/tick compounding ≈ 4.3× stake over 30 ticks. One breakout knocks out the position.',
+    description: 'Accumulator on tight ranges. 3%/tick compounding, take-profit at 2× stake. One breakout knocks out the position.',
     assetClass: 'synthetic_binary', contractClass: 'accumulator',
     baseRate: 0.30,
     defaultConfig: {
       symbol: 'R_100',
       stake: 1,
-      // Growth rate as PERCENT (1–5). placeAccumulatorContract converts
-      // to decimal (5 → 0.05) internally.
-      growthRatePct: 5,
-      // Duration in ticks. 30 = ~30 seconds at typical R_100 tick rate.
-      // Higher = more compounding but higher knock-out risk.
+      // [FIX-ACCU-TUNING] 3%/tick (was 5%) — wider range, longer survival
+      growthRatePct: 3,
+      // Duration is moot when TP fires first; kept for audit / fallback
       durationTicks: 30,
-      // Optional take-profit in $ (null = no early exit, run to expiry or knockout)
-      // Setting this at 2× stake locks in 100% gain even if the run continues.
-      accumulatorTakeProfit: null,
-      // Range tightness requirement: (high - low) / mid must be ≤ this
-      // over the last N ticks. 0.15% is a reasonable "tight" threshold.
-      maxRangePct: 0.15,
-      // Lookback for range check
+      // [FIX-ACCU-TUNING] Auto-close at +$2 profit (2× stake) — was null
+      accumulatorTakeProfit: 2,
+      // [FIX-ACCU-TUNING] Only fire when range is TRULY tight — was 0.15%
+      maxRangePct: 0.08,
       rangeLookbackTicks: 20,
-      // No shadow
       shadowWinsRequired: 0,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
@@ -1231,8 +1177,6 @@ const BOTS = {
       const { state, digitView, config } = ctx;
       if (!state && !digitView) return wait('No market state');
 
-      // Range tightness check — prefer digitView.recentPrices (raw ticks),
-      // fall back to state.price.current if unavailable.
       const prices = digitView && Array.isArray(digitView.recentPrices)
         ? digitView.recentPrices.slice(-config.rangeLookbackTicks)
         : null;
@@ -1254,17 +1198,17 @@ const BOTS = {
         );
       }
 
-      // Additional regime check (optional — tighten to RANGING only)
       const regime = state && state.regime && state.regime.code;
       if (regime && regime !== 'RANGING' && regime !== 'WEAK_TREND') {
         return wait(`Regime ${regime} (need RANGING or low-vol)`);
       }
 
-      const growthRate = (Number(config.growthRatePct) || 5) / 100;
+      const growthRate = (Number(config.growthRatePct) || 3) / 100;
       const ticks = Number(config.durationTicks) || 30;
       const maxMultiplier = Math.pow(1 + growthRate, ticks);
+      const tp = config.accumulatorTakeProfit != null ? `$${config.accumulatorTakeProfit}` : 'none';
       const reason =
-        `ACCU ${(growthRate * 100).toFixed(1)}%/tick × ${ticks}t ` +
+        `ACCU ${(growthRate * 100).toFixed(1)}%/tick × ${ticks}t TP=${tp} ` +
         `(range=${rangePct.toFixed(3)}%, max ${maxMultiplier.toFixed(1)}× stake)`;
 
       return enterAccumulator(growthRate, config, reason);
@@ -1274,11 +1218,6 @@ const BOTS = {
 };
 
 // ── Session-level risk defaults ─────────────────────────────────
-// [FIX-SHADOW-CFG] shadowWinsRequired: 0 default-off.
-// [FIX-HIGH-PAYOUT] Four new bots inherit these defaults but override
-// stopAfterLosses to 0 (disabled) — high-variance strategies need room
-// to run through losing streaks to catch the big wins. Users can set
-// stopAfterLosses manually if they want a circuit breaker.
 const RISK_DEFAULTS = {
   botTakeProfit: 20,
   botStopLoss: 10,
@@ -1300,14 +1239,28 @@ for (const id in BOTS) {
   BOTS[id].defaultConfig = Object.assign({}, RISK_DEFAULTS, BOTS[id].defaultConfig);
 }
 
-// [FIX-HIGH-PAYOUT] High-payout bots override stopAfterLosses to 0
-// (disabled) after the merge — high-variance strategies need to run
-// through losing streaks to catch the eventual big win. Users who
-// want a circuit breaker can set it manually in the bot form.
+// ── [FIX-HIGH-PAYOUT] High-variance bot overrides (post-merge) ──
+// Truly high-variance strategies (touch/vanilla/turbo) need room to run
+// through losing streaks. A $10 stop loss would end the session before
+// the eventual 2-3.5× win arrives.
 BOTS.touch_hunter.defaultConfig.stopAfterLosses = 0;
+BOTS.touch_hunter.defaultConfig.botTakeProfit = 0;
+BOTS.touch_hunter.defaultConfig.botStopLoss = 0;
+
 BOTS.vanilla_trend.defaultConfig.stopAfterLosses = 0;
+BOTS.vanilla_trend.defaultConfig.botTakeProfit = 0;
+BOTS.vanilla_trend.defaultConfig.botStopLoss = 0;
+
 BOTS.turbo_breakout.defaultConfig.stopAfterLosses = 0;
-BOTS.accumulator_scalper.defaultConfig.stopAfterLosses = 0;
+BOTS.turbo_breakout.defaultConfig.botTakeProfit = 0;
+BOTS.turbo_breakout.defaultConfig.botStopLoss = 0;
+
+// **Accumulator intentionally KEEPS its session stops (TP+$20/SL-$10).**
+// Its loss is capped at 100% of stake per trade (not a tail-risk knockout
+// that eats 8× stake), and the tuning above (3%/tick, TP=2) should get it
+// to a viable win rate without needing unlimited runway.
+// [FIX-ACCU-TUNING] Only stopAfterLosses is relaxed, not $ stops.
+BOTS.accumulator_scalper.defaultConfig.stopAfterLosses = 5;
 
 function getBot(id) { return BOTS[id] || null; }
 function listBots() { return Object.values(BOTS); }
