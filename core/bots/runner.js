@@ -51,7 +51,6 @@ const SELL_CONTRACT_TYPES = new Set([
   'VANILLALONGPUT', 'TURBOSSHORT',
 ]);
 
-// [FIX-SHADOW] Shadow-mode tuning constants.
 const ESTIMATED_TICK_MS = 1000;
 const SHADOW_MAX_PENDING_AGE_MS = 60_000;
 const SHADOW_SEQUENCE_MAX = 20;
@@ -76,7 +75,6 @@ class BotRunner extends EventEmitter {
       shadowResolved: 0,
       shadowWins: 0,
       shadowLosses: 0,
-      // [FIX-HIGH-PAYOUT] trailing exit diagnostics
       trailingExits: 0,
       trailingSkipped: 0,
     };
@@ -114,8 +112,6 @@ class BotRunner extends EventEmitter {
       timer: null, _running: false, _lastEntryTime: 0,
       _entryFailureBackoffUntil: 0,
       shadow,
-      // [FIX-HIGH-PAYOUT] Per-contract trailing state for Vanilla/Turbo bots.
-      // Map<contractId, { peakProfit:number, entryPrice:number, activatedAt:number|null }>
       _trailingPeaks: new Map(),
       stats: {
         runs: 0, entries: 0, wins: 0, losses: 0, pnl: 0, peakPnl: 0, consecutiveLosses: 0,
@@ -192,7 +188,6 @@ class BotRunner extends EventEmitter {
           ? Number((this._metrics.shadowWins / this._metrics.shadowResolved).toFixed(3))
           : 0,
       },
-      // [FIX-HIGH-PAYOUT] trailing exit diagnostics
       trailing: {
         exits: this._metrics.trailingExits,
         skipped: this._metrics.trailingSkipped,
@@ -206,7 +201,7 @@ class BotRunner extends EventEmitter {
   }
 
   // ─────────────────────────────────────────────────────────────
-  //  Symbol locks (unchanged)
+  //  Symbol locks
   // ─────────────────────────────────────────────────────────────
   _tryAcquireSymbolLock(symbol, instanceId, ttlMs = SYMBOL_LOCK_TTL_MS) {
     const now = Date.now();
@@ -240,23 +235,8 @@ class BotRunner extends EventEmitter {
   }
 
   // ─────────────────────────────────────────────────────────────
-  //  [FIX-HIGH-PAYOUT] Trailing exits for Vanilla/Turbo bots
+  //  Trailing exits for Vanilla/Turbo bots
   // ─────────────────────────────────────────────────────────────
-  /**
-   * Track peak profit on open Vanilla/Turbo positions and close them
-   * when current profit has retraced more than `trailingRetracePct` from
-   * the peak (after peak has exceeded `trailingActivateAfterUSD`).
-   *
-   * Runs at the top of every _runCycle, before other checks. No-op for:
-   *   • Any bot without trailingEnabled
-   *   • Any bot whose contractClass isn't vanilla/turbo
-   *   • Any bot running in _edgeTest mode
-   *   • Any bot with no open positions on its own symbol
-   *
-   * Uses broker.closeTrade (market close) rather than modifySLTP because
-   * Vanilla/Turbo don't support SL/TP modification — they're closed early
-   * by selling at market.
-   */
   async _manageTrailingExits(instance) {
     if (!instance.config.trailingEnabled) return;
     if (instance.config._edgeTest) return;
@@ -267,7 +247,6 @@ class BotRunner extends EventEmitter {
     try { positions = await broker.getOpenTrades(); }
     catch (_) { return; }
     if (!Array.isArray(positions) || positions.length === 0) {
-      // No positions — clear stale tracking
       if (instance._trailingPeaks.size > 0) instance._trailingPeaks.clear();
       return;
     }
@@ -275,9 +254,6 @@ class BotRunner extends EventEmitter {
     const activateAfter = Number(instance.config.trailingActivateAfterUSD) || 2.0;
     const retracePct = Number(instance.config.trailingRetracePct) || 30;
 
-    // Build set of currently-open contract IDs on this bot's symbol so
-    // we can prune tracking entries for contracts that have since closed
-    // (either by trail-out or by expiry/knockout).
     const liveIds = new Set();
     for (const pos of positions) {
       if (normalizeSymbol(pos.instrument) === instance.symbol) {
@@ -288,7 +264,6 @@ class BotRunner extends EventEmitter {
       if (!liveIds.has(cid)) instance._trailingPeaks.delete(cid);
     }
 
-    // Iterate positions on this bot's symbol
     for (const pos of positions) {
       if (normalizeSymbol(pos.instrument) !== instance.symbol) continue;
 
@@ -305,12 +280,10 @@ class BotRunner extends EventEmitter {
         instance._trailingPeaks.set(contractId, tracking);
       }
 
-      // Update peak
       if (currentProfit > tracking.peakProfit) {
         tracking.peakProfit = currentProfit;
       }
 
-      // Only engage trailing after peak exceeds activation threshold
       if (tracking.peakProfit < activateAfter) continue;
 
       if (tracking.activatedAt == null) {
@@ -321,8 +294,6 @@ class BotRunner extends EventEmitter {
         );
       }
 
-      // Compute close threshold: close if current profit falls below
-      // (peak − retrace% of peak). E.g. peak=$10, retrace=30% → close if $<7.
       const closeBelow = tracking.peakProfit * (1 - retracePct / 100);
 
       if (currentProfit <= closeBelow) {
@@ -356,7 +327,7 @@ class BotRunner extends EventEmitter {
   }
 
   // ─────────────────────────────────────────────────────────────
-  //  Shadow trade lifecycle (unchanged from File 4)
+  //  Shadow trade lifecycle
   // ─────────────────────────────────────────────────────────────
   _shadowEligible(instance) {
     return !!(
@@ -534,7 +505,7 @@ class BotRunner extends EventEmitter {
   }
 
   // ─────────────────────────────────────────────────────────────
-  //  Flip state (unchanged)
+  //  Flip state
   // ─────────────────────────────────────────────────────────────
   _updateFlipState(instance) {
     const c = instance.config;
@@ -598,7 +569,7 @@ class BotRunner extends EventEmitter {
       s.phaseTrades = 0;
       s.phaseWins = 0;
       s.phasePnl = 0;
-      logger.info(`[BotRunner] ${botName(instance)} FLIP ON — normal phase ${phaseTradesAtToggle} trades, WR ${normalWinRate.toFixed(1)}%`);
+      logger.info(`[BotRunner] ${instance.botId}/${instance.instanceId} FLIP ON — normal phase ${phaseTradesAtToggle} trades, WR ${normalWinRate.toFixed(1)}%`);
       this.emit('botFlip', { instanceId: instance.instanceId, botId: instance.botId, flipped: true, reason: 'normal_phase_low_winrate' });
     }
   }
@@ -617,13 +588,8 @@ class BotRunner extends EventEmitter {
     try {
       this._updateFlipState(instance);
 
-      // [FIX-SHADOW] Resolve any pending shadow trades
       this._resolvePendingShadows(instance);
 
-      // [FIX-HIGH-PAYOUT] Check Vanilla/Turbo positions for trailing exits.
-      // No-op for all other contract classes. Runs BEFORE the usual
-      // position check so a trailing close happens before we try to
-      // evaluate a new entry.
       try { await this._manageTrailingExits(instance); }
       catch (trErr) {
         logger.warn(`[BotRunner] ${instance.instanceId}: trailing check failed: ${trErr.message}`);
@@ -710,7 +676,11 @@ class BotRunner extends EventEmitter {
 
       const ctx = { config: instance.config, stats: instance.stats };
 
+      // ─────────────────────────────────────────────────────────────
+      // Context building — three branches
+      // ─────────────────────────────────────────────────────────────
       if (bot.assetClass === 'fx') {
+        // FX bots: full deep-market pipeline (state, consensus, prediction, candles)
         const state = await deepMarketState.compute(instance.symbol, timeframe, 200).catch(() => null);
         if (!state) { instance.lastReason = 'no deep state'; return; }
         ctx.state = state;
@@ -727,7 +697,46 @@ class BotRunner extends EventEmitter {
         ctx.consensus = await ranker.rank(state, instance.symbol, { timeframe }).catch(() => null);
         ctx.prediction = await predictor.predict(instance.symbol, state, ctx.consensus, { timeframe }).catch(() => null);
         ctx.candles = await candleHistory.getHistory(instance.symbol, timeframe, 100).catch(() => []) || [];
+
+      // [FIX-HIGH-PAYOUT-CTX] High-payout bots (touch/vanilla/turbo/accumulator)
+      // reference ctx.state.regime, ctx.state.volatility, ctx.consensus, and
+      // ctx.prediction — exactly like FX bots. Without this branch they fell
+      // into the digit-only else below, got only ctx.digitView, and always
+      // returned "No market state" / "No state/prediction" before reaching
+      // the proposal call.
+      //
+      // The `deepMarketState.compute` call needs candle history for R_100.
+      // The first 1–2 cycles after start may return null while candles load
+      // (shown as "no deep state (candle history loading)" — self-heals).
+      //
+      // We ALSO populate digitView (for accumulator_scalper's tight-range
+      // check that reads ctx.digitView.recentPrices). Harmless for the other
+      // three bots (they don't read digitView).
+      } else if (HIGH_PAYOUT_CLASSES.has(bot.contractClass)) {
+        const state = await deepMarketState.compute(instance.symbol, timeframe, 200).catch(() => null);
+        if (!state) { instance.lastReason = 'no deep state (candle history loading)'; return; }
+        ctx.state = state;
+
+        const allowedRegimes = instance.config.allowedRegimes;
+        if (Array.isArray(allowedRegimes) && allowedRegimes.length > 0) {
+          const currentRegime = state.regime && state.regime.code;
+          if (currentRegime && allowedRegimes.indexOf(currentRegime) < 0) {
+            instance.lastReason = `Waiting: regime ${currentRegime} not in [${allowedRegimes.join(',')}]`;
+            return;
+          }
+        }
+
+        ctx.consensus = await ranker.rank(state, instance.symbol, { timeframe }).catch(() => null);
+        ctx.prediction = await predictor.predict(instance.symbol, state, ctx.consensus, { timeframe }).catch(() => null);
+        ctx.candles = await candleHistory.getHistory(instance.symbol, timeframe, 100).catch(() => []) || [];
+
+        // Populate digitView too — accumulator_scalper needs recentPrices
+        // for its tight-range check. Other three bots ignore it.
+        const dv = digitAnalyzer.getView(instance.symbol);
+        if (dv) ctx.digitView = dv;
+
       } else {
+        // Digit bots: digitView only (existing behavior, unchanged)
         const digitView = digitAnalyzer.getView(instance.symbol);
         if (!digitView) { instance.lastReason = 'no digit data'; return; }
         ctx.digitView = digitView;
@@ -852,7 +861,7 @@ class BotRunner extends EventEmitter {
       flipCount: instance.stats.flipCount,
     } : null;
 
-    if (instance.assetClass === 'fx') {
+    if (instance.assetClass === 'fx' || HIGH_PAYOUT_CLASSES.has(instance.contractClass)) {
       const pred = ctx && ctx.prediction;
       const st = ctx && ctx.state;
       const cons = ctx && ctx.consensus && ctx.consensus.consensus;
@@ -964,11 +973,6 @@ class BotRunner extends EventEmitter {
     return candidates[0];
   }
 
-  // [FIX-HIGH-PAYOUT] BotRun persistence now also stores high-payout
-  // metadata (payoutPerPoint, growthRate, strikePrice, touchBarrier,
-  // touchDirection) from `result.metadata` if present. Recovery path
-  // (fake result) passes no metadata → all those fields null, which is
-  // correct (metadata can't be recovered from portfolio listing).
   async _persistBotRun(instance, result, tradeParams, direction, stakeCheck, reasons, entryThesis, currentRegime, currentSession) {
     const shadowSnapshot = instance.shadow && instance.shadow.enabled ? {
       shadowEnabled: true,
@@ -986,8 +990,6 @@ class BotRunner extends EventEmitter {
       gateTightenCount: 0,
     };
 
-    // [FIX-HIGH-PAYOUT] Pull metadata from the place*Contract result.
-    // For non-high-payout contracts this will be undefined → all null.
     const md = (result && result.metadata) || {};
 
     try {
@@ -1005,7 +1007,6 @@ class BotRunner extends EventEmitter {
         session: currentSession,
         entryThesis,
         ...shadowSnapshot,
-        // [FIX-HIGH-PAYOUT] metadata from placeTouch/Vanilla/Turbo/Accumulator
         payoutPerPoint: md.payoutPerPoint != null ? Number(md.payoutPerPoint) : null,
         growthRate: md.growthRate != null ? Number(md.growthRate) : null,
         strikePrice: md.strikePrice != null ? Number(md.strikePrice) : null,
@@ -1091,14 +1092,8 @@ class BotRunner extends EventEmitter {
           strategy: instance.botId, regimeCode: instance.config.regimeCode || 'NEUTRAL',
           entryThesis,
         });
-      // [FIX-HIGH-PAYOUT] New contract class branches — additive.
-      // contractService.placeContract dispatches based on contractClass
-      // (or contractType for touch/vanilla/turbo/accumulator).
       } else if (HIGH_PAYOUT_CLASSES.has(tradeParams.contractClass)) {
         result = await contractService.placeContract({
-          // Pass EVERYTHING through: symbol, contractClass, contractType,
-          // direction, barrier, touchDirection, growthRate, duration,
-          // durationUnit, takeProfit — each place*Contract picks what it needs
           ...tradeParams,
           stake: stakeCheck.stake,
           strategy: instance.botId,
@@ -1161,8 +1156,6 @@ class BotRunner extends EventEmitter {
               contractId: recovered.id,
               entryPrice: recovered.entryPrice,
               purchasePrice: recovered.purchasePrice,
-              // metadata intentionally absent — cannot recover payout_per_point
-              // or strike from portfolio listing
             },
             tradeParams, direction, stakeCheck, reasons, entryThesis,
             currentRegime, currentSession
@@ -1246,7 +1239,6 @@ class BotRunner extends EventEmitter {
         instance.stats.phasePnl += realizedProfit;
         if (run.result === 'WIN') instance.stats.phaseWins++;
 
-        // Clean up trailing tracking for this contract
         if (instance._trailingPeaks) instance._trailingPeaks.delete(contractId);
 
         this._adaptGateAfterReal(instance, run.result);
@@ -1281,7 +1273,6 @@ class BotRunner extends EventEmitter {
       stats: instance.shadow.stats,
     } : null;
 
-    // [FIX-HIGH-PAYOUT] Trailing state for Vanilla/Turbo bots
     let trailingForSummary = null;
     if (TRAIL_ELIGIBLE_CLASSES.has(instance.contractClass) && instance.config.trailingEnabled) {
       const tracked = Array.from(instance._trailingPeaks.values());
@@ -1292,7 +1283,6 @@ class BotRunner extends EventEmitter {
         retracePct: Number(instance.config.trailingRetracePct) || 30,
         trackedContracts: tracked.length,
         activeTrailing: activePeaks.length,
-        // Best peak profit across all currently-tracked contracts
         bestPeakProfit: tracked.length > 0
           ? Number(Math.max(...tracked.map(t => t.peakProfit || 0)).toFixed(2))
           : 0,
@@ -1308,11 +1298,6 @@ class BotRunner extends EventEmitter {
       trailing: trailingForSummary,
     };
   }
-}
-
-// Helper used in one log line above — keeps this file self-contained
-function botName(instance) {
-  return `${instance.botId}/${instance.instanceId}`;
 }
 
 const botRunner = new BotRunner();
