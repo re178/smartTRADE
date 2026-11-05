@@ -56,6 +56,18 @@ const SELL_CONTRACT_TYPES = new Set([
   'MULTDOWN', 'PUT', 'DIGITODD', 'DIGITUNDER', 'DIGITDIFF', 'NOTOUCH',
 ]);
 
+// [FIX-SHADOW] Shadow-mode tuning constants.
+// Shadow resolution: use whichever comes first —
+//   • sampleSize delta >= durationTicks (accurate tick count)
+//   • wall clock >= durationTicks * ESTIMATED_TICK_MS (fallback)
+// For synthetics (R_100 etc.), the Deriv feed runs 1–2 ticks/sec. Using
+// 1000 ms per tick means a 5-tick shadow resolves in ~5s wall-clock,
+// which is the same order as the real trade's duration.
+// Hard timeout at 60s ensures a shadow NEVER hangs indefinitely.
+const ESTIMATED_TICK_MS = 1000;
+const SHADOW_MAX_PENDING_AGE_MS = 60_000;
+const SHADOW_SEQUENCE_MAX = 20;
+
 class BotRunner extends EventEmitter {
   constructor() {
     super();
@@ -69,6 +81,11 @@ class BotRunner extends EventEmitter {
       reconcilePositionRecovered: 0,
       lastReconciledAt: null,
       lastOriginalError: null,
+      // [FIX-SHADOW] aggregate shadow diagnostics
+      shadowPlaced: 0,
+      shadowResolved: 0,
+      shadowWins: 0,
+      shadowLosses: 0,
     };
   }
 
@@ -80,12 +97,41 @@ class BotRunner extends EventEmitter {
     const finalConfig = Object.assign({}, bot.defaultConfig, config || {});
     const symbol = normalizeSymbol(finalConfig.symbol);
 
+    // [FIX-SHADOW] Initialise shadow state only for eligible bots.
+    // Eligible = synthetic_binary asset class, shadowWinsRequired > 0,
+    // AND not an edge test. Everything else gets shadow = null and
+    // runs identically to before.
+    const shadowWinsRequired = Number(finalConfig.shadowWinsRequired) || 0;
+    const shadowEligible =
+      shadowWinsRequired > 0 &&
+      bot.assetClass === 'synthetic_binary' &&
+      !finalConfig._edgeTest;
+
+    const shadow = shadowEligible ? {
+      enabled: true,
+      originalGate: shadowWinsRequired,
+      currentGate: shadowWinsRequired,
+      // [FIX-SHADOW] shadowRequired=true means the next real fire must
+      // first accumulate `currentGate` consecutive shadow wins. Set
+      // false after a real WIN (continue trading directly). Set back to
+      // true after a real LOSS (re-earn the right to trade).
+      shadowRequired: true,
+      consecutiveShadowWins: 0,
+      gateTightenCount: 0,
+      sequence: [],            // last ≤20 shadow outcomes: 'W' or 'L'
+      stats: { wins: 0, losses: 0, total: 0, winRate: 0 },
+      pending: [],             // unresolved shadow trades
+    } : null;
+
     const instance = {
       instanceId, botId, name: bot.name, assetClass: bot.assetClass, contractClass: bot.contractClass,
       symbol, config: finalConfig, status: 'RUNNING', startedAt: new Date(), lastRunAt: null, lastReason: null,
       timer: null, _running: false, _lastEntryTime: 0,
       // [FIX-R2] When > Date.now(), skip cycles to avoid rapid entry retry
       _entryFailureBackoffUntil: 0,
+      // [FIX-SHADOW] Per-instance shadow state (in-memory only — discarded
+      // on stop, per spec: "persistence don't survive bot restart").
+      shadow,
       stats: {
         runs: 0, entries: 0, wins: 0, losses: 0, pnl: 0, peakPnl: 0, consecutiveLosses: 0,
         closedTrades: 0,
@@ -109,7 +155,11 @@ class BotRunner extends EventEmitter {
     if (typeof instance.timer.unref === 'function') instance.timer.unref();
 
     this._instances.set(instanceId, instance);
-    logger.info(`[BotRunner] Started ${bot.name} (${instanceId}) on ${symbol}${finalConfig._edgeTest ? ' [EDGE TEST]' : ''}`);
+    logger.info(
+      `[BotRunner] Started ${bot.name} (${instanceId}) on ${symbol}` +
+      (finalConfig._edgeTest ? ' [EDGE TEST]' : '') +
+      (shadowEligible ? ` [SHADOW gate=${shadowWinsRequired}]` : '')
+    );
     const summary = this._summarize(instance);
     this.emit('botStarted', summary);
     setTimeout(() => { this._runCycle(instance).catch(() => {}); }, 1000);
@@ -142,7 +192,7 @@ class BotRunner extends EventEmitter {
   list() { return Array.from(this._instances.values()).map(i => this._summarize(i)); }
   get(instanceId) { const i = this._instances.get(instanceId); return i ? this._summarize(i) : null; }
 
-  // [FIX-R4] Exposure for health checks / dashboards.
+  // [FIX-R4] [FIX-SHADOW] Exposure for health checks / dashboards.
   getStats() {
     return {
       reconcilePosition: {
@@ -150,6 +200,15 @@ class BotRunner extends EventEmitter {
         recovered: this._metrics.reconcilePositionRecovered,
         lastReconciledAt: this._metrics.lastReconciledAt,
         lastOriginalError: this._metrics.lastOriginalError,
+      },
+      shadow: {
+        placed: this._metrics.shadowPlaced,
+        resolved: this._metrics.shadowResolved,
+        wins: this._metrics.shadowWins,
+        losses: this._metrics.shadowLosses,
+        winRate: this._metrics.shadowResolved > 0
+          ? Number((this._metrics.shadowWins / this._metrics.shadowResolved).toFixed(3))
+          : 0,
       },
       runningInstances: this._instances.size,
       symbolLocks: this._symbolLocks.size,
@@ -179,8 +238,6 @@ class BotRunner extends EventEmitter {
     }
   }
 
-  // [FIX-M4] Shorten the lock's TTL after a successful entry so other
-  // bots aren't blocked longer than the position-propagation window.
   _shortenSymbolLock(symbol, instanceId, ttlMs = SYMBOL_LOCK_TAIL_MS) {
     const lock = this._symbolLocks.get(symbol);
     if (lock && lock.instanceId === instanceId) {
@@ -192,6 +249,201 @@ class BotRunner extends EventEmitter {
     const now = Date.now();
     for (const [sym, lock] of this._symbolLocks) {
       if (lock.expiresAt <= now) this._symbolLocks.delete(sym);
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  //  [FIX-SHADOW] Shadow trade lifecycle
+  // ─────────────────────────────────────────────────────────────
+
+  // Is this instance eligible to use shadow at all?
+  _shadowEligible(instance) {
+    return !!(
+      instance.shadow &&
+      instance.shadow.enabled &&
+      instance.assetClass === 'synthetic_binary' &&
+      Number(instance.config.shadowWinsRequired) > 0 &&
+      !instance.config._edgeTest
+    );
+  }
+
+  // Resolve any pending shadow trades whose duration has elapsed.
+  // Called at the top of every _runCycle. Cheap when no pending shadows.
+  _resolvePendingShadows(instance) {
+    if (!instance.shadow || instance.shadow.pending.length === 0) return;
+
+    const dv = digitAnalyzer.getView(instance.symbol);
+    if (!dv) return;   // no data yet — retry next cycle
+
+    const now = Date.now();
+    const remaining = [];
+
+    for (const shadow of instance.shadow.pending) {
+      const ticksElapsed = Number(dv.sampleSize) - shadow.entryTickNum;
+      const timeElapsed = now - shadow.startedAt;
+      const expectedTimeMs = shadow.durationTicks * ESTIMATED_TICK_MS;
+
+      // Resolve when either enough ticks have passed OR wall-clock
+      // threshold hit. Hard timeout prevents stuck shadows.
+      const forceResolve = timeElapsed > SHADOW_MAX_PENDING_AGE_MS;
+      const readyToResolve =
+        forceResolve ||
+        timeElapsed >= expectedTimeMs ||
+        ticksElapsed >= shadow.durationTicks;
+
+      if (!readyToResolve) {
+        remaining.push(shadow);
+        continue;
+      }
+
+      // Determine outcome
+      const exitPrice = Number(dv.price);
+      let outcome;
+      if (shadow.prediction === 'CALL') {
+        outcome = exitPrice > shadow.entryPrice ? 'W' : 'L';
+      } else if (shadow.prediction === 'PUT') {
+        outcome = exitPrice < shadow.entryPrice ? 'W' : 'L';
+      } else {
+        // Unknown prediction — treat as loss, log it
+        logger.warn(
+          `[BotRunner] ${instance.instanceId}: shadow with unknown prediction ` +
+          `"${shadow.prediction}" — treating as loss`
+        );
+        outcome = 'L';
+      }
+
+      // Update sequence + counters
+      instance.shadow.sequence.push(outcome);
+      if (instance.shadow.sequence.length > SHADOW_SEQUENCE_MAX) {
+        instance.shadow.sequence.shift();
+      }
+
+      instance.shadow.stats.total++;
+      if (outcome === 'W') {
+        instance.shadow.consecutiveShadowWins++;
+        instance.shadow.stats.wins++;
+        this._metrics.shadowWins++;
+      } else {
+        instance.shadow.consecutiveShadowWins = 0;
+        instance.shadow.stats.losses++;
+        this._metrics.shadowLosses++;
+      }
+      instance.shadow.stats.winRate = instance.shadow.stats.total > 0
+        ? Number((instance.shadow.stats.wins / instance.shadow.stats.total).toFixed(3))
+        : 0;
+
+      this._metrics.shadowResolved++;
+
+      logger.info(
+        `[BotRunner] ${instance.instanceId}: shadow ${shadow.prediction} RESOLVED ${outcome} ` +
+        `(entry=${shadow.entryPrice} exit=${exitPrice}, ticks=${ticksElapsed}) — ` +
+        `consecutive=${instance.shadow.consecutiveShadowWins}/${instance.shadow.currentGate}`
+      );
+
+      try {
+        this.emit('botShadowResolved', {
+          instanceId: instance.instanceId,
+          botId: instance.botId,
+          outcome,
+          prediction: shadow.prediction,
+          entryPrice: shadow.entryPrice,
+          exitPrice,
+          ticksElapsed,
+          consecutiveShadowWins: instance.shadow.consecutiveShadowWins,
+          currentGate: instance.shadow.currentGate,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (_) {}
+    }
+
+    instance.shadow.pending = remaining;
+  }
+
+  // Record a shadow trade (do NOT execute). Called when the bot fires
+  // ENTER but the shadow gate isn't met.
+  _recordShadowTrade(instance, signal, ctx) {
+    const { tradeParams } = signal;
+    const dv = ctx && ctx.digitView;
+    if (!dv) {
+      instance.lastReason = 'Shadow skipped: no digit view';
+      return;
+    }
+
+    const prediction = tradeParams.contractType;
+    if (prediction !== 'CALL' && prediction !== 'PUT') {
+      instance.lastReason = `Shadow skipped: unsupported contractType ${prediction}`;
+      logger.warn(
+        `[BotRunner] ${instance.instanceId}: shadow cannot track ${prediction} ` +
+        `(only CALL/PUT supported). Firing without shadow.`
+      );
+      // Fall through — fire real (safety: don't block trading on an
+      // unsupported contract type, just skip shadow accounting)
+      return this._execute(instance, signal, ctx);
+    }
+
+    const entryPrice = Number(dv.price);
+    const entryTickNum = Number(dv.sampleSize);
+    const durationTicks = Number(tradeParams.duration) || 5;
+
+    instance.shadow.pending.push({
+      prediction,
+      entryPrice,
+      entryTickNum,
+      durationTicks,
+      startedAt: Date.now(),
+    });
+
+    this._metrics.shadowPlaced++;
+
+    instance.lastReason =
+      `Shadow ${prediction} placed (${instance.shadow.consecutiveShadowWins}/${instance.shadow.currentGate})`;
+
+    logger.info(
+      `[BotRunner] ${instance.instanceId}: shadow ${prediction} placed ` +
+      `price=${entryPrice} tick#${entryTickNum} dur=${durationTicks} ` +
+      `(need ${instance.shadow.currentGate - instance.shadow.consecutiveShadowWins} more)`
+    );
+
+    try {
+      this.emit('botShadowPlaced', {
+        instanceId: instance.instanceId,
+        botId: instance.botId,
+        prediction,
+        entryPrice,
+        entryTickNum,
+        durationTicks,
+        consecutiveShadowWins: instance.shadow.consecutiveShadowWins,
+        currentGate: instance.shadow.currentGate,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (_) {}
+  }
+
+  // Called from _onTradeClosed when a real trade settles.
+  // Adapts the gate per spec:
+  //   • WIN  → shadowRequired=false, counter=0, gate unchanged
+  //   • LOSS → shadowRequired=true,  counter=0, gate = min(10, gate+1)
+  _adaptGateAfterReal(instance, result) {
+    if (!instance.shadow || !instance.shadow.enabled) return;
+
+    instance.shadow.consecutiveShadowWins = 0;
+
+    if (result === 'WIN') {
+      instance.shadow.shadowRequired = false;
+      logger.info(
+        `[BotRunner] ${instance.instanceId}: real WIN → continue trading ` +
+        `(gate stays at ${instance.shadow.currentGate})`
+      );
+    } else if (result === 'LOSS') {
+      instance.shadow.shadowRequired = true;
+      const oldGate = instance.shadow.currentGate;
+      instance.shadow.currentGate = Math.min(10, oldGate + 1);
+      instance.shadow.gateTightenCount++;
+      logger.info(
+        `[BotRunner] ${instance.instanceId}: real LOSS → gate tightened ` +
+        `${oldGate} → ${instance.shadow.currentGate} ` +
+        `(total tightens=${instance.shadow.gateTightenCount})`
+      );
     }
   }
 
@@ -221,11 +473,9 @@ class BotRunner extends EventEmitter {
     const flipThreshold = Number(c.flipBelowPct) || 10;
 
     if (s.flipped) {
-      // ── Currently FLIPPED — decide if we should un-flip ──
       if (s.phaseTrades < stableTrades) return;
 
       if (s.phasePnl < 0) {
-        // [FIX-R1] Capture phase values BEFORE reset so the log is accurate.
         const phaseTradesAtToggle = s.phaseTrades;
         const phasePnlAtToggle = s.phasePnl;
         s.flipHistory.push({
@@ -245,12 +495,10 @@ class BotRunner extends EventEmitter {
       return;
     }
 
-    // ── Currently NORMAL — decide if we should flip ──
     if (s.phaseTrades < minTrades) return;
 
     const normalWinRate = (s.phaseWins / s.phaseTrades) * 100;
     if (normalWinRate < flipThreshold) {
-      // [FIX-R1] Capture before reset so the log reflects the triggering phase.
       const phaseTradesAtToggle = s.phaseTrades;
       const phasePnlAtToggle = s.phasePnl;
       s.flipHistory.push({
@@ -282,6 +530,10 @@ class BotRunner extends EventEmitter {
 
     try {
       this._updateFlipState(instance);
+
+      // [FIX-SHADOW] Resolve any pending shadow trades from prior cycles
+      // before doing anything else. Cheap no-op when none are pending.
+      this._resolvePendingShadows(instance);
 
       // [FIX-M4] Garbage-collect expired symbol locks each cycle.
       this._cleanupExpiredLocks();
@@ -360,9 +612,6 @@ class BotRunner extends EventEmitter {
         return;
       }
 
-      // [FIX-M4] If another instance holds the lock for this symbol, wait.
-      // (Belt-and-suspenders: the position check above misses concurrent
-      // entries where neither has filled yet.)
       const existingLock = this._symbolLocks.get(instance.symbol);
       if (existingLock && existingLock.expiresAt > Date.now() && existingLock.instanceId !== instance.instanceId) {
         instance.lastReason = `Symbol ${instance.symbol} locked by ${existingLock.instanceId}`;
@@ -410,6 +659,24 @@ class BotRunner extends EventEmitter {
       }
 
       if (result.action === 'ENTER') {
+        // [FIX-SHADOW] If shadow is enabled AND required, gate the real
+        // fire. If shadow is not required (post-win continuation), the
+        // bot proceeds straight to _execute.
+        if (this._shadowEligible(instance) && instance.shadow.shadowRequired) {
+          if (instance.shadow.pending.length > 0) {
+            instance.lastReason = 'Shadow pending (waiting for resolution)';
+            return;
+          }
+          if (instance.shadow.consecutiveShadowWins < instance.shadow.currentGate) {
+            this._recordShadowTrade(instance, result, ctx);
+            return;
+          }
+          // Gate met — fall through to real execute
+          logger.info(
+            `[BotRunner] ${instance.instanceId}: shadow gate MET ` +
+            `(${instance.shadow.consecutiveShadowWins}/${instance.shadow.currentGate}) → real fire`
+          );
+        }
         await this._execute(instance, result, ctx);
       }
     } catch (err) {
@@ -426,7 +693,6 @@ class BotRunner extends EventEmitter {
       return { ok: false, reason: `Invalid stake: ${stake}` };
     }
     const rawMax = instance.config.maxStake;
-    // [FIX-STAKE] Explicit "no cap" cases.
     if (rawMax == null || rawMax === '') return { ok: true, stake: requested };
     const cap = Number(rawMax);
     if (cap === 0) {
@@ -444,13 +710,7 @@ class BotRunner extends EventEmitter {
     return { ok: true, stake: requested };
   }
 
-  // [FIX-M4c] Extend validation to reject SL/TP on the wrong side of entry.
-  // Previous code used Math.abs() which hid direction — a TP below entry for
-  // a BUY would pass as a valid "distance" and reach broker where the C1
-  // fix would then silently omit the field (trade proceeds with no TP).
-  // Rejecting here is safer.
   _validateRiskReward(instance, tradeParams, ctx, direction) {
-    // Only multiplier contracts use knockoutLevel / takeProfitLevel.
     if (tradeParams.contractClass !== 'multiplier') return { ok: true };
 
     const entryPrice =
@@ -460,7 +720,6 @@ class BotRunner extends EventEmitter {
     const tp = Number(tradeParams.takeProfitLevel);
     const dir = tradeParams.direction || direction || null;
 
-    // [FIX-M4c] Side validation — independent of minRR config.
     if (Number.isFinite(entryPrice) && entryPrice > 0 && dir) {
       const isBuy = dir === 'BUY' || dir === 'MULTUP';
       if (Number.isFinite(ko)) {
@@ -564,8 +823,6 @@ class BotRunner extends EventEmitter {
     };
   }
 
-  // [FIX-R4] Is this error ambiguous (buy may have succeeded despite the
-  // client-side failure)? Only these errors trigger reconciliation.
   _isAmbiguousError(err) {
     if (!err || !err.message) return false;
     const msg = String(err.message);
@@ -581,13 +838,9 @@ class BotRunner extends EventEmitter {
     );
   }
 
-  // [FIX-R4] Third-layer recovery — matches contractService._reconcileBuy
-  // and broker._reconcileOrphanBuy criteria, but only has the instance's
-  // symbol, expected side, and intended stake to match against.
   async _reconcileOrphanPosition(instance, symbol, expectedSide, intendedStake) {
     this._metrics.reconcilePositionAttempts++;
 
-    // Give Deriv time to settle a possibly-succeeded buy.
     await new Promise(r => setTimeout(r, RECONCILE_POSITION_GRACE_MS));
 
     const broker = getBroker('deriv_cfd');
@@ -595,8 +848,6 @@ class BotRunner extends EventEmitter {
     const submittedBefore = Date.now() - RECONCILE_POSITION_LOOKBACK_MS;
     const stakeNum = Math.abs(Number(intendedStake));
 
-    // Force a fresh portfolio fetch — the buy may have succeeded server-side
-    // but the 3s cache still reflects state from before the attempt.
     if (broker._portfolioCache) broker._portfolioCache.at = 0;
 
     let positions;
@@ -630,10 +881,24 @@ class BotRunner extends EventEmitter {
     return candidates[0];
   }
 
-  // [FIX-R4] Extracted from _execute so both success path and recovery path
-  // share one implementation. Persists a BotRun record so _onTradeClosed
-  // can match the settlement event to this instance.
+  // [FIX-SHADOW] BotRun persistence now includes shadow snapshot.
   async _persistBotRun(instance, result, tradeParams, direction, stakeCheck, reasons, entryThesis, currentRegime, currentSession) {
+    const shadowSnapshot = instance.shadow && instance.shadow.enabled ? {
+      shadowEnabled: true,
+      shadowSequence: instance.shadow.sequence.slice(-SHADOW_SEQUENCE_MAX),
+      shadowStats: { ...instance.shadow.stats },
+      gateAtEntry: instance.shadow.currentGate,
+      originalGate: instance.shadow.originalGate,
+      gateTightenCount: instance.shadow.gateTightenCount,
+    } : {
+      shadowEnabled: false,
+      shadowSequence: [],
+      shadowStats: null,
+      gateAtEntry: null,
+      originalGate: null,
+      gateTightenCount: 0,
+    };
+
     try {
       await BotRun.create({
         botId: instance.botId, instanceId: instance.instanceId, contractId: String(result.contractId),
@@ -648,25 +913,21 @@ class BotRunner extends EventEmitter {
         regimeCode: currentRegime,
         session: currentSession,
         entryThesis,
+        // [FIX-SHADOW] Audit trail — snapshot at fire time
+        ...shadowSnapshot,
       });
     } catch (persistErr) {
       logger.error(
         `[BotRunner] BotRun persist failed for ${result.contractId} ` +
         `(${instance.botId}/${instance.instanceId}): ${persistErr.message}`
       );
-      // Trade is live — don't abort. _onTradeClosed will warn if it can't match.
     }
   }
 
   async _execute(instance, signal, ctx) {
     const { tradeParams, direction, reasons } = signal;
-    // [FIX-M4] Lock key — falls back to the instance's configured symbol if
-    // the bot's tradeParams doesn't specify one.
     const lockSymbol = normalizeSymbol(tradeParams.symbol || instance.symbol);
 
-    // [FIX-STAKE] Prefer instance.config.stake (editable in dashboard form)
-    // over the bot's computed tradeParams.stake. This is what makes the
-    // "stake: 1" default in defaultConfig actually take effect per trade.
     const configStake = instance.config.stake;
     const hasConfigStake =
       configStake != null && configStake !== '' &&
@@ -689,8 +950,6 @@ class BotRunner extends EventEmitter {
       return;
     }
 
-    // [FIX-M4] Acquire the symbol lock. Only one bot per symbol can be
-    // between "decided to enter" and "position is visible in portfolio".
     if (!this._tryAcquireSymbolLock(lockSymbol, instance.instanceId, SYMBOL_LOCK_TTL_MS)) {
       const holder = this._symbolLocks.get(lockSymbol);
       instance.lastReason = `Execution blocked: ${lockSymbol} locked by ${holder ? holder.instanceId : 'unknown'}`;
@@ -703,7 +962,6 @@ class BotRunner extends EventEmitter {
     const currentSession = detectSession();
     const currentRegime = ctx && ctx.state && ctx.state.regime ? ctx.state.regime.code : null;
 
-    // [FIX-R4] Resolve expected side for recovery matching.
     let expectedSide = direction;
     if (!expectedSide && tradeParams.direction) expectedSide = tradeParams.direction;
     if (!expectedSide && tradeParams.contractType) {
@@ -713,9 +971,6 @@ class BotRunner extends EventEmitter {
     }
 
     try {
-      // [FIX-M4] Re-check positions now that we hold the lock. This catches
-      // the window between the cycle-start check and this entry attempt,
-      // where another bot may have filled a trade.
       const broker = getBroker('deriv_cfd');
       const freshPositions = await broker.getOpenTrades().catch(() => []);
       if (freshPositions.some(p => normalizeSymbol(p.instrument) === lockSymbol)) {
@@ -747,10 +1002,8 @@ class BotRunner extends EventEmitter {
       instance.stats.entries++;
       instance._lastEntryTime = Date.now();
       instance.lastReason = 'TRADE PLACED';
-      // [FIX-R2] Successful entry clears any pending failure backoff.
       instance._entryFailureBackoffUntil = 0;
 
-      // [FIX-R3] Persist BotRun with proper error handling.
       await this._persistBotRun(instance, result, tradeParams, direction, stakeCheck, reasons, entryThesis, currentRegime, currentSession);
 
       this.emit('botEntry', {
@@ -761,12 +1014,8 @@ class BotRunner extends EventEmitter {
         timestamp: new Date().toISOString(),
       });
 
-      // [FIX-M4] Success → shorten the lock TTL. After ~5s the position is
-      // visible in portfolio, so other bots can rely on the position check.
       this._shortenSymbolLock(lockSymbol, instance.instanceId, SYMBOL_LOCK_TAIL_MS);
     } catch (err) {
-      // [FIX-R4] Before declaring failure, attempt reconciliation if the
-      // error is ambiguous (buy may have succeeded server-side).
       if (this._isAmbiguousError(err)) {
         this._metrics.lastOriginalError = err.message;
         logger.warn(
@@ -793,12 +1042,9 @@ class BotRunner extends EventEmitter {
           instance.lastReason = 'TRADE PLACED (recovered)';
           instance._entryFailureBackoffUntil = 0;
 
-          // Ensure subscription so the settlement event fires and
-          // _onTradeClosed can update stats.
           const broker = getBroker('deriv_cfd');
           broker._subscribeOpenContract(recovered.id).catch(() => {});
 
-          // Persist BotRun for the recovered contract.
           await this._persistBotRun(
             instance,
             {
@@ -821,7 +1067,6 @@ class BotRunner extends EventEmitter {
             timestamp: new Date().toISOString(),
           });
 
-          // [FIX-M4] Shorten lock — the recovered position is now visible.
           this._shortenSymbolLock(lockSymbol, instance.instanceId, SYMBOL_LOCK_TAIL_MS);
           return;
         }
@@ -832,13 +1077,10 @@ class BotRunner extends EventEmitter {
         );
       }
 
-      // [FIX-R2] Set failure backoff so the bot doesn't retry immediately
-      // next cycle with the same bad payload / network condition.
       instance._entryFailureBackoffUntil = Date.now() + ENTRY_FAILURE_BACKOFF_MS;
       logger.error(`[BotRunner] ${instance.botId}/${instance.instanceId} entry failed: ${err.message}`);
       instance.lastReason = `Execution failed: ${err.message}`;
       this.emit('botError', { instanceId: instance.instanceId, botId: instance.botId, error: err.message });
-      // [FIX-M4] Failure → release lock immediately so other bots can try.
       this._releaseSymbolLock(lockSymbol, instance.instanceId);
     }
   }
@@ -849,8 +1091,6 @@ class BotRunner extends EventEmitter {
       if (!contractId) return;
       const run = await BotRun.findOne({ contractId, status: 'OPEN' });
       if (!run) {
-        // [FIX-R3] Surface missing BotRun at WARN — indicates a persist failure
-        // during entry. Stats won't update for this contract.
         logger.warn(
           `[BotRunner] _onTradeClosed: no OPEN BotRun for contract ${contractId} ` +
           `(entry persist may have failed)`
@@ -894,6 +1134,11 @@ class BotRunner extends EventEmitter {
         instance.stats.phasePnl += realizedProfit;
         if (run.result === 'WIN') instance.stats.phaseWins++;
 
+        // [FIX-SHADOW] Adapt the gate after this real trade settles.
+        // WIN → continue trading (shadowRequired=false, gate unchanged)
+        // LOSS → re-enter shadow mode with a tighter gate
+        this._adaptGateAfterReal(instance, run.result);
+
         this.emit('botResult', {
           instanceId: run.instanceId, botId: run.botId, contractId,
           result: run.result, pnl: realizedProfit, totalPnl: instance.stats.pnl,
@@ -912,11 +1157,25 @@ class BotRunner extends EventEmitter {
       statsForSummary.flipHistory = statsForSummary.flipHistory.slice(-5);
     }
 
+    // [FIX-SHADOW] Frontend gets shadow state for display
+    const shadowForSummary = instance.shadow && instance.shadow.enabled ? {
+      enabled: true,
+      currentGate: instance.shadow.currentGate,
+      originalGate: instance.shadow.originalGate,
+      shadowRequired: instance.shadow.shadowRequired,
+      consecutiveShadowWins: instance.shadow.consecutiveShadowWins,
+      gateTightenCount: instance.shadow.gateTightenCount,
+      pending: instance.shadow.pending.length,
+      sequence: instance.shadow.sequence.slice(-10),
+      stats: instance.shadow.stats,
+    } : null;
+
     return {
       instanceId: instance.instanceId, botId: instance.botId, name: instance.name, assetClass: instance.assetClass,
       contractClass: instance.contractClass, symbol: instance.symbol, status: instance.status, startedAt: instance.startedAt,
       lastRunAt: instance.lastRunAt, lastReason: instance.lastReason, config: instance.config,
       stats: statsForSummary,
+      shadow: shadowForSummary,
     };
   }
 }
