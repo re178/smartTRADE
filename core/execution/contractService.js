@@ -3,6 +3,10 @@
 //   • Multiplier (MULTUP / MULTDOWN)         — FX pairs
 //   • Digital (DIGITEVEN/ODD/OVER/UNDER/...) — Synthetic indices
 //   • Binary (CALL/PUT/ONETOUCH/NOTOUCH)     — Synthetic indices
+//   • Touch/No Touch (ONETOUCH/NOTOUCH)      — [FIX-HIGH-PAYOUT]
+//   • Vanilla (VANILLALONGCALL/PUT)          — [FIX-HIGH-PAYOUT]
+//   • Turbo (TURBOSLONG/SHORT)               — [FIX-HIGH-PAYOUT]
+//   • Accumulator (ACCU)                     — [FIX-HIGH-PAYOUT]
 //
 // Uses broker._sendAuthRequest — does NOT modify broker.js.
 // Callers: bots/runner.js (bot entries), api/controllers.js (manual orders).
@@ -83,6 +87,44 @@
 //             This makes bot entries as resilient to the buy-timeout problem
 //             as manual/live-signal entries are after FIX-RECON-BUY in
 //             broker.js. Metrics tracked and exposed via getStats().
+//
+// [FIX-HIGH-PAYOUT] **Four new contract classes for high-payout bots.**
+//             Adds placement functions for the four Deriv contract types
+//             that pay significantly more than fixed-payout digit/CALL-PUT
+//             contracts:
+//
+//               • Touch/No Touch (ONETOUCH / NOTOUCH)
+//                   Payout = fixed, but barrier-dependent. Far barriers
+//                   (2 ATR+) pay 200–350%+. Used by touch_hunter bot.
+//                   Requires: barrier (relative string "+X.XX" / "-X.XX")
+//
+//               • Vanilla (VANILLALONGCALL / VANILLALONGPUT)
+//                   Payout = payout_per_point × (final − strike). Uncapped.
+//                   Used by vanilla_trend bot. Requires: barrier (strike,
+//                   relative string; "+0.00" = at-the-money).
+//
+//               • Turbo (TURBOSLONG / TURBOSSHORT)
+//                   Payout = payout_per_point × distance from barrier.
+//                   Knockout if barrier breached. Used by turbo_breakout.
+//                   Requires: barrier (relative), optional take_profit.
+//
+//               • Accumulator (ACCU)
+//                   Payout compounds at growth_rate per tick while price
+//                   stays in range. 5% × 30 ticks ≈ 4.3× stake.
+//                   Used by accumulator_scalper. Requires: growth_rate
+//                   (0.01–0.05), duration in ticks.
+//
+//             All four reuse _buyProposal (reconcile) and _persist (Order +
+//             Trade docs). The new metadata fields (payoutPerPoint, growthRate,
+//             strikePrice, touchBarrier, touchDirection) are returned in the
+//             result object so runner._persistBotRun can record them on
+//             BotRun. Mongoose silently ignores unknown fields on Trade/Order
+//             schemas, so _persist needs no schema migration.
+//
+//             _checkContractAvailability caches contracts_for per symbol for
+//             5 minutes and throws a clear error if the requested type is
+//             not offered on that symbol (e.g. Vanilla on EURUSD requires
+//             1-day minimum duration in some regions).
 
 'use strict';
 
@@ -123,15 +165,24 @@ const RECONCILE_BUY_GRACE_MS = 2000;
 // How far back in portfolio history to look for a matching contract.
 const RECONCILE_BUY_LOOKBACK_MS = 60_000;
 
+// [FIX-HIGH-PAYOUT] Contract availability cache (5 min TTL per symbol).
+const CONTRACT_AVAILABILITY_TTL_MS = 5 * 60_000;
+const _contractAvailabilityCache = new Map();  // symbol → { types, at }
+
 const SIDE_BUY_TYPES = new Set([
   'MULTUP', 'CALL',
   'DIGITEVEN', 'DIGITOVER', 'DIGITMATCH',
   'ONETOUCH',
+  'VANILLALONGCALL',
+  'TURBOSLONG',
+  'ACCU',
 ]);
 const SIDE_SELL_TYPES = new Set([
   'MULTDOWN', 'PUT',
   'DIGITODD', 'DIGITUNDER', 'DIGITDIFF',
   'NOTOUCH',
+  'VANILLALONGPUT',
+  'TURBOSSHORT',
 ]);
 
 // [FIX-CS-C3] Reconcile metrics — surfaced via getStats().
@@ -198,25 +249,67 @@ async function _fetchProposal(broker, params) {
 }
 
 // ============================================================
+// [FIX-HIGH-PAYOUT] Contract availability check
+// ============================================================
+/**
+ * Query contracts_for once per symbol (5-min cache) and confirm the
+ * requested contract type is available.
+ *
+ * Throws a clear error if not available — the runner will surface it
+ * as instance.lastReason and skip the entry cleanly.
+ */
+async function _checkContractAvailability(broker, derivSymbol, contractType) {
+  const now = Date.now();
+  const cached = _contractAvailabilityCache.get(derivSymbol);
+
+  if (cached && (now - cached.at) < CONTRACT_AVAILABILITY_TTL_MS) {
+    if (!cached.types.has(contractType)) {
+      throw new Error(
+        `Contract type ${contractType} not available on ${derivSymbol} ` +
+        `(cached). Available: ${Array.from(cached.types).slice(0, 8).join(', ')}...`
+      );
+    }
+    return true;
+  }
+
+  let resp;
+  try {
+    resp = await broker._sendPublicRequest({ contracts_for: derivSymbol }, 10000);
+  } catch (err) {
+    logger.warn(
+      `[contractService] contracts_for(${derivSymbol}) failed: ${err.message} — ` +
+      `skipping availability check for ${contractType}`
+    );
+    return true;  // fail-open: let proposal surface the real error
+  }
+
+  const contracts = (resp && resp.contracts_for && resp.contracts_for.available) || [];
+  const types = new Set();
+  for (const c of contracts) {
+    if (c.contract_type) types.add(c.contract_type);
+    // Some entries list contract_category; check both
+    if (c.contract_category) types.add(c.contract_category);
+  }
+
+  _contractAvailabilityCache.set(derivSymbol, { types, at: now });
+
+  if (!types.has(contractType)) {
+    throw new Error(
+      `Contract type ${contractType} not available on ${derivSymbol}. ` +
+      `Available: ${Array.from(types).slice(0, 12).join(', ')}` +
+      (types.size > 12 ? '...' : '')
+    );
+  }
+
+  return true;
+}
+
+// ============================================================
 // [FIX-CS-C3] Buy + reconcile
 // ============================================================
-
-/**
- * Reconcile a failed buy against the live portfolio.
- *
- * Matches the same criteria as broker._reconcileOrphanBuy so the two
- * recovery paths stay consistent:
- *   • same underlying_symbol as the intended trade
- *   • same side (BUY/SELL) as the intended direction
- *   • purchase_price within $0.01 of the intended stake
- *   • openTime >= (submittedAt - RECONCILE_BUY_LOOKBACK_MS)
- *
- * Returns a synthetic `buy` object or null if no match.
- */
 async function _reconcileBuy(broker, context, submittedAt) {
   _reconcileMetrics.attempts++;
 
-  // Give Deriv a beat to settle the (possibly-succeeded) buy.
   await new Promise(r => setTimeout(r, RECONCILE_BUY_GRACE_MS));
 
   const derivSymbol = toDerivSymbol(context.symbol, broker);
@@ -252,7 +345,6 @@ async function _reconcileBuy(broker, context, submittedAt) {
 
   if (candidates.length === 0) return null;
 
-  // Prefer the most recently opened candidate.
   candidates.sort((a, b) => (b.openTime || 0) - (a.openTime || 0));
   const match = candidates[0];
 
@@ -265,7 +357,6 @@ async function _reconcileBuy(broker, context, submittedAt) {
     `(original error: ${_reconcileMetrics.lastOriginalError || 'unknown'})`
   );
 
-  // Return a buy-shaped object so callers see it as a successful buy.
   return {
     contract_id: match.id,
     buy_price: match.purchasePrice,
@@ -274,14 +365,6 @@ async function _reconcileBuy(broker, context, submittedAt) {
   };
 }
 
-/**
- * Wrapped buy. On any thrown error, attempts portfolio reconciliation
- * before re-throwing.
- *
- * `context` should contain { symbol, direction?, contractType?, stake }.
- * If context is missing, no reconciliation is attempted (same behaviour
- * as before FIX-CS-C3).
- */
 async function _buyProposal(broker, proposal, context) {
   const askPrice = Number(proposal.ask_price);
   if (!Number.isFinite(askPrice) || askPrice <= 0) {
@@ -297,7 +380,6 @@ async function _buyProposal(broker, proposal, context) {
     }
     return buy;
   } catch (buyErr) {
-    // [FIX-CS-C3] Attempt recovery if context was supplied.
     if (context && context.symbol && context.stake) {
       _reconcileMetrics.lastOriginalError = buyErr.message;
       logger.warn(
@@ -316,7 +398,6 @@ async function _buyProposal(broker, proposal, context) {
       if (recovered) return recovered;
     }
 
-    // No recovery — propagate the original error.
     throw buyErr;
   }
 }
@@ -324,18 +405,7 @@ async function _buyProposal(broker, proposal, context) {
 // ============================================================
 // [FIX-CS-C1] Multiplier limit_order conversion
 // ============================================================
-
-/**
- * Resolve a reference entry price for computing limit_order AMOUNTS.
- *
- * Order of preference:
- *   1. Streaming cache — free, but only if < CACHE_PRICE_MAX_AGE_MS old
- *   2. Base proposal (no limit_order) — one API call, authoritative
- *
- * Returns null if neither path produces a usable price.
- */
 async function _resolveReferenceEntry(broker, derivSymbol, baseProposalParams) {
-  // 1. Streaming cache
   try {
     const cached = broker.streaming && typeof broker.streaming.getPrice === 'function'
       ? broker.streaming.getPrice(derivSymbol)
@@ -352,7 +422,6 @@ async function _resolveReferenceEntry(broker, derivSymbol, baseProposalParams) {
     }
   } catch (_) { /* cache miss is fine */ }
 
-  // 2. Base proposal
   try {
     const baseProposal = await _fetchProposal(broker, baseProposalParams);
     const spot = Number(baseProposal.spot);
@@ -372,20 +441,6 @@ async function _resolveReferenceEntry(broker, derivSymbol, baseProposalParams) {
   return null;
 }
 
-/**
- * [FIX-CS-C1] Convert SL/TP PRICE LEVELS to currency AMOUNTS for Deriv
- * Multiplier `limit_order`.
- *
- * Deriv's Multiplier contracts size stop-loss / take-profit by the LOSS or
- * PROFIT they should trigger at, expressed in account currency. A caller
- * that has SL=1.11969 / TP=1.12249 (price levels) must convert to amounts:
- *
- *   notional   = stake × multiplier
- *   priceDiff  = |level - entry|
- *   amount     = notional × priceDiff / entry
- *
- * @returns {{ stop_loss?: number, take_profit?: number }}
- */
 function _buildMultiplierLimitOrder(stake, multiplier, direction, entryPrice, stopLossPrice, takeProfitPrice) {
   const limitOrder = {};
   const notional = Number(stake) * Number(multiplier);
@@ -399,7 +454,6 @@ function _buildMultiplierLimitOrder(stake, multiplier, direction, entryPrice, st
       if (priceDiff > 0) {
         const lossAmount = notional * priceDiff / entryPrice;
         let rounded = Math.round(lossAmount * 100) / 100;
-        // [FIX-CS-C2] Multiplier loss cannot exceed the stake — cap it.
         const stakeNum = Number(stake) || 0;
         if (stakeNum > 0 && rounded > stakeNum) rounded = Math.floor(stakeNum * 100) / 100;
         if (rounded >= MIN_LIMIT_ORDER_AMOUNT) {
@@ -439,12 +493,13 @@ function _buildMultiplierLimitOrder(stake, multiplier, direction, entryPrice, st
 // ============================================================
 // Persistence
 // ============================================================
-
 async function _persist(params) {
   const {
     contractId, symbol, side, stake, multiplier, duration, durationUnit,
     entryPrice, purchasePrice, knockoutLevel, takeProfitLevel, barrier,
     contractType, product, strategy, regimeCode, entryThesis,
+    // [FIX-HIGH-PAYOUT] new metadata fields
+    payoutPerPoint, growthRate, strikePrice, touchBarrier, touchDirection,
   } = params;
 
   const normalizedSide = _normalizeSide(side);
@@ -458,6 +513,8 @@ async function _persist(params) {
     ? entryThesis
     : null;
 
+  // Mongoose silently ignores fields not in the Order/Trade schemas, so
+  // passing the new fields is safe (they're preserved in the return object).
   const orderDoc = await Order.create({
     clientOrderId: String(contractId),
     instrument: normalizeSymbol(symbol),
@@ -525,13 +582,25 @@ async function _persist(params) {
     return null;
   });
 
-  return { order: orderDoc, trade: tradeDoc };
+  // [FIX-HIGH-PAYOUT] Return the raw metadata so the caller (runner) can
+  // pass it to BotRun. Mongoose ignores unknown fields above, so we
+  // re-include them here explicitly.
+  return {
+    order: orderDoc,
+    trade: tradeDoc,
+    _metadata: {
+      payoutPerPoint: payoutPerPoint != null ? Number(payoutPerPoint) : null,
+      growthRate: growthRate != null ? Number(growthRate) : null,
+      strikePrice: strikePrice != null ? Number(strikePrice) : null,
+      touchBarrier: touchBarrier != null ? Number(touchBarrier) : null,
+      touchDirection: touchDirection || null,
+    },
+  };
 }
 
 // ============================================================
 // Multiplier contract (FX)
 // ============================================================
-
 async function placeMultiplier(params) {
   const {
     symbol, direction, stake, multiplier,
@@ -558,11 +627,9 @@ async function placeMultiplier(params) {
   const derivSymbol = toDerivSymbol(symbol, broker);
   const contractType = direction === 'BUY' ? 'MULTUP' : 'MULTDOWN';
 
-  // Rounded PRICE levels — these are what we persist in the DB.
   const koRounded = roundPrice(symbol, knockoutLevel);
   const tpRounded = roundPrice(symbol, takeProfitLevel);
 
-  // Base proposal params (no limit_order yet)
   const baseProposalParams = {
     amount: stakeNum,
     basis: 'stake',
@@ -572,7 +639,6 @@ async function placeMultiplier(params) {
     multiplier: multNum,
   };
 
-  // [FIX-CS-C1] Convert price levels → currency amounts for Deriv.
   const needLimitOrder = (koRounded != null || tpRounded != null);
   let limitOrderAmounts = {};
 
@@ -602,7 +668,6 @@ async function placeMultiplier(params) {
     }
   }
 
-  // Final proposal — with amounts if we have them, without if we don't
   const proposalParams = { ...baseProposalParams };
   if (Object.keys(limitOrderAmounts).length > 0) {
     proposalParams.limit_order = limitOrderAmounts;
@@ -610,7 +675,6 @@ async function placeMultiplier(params) {
 
   const proposal = await _fetchProposal(broker, proposalParams);
 
-  // [FIX-CS-C3] Pass context so _buyProposal can reconcile on failure.
   const buy = await _buyProposal(broker, proposal, {
     symbol, direction, stake: stakeNum,
   });
@@ -626,7 +690,6 @@ async function placeMultiplier(params) {
   const entryPrice = Number(buy.entry_spot || proposal.spot || 0);
   const purchasePrice = Number(buy.buy_price || proposal.ask_price);
 
-  // Persist: PRICE LEVELS in DB (not the converted amounts)
   const persisted = await _persist({
     contractId, symbol, side: direction, stake: stakeNum, multiplier: multNum,
     duration: null, durationUnit: null,
@@ -652,7 +715,6 @@ async function placeMultiplier(params) {
 // ============================================================
 // Digital / binary contract (synthetics)
 // ============================================================
-
 async function placeDigitOrBinary(params) {
   const {
     symbol, contractType, stake,
@@ -689,8 +751,6 @@ async function placeDigitOrBinary(params) {
 
   const proposal = await _fetchProposal(broker, proposalParams);
 
-  // [FIX-CS-C3] Pass context so _buyProposal can reconcile on failure.
-  // Side is derived from contractType inside _reconcileBuy.
   const buy = await _buyProposal(broker, proposal, {
     symbol, contractType, stake: stakeNum,
   });
@@ -726,10 +786,423 @@ async function placeDigitOrBinary(params) {
   };
 }
 
+// ============================================================
+// [FIX-HIGH-PAYOUT] Touch/No Touch contract
+// ============================================================
+async function placeTouchContract(params) {
+  const {
+    symbol, touchDirection, barrier, stake,
+    duration, durationUnit = 'm',
+    strategy = null, regimeCode = null, entryThesis = null,
+  } = params;
+
+  if (!symbol) throw new Error('symbol required');
+  if (touchDirection !== 'TOUCH' && touchDirection !== 'NO_TOUCH') {
+    throw new Error(`touchDirection must be TOUCH or NO_TOUCH (got ${touchDirection})`);
+  }
+  if (!barrier || typeof barrier !== 'string' || !/^[+-]/.test(barrier)) {
+    throw new Error(
+      `barrier must be a relative string starting with +/- (e.g. "+12.50"). Got: ${barrier}`
+    );
+  }
+  const stakeNum = Number(stake);
+  if (!Number.isFinite(stakeNum) || stakeNum <= 0) throw new Error('stake must be positive');
+  const durNum = parseInt(duration, 10);
+  if (!Number.isFinite(durNum) || durNum <= 0) throw new Error('duration must be positive');
+
+  const broker = getBroker('deriv_cfd');
+  if (!broker.isConnected()) await broker.connect();
+
+  const derivSymbol = toDerivSymbol(symbol, broker);
+  const contractType = touchDirection === 'TOUCH' ? 'ONETOUCH' : 'NOTOUCH';
+
+  await _checkContractAvailability(broker, derivSymbol, contractType);
+
+  const proposalParams = {
+    amount: stakeNum,
+    basis: 'stake',
+    contract_type: contractType,
+    currency: broker.accountCurrency || 'USD',
+    underlying_symbol: derivSymbol,
+    barrier: String(barrier),
+    duration: durNum,
+    duration_unit: durationUnit,
+  };
+
+  const proposal = await _fetchProposal(broker, proposalParams);
+
+  const buy = await _buyProposal(broker, proposal, {
+    symbol, contractType, stake: stakeNum,
+  });
+  const contractId = String(buy.contract_id);
+  if (!contractId || contractId === 'undefined') {
+    throw new Error(`Buy returned no contract_id: ${JSON.stringify(buy)}`);
+  }
+
+  broker._subscribeOpenContract(contractId).catch(() => {});
+
+  const entryPrice = Number(buy.entry_spot || proposal.spot || 0);
+  const purchasePrice = Number(buy.buy_price || proposal.ask_price);
+  // Barrier is relative; compute the absolute touch price for logging/BotRun.
+  const touchBarrierAbs = roundPrice(symbol, entryPrice + Number(barrier));
+
+  logger.info(
+    `[contractService] ${symbol} ${contractType} placed: ` +
+    `entry=${entryPrice} barrier=${barrier} (abs=${touchBarrierAbs}) ` +
+    `stake=$${stakeNum} dur=${durNum}${durationUnit} ` +
+    `payout=${proposal.payout || '?'}`
+  );
+
+  const persisted = await _persist({
+    contractId, symbol, side: contractType, stake: stakeNum, multiplier: null,
+    duration: durNum, durationUnit, entryPrice, purchasePrice,
+    knockoutLevel: null, takeProfitLevel: null,
+    barrier, contractType, product: 'deriv_touch',
+    strategy, regimeCode,
+    entryThesis: { ...(entryThesis || {}), contractType, barrier, touchDirection },
+    touchBarrier: touchBarrierAbs,
+    touchDirection: touchDirection === 'TOUCH' ? 'TOUCH' : 'NO_TOUCH',
+  });
+
+  eventBus.emit('order.placed', { contractId, symbol, contractType, stake: stakeNum, strategy });
+  eventBus.emit('trade.placed', { contractId, symbol, strategy });
+
+  return {
+    contractId,
+    entryPrice,
+    purchasePrice,
+    raw: buy,
+    order: persisted.order,
+    trade: persisted.trade,
+    metadata: {
+      touchBarrier: touchBarrierAbs,
+      touchDirection,
+      barrier,
+    },
+  };
+}
+
+// ============================================================
+// [FIX-HIGH-PAYOUT] Vanilla Call/Put contract
+// ============================================================
+async function placeVanillaContract(params) {
+  const {
+    symbol, direction, barrier = '+0.00', stake,
+    duration, durationUnit = 'm',
+    strategy = null, regimeCode = null, entryThesis = null,
+  } = params;
+
+  if (!symbol) throw new Error('symbol required');
+  if (!direction || (direction !== 'BUY' && direction !== 'SELL')) {
+    throw new Error(`direction must be BUY or SELL (got ${direction})`);
+  }
+  if (typeof barrier !== 'string' || !/^[+-]/.test(barrier)) {
+    throw new Error(
+      `barrier must be a relative string starting with +/- (e.g. "+0.00" for ATM). Got: ${barrier}`
+    );
+  }
+  const stakeNum = Number(stake);
+  if (!Number.isFinite(stakeNum) || stakeNum <= 0) throw new Error('stake must be positive');
+  const durNum = parseInt(duration, 10);
+  if (!Number.isFinite(durNum) || durNum <= 0) throw new Error('duration must be positive');
+
+  const broker = getBroker('deriv_cfd');
+  if (!broker.isConnected()) await broker.connect();
+
+  const derivSymbol = toDerivSymbol(symbol, broker);
+  const contractType = direction === 'BUY' ? 'VANILLALONGCALL' : 'VANILLALONGPUT';
+
+  await _checkContractAvailability(broker, derivSymbol, contractType);
+
+  const proposalParams = {
+    amount: stakeNum,
+    basis: 'stake',
+    contract_type: contractType,
+    currency: broker.accountCurrency || 'USD',
+    underlying_symbol: derivSymbol,
+    barrier: String(barrier),
+    duration: durNum,
+    duration_unit: durationUnit,
+  };
+
+  const proposal = await _fetchProposal(broker, proposalParams);
+
+  const buy = await _buyProposal(broker, proposal, {
+    symbol, direction, stake: stakeNum,
+  });
+  const contractId = String(buy.contract_id);
+  if (!contractId || contractId === 'undefined') {
+    throw new Error(`Buy returned no contract_id: ${JSON.stringify(buy)}`);
+  }
+
+  broker._subscribeOpenContract(contractId).catch(() => {});
+
+  const entryPrice = Number(buy.entry_spot || proposal.spot || 0);
+  const purchasePrice = Number(buy.buy_price || proposal.ask_price);
+  const strikeAbs = roundPrice(symbol, entryPrice + Number(barrier));
+  const payoutPerPoint = Number(proposal.payout_per_point || 0) || null;
+
+  logger.info(
+    `[contractService] ${symbol} ${contractType} placed: ` +
+    `entry=${entryPrice} strike=${barrier} (abs=${strikeAbs}) ` +
+    `stake=$${stakeNum} dur=${durNum}${durationUnit} ` +
+    `payout_per_point=${payoutPerPoint || '?'}`
+  );
+
+  const persisted = await _persist({
+    contractId, symbol, side: direction, stake: stakeNum, multiplier: null,
+    duration: durNum, durationUnit, entryPrice, purchasePrice,
+    knockoutLevel: null, takeProfitLevel: null,
+    barrier, contractType, product: 'deriv_vanilla',
+    strategy, regimeCode,
+    entryThesis: { ...(entryThesis || {}), contractType, barrier },
+    strikePrice: strikeAbs,
+    payoutPerPoint,
+  });
+
+  eventBus.emit('order.placed', { contractId, symbol, contractType, stake: stakeNum, strategy });
+  eventBus.emit('trade.placed', { contractId, symbol, strategy });
+
+  return {
+    contractId,
+    entryPrice,
+    purchasePrice,
+    raw: buy,
+    order: persisted.order,
+    trade: persisted.trade,
+    metadata: {
+      strikePrice: strikeAbs,
+      barrier,
+      payoutPerPoint,
+    },
+  };
+}
+
+// ============================================================
+// [FIX-HIGH-PAYOUT] Turbo Long/Short contract
+// ============================================================
+async function placeTurboContract(params) {
+  const {
+    symbol, direction, barrier, stake,
+    duration, durationUnit = 'm',
+    takeProfit = null,     // optional currency amount (e.g. 150 = $150 TP)
+    strategy = null, regimeCode = null, entryThesis = null,
+  } = params;
+
+  if (!symbol) throw new Error('symbol required');
+  if (!direction || (direction !== 'BUY' && direction !== 'SELL')) {
+    throw new Error(`direction must be BUY or SELL (got ${direction})`);
+  }
+  if (typeof barrier !== 'string' || !/^[+-]/.test(barrier)) {
+    throw new Error(
+      `barrier must be a relative string starting with +/-. Got: ${barrier}`
+    );
+  }
+  const stakeNum = Number(stake);
+  if (!Number.isFinite(stakeNum) || stakeNum <= 0) throw new Error('stake must be positive');
+  const durNum = parseInt(duration, 10);
+  if (!Number.isFinite(durNum) || durNum <= 0) throw new Error('duration must be positive');
+
+  const broker = getBroker('deriv_cfd');
+  if (!broker.isConnected()) await broker.connect();
+
+  const derivSymbol = toDerivSymbol(symbol, broker);
+  const contractType = direction === 'BUY' ? 'TURBOSLONG' : 'TURBOSSHORT';
+
+  await _checkContractAvailability(broker, derivSymbol, contractType);
+
+  const proposalParams = {
+    amount: stakeNum,
+    basis: 'stake',
+    contract_type: contractType,
+    currency: broker.accountCurrency || 'USD',
+    underlying_symbol: derivSymbol,
+    barrier: String(barrier),
+    duration: durNum,
+    duration_unit: durationUnit,
+  };
+
+  if (takeProfit != null && Number(takeProfit) > 0) {
+    proposalParams.limit_order = { take_profit: Number(takeProfit) };
+  }
+
+  const proposal = await _fetchProposal(broker, proposalParams);
+
+  const buy = await _buyProposal(broker, proposal, {
+    symbol, direction, stake: stakeNum,
+  });
+  const contractId = String(buy.contract_id);
+  if (!contractId || contractId === 'undefined') {
+    throw new Error(`Buy returned no contract_id: ${JSON.stringify(buy)}`);
+  }
+
+  broker._subscribeOpenContract(contractId).catch(() => {});
+
+  const entryPrice = Number(buy.entry_spot || proposal.spot || 0);
+  const purchasePrice = Number(buy.buy_price || proposal.ask_price);
+  const strikeAbs = roundPrice(symbol, entryPrice + Number(barrier));
+  const payoutPerPoint = Number(proposal.payout_per_point || 0) || null;
+
+  logger.info(
+    `[contractService] ${symbol} ${contractType} placed: ` +
+    `entry=${entryPrice} barrier=${barrier} (abs=${strikeAbs}) ` +
+    `stake=$${stakeNum} dur=${durNum}${durationUnit} ` +
+    `payout_per_point=${payoutPerPoint || '?'}` +
+    (takeProfit != null ? ` TP=$${takeProfit}` : '')
+  );
+
+  const persisted = await _persist({
+    contractId, symbol, side: direction, stake: stakeNum, multiplier: null,
+    duration: durNum, durationUnit, entryPrice, purchasePrice,
+    knockoutLevel: strikeAbs, takeProfitLevel: null,
+    barrier, contractType, product: 'deriv_turbo',
+    strategy, regimeCode,
+    entryThesis: { ...(entryThesis || {}), contractType, barrier },
+    strikePrice: strikeAbs,
+    payoutPerPoint,
+  });
+
+  eventBus.emit('order.placed', { contractId, symbol, contractType, stake: stakeNum, strategy });
+  eventBus.emit('trade.placed', { contractId, symbol, strategy });
+
+  return {
+    contractId,
+    entryPrice,
+    purchasePrice,
+    raw: buy,
+    order: persisted.order,
+    trade: persisted.trade,
+    metadata: {
+      strikePrice: strikeAbs,
+      barrier,
+      payoutPerPoint,
+    },
+  };
+}
+
+// ============================================================
+// [FIX-HIGH-PAYOUT] Accumulator contract
+// ============================================================
+async function placeAccumulatorContract(params) {
+  const {
+    symbol, stake,
+    growthRate = 0.03,     // 0.01–0.05 (1%–5%)
+    duration = 30,         // ticks
+    takeProfit = null,     // optional currency amount
+    strategy = null, regimeCode = null, entryThesis = null,
+  } = params;
+
+  if (!symbol) throw new Error('symbol required');
+  const stakeNum = Number(stake);
+  if (!Number.isFinite(stakeNum) || stakeNum <= 0) throw new Error('stake must be positive');
+  const gr = Number(growthRate);
+  if (!Number.isFinite(gr) || gr < 0.01 || gr > 0.05) {
+    throw new Error(
+      `growthRate must be between 0.01 (1%) and 0.05 (5%). Got: ${growthRate}`
+    );
+  }
+  const durNum = parseInt(duration, 10);
+  if (!Number.isFinite(durNum) || durNum <= 0) throw new Error('duration (ticks) must be positive');
+
+  const broker = getBroker('deriv_cfd');
+  if (!broker.isConnected()) await broker.connect();
+
+  const derivSymbol = toDerivSymbol(symbol, broker);
+  const contractType = 'ACCU';
+
+  await _checkContractAvailability(broker, derivSymbol, contractType);
+
+  const proposalParams = {
+    amount: stakeNum,
+    basis: 'stake',
+    contract_type: contractType,
+    currency: broker.accountCurrency || 'USD',
+    underlying_symbol: derivSymbol,
+    growth_rate: gr,
+    duration: durNum,
+    duration_unit: 't',
+  };
+
+  if (takeProfit != null && Number(takeProfit) > 0) {
+    proposalParams.limit_order = { take_profit: Number(takeProfit) };
+  }
+
+  const proposal = await _fetchProposal(broker, proposalParams);
+
+  const buy = await _buyProposal(broker, proposal, {
+    symbol, contractType, stake: stakeNum,
+  });
+  const contractId = String(buy.contract_id);
+  if (!contractId || contractId === 'undefined') {
+    throw new Error(`Buy returned no contract_id: ${JSON.stringify(buy)}`);
+  }
+
+  broker._subscribeOpenContract(contractId).catch(() => {});
+
+  const entryPrice = Number(buy.entry_spot || proposal.spot || 0);
+  const purchasePrice = Number(buy.buy_price || proposal.ask_price);
+
+  logger.info(
+    `[contractService] ${symbol} ACCU placed: ` +
+    `entry=${entryPrice} stake=$${stakeNum} ` +
+    `growth=${(gr * 100).toFixed(1)}% dur=${durNum}t` +
+    (takeProfit != null ? ` TP=$${takeProfit}` : '') +
+    ` (max payout at full run ≈ $${(stakeNum * Math.pow(1 + gr, durNum)).toFixed(2)})`
+  );
+
+  const persisted = await _persist({
+    contractId, symbol, side: 'ACCU', stake: stakeNum, multiplier: null,
+    duration: durNum, durationUnit: 't', entryPrice, purchasePrice,
+    knockoutLevel: null, takeProfitLevel: takeProfit != null ? Number(takeProfit) : null,
+    barrier: null, contractType, product: 'deriv_accumulator',
+    strategy, regimeCode,
+    entryThesis: { ...(entryThesis || {}), contractType, growthRate: gr },
+    growthRate: gr,
+  });
+
+  eventBus.emit('order.placed', { contractId, symbol, contractType, stake: stakeNum, strategy });
+  eventBus.emit('trade.placed', { contractId, symbol, strategy });
+
+  return {
+    contractId,
+    entryPrice,
+    purchasePrice,
+    raw: buy,
+    order: persisted.order,
+    trade: persisted.trade,
+    metadata: {
+      growthRate: gr,
+      durationTicks: durNum,
+    },
+  };
+}
+
+// ============================================================
+// Router
+// ============================================================
 async function placeContract(params) {
+  // [FIX-HIGH-PAYOUT] New contract classes — checked BEFORE placeDigitOrBinary
+  // so ONETOUCH/NOTOUCH/VANILLA/TURBO/ACCU don't fall through to the digit
+  // handler (which would reject them as unknown CONTRACT_TYPES).
+  const ct = String(params.contractType || '').toUpperCase();
+
+  if (params.contractClass === 'touch' || ct === 'ONETOUCH' || ct === 'NOTOUCH') {
+    return placeTouchContract(params);
+  }
+  if (params.contractClass === 'vanilla' || ct === 'VANILLALONGCALL' || ct === 'VANILLALONGPUT') {
+    return placeVanillaContract(params);
+  }
+  if (params.contractClass === 'turbo' || ct === 'TURBOSLONG' || ct === 'TURBOSSHORT') {
+    return placeTurboContract(params);
+  }
+  if (params.contractClass === 'accumulator' || ct === 'ACCU') {
+    return placeAccumulatorContract(params);
+  }
+
+  // Existing classes — unchanged
   if (params.multiplier != null) return placeMultiplier(params);
   if (params.contractType) return placeDigitOrBinary(params);
-  throw new Error('placeContract requires either multiplier or contractType');
+  throw new Error('placeContract requires multiplier, contractType, or contractClass');
 }
 
 // [FIX-CS-C3] Expose reconcile metrics for health checks / dashboards.
@@ -741,6 +1214,7 @@ function getStats() {
       lastRecoveredAt: _reconcileMetrics.lastRecoveredAt,
       lastOriginalError: _reconcileMetrics.lastOriginalError,
     },
+    contractAvailabilityCacheSize: _contractAvailabilityCache.size,
   };
 }
 
@@ -751,13 +1225,18 @@ module.exports = {
   placeContract,
   placeMultiplier,
   placeDigitOrBinary,
+  // [FIX-HIGH-PAYOUT] new placement functions
+  placeTouchContract,
+  placeVanillaContract,
+  placeTurboContract,
+  placeAccumulatorContract,
   roundPrice,
   getStats,
   _fetchProposal,
   _buyProposal,
-  // [FIX-CS-C1] exposed for testing
   _buildMultiplierLimitOrder,
   _resolveReferenceEntry,
-  // [FIX-CS-C3] exposed for testing
   _reconcileBuy,
+  // [FIX-HIGH-PAYOUT] exposed for tests
+  _checkContractAvailability,
 };
