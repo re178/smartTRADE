@@ -8,70 +8,30 @@
 //   • Turbo (TURBOSLONG/SHORT)               — [FIX-HIGH-PAYOUT]
 //   • Accumulator (ACCU)                     — [FIX-HIGH-PAYOUT]
 //
-// Uses broker._sendAuthRequest — does NOT modify broker.js.
-// Callers: bots/runner.js (bot entries), api/controllers.js (manual orders).
+// [FIX-RECONCILE-OPENPOS] _buyProposal now skips portfolio reconciliation
+//             when the broker rejects with `OpenPositionLimitExceeded`.
+//             This error is definitive — the broker rejects the buy BEFORE
+//             creating any contract. Reconciling would incorrectly match
+//             a DIFFERENT bot's already-open position on the same symbol
+//             (same stake size, within the 60s lookback window).
 //
-// [FIX-1] Multiplier contracts on Deriv do NOT accept duration_unit: 's'.
-//         They exit on limit_order barrier hit (or manual close).
-//         Sending duration/duration_unit caused InvalidExpiry on every
-//         FX bot entry — all FX bots have been blocked until this fix.
+//             Symptom this was causing:
+//               • Bot A holds an open R_100 ACCU
+//               • Bot B tries to buy the same setup → OpenPositionLimitExceeded
+//               • _reconcileBuy matches Bot A's open contract
+//               • Bot B thinks it succeeded with Bot A's contractId
+//               • Bot B creates a duplicate BotRun (silently fails on unique key)
+//               • Bot B holds the symbol lock while Bot A's position runs
+//               • Other bots (Vanilla etc.) can't acquire the lock
+//               • Stats get confused — Bot B shows entries but no real position
 //
-// [FIX-2] Deriv deprecated multipliers 100, 300, 500. Only [200, 400, 600, 800]
-//         are accepted now. Any attempt with an invalid multiplier is rejected.
+// [FIX-ACCU-EXPIRY] ACCU omits duration / duration_unit from the proposal
+//             payload — Deriv computes max ticks from growth_rate alone.
 //
-// [FIX-3] roundPrice() applies per-symbol decimal precision to
-//         knockoutLevel / takeProfitLevel before they hit Deriv's proposal API.
-//         Prevents USDJPY InputValidationFailed on float noise.
+// [FIX-CS-C3] Bot-path buy recovery wrapper (unchanged, except for the
+//             OpenPositionLimitExceeded skip in [FIX-RECONCILE-OPENPOS]).
 //
-// [FIX-DIGIT-PERSIST] _persist() was failing to save Order and Trade docs
-//         for every digit/binary contract. Three root causes:
-//           1. side was stored as 'CALL'/'call'/'DIGITEVEN'/'digiteven'/etc.
-//              which violated both enums (Order: BUY/SELL; Trade: buy/sell).
-//           2. Order.units and Order.clientOrderId were required but never
-//              populated.
-//           3. Trade.side was lowercased from an already-invalid value.
-//
-// [FIX-DIGIT-PERSIST-2] Persist contractType, barrier, durationUnit, product,
-//              and entryThesis on BOTH Order and Trade.
-//
-// [FIX-CS-C1] **ROOT CAUSE FIX for ContractBuyValidationError on FX multipliers.**
-//             Deriv's Multiplier contracts expect `limit_order.stop_loss` and
-//             `limit_order.take_profit` as CURRENCY AMOUNTS (2 decimals), NOT
-//             PRICE LEVELS. Conversion is done inside placeMultiplier.
-//
-// [FIX-CS-C2] Defensive guards on the SL/TP conversion:
-//               • Skips SL/TP amounts below $0.01
-//               • Caps SL amount at stake
-//               • Skips SL/TP on wrong side of entry (WARN)
-//               • If base proposal fails, proceeds without limit_order
-//
-// [FIX-CS-C3] **Bot-path buy recovery.** Bots bypass broker.placeMarketOrder
-//             and call broker._sendAuthRequest({ buy }) directly. This file
-//             wraps _buyProposal: on any thrown error, waits
-//             RECONCILE_BUY_GRACE_MS, fetches the portfolio, and matches a
-//             contract created within the lookback window against the
-//             intended symbol, side, stake, and open time. On match, returns
-//             a synthetic `buy` object so the caller sees success and no
-//             retry is attempted. On no match, re-throws the original error.
-//
-// [FIX-HIGH-PAYOUT] **Four new contract classes for high-payout bots.**
-//             Touch/No Touch, Vanilla, Turbo, Accumulator placement
-//             functions. All reuse _buyProposal (reconcile) and _persist
-//             (Order + Trade docs). Metadata fields (payoutPerPoint,
-//             growthRate, strikePrice, touchBarrier, touchDirection) are
-//             returned in the result object so runner._persistBotRun can
-//             record them on BotRun.
-//
-// [FIX-ACCU-EXPIRY] **Accumulator InvalidExpiry fix.**
-//             Deriv's ACCU contract accepts ONLY `growth_rate` — no
-//             duration, no duration_unit. The contract runs until it
-//             knocks out or hits the symbol's max tick count (60 for 5%).
-//             Sending `duration: 30, duration_unit: 't'` triggered
-//             InvalidExpiry on every attempt. Now:
-//               • proposal payload omits duration/duration_unit entirely
-//               • persistence still records intended max ticks for audit
-//               • optional limit_order.take_profit for early exit still works
-//             Tested against Deriv docs (accumulator contract payload).
+// [FIX-HIGH-PAYOUT] Four new contract classes with placement functions.
 
 'use strict';
 
@@ -127,6 +87,7 @@ const SIDE_SELL_TYPES = new Set([
 const _reconcileMetrics = {
   attempts: 0,
   recovered: 0,
+  skippedLimit: 0,   // [FIX-RECONCILE-OPENPOS] count of skips due to OpenPositionLimitExceeded
   lastRecoveredAt: null,
   lastOriginalError: null,
 };
@@ -310,12 +271,30 @@ async function _buyProposal(broker, proposal, context) {
     }
     return buy;
   } catch (buyErr) {
+    const errMsg = String(buyErr && buyErr.message || '');
+
+    // [FIX-RECONCILE-OPENPOS] OpenPositionLimitExceeded means the broker
+    // rejected the buy BEFORE creating any contract. Reconciling would
+    // just match some other bot's open position on the same symbol and
+    // cause a cascade of confusion (duplicate BotRun, stuck symbol lock).
+    // Skip reconcile for this specific error — re-throw immediately.
+    if (errMsg.includes('OpenPositionLimitExceeded')) {
+      _reconcileMetrics.skippedLimit++;
+      _reconcileMetrics.lastOriginalError = errMsg;
+      logger.warn(
+        `[contractService] Buy rejected (OpenPositionLimitExceeded) for ` +
+        `${context && context.symbol ? context.symbol : '?'} — NOT reconciling ` +
+        `(broker definitively rejected the buy, no contract was created)`
+      );
+      throw buyErr;
+    }
+
     if (context && context.symbol && context.stake) {
-      _reconcileMetrics.lastOriginalError = buyErr.message;
+      _reconcileMetrics.lastOriginalError = errMsg;
       logger.warn(
         `[contractService] _buyProposal failed for ${context.symbol} ` +
         `(${context.direction || context.contractType || '?'}) ` +
-        `stake=${context.stake}: ${buyErr.message}. Reconciling against portfolio...`
+        `stake=${context.stake}: ${errMsg}. Reconciling against portfolio...`
       );
 
       let recovered = null;
@@ -1037,10 +1016,8 @@ async function placeAccumulatorContract(params) {
 
   // [FIX-ACCU-EXPIRY] ACCU does NOT accept duration or duration_unit.
   // The contract runs until it knocks out or hits the symbol's max tick
-  // count (60 ticks at 5% growth for R_100). Sending `duration: 30,
-  // duration_unit: 't'` triggered InvalidExpiry on every attempt.
-  // The `durNum` is still passed to _persist for audit, but MUST NOT
-  // appear in the proposal payload.
+  // count. The `durNum` is still passed to _persist for audit, but MUST
+  // NOT appear in the proposal payload.
   const proposalParams = {
     amount: stakeNum,
     basis: 'stake',
@@ -1048,7 +1025,6 @@ async function placeAccumulatorContract(params) {
     currency: broker.accountCurrency || 'USD',
     underlying_symbol: derivSymbol,
     growth_rate: gr,
-    // NO duration, NO duration_unit — Deriv computes from growth_rate
   };
 
   if (takeProfit != null && Number(takeProfit) > 0) {
@@ -1078,8 +1054,6 @@ async function placeAccumulatorContract(params) {
     ` (contract runs to max ticks or knockout)`
   );
 
-  // Persist the intended tick count for audit — the actual duration is
-  // decided by Deriv (max 60 ticks or knockout).
   const persisted = await _persist({
     contractId, symbol, side: 'ACCU', stake: stakeNum, multiplier: null,
     duration: durNum, durationUnit: 't', entryPrice, purchasePrice,
@@ -1136,6 +1110,7 @@ function getStats() {
     reconcile: {
       attempts: _reconcileMetrics.attempts,
       recovered: _reconcileMetrics.recovered,
+      skippedLimit: _reconcileMetrics.skippedLimit,
       lastRecoveredAt: _reconcileMetrics.lastRecoveredAt,
       lastOriginalError: _reconcileMetrics.lastOriginalError,
     },
