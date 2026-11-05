@@ -5,6 +5,7 @@
 //   • Rise/Fall percentages (higher/lower than previous tick)
 //   • Current digit + arrow direction
 //   • Over/Under edge
+//   • [FIX-3] Z-scores for every statistic (statistical significance layer)
 // Emits 'digitUpdate' per tick, 'digitSignal' when edge exceeds threshold.
 // Also tracks recentPrices and directions for breakout bots.
 //
@@ -20,6 +21,36 @@
 // [FIX-2] Added degenerate-distribution detection. If a 100+ sample
 //         window has <3 unique digits, log a warning. This would have
 //         caught the above bug in production.
+//
+// [FIX-3] **Statistical significance layer.**
+//         The digit bots used fixed percentage thresholds (e.g., "even
+//         >= 62%", "digit 5 <= 3%", "over 8 <= 5%"). On a fair RNG
+//         these require 5–7σ events — essentially unreachable. Result:
+//         every digit bot fired 0 trades over 87+ cycles.
+//
+//         This file now computes Z-scores for every statistic the bots
+//         already use:
+//             z = (observed - expected) / σ
+//         where σ depends on the sample size n and the Bernoulli
+//         probability of the event.
+//
+//         Bots can compare against a configurable zThreshold (default
+//         1.5 → ~7% fire rate) instead of an arbitrary percentage.
+//         At N=200 with zThreshold=1.5:
+//             • even/odd fires when even% ≥ 55.3%
+//             • target digit fires when digit% ≤ 6.8% (cold) or ≥ 13.2% (hot)
+//             • over/under fires when threshold% ≤ 6.8% or ≥ 13.2%
+//         These are statistically meaningful AND reachable in practice.
+//
+//         Also adds streak metrics derived from log2(n) so the streak-
+//         fade bot can adapt its threshold to the window size instead
+//         of using a fixed `minStreak: 8`.
+//
+//         Z-scores are computed at every tick from the last
+//         `DEFAULT_Z_WINDOW` (200) ticks. Bots can call
+//         `getZView(symbol, customWindow)` for a different window.
+//         Full-history percentages (`evenPct`, `digitFreqPct`, etc.)
+//         are still exposed unchanged for the UI.
 
 'use strict';
 
@@ -32,6 +63,12 @@ const SIGNAL_MIN_SAMPLES = 50;
 const SIGNAL_MIN_EDGE = 0.08;
 const DEGENERATE_CHECK_SAMPLES = 100;
 const DEGENERATE_MIN_UNIQUE = 3;
+
+// [FIX-3] Default window for z-score computation. Bots get this via
+// view.zStats; a different window requires `getZView(symbol, N)`.
+const DEFAULT_Z_WINDOW = 200;
+// [FIX-3] Minimum samples below which z-scores are meaningless.
+const Z_MIN_SAMPLES = 30;
 
 function normalizeSymbol(sym) {
   return String(sym || '').replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
@@ -70,6 +107,133 @@ function getDigitPrecision(symbol) {
   // Default to 2 — safest for synthetics, which is where digit trading runs.
   // If a new symbol is added that needs >2, add it to the map.
   return map[clean] != null ? map[clean] : 2;
+}
+
+// ============================================================
+// [FIX-3] Z-score computation
+// ============================================================
+/**
+ * Compute statistical z-scores for a sliding window of digit data.
+ *
+ * All z-scores follow the form: (observed - expected) / stdDev
+ *
+ * Sign convention:
+ *   evenZ > 0  → more EVEN than expected
+ *   oddZ  > 0  → more ODD than expected (oddZ = -evenZ)
+ *   digitZ[i] > 0 → digit i appears MORE often than expected (hot)
+ *   digitZ[i] < 0 → digit i appears LESS often than expected (cold)
+ *   overZ[th]  > 0 → more digits > th than expected
+ *   underZ[th] > 0 → more digits < th than expected
+ *   riseZ > 0  → more UP ticks than expected
+ *   fallZ > 0  → more DOWN ticks than expected (fallZ = -riseZ)
+ *
+ * Returns null if windowSize < Z_MIN_SAMPLES.
+ */
+function computeZStats(digits, directions, windowSize) {
+  if (!Array.isArray(digits) || digits.length < Z_MIN_SAMPLES) return null;
+
+  const n = Math.min(windowSize || DEFAULT_Z_WINDOW, digits.length);
+  const arr = digits.slice(-n);
+  const dirArr = Array.isArray(directions) ? directions.slice(-n) : [];
+
+  // ---------- Digit frequencies ----------
+  const freq = new Array(10).fill(0);
+  for (const d of arr) {
+    if (d >= 0 && d <= 9) freq[d]++;
+  }
+
+  // ---------- Per-digit z-scores ----------
+  // Expected count per digit: n * 0.1; std: sqrt(n * 0.1 * 0.9)
+  const expDigit = n * 0.1;
+  const stdDigit = Math.sqrt(n * 0.1 * 0.9);
+  const digitZ = freq.map(f => stdDigit > 0 ? (f - expDigit) / stdDigit : 0);
+
+  // ---------- Even/Odd z-score ----------
+  const evenCount = freq[0] + freq[2] + freq[4] + freq[6] + freq[8];
+  const oddCount = freq[1] + freq[3] + freq[5] + freq[7] + freq[9];
+  const expEven = n * 0.5;
+  const stdEven = Math.sqrt(n * 0.25);
+  const evenZ = stdEven > 0 ? (evenCount - expEven) / stdEven : 0;
+
+  // ---------- Over/Under z-scores (thresholds 1..8) ----------
+  // OVER th  = digits > th (count in th+1..9); p = (9-th)/10
+  // UNDER th = digits < th (count in 0..th-1);  p = th/10
+  const overZ = {};
+  const underZ = {};
+  for (let th = 1; th <= 8; th++) {
+    const cntOver = freq.slice(th + 1).reduce((a, b) => a + b, 0);
+    const pOver = (9 - th) / 10;
+    const expOver = n * pOver;
+    const stdOver = Math.sqrt(n * pOver * (1 - pOver));
+    overZ[th] = stdOver > 0 ? (cntOver - expOver) / stdOver : 0;
+
+    const cntUnder = freq.slice(0, th).reduce((a, b) => a + b, 0);
+    const pUnder = th / 10;
+    const expUnder = n * pUnder;
+    const stdUnder = Math.sqrt(n * pUnder * (1 - pUnder));
+    underZ[th] = stdUnder > 0 ? (cntUnder - expUnder) / stdUnder : 0;
+  }
+
+  // ---------- Rise/Fall z-score (excluding flat) ----------
+  let riseCount = 0;
+  let fallCount = 0;
+  for (const d of dirArr) {
+    if (d === 'up') riseCount++;
+    else if (d === 'down') fallCount++;
+  }
+  const dirTotal = riseCount + fallCount;
+  const expRise = dirTotal * 0.5;
+  const stdRise = Math.sqrt(dirTotal * 0.25);
+  const riseZ = stdRise > 0 ? (riseCount - expRise) / stdRise : 0;
+
+  // ---------- Streaks ----------
+  // currentStreak — length of the TRAILING same-parity run
+  let currentStreak = 0;
+  let currentStreakParity = null;
+  for (let i = arr.length - 1; i >= 0; i--) {
+    const p = arr[i] % 2 === 0 ? 'even' : 'odd';
+    if (currentStreakParity === null) currentStreakParity = p;
+    if (p !== currentStreakParity) break;
+    currentStreak++;
+  }
+
+  // maxRecentStreak — longest same-parity run ANYWHERE in window
+  let maxRecentStreak = 0;
+  let runLen = 0;
+  let runParity = null;
+  for (const d of arr) {
+    const p = d % 2 === 0 ? 'even' : 'odd';
+    if (p === runParity) runLen++;
+    else { runLen = 1; runParity = p; }
+    if (runLen > maxRecentStreak) maxRecentStreak = runLen;
+  }
+
+  // expectedMaxStreak — expected longest run of heads/tails in n flips
+  // Empirically ~log2(n) + 0.33. For n=200 → 7.9; n=500 → 9.3; n=1000 → 10.3.
+  const expectedMaxStreak = Math.log2(n) + 0.33;
+
+  return {
+    windowSize: n,
+    // Per-feature z-scores
+    digitZ,
+    evenZ,
+    oddZ: -evenZ,
+    overZ,
+    underZ,
+    riseZ,
+    fallZ: -riseZ,
+    // Streak metrics
+    currentStreak,
+    currentStreakParity,
+    maxRecentStreak,
+    expectedMaxStreak,
+    // Raw counts for reference (bot can double-check)
+    evenCount,
+    oddCount,
+    riseCount,
+    fallCount,
+    dirTotal,
+  };
 }
 
 class DigitAnalyzer extends EventEmitter {
@@ -217,6 +381,10 @@ class DigitAnalyzer extends EventEmitter {
       evenStreak,
       oddStreak,
 
+      // [FIX-3] Z-scores computed from last DEFAULT_Z_WINDOW ticks.
+      // null if fewer than Z_MIN_SAMPLES accumulated.
+      zStats: computeZStats(digits, directions, DEFAULT_Z_WINDOW),
+
       recentDigits: digits.slice(-30),
       directions: directions.slice(-30),
       recentPrices: s.prices.slice(-30),
@@ -279,6 +447,15 @@ class DigitAnalyzer extends EventEmitter {
     return this._computeView(s, symbol, s.lastPrice, precision);
   }
 
+  // [FIX-3] Z-score view from a custom window size. Returns null if
+  // fewer than Z_MIN_SAMPLES ticks are available.
+  getZView(symbol, windowSize = DEFAULT_Z_WINDOW) {
+    const clean = normalizeSymbol(symbol);
+    const s = this._state.get(clean);
+    if (!s || s.digits.length < Z_MIN_SAMPLES) return null;
+    return computeZStats(s.digits, s.directions, windowSize);
+  }
+
   getAllViews() {
     const out = {};
     for (const [symbol, s] of this._state) {
@@ -295,5 +472,9 @@ class DigitAnalyzer extends EventEmitter {
   }
 }
 
-module.exports = new DigitAnalyzer();
+const instance = new DigitAnalyzer();
+module.exports = instance;
 module.exports.getDigitPrecision = getDigitPrecision;
+module.exports.computeZStats = computeZStats;    // [FIX-3] exposed for tests
+module.exports.DEFAULT_Z_WINDOW = DEFAULT_Z_WINDOW;
+module.exports.Z_MIN_SAMPLES = Z_MIN_SAMPLES;
