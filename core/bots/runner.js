@@ -38,6 +38,10 @@ const SYMBOL_LOCK_TTL_MS = 30_000;
 const SYMBOL_LOCK_TAIL_MS = 5_000;
 
 const ENTRY_FAILURE_BACKOFF_MS = 30_000;
+// [FIX-OPENPOS-BACKOFF] Longer backoff when broker rejects with
+// OpenPositionLimitExceeded — the conflict won't clear for at least as
+// long as the other bot's contract runs (typically 30-60s for ACCU).
+const OPEN_POSITION_BACKOFF_MS = 60_000;
 
 const RECONCILE_POSITION_GRACE_MS = 2500;
 const RECONCILE_POSITION_LOOKBACK_MS = 60_000;
@@ -55,8 +59,6 @@ const ESTIMATED_TICK_MS = 1000;
 const SHADOW_MAX_PENDING_AGE_MS = 60_000;
 const SHADOW_SEQUENCE_MAX = 20;
 
-// [FIX-HIGH-PAYOUT] Contract classes that route to the new placement functions
-// and are eligible for exit trailing.
 const HIGH_PAYOUT_CLASSES = new Set(['touch', 'vanilla', 'turbo', 'accumulator']);
 const TRAIL_ELIGIBLE_CLASSES = new Set(['vanilla', 'turbo']);
 
@@ -77,6 +79,8 @@ class BotRunner extends EventEmitter {
       shadowLosses: 0,
       trailingExits: 0,
       trailingSkipped: 0,
+      // [FIX-OPENPOS-BACKOFF] Track open-position rejections separately
+      openPositionRejections: 0,
     };
   }
 
@@ -195,6 +199,8 @@ class BotRunner extends EventEmitter {
           .filter(i => TRAIL_ELIGIBLE_CLASSES.has(i.contractClass) && i.config.trailingEnabled)
           .length,
       },
+      // [FIX-OPENPOS-BACKOFF] diagnostic
+      openPositionRejections: this._metrics.openPositionRejections,
       runningInstances: this._instances.size,
       symbolLocks: this._symbolLocks.size,
     };
@@ -676,11 +682,7 @@ class BotRunner extends EventEmitter {
 
       const ctx = { config: instance.config, stats: instance.stats };
 
-      // ─────────────────────────────────────────────────────────────
-      // Context building — three branches
-      // ─────────────────────────────────────────────────────────────
       if (bot.assetClass === 'fx') {
-        // FX bots: full deep-market pipeline (state, consensus, prediction, candles)
         const state = await deepMarketState.compute(instance.symbol, timeframe, 200).catch(() => null);
         if (!state) { instance.lastReason = 'no deep state'; return; }
         ctx.state = state;
@@ -698,20 +700,6 @@ class BotRunner extends EventEmitter {
         ctx.prediction = await predictor.predict(instance.symbol, state, ctx.consensus, { timeframe }).catch(() => null);
         ctx.candles = await candleHistory.getHistory(instance.symbol, timeframe, 100).catch(() => []) || [];
 
-      // [FIX-HIGH-PAYOUT-CTX] High-payout bots (touch/vanilla/turbo/accumulator)
-      // reference ctx.state.regime, ctx.state.volatility, ctx.consensus, and
-      // ctx.prediction — exactly like FX bots. Without this branch they fell
-      // into the digit-only else below, got only ctx.digitView, and always
-      // returned "No market state" / "No state/prediction" before reaching
-      // the proposal call.
-      //
-      // The `deepMarketState.compute` call needs candle history for R_100.
-      // The first 1–2 cycles after start may return null while candles load
-      // (shown as "no deep state (candle history loading)" — self-heals).
-      //
-      // We ALSO populate digitView (for accumulator_scalper's tight-range
-      // check that reads ctx.digitView.recentPrices). Harmless for the other
-      // three bots (they don't read digitView).
       } else if (HIGH_PAYOUT_CLASSES.has(bot.contractClass)) {
         const state = await deepMarketState.compute(instance.symbol, timeframe, 200).catch(() => null);
         if (!state) { instance.lastReason = 'no deep state (candle history loading)'; return; }
@@ -730,13 +718,10 @@ class BotRunner extends EventEmitter {
         ctx.prediction = await predictor.predict(instance.symbol, state, ctx.consensus, { timeframe }).catch(() => null);
         ctx.candles = await candleHistory.getHistory(instance.symbol, timeframe, 100).catch(() => []) || [];
 
-        // Populate digitView too — accumulator_scalper needs recentPrices
-        // for its tight-range check. Other three bots ignore it.
         const dv = digitAnalyzer.getView(instance.symbol);
         if (dv) ctx.digitView = dv;
 
       } else {
-        // Digit bots: digitView only (existing behavior, unchanged)
         const digitView = digitAnalyzer.getView(instance.symbol);
         if (!digitView) { instance.lastReason = 'no digit data'; return; }
         ctx.digitView = digitView;
@@ -1069,6 +1054,24 @@ class BotRunner extends EventEmitter {
 
     try {
       const broker = getBroker('deriv_cfd');
+
+      // [FIX-STALE-CACHE] **Root cause fix for OpenPositionLimitExceeded.**
+      //
+      // The pre-check in _runCycle uses cached portfolio data (3s TTL).
+      // If bot-1 fired 1-2 seconds ago and its position is now live, but
+      // the cache was populated before bot-1's buy completed, the cache
+      // still shows empty. Bot-2 acquires the symbol lock (bot-1 shortened
+      // it to 5s after succeeding), reads the stale cache, sees no
+      // position, and proceeds to buy — which the broker rejects with
+      // OpenPositionLimitExceeded.
+      //
+      // Fix: after acquiring the lock, bust the portfolio cache to force
+      // a fresh fetch. If bot-1 has an inflight fetch, our call joins it
+      // and gets the same fresh result (via _portfolioInflight dedupe).
+      // If not, we trigger a new fetch. Either way, we see the up-to-date
+      // portfolio before committing to a buy.
+      if (broker._portfolioCache) broker._portfolioCache.at = 0;
+
       const freshPositions = await broker.getOpenTrades().catch(() => []);
       if (freshPositions.some(p => normalizeSymbol(p.instrument) === lockSymbol)) {
         instance.lastReason = 'Execution blocked: position opened by concurrent bot';
@@ -1121,11 +1124,37 @@ class BotRunner extends EventEmitter {
 
       this._shortenSymbolLock(lockSymbol, instance.instanceId, SYMBOL_LOCK_TAIL_MS);
     } catch (err) {
+      const errMsg = String(err && err.message || '');
+
+      // [FIX-OPENPOS-BACKOFF] OpenPositionLimitExceeded means another bot
+      // (or a manual position) has an open contract on the same symbol.
+      // Bust the cache so the NEXT cycle's pre-check in _runCycle sees
+      // the conflict immediately, and use a longer backoff (60s) so we
+      // don't keep retrying and getting rejected.
+      if (errMsg.includes('OpenPositionLimitExceeded')) {
+        this._metrics.openPositionRejections++;
+        if (getBroker('deriv_cfd')._portfolioCache) {
+          getBroker('deriv_cfd')._portfolioCache.at = 0;
+        }
+        instance._entryFailureBackoffUntil = Date.now() + OPEN_POSITION_BACKOFF_MS;
+        instance.lastReason = `Symbol busy (OpenPositionLimitExceeded) — retry in ${OPEN_POSITION_BACKOFF_MS / 1000}s`;
+        logger.warn(
+          `[BotRunner] ${instance.instanceId}: OpenPositionLimitExceeded on ${lockSymbol} — ` +
+          `another position is open. Backoff ${OPEN_POSITION_BACKOFF_MS / 1000}s.`
+        );
+        this.emit('botError', {
+          instanceId: instance.instanceId, botId: instance.botId,
+          error: errMsg, reason: 'open_position_limit'
+        });
+        this._releaseSymbolLock(lockSymbol, instance.instanceId);
+        return;
+      }
+
       if (this._isAmbiguousError(err)) {
-        this._metrics.lastOriginalError = err.message;
+        this._metrics.lastOriginalError = errMsg;
         logger.warn(
           `[BotRunner] ${instance.botId}/${instance.instanceId} entry threw ` +
-          `"${err.message}" — attempting recovery before declaring failure`
+          `"${errMsg}" — attempting recovery before declaring failure`
         );
 
         let recovered = null;
@@ -1168,7 +1197,7 @@ class BotRunner extends EventEmitter {
             entryPrice: recovered.entryPrice,
             stake: stakeCheck.stake, reasons, flipped: instance.stats.flipped,
             reconciled: true,
-            originalError: err.message,
+            originalError: errMsg,
             timestamp: new Date().toISOString(),
           });
 
@@ -1183,9 +1212,9 @@ class BotRunner extends EventEmitter {
       }
 
       instance._entryFailureBackoffUntil = Date.now() + ENTRY_FAILURE_BACKOFF_MS;
-      logger.error(`[BotRunner] ${instance.botId}/${instance.instanceId} entry failed: ${err.message}`);
-      instance.lastReason = `Execution failed: ${err.message}`;
-      this.emit('botError', { instanceId: instance.instanceId, botId: instance.botId, error: err.message });
+      logger.error(`[BotRunner] ${instance.botId}/${instance.instanceId} entry failed: ${errMsg}`);
+      instance.lastReason = `Execution failed: ${errMsg}`;
+      this.emit('botError', { instanceId: instance.instanceId, botId: instance.botId, error: errMsg });
       this._releaseSymbolLock(lockSymbol, instance.instanceId);
     }
   }
