@@ -4,23 +4,29 @@
 // Includes EXPORT and CLEAR functionality for recent runs.
 //
 // v3 changes:
-//   • Boolean config fields (flipEnabled, requireConsensus, etc.) render as
-//     checkboxes, not text inputs. Previously the form sent "true"/"false"
-//     as strings, so runner's `if (!c.flipEnabled)` treated "false" as truthy
-//     — toggling flip OFF from the form had no effect.
+//   • Boolean config fields render as checkboxes, not text inputs.
 //   • Flip-related fields grouped visually with a section header.
 //   • Checkbox state submitted as real booleans on Start.
-//   • Running-bot cards show current flip state (NORMAL / FLIPPED) and
-//     phase PnL so you can watch the flip decision evolve live.
+//   • Running-bot cards show current flip state (NORMAL / FLIPPED).
 //
 // [FIX-SHADOW-UI] Shadow trading display:
-//   • `shadowWinsRequired` grouped under its own form section with a
-//     help header explaining 0=off, 3=default, 10=max-gate.
+//   • shadowWinsRequired grouped under its own form section.
 //   • Running-bot cards show a shadow badge + gate detail line +
 //     last-10 W/L sequence for Rise/Fall & Volatility bots.
 //   • Runs table gets a "Shadow" column showing gate-at-entry per trade.
-//   • Bot summaries from runner expose `shadow` block; this file renders
-//     it defensively — non-shadow bots show nothing extra.
+//
+// [FIX-COMPOUND-UI] **Compound stake display:**
+//   • 6 compound fields grouped under "Compound Stake" section in the
+//     bot start form. Only rendered for synthetic_binary bots (those
+//     with `compoundEnabled` in defaultConfig).
+//   • Running-bot cards show a compound status line:
+//       Comp: stake $1.00 → $2.44 · 5/8 wins · max $10 · 4↑ 1↺
+//     Plus a small progress bar showing winsSinceReset / resetAfterWins
+//     when resetAfterWins > 0.
+//   • Recent Runs table already shows the actual `stake` used per trade
+//     (from BotRun.stake) — no change needed there.
+//   • 12 non-synthetic_binary bots (7 FX + 5 digit) show no compound UI
+//     because their defaultConfig never includes compoundEnabled.
 
 'use strict';
 
@@ -29,11 +35,18 @@
   let _selectedBot = null;
   let _running = [];
 
-  // Fields that belong to the "flip" group — displayed together under a header
+  // Fields grouped under their own section headers in the start form
   const FLIP_FIELDS = ['flipEnabled', 'flipBelowPct', 'flipMinTrades', 'flipStableTrades'];
-
-  // [FIX-SHADOW-UI] Fields that belong to the "shadow" group
-  const SHADOW_FIELDS = ['shadowWinsRequired'];
+  const SHADOW_FIELDS = ['shadowWinsRequired', 'shadowObservational'];
+  // [FIX-COMPOUND-UI] Compound stake fields — synthetic_binary only
+  const COMPOUND_FIELDS = [
+    'compoundEnabled',
+    'compoundMaxStake',
+    'compoundStartAfterWins',
+    'compoundGrowthRatePct',
+    'compoundStopAfterWins',
+    'compoundResetAfterWins',
+  ];
 
   // ============================================================
   // 1. FETCHERS
@@ -132,9 +145,8 @@
     });
   }
 
-  // [FIX-SHADOW-UI] buildField now accepts an optional `extras` object of
-  // extra HTML attributes for the input — used to give shadowWinsRequired
-  // min=0 / max=10 / step=1 (backward-compatible: undefined = no extras).
+  // [FIX-SHADOW-UI] buildField accepts an optional `extras` object of extra
+  // HTML attributes. Used for compound field min/max/step and shadow range.
   function buildField(key, val, extras) {
     const extrasAttr = extras
       ? Object.entries(extras).map(([k, v]) => `${k}="${v}"`).join(' ')
@@ -176,20 +188,48 @@
 
     if (fields) {
       const cfg = _selectedBot.defaultConfig || {};
-      // Partition config into: shadow fields, flip fields, main fields
+      // Partition config into: compound, shadow, flip, main
+      const compoundEntries = [];
       const shadowEntries = [];
       const flipEntries = [];
       const mainEntries = [];
       for (const [key, val] of Object.entries(cfg)) {
         if (val === null || val === undefined) continue;
-        if (SHADOW_FIELDS.indexOf(key) >= 0) shadowEntries.push([key, val]);
+        if (COMPOUND_FIELDS.indexOf(key) >= 0) compoundEntries.push([key, val]);
+        else if (SHADOW_FIELDS.indexOf(key) >= 0) shadowEntries.push([key, val]);
         else if (FLIP_FIELDS.indexOf(key) >= 0) flipEntries.push([key, val]);
         else mainEntries.push([key, val]);
       }
 
       let html = mainEntries.map(([key, val]) => buildField(key, val)).join('');
 
-      // [FIX-SHADOW-UI] Shadow group — only render if the bot has shadow fields
+      // [FIX-COMPOUND-UI] Compound group — only render if the bot has
+      // compound fields (synthetic_binary bots do, everything else doesn't)
+      if (compoundEntries.length > 0) {
+        html += `<div class="col-12 mt-3 mb-1">
+          <hr class="mt-1 mb-2"/>
+          <div class="small fw-bold text-uppercase text-muted" style="letter-spacing:0.05em;">
+            <i class="fas fa-chart-line me-1"></i> Compound Stake (synthetic & volatility bots)
+          </div>
+          <div class="small text-muted mb-2">
+            Grows stake on consecutive wins, resets periodically. Base = the <code>stake</code> field above.
+            <br><strong>Off by default.</strong> Applies only when <code>compoundEnabled</code> is checked.
+            Restarts of the bot reset the counter and current stake back to base.
+          </div>
+        </div>`;
+        // Render each compound field with sensible input bounds
+        for (const [key, val] of compoundEntries) {
+          const extras = { min: 0, step: 'any' };
+          if (key === 'compoundGrowthRatePct') { extras.min = 0; extras.max = 100; extras.step = 1; }
+          if (key === 'compoundMaxStake') { extras.min = 0.01; extras.step = 0.01; }
+          if (key === 'compoundStartAfterWins' || key === 'compoundStopAfterWins' || key === 'compoundResetAfterWins') {
+            extras.min = 0; extras.step = 1;
+          }
+          html += buildField(key, val, extras);
+        }
+      }
+
+      // Shadow group — only if the bot has shadow fields
       if (shadowEntries.length > 0) {
         html += `<div class="col-12 mt-3 mb-1">
           <hr class="mt-1 mb-2"/>
@@ -197,18 +237,18 @@
             <i class="fas fa-user-secret me-1"></i> Shadow Trading (paper-trade gate)
           </div>
           <div class="small text-muted mb-2">
-            Requires <strong>N consecutive shadow wins</strong> before the first real trade fires.
-            After a real <span class="text-success">WIN</span>, continues trading directly while rules hold.
-            After a real <span class="text-danger">LOSS</span>, gate tightens by +1 (max 10) and re-accumulates.
-            <br><strong>0 = disabled (fires immediately)</strong> · 3 = default · up to 10.
+            <strong>shadowWinsRequired &gt; 0</strong> → GATED mode: fire real trade only after N consecutive shadow wins.<br>
+            <strong>wins=0 + shadowObservational=true</strong> → OBSERVATIONAL mode: shadow runs in parallel with every real fire (data collection).<br>
+            <strong>wins=0 + obs=false</strong> → OFF: fire immediately, no shadow.
           </div>
         </div>`;
-        html += shadowEntries.map(([key, val]) =>
-          buildField(key, val, { min: 0, max: 10, step: 1 })
-        ).join('');
+        html += shadowEntries.map(([key, val]) => {
+          const extras = (key === 'shadowWinsRequired') ? { min: 0, max: 10, step: 1 } : null;
+          return buildField(key, val, extras);
+        }).join('');
       }
 
-      // Group flip fields with a header
+      // Flip group — only if the bot has flip fields
       if (flipEntries.length > 0) {
         html += `<div class="col-12 mt-3 mb-1">
           <hr class="mt-1 mb-2"/>
@@ -228,9 +268,14 @@
     if (form) { form.style.display = 'block'; form.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
   }
 
-  // [FIX-SHADOW-UI] Helpers for shadow rendering
+  // [FIX-SHADOW-UI] Helper: shadow present and enabled
   function hasShadow(inst) {
     return !!(inst && inst.shadow && inst.shadow.enabled);
+  }
+
+  // [FIX-COMPOUND-UI] Helper: compound present and enabled
+  function hasCompound(inst) {
+    return !!(inst && inst.compound && inst.compound.enabled);
   }
 
   function renderShadowBadge(shadow) {
@@ -244,7 +289,8 @@
     if (shadow.consecutiveShadowWins >= shadow.currentGate) {
       return `<span class="badge bg-success ms-1" title="Shadow gate met — will fire on next rules hit">GATE MET</span>`;
     }
-    return `<span class="badge bg-secondary ms-1" title="Accumulating shadow wins">SHADOW ${shadow.consecutiveShadowWins}/${shadow.currentGate}</span>`;
+    const mode = shadow.mode === 'observational' ? 'OBS' : 'SHADOW';
+    return `<span class="badge bg-secondary ms-1" title="Accumulating shadow wins (${mode})">${mode} ${shadow.consecutiveShadowWins}/${shadow.currentGate}</span>`;
   }
 
   function renderShadowDetailLine(shadow) {
@@ -254,7 +300,9 @@
     const origGate = Number(shadow.originalGate) || 0;
     const tightens = Number(shadow.gateTightenCount) || 0;
 
-    if (tightens > 0) {
+    if (shadow.mode === 'observational') {
+      parts.push(`observational (no gating)`);
+    } else if (tightens > 0) {
       parts.push(`gate <strong>${gate}</strong> (from ${origGate}, ${tightens} tighten${tightens === 1 ? '' : 's'})`);
     } else {
       parts.push(`gate <strong>${gate}</strong>`);
@@ -285,6 +333,58 @@
     }).join(' ');
     return `<div class="mt-1" style="font-size:0.7rem;" title="Last ${shadow.sequence.length} shadow outcomes (oldest → newest)">
       <span class="text-muted">Sequence:</span> ${badges}
+    </div>`;
+  }
+
+  // [FIX-COMPOUND-UI] Compound detail line.
+  // Example outputs:
+  //   No growth yet:   "stake $1.00 · 0/8 wins · max $10"
+  //   After growth:    "stake $1.00 → $2.44 · 5/8 wins · max $10 · 4↑ 1↺"
+  //   No reset config: "stake $1.00 → $3.05 · 6W · max $10 · 5↑"
+  function renderCompoundDetailLine(compound) {
+    if (!compound) return '';
+    const base = Number(compound.baseStake) || 0;
+    const cur = Number(compound.currentStake) || 0;
+    const max = Number(compound.maxStake) || 0;
+    const wins = Number(compound.winsSinceReset) || 0;
+    const resetAfter = Number(compound.resetAfterWins) || 0;
+    const grows = Number(compound.growthCount) || 0;
+    const resets = Number(compound.resetCount) || 0;
+
+    // Stake display: if current differs from base, show "base → current", else "current"
+    const stakePart = (cur > base + 0.001)
+      ? `stake <strong>$${base.toFixed(2)} → $${cur.toFixed(2)}</strong>`
+      : `stake <strong>$${cur.toFixed(2)}</strong>`;
+
+    // Wins counter: show progress toward reset if reset configured
+    const winsPart = resetAfter > 0
+      ? `${wins}/${resetAfter} wins`
+      : `${wins}W`;
+
+    // Growth/reset counts (only if any)
+    const countParts = [];
+    if (grows > 0) countParts.push(`${grows}↑`);
+    if (resets > 0) countParts.push(`${resets}↺`);
+    const countStr = countParts.length > 0 ? ` · ${countParts.join(' ')}` : '';
+
+    return `<div class="small text-success mt-1" style="font-size:0.72rem;">
+      <i class="fas fa-chart-line me-1"></i>${stakePart} · ${winsPart} · max $${max}${countStr}
+    </div>`;
+  }
+
+  // [FIX-COMPOUND-UI] Progress bar toward reset.
+  // Only rendered when resetAfterWins > 0. Fill = winsSinceReset / resetAfterWins.
+  function renderCompoundProgress(compound) {
+    if (!compound) return '';
+    const resetAfter = Number(compound.resetAfterWins) || 0;
+    if (resetAfter <= 0) return '';    // no reset configured → no bar
+    const wins = Number(compound.winsSinceReset) || 0;
+    const pct = Math.min(100, (wins / resetAfter) * 100);
+    const barColor = pct >= 100 ? '#e74c5e' : (pct >= 75 ? '#f39c12' : '#00b894');
+    return `<div class="mt-1" title="${wins} of ${resetAfter} wins until stake resets to base">
+      <div style="height:4px; background:#e9edf2; border-radius:2px; overflow:hidden;">
+        <div style="height:100%; width:${pct.toFixed(1)}%; background:${barColor}; transition:width 0.3s ease;"></div>
+      </div>
     </div>`;
   }
 
@@ -334,6 +434,11 @@
       const shadowDetail = shadowEnabled ? renderShadowDetailLine(inst.shadow) : '';
       const shadowSeq = shadowEnabled ? renderShadowSequence(inst.shadow) : '';
 
+      // [FIX-COMPOUND-UI] Compound state for eligible bots
+      const compoundEnabled = hasCompound(inst);
+      const compoundDetail = compoundEnabled ? renderCompoundDetailLine(inst.compound) : '';
+      const compoundProgress = compoundEnabled ? renderCompoundProgress(inst.compound) : '';
+
       return `<div class="card mb-2" style="border-left:3px solid #00b894;">
         <div class="card-body p-3">
           <div class="d-flex justify-content-between align-items-start">
@@ -351,6 +456,8 @@
               ${phaseLine}
               ${shadowDetail}
               ${shadowSeq}
+              ${compoundDetail}
+              ${compoundProgress}
               <div class="small text-muted mt-1 fw-bold" style="font-size:0.75rem;">${inst.lastReason || ''}</div>
             </div>
             <button class="btn btn-sm btn-danger" data-stop="${inst.instanceId}">
@@ -371,6 +478,9 @@
   }
 
   // [FIX-SHADOW-UI] Runs table gains a Shadow column.
+  // [FIX-COMPOUND-UI] Stake column already shows the ACTUAL stake used per
+  // trade (BotRun.stake comes from stakeCheck.stake in runner), so compound
+  // growth is visible in the table without any change needed here.
   function renderRuns(runs) {
     const container = document.getElementById('botRunsContainer');
     if (!container) return;
