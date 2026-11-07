@@ -38,9 +38,6 @@ const SYMBOL_LOCK_TTL_MS = 30_000;
 const SYMBOL_LOCK_TAIL_MS = 5_000;
 
 const ENTRY_FAILURE_BACKOFF_MS = 30_000;
-// [FIX-OPENPOS-BACKOFF] Longer backoff when broker rejects with
-// OpenPositionLimitExceeded — the conflict won't clear for at least as
-// long as the other bot's contract runs (typically 30-60s for ACCU).
 const OPEN_POSITION_BACKOFF_MS = 60_000;
 
 const RECONCILE_POSITION_GRACE_MS = 2500;
@@ -55,8 +52,7 @@ const SELL_CONTRACT_TYPES = new Set([
   'VANILLALONGPUT', 'TURBOSSHORT',
 ]);
 
-const ESTIMATED_TICK_MS = 1000;
-const SHADOW_MAX_PENDING_AGE_MS = 60_000;
+const SHADOW_STALL_TIMEOUT_MS = 30_000;
 const SHADOW_SEQUENCE_MAX = 20;
 
 const HIGH_PAYOUT_CLASSES = new Set(['touch', 'vanilla', 'turbo', 'accumulator']);
@@ -79,8 +75,10 @@ class BotRunner extends EventEmitter {
       shadowLosses: 0,
       trailingExits: 0,
       trailingSkipped: 0,
-      // [FIX-OPENPOS-BACKOFF] Track open-position rejections separately
       openPositionRejections: 0,
+      // [FIX-COMPOUND-STAKE] Aggregate compound diagnostics
+      compoundGrowths: 0,
+      compoundResets: 0,
     };
   }
 
@@ -92,17 +90,13 @@ class BotRunner extends EventEmitter {
     const finalConfig = Object.assign({}, bot.defaultConfig, config || {});
     const symbol = normalizeSymbol(finalConfig.symbol);
 
-    const shadowWinsRequired = Number(finalConfig.shadowWinsRequired) || 0;
-    const shadowEligible =
-      shadowWinsRequired > 0 &&
-      bot.assetClass === 'synthetic_binary' &&
-      !finalConfig._edgeTest;
-
-    const shadow = shadowEligible ? {
+    const mode = this._shadowModeForConfig(finalConfig, bot);
+    const shadow = mode !== 'off' ? {
       enabled: true,
-      originalGate: shadowWinsRequired,
-      currentGate: shadowWinsRequired,
-      shadowRequired: true,
+      mode,
+      originalGate: Number(finalConfig.shadowWinsRequired) || 0,
+      currentGate: Number(finalConfig.shadowWinsRequired) || 0,
+      shadowRequired: mode === 'gated',
       consecutiveShadowWins: 0,
       gateTightenCount: 0,
       sequence: [],
@@ -110,12 +104,17 @@ class BotRunner extends EventEmitter {
       pending: [],
     } : null;
 
+    // [FIX-COMPOUND-STAKE] Build compound state for synthetic_binary bots
+    // with compoundEnabled=true. State is per-instance (no persistence).
+    const compound = this._buildCompoundState(finalConfig, bot);
+
     const instance = {
       instanceId, botId, name: bot.name, assetClass: bot.assetClass, contractClass: bot.contractClass,
       symbol, config: finalConfig, status: 'RUNNING', startedAt: new Date(), lastRunAt: null, lastReason: null,
       timer: null, _running: false, _lastEntryTime: 0,
       _entryFailureBackoffUntil: 0,
       shadow,
+      compound,
       _trailingPeaks: new Map(),
       stats: {
         runs: 0, entries: 0, wins: 0, losses: 0, pnl: 0, peakPnl: 0, consecutiveLosses: 0,
@@ -140,13 +139,60 @@ class BotRunner extends EventEmitter {
     logger.info(
       `[BotRunner] Started ${bot.name} (${instanceId}) on ${symbol}` +
       (finalConfig._edgeTest ? ' [EDGE TEST]' : '') +
-      (shadowEligible ? ` [SHADOW gate=${shadowWinsRequired}]` : '') +
-      (TRAIL_ELIGIBLE_CLASSES.has(bot.contractClass) && finalConfig.trailingEnabled ? ' [TRAILING]' : '')
+      (mode !== 'off' ? ` [SHADOW ${mode.toUpperCase()}${mode === 'gated' ? ` gate=${shadow.currentGate}` : ''}]` : '') +
+      (TRAIL_ELIGIBLE_CLASSES.has(bot.contractClass) && finalConfig.trailingEnabled ? ' [TRAILING]' : '') +
+      (compound ? ` [COMPOUND base=$${compound.baseStake} max=$${compound.maxStake} rate=${compound.growthRatePct}%]` : '')
     );
     const summary = this._summarize(instance);
     this.emit('botStarted', summary);
     setTimeout(() => { this._runCycle(instance).catch(() => {}); }, 1000);
     return summary;
+  }
+
+  // [FIX-COMPOUND-STAKE] Build compound state — null if not applicable.
+  _buildCompoundState(config, bot) {
+    if (!bot || bot.assetClass !== 'synthetic_binary') return null;
+    if (!config.compoundEnabled) return null;
+
+    const baseStake = Math.max(0.01, Number(config.stake) || 1);
+    const maxStake = Math.max(baseStake, Number(config.compoundMaxStake) || 10);
+    const growthRatePct = Math.max(0, Number(config.compoundGrowthRatePct) || 0);
+
+    return {
+      enabled: true,
+      baseStake,
+      currentStake: Math.min(baseStake, maxStake),
+      maxStake,
+      startAfterWins: Math.max(0, Number(config.compoundStartAfterWins) || 0),
+      growthRatePct,
+      stopAfterWins: Math.max(0, Number(config.compoundStopAfterWins) || 0),
+      resetAfterWins: Math.max(0, Number(config.compoundResetAfterWins) || 0),
+      winsSinceReset: 0,
+      growthCount: 0,
+      resetCount: 0,
+      lastGrowthAt: null,
+      lastResetAt: null,
+    };
+  }
+
+  _shadowModeForConfig(config, bot) {
+    if (!bot || bot.assetClass !== 'synthetic_binary') return 'off';
+    if (config._edgeTest) return 'off';
+    const wins = Number(config.shadowWinsRequired) || 0;
+    if (wins > 0) return 'gated';
+    if (!!config.shadowObservational) return 'observational';
+    return 'off';
+  }
+
+  _shadowConfig(instance) {
+    if (!instance.shadow) return { gating: false, tracking: false, mode: 'off' };
+    const wins = Number(instance.config.shadowWinsRequired) || 0;
+    const obs = !!instance.config.shadowObservational;
+    return {
+      mode: instance.shadow.mode,
+      gating: wins > 0,
+      tracking: wins > 0 || obs,
+    };
   }
 
   stop(instanceId) {
@@ -159,6 +205,8 @@ class BotRunner extends EventEmitter {
       if (lock.instanceId === instanceId) this._symbolLocks.delete(sym);
     }
     if (instance._trailingPeaks) instance._trailingPeaks.clear();
+    // [FIX-COMPOUND-STAKE] compound state is discarded with the instance
+    // (no persistence across restart, per spec)
     this._instances.delete(instanceId);
     logger.info(`[BotRunner] Stopped ${instance.name} (${instanceId})`);
     const summary = this._summarize(instance);
@@ -199,7 +247,13 @@ class BotRunner extends EventEmitter {
           .filter(i => TRAIL_ELIGIBLE_CLASSES.has(i.contractClass) && i.config.trailingEnabled)
           .length,
       },
-      // [FIX-OPENPOS-BACKOFF] diagnostic
+      compound: {
+        growths: this._metrics.compoundGrowths,
+        resets: this._metrics.compoundResets,
+        instancesWithCompound: Array.from(this._instances.values())
+          .filter(i => i.compound && i.compound.enabled)
+          .length,
+      },
       openPositionRejections: this._metrics.openPositionRejections,
       runningInstances: this._instances.size,
       symbolLocks: this._symbolLocks.size,
@@ -207,23 +261,123 @@ class BotRunner extends EventEmitter {
   }
 
   // ─────────────────────────────────────────────────────────────
-  //  Symbol locks
+  //  [FIX-COMPOUND-STAKE] Stake resolution + post-win adaptation
   // ─────────────────────────────────────────────────────────────
+
+  /**
+   * Resolve the stake to use for the NEXT trade.
+   *
+   * If compound is enabled → return instance.compound.currentStake
+   * Else → config.stake if set, else tradeParams.stake (bot's own value)
+   */
+  _getEffectiveStake(instance, tradeParams) {
+    if (instance.compound && instance.compound.enabled) {
+      return instance.compound.currentStake;
+    }
+    const configStake = instance.config.stake;
+    const hasConfigStake =
+      configStake != null && configStake !== '' &&
+      Number.isFinite(Number(configStake)) && Number(configStake) > 0;
+    return hasConfigStake ? Number(configStake) : (tradeParams ? tradeParams.stake : 1);
+  }
+
+  /**
+   * [FIX-COMPOUND-STAKE] Apply compound rules after a real trade settles.
+   *
+   * Called from _onTradeClosed. Only acts on WIN results.
+   * On LOSS / BREAKEVEN / anything else → no change (counter and stake
+   * stay where they were).
+   *
+   * Cycle logic on WIN:
+   *   1. winsSinceReset += 1
+   *   2. If resetAfterWins > 0 && winsSinceReset >= resetAfterWins:
+   *        → reset stake to base, counter to 0, resetCount++
+   *        → return (reset takes priority over growth)
+   *   3. If winsSinceReset > startAfterWins:
+   *        a. If stopAfterWins > 0 && winsSinceReset > stopAfterWins:
+   *             → return (growth capped, no further change)
+   *        b. Grow: newStake = min(currentStake * (1 + rate/100), maxStake)
+   *             → if newStake > currentStake, adopt it, growthCount++
+   */
+  _applyCompoundAfterWin(instance, run) {
+    if (!instance.compound || !instance.compound.enabled) return;
+    if (!run || run.result !== 'WIN') return;
+
+    const c = instance.compound;
+    c.winsSinceReset += 1;
+
+    // Step 2 — reset check FIRST (highest priority)
+    if (c.resetAfterWins > 0 && c.winsSinceReset >= c.resetAfterWins) {
+      const oldStake = c.currentStake;
+      c.currentStake = Math.min(c.baseStake, c.maxStake);
+      const oldWins = c.winsSinceReset;
+      c.winsSinceReset = 0;
+      c.resetCount++;
+      c.lastResetAt = new Date().toISOString();
+      this._metrics.compoundResets++;
+      logger.info(
+        `[BotRunner] ${instance.instanceId}: COMPOUND RESET after ${oldWins} wins — ` +
+        `stake $${oldStake.toFixed(2)} → $${c.currentStake.toFixed(2)} (base)`
+      );
+      this.emit('botCompoundReset', {
+        instanceId: instance.instanceId, botId: instance.botId,
+        winsSinceResetBeforeReset: oldWins,
+        oldStake: Number(oldStake.toFixed(2)),
+        newStake: Number(c.currentStake.toFixed(2)),
+        resetCount: c.resetCount,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    // Step 3a — growth gate not yet met
+    if (c.winsSinceReset <= c.startAfterWins) return;
+
+    // Step 3b — stop gate
+    if (c.stopAfterWins > 0 && c.winsSinceReset > c.stopAfterWins) {
+      // At or past stop ceiling — stake stays at whatever it reached
+      return;
+    }
+
+    // Step 3b — grow
+    const oldStake = c.currentStake;
+    const factor = 1 + c.growthRatePct / 100;
+    const grownRaw = oldStake * factor;
+    const grown = Math.min(grownRaw, c.maxStake);
+    if (grown > oldStake + 0.0001) {
+      c.currentStake = grown;
+      c.growthCount++;
+      c.lastGrowthAt = new Date().toISOString();
+      this._metrics.compoundGrowths++;
+      logger.info(
+        `[BotRunner] ${instance.instanceId}: COMPOUND GROW win #${c.winsSinceReset} — ` +
+        `stake $${oldStake.toFixed(2)} → $${grown.toFixed(2)} ` +
+        `(rate=${c.growthRatePct}%, max=$${c.maxStake})`
+      );
+      this.emit('botCompoundGrow', {
+        instanceId: instance.instanceId, botId: instance.botId,
+        winsSinceReset: c.winsSinceReset,
+        oldStake: Number(oldStake.toFixed(2)),
+        newStake: Number(grown.toFixed(2)),
+        maxStake: c.maxStake,
+        growthRatePct: c.growthRatePct,
+        growthCount: c.growthCount,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+
   _tryAcquireSymbolLock(symbol, instanceId, ttlMs = SYMBOL_LOCK_TTL_MS) {
     const now = Date.now();
     const existing = this._symbolLocks.get(symbol);
-    if (existing && existing.expiresAt > now && existing.instanceId !== instanceId) {
-      return false;
-    }
+    if (existing && existing.expiresAt > now && existing.instanceId !== instanceId) return false;
     this._symbolLocks.set(symbol, { instanceId, acquiredAt: now, expiresAt: now + ttlMs });
     return true;
   }
 
   _releaseSymbolLock(symbol, instanceId) {
     const lock = this._symbolLocks.get(symbol);
-    if (lock && lock.instanceId === instanceId) {
-      this._symbolLocks.delete(symbol);
-    }
+    if (lock && lock.instanceId === instanceId) this._symbolLocks.delete(symbol);
   }
 
   _shortenSymbolLock(symbol, instanceId, ttlMs = SYMBOL_LOCK_TAIL_MS) {
@@ -240,9 +394,6 @@ class BotRunner extends EventEmitter {
     }
   }
 
-  // ─────────────────────────────────────────────────────────────
-  //  Trailing exits for Vanilla/Turbo bots
-  // ─────────────────────────────────────────────────────────────
   async _manageTrailingExits(instance) {
     if (!instance.config.trailingEnabled) return;
     if (instance.config._edgeTest) return;
@@ -262,9 +413,7 @@ class BotRunner extends EventEmitter {
 
     const liveIds = new Set();
     for (const pos of positions) {
-      if (normalizeSymbol(pos.instrument) === instance.symbol) {
-        liveIds.add(String(pos.id));
-      }
+      if (normalizeSymbol(pos.instrument) === instance.symbol) liveIds.add(String(pos.id));
     }
     for (const cid of Array.from(instance._trailingPeaks.keys())) {
       if (!liveIds.has(cid)) instance._trailingPeaks.delete(cid);
@@ -272,77 +421,42 @@ class BotRunner extends EventEmitter {
 
     for (const pos of positions) {
       if (normalizeSymbol(pos.instrument) !== instance.symbol) continue;
-
       const contractId = String(pos.id);
       const currentProfit = Number(pos.unrealizedPL || 0);
 
       let tracking = instance._trailingPeaks.get(contractId);
       if (!tracking) {
-        tracking = {
-          peakProfit: currentProfit,
-          entryPrice: Number(pos.entryPrice || 0),
-          activatedAt: null,
-        };
+        tracking = { peakProfit: currentProfit, entryPrice: Number(pos.entryPrice || 0), activatedAt: null };
         instance._trailingPeaks.set(contractId, tracking);
       }
-
-      if (currentProfit > tracking.peakProfit) {
-        tracking.peakProfit = currentProfit;
-      }
-
+      if (currentProfit > tracking.peakProfit) tracking.peakProfit = currentProfit;
       if (tracking.peakProfit < activateAfter) continue;
 
       if (tracking.activatedAt == null) {
         tracking.activatedAt = Date.now();
-        logger.info(
-          `[BotRunner] ${instance.instanceId}: trailing activated on ${contractId} ` +
-          `(peak=$${tracking.peakProfit.toFixed(2)} ≥ $${activateAfter})`
-        );
+        logger.info(`[BotRunner] ${instance.instanceId}: trailing activated on ${contractId} (peak=$${tracking.peakProfit.toFixed(2)} ≥ $${activateAfter})`);
       }
 
       const closeBelow = tracking.peakProfit * (1 - retracePct / 100);
-
       if (currentProfit <= closeBelow) {
-        logger.info(
-          `[BotRunner] ${instance.instanceId}: trailing EXIT on ${contractId} ` +
-          `(peak=$${tracking.peakProfit.toFixed(2)} current=$${currentProfit.toFixed(2)} ` +
-          `retrace=$${(tracking.peakProfit - currentProfit).toFixed(2)} ≥ ${retracePct}% of peak)`
-        );
+        logger.info(`[BotRunner] ${instance.instanceId}: trailing EXIT on ${contractId} (peak=$${tracking.peakProfit.toFixed(2)} current=$${currentProfit.toFixed(2)} retrace=$${(tracking.peakProfit - currentProfit).toFixed(2)} ≥ ${retracePct}% of peak)`);
         try {
           await broker.closeTrade(contractId);
           this._metrics.trailingExits++;
           instance._trailingPeaks.delete(contractId);
           instance.lastReason = `Trailing exit ${contractId} (peak $${tracking.peakProfit.toFixed(2)})`;
           this.emit('botTrailingExit', {
-            instanceId: instance.instanceId,
-            botId: instance.botId,
-            contractId,
+            instanceId: instance.instanceId, botId: instance.botId, contractId,
             peakProfit: Number(tracking.peakProfit.toFixed(2)),
             currentProfit: Number(currentProfit.toFixed(2)),
-            retracePct,
-            timestamp: new Date().toISOString(),
+            retracePct, timestamp: new Date().toISOString(),
           });
         } catch (err) {
-          logger.warn(
-            `[BotRunner] ${instance.instanceId}: trailing close FAILED for ${contractId}: ${err.message}`
-          );
+          logger.warn(`[BotRunner] ${instance.instanceId}: trailing close FAILED for ${contractId}: ${err.message}`);
           this._metrics.trailingSkipped++;
         }
       }
     }
-  }
-
-  // ─────────────────────────────────────────────────────────────
-  //  Shadow trade lifecycle
-  // ─────────────────────────────────────────────────────────────
-  _shadowEligible(instance) {
-    return !!(
-      instance.shadow &&
-      instance.shadow.enabled &&
-      instance.assetClass === 'synthetic_binary' &&
-      Number(instance.config.shadowWinsRequired) > 0 &&
-      !instance.config._edgeTest
-    );
   }
 
   _resolvePendingShadows(instance) {
@@ -357,37 +471,34 @@ class BotRunner extends EventEmitter {
     for (const shadow of instance.shadow.pending) {
       const ticksElapsed = Number(dv.sampleSize) - shadow.entryTickNum;
       const timeElapsed = now - shadow.startedAt;
-      const expectedTimeMs = shadow.durationTicks * ESTIMATED_TICK_MS;
 
-      const forceResolve = timeElapsed > SHADOW_MAX_PENDING_AGE_MS;
-      const readyToResolve =
-        forceResolve ||
-        timeElapsed >= expectedTimeMs ||
-        ticksElapsed >= shadow.durationTicks;
+      const ticksReady = ticksElapsed >= shadow.durationTicks;
+      const feedStalled = timeElapsed > SHADOW_STALL_TIMEOUT_MS;
 
-      if (!readyToResolve) {
+      if (!ticksReady && !feedStalled) {
         remaining.push(shadow);
         continue;
       }
 
+      if (feedStalled && !ticksReady) {
+        logger.warn(
+          `[BotRunner] ${instance.instanceId}: shadow force-resolved after ` +
+          `${SHADOW_STALL_TIMEOUT_MS}ms stall (${ticksElapsed}/${shadow.durationTicks} ticks) — ` +
+          `tick feed may be interrupted`
+        );
+      }
+
       const exitPrice = Number(dv.price);
       let outcome;
-      if (shadow.prediction === 'CALL') {
-        outcome = exitPrice > shadow.entryPrice ? 'W' : 'L';
-      } else if (shadow.prediction === 'PUT') {
-        outcome = exitPrice < shadow.entryPrice ? 'W' : 'L';
-      } else {
-        logger.warn(
-          `[BotRunner] ${instance.instanceId}: shadow with unknown prediction ` +
-          `"${shadow.prediction}" — treating as loss`
-        );
+      if (shadow.prediction === 'CALL') outcome = exitPrice > shadow.entryPrice ? 'W' : 'L';
+      else if (shadow.prediction === 'PUT') outcome = exitPrice < shadow.entryPrice ? 'W' : 'L';
+      else {
+        logger.warn(`[BotRunner] ${instance.instanceId}: shadow with unknown prediction "${shadow.prediction}" — treating as loss`);
         outcome = 'L';
       }
 
       instance.shadow.sequence.push(outcome);
-      if (instance.shadow.sequence.length > SHADOW_SEQUENCE_MAX) {
-        instance.shadow.sequence.shift();
-      }
+      if (instance.shadow.sequence.length > SHADOW_SEQUENCE_MAX) instance.shadow.sequence.shift();
 
       instance.shadow.stats.total++;
       if (outcome === 'W') {
@@ -407,19 +518,16 @@ class BotRunner extends EventEmitter {
 
       logger.info(
         `[BotRunner] ${instance.instanceId}: shadow ${shadow.prediction} RESOLVED ${outcome} ` +
-        `(entry=${shadow.entryPrice} exit=${exitPrice}, ticks=${ticksElapsed}) — ` +
-        `consecutive=${instance.shadow.consecutiveShadowWins}/${instance.shadow.currentGate}`
+        `(entry=${shadow.entryPrice} exit=${exitPrice}, ticks=${ticksElapsed}/${shadow.durationTicks}) — ` +
+        `consecutive=${instance.shadow.consecutiveShadowWins}/${instance.shadow.currentGate || '-'}`
       );
 
       try {
         this.emit('botShadowResolved', {
-          instanceId: instance.instanceId,
-          botId: instance.botId,
-          outcome,
-          prediction: shadow.prediction,
-          entryPrice: shadow.entryPrice,
-          exitPrice,
-          ticksElapsed,
+          instanceId: instance.instanceId, botId: instance.botId,
+          outcome, prediction: shadow.prediction,
+          entryPrice: shadow.entryPrice, exitPrice, ticksElapsed,
+          durationTicks: shadow.durationTicks,
           consecutiveShadowWins: instance.shadow.consecutiveShadowWins,
           currentGate: instance.shadow.currentGate,
           timestamp: new Date().toISOString(),
@@ -431,88 +539,62 @@ class BotRunner extends EventEmitter {
   }
 
   _recordShadowTrade(instance, signal, ctx) {
+    if (!instance.shadow || !instance.shadow.enabled) return false;
     const { tradeParams } = signal;
     const dv = ctx && ctx.digitView;
-    if (!dv) {
-      instance.lastReason = 'Shadow skipped: no digit view';
-      return;
-    }
+    if (!dv) return false;
 
     const prediction = tradeParams.contractType;
-    if (prediction !== 'CALL' && prediction !== 'PUT') {
-      instance.lastReason = `Shadow skipped: unsupported contractType ${prediction}`;
-      logger.warn(
-        `[BotRunner] ${instance.instanceId}: shadow cannot track ${prediction} ` +
-        `(only CALL/PUT supported). Firing without shadow.`
-      );
-      return this._execute(instance, signal, ctx);
-    }
+    if (prediction !== 'CALL' && prediction !== 'PUT') return false;
 
     const entryPrice = Number(dv.price);
     const entryTickNum = Number(dv.sampleSize);
     const durationTicks = Number(tradeParams.duration) || 5;
 
     instance.shadow.pending.push({
-      prediction,
-      entryPrice,
-      entryTickNum,
-      durationTicks,
+      prediction, entryPrice, entryTickNum, durationTicks,
       startedAt: Date.now(),
     });
 
     this._metrics.shadowPlaced++;
 
-    instance.lastReason =
-      `Shadow ${prediction} placed (${instance.shadow.consecutiveShadowWins}/${instance.shadow.currentGate})`;
-
     logger.info(
       `[BotRunner] ${instance.instanceId}: shadow ${prediction} placed ` +
       `price=${entryPrice} tick#${entryTickNum} dur=${durationTicks} ` +
-      `(need ${instance.shadow.currentGate - instance.shadow.consecutiveShadowWins} more)`
+      `(mode=${instance.shadow.mode}, gate=${instance.shadow.currentGate || '-'})`
     );
 
     try {
       this.emit('botShadowPlaced', {
-        instanceId: instance.instanceId,
-        botId: instance.botId,
-        prediction,
-        entryPrice,
-        entryTickNum,
-        durationTicks,
+        instanceId: instance.instanceId, botId: instance.botId,
+        prediction, entryPrice, entryTickNum, durationTicks,
         consecutiveShadowWins: instance.shadow.consecutiveShadowWins,
         currentGate: instance.shadow.currentGate,
+        mode: instance.shadow.mode,
         timestamp: new Date().toISOString(),
       });
     } catch (_) {}
+    return true;
   }
 
   _adaptGateAfterReal(instance, result) {
     if (!instance.shadow || !instance.shadow.enabled) return;
+    if (instance.shadow.mode !== 'gated') return;
 
     instance.shadow.consecutiveShadowWins = 0;
 
     if (result === 'WIN') {
       instance.shadow.shadowRequired = false;
-      logger.info(
-        `[BotRunner] ${instance.instanceId}: real WIN → continue trading ` +
-        `(gate stays at ${instance.shadow.currentGate})`
-      );
+      logger.info(`[BotRunner] ${instance.instanceId}: real WIN → continue trading (gate stays at ${instance.shadow.currentGate})`);
     } else if (result === 'LOSS') {
       instance.shadow.shadowRequired = true;
       const oldGate = instance.shadow.currentGate;
       instance.shadow.currentGate = Math.min(10, oldGate + 1);
       instance.shadow.gateTightenCount++;
-      logger.info(
-        `[BotRunner] ${instance.instanceId}: real LOSS → gate tightened ` +
-        `${oldGate} → ${instance.shadow.currentGate} ` +
-        `(total tightens=${instance.shadow.gateTightenCount})`
-      );
+      logger.info(`[BotRunner] ${instance.instanceId}: real LOSS → gate tightened ${oldGate} → ${instance.shadow.currentGate} (total tightens=${instance.shadow.gateTightenCount})`);
     }
   }
 
-  // ─────────────────────────────────────────────────────────────
-  //  Flip state
-  // ─────────────────────────────────────────────────────────────
   _updateFlipState(instance) {
     const c = instance.config;
     const s = instance.stats;
@@ -537,7 +619,6 @@ class BotRunner extends EventEmitter {
 
     if (s.flipped) {
       if (s.phaseTrades < stableTrades) return;
-
       if (s.phasePnl < 0) {
         const phaseTradesAtToggle = s.phaseTrades;
         const phasePnlAtToggle = s.phasePnl;
@@ -549,9 +630,7 @@ class BotRunner extends EventEmitter {
         this._capFlipHistory(s);
         s.flipped = false;
         s.flipCount++;
-        s.phaseTrades = 0;
-        s.phaseWins = 0;
-        s.phasePnl = 0;
+        s.phaseTrades = 0; s.phaseWins = 0; s.phasePnl = 0;
         logger.info(`[BotRunner] ${instance.botId}/${instance.instanceId} UN-FLIP — flipped phase ${phaseTradesAtToggle} trades, PnL $${phasePnlAtToggle.toFixed(2)}`);
         this.emit('botFlip', { instanceId: instance.instanceId, botId: instance.botId, flipped: false, reason: 'flipped_phase_negative' });
       }
@@ -559,7 +638,6 @@ class BotRunner extends EventEmitter {
     }
 
     if (s.phaseTrades < minTrades) return;
-
     const normalWinRate = (s.phaseWins / s.phaseTrades) * 100;
     if (normalWinRate < flipThreshold) {
       const phaseTradesAtToggle = s.phaseTrades;
@@ -572,18 +650,14 @@ class BotRunner extends EventEmitter {
       this._capFlipHistory(s);
       s.flipped = true;
       s.flipCount++;
-      s.phaseTrades = 0;
-      s.phaseWins = 0;
-      s.phasePnl = 0;
+      s.phaseTrades = 0; s.phaseWins = 0; s.phasePnl = 0;
       logger.info(`[BotRunner] ${instance.botId}/${instance.instanceId} FLIP ON — normal phase ${phaseTradesAtToggle} trades, WR ${normalWinRate.toFixed(1)}%`);
       this.emit('botFlip', { instanceId: instance.instanceId, botId: instance.botId, flipped: true, reason: 'normal_phase_low_winrate' });
     }
   }
 
   _capFlipHistory(s) {
-    if (s.flipHistory.length > FLIP_HISTORY_MAX) {
-      s.flipHistory = s.flipHistory.slice(-FLIP_HISTORY_MAX);
-    }
+    if (s.flipHistory.length > FLIP_HISTORY_MAX) s.flipHistory = s.flipHistory.slice(-FLIP_HISTORY_MAX);
   }
 
   async _runCycle(instance) {
@@ -593,13 +667,10 @@ class BotRunner extends EventEmitter {
 
     try {
       this._updateFlipState(instance);
-
       this._resolvePendingShadows(instance);
 
       try { await this._manageTrailingExits(instance); }
-      catch (trErr) {
-        logger.warn(`[BotRunner] ${instance.instanceId}: trailing check failed: ${trErr.message}`);
-      }
+      catch (trErr) { logger.warn(`[BotRunner] ${instance.instanceId}: trailing check failed: ${trErr.message}`); }
 
       this._cleanupExpiredLocks();
 
@@ -628,7 +699,6 @@ class BotRunner extends EventEmitter {
       const trailPct = Number(instance.config.trailingDrawdownPct) || 0;
 
       if (s.pnl > s.peakPnl) s.peakPnl = s.pnl;
-
       if (tp > 0 && s.pnl >= tp) {
         instance.lastReason = `Stopped: Take profit hit (+$${s.pnl.toFixed(2)} >= +$${tp})`;
         logger.info(`[BotRunner] ${instance.instanceId} — ${instance.lastReason}`);
@@ -644,8 +714,7 @@ class BotRunner extends EventEmitter {
       if (trailPct > 0 && s.peakPnl > 0) {
         const trailFloor = s.peakPnl * (1 - trailPct / 100);
         if (s.pnl <= trailFloor) {
-          instance.lastReason =
-            `Stopped: Trailing drawdown (${s.pnl.toFixed(2)} <= ${trailFloor.toFixed(2)}, peak +$${s.peakPnl.toFixed(2)})`;
+          instance.lastReason = `Stopped: Trailing drawdown (${s.pnl.toFixed(2)} <= ${trailFloor.toFixed(2)}, peak +$${s.peakPnl.toFixed(2)})`;
           logger.info(`[BotRunner] ${instance.instanceId} — ${instance.lastReason}`);
           this.stop(instance.instanceId);
           return;
@@ -686,7 +755,6 @@ class BotRunner extends EventEmitter {
         const state = await deepMarketState.compute(instance.symbol, timeframe, 200).catch(() => null);
         if (!state) { instance.lastReason = 'no deep state'; return; }
         ctx.state = state;
-
         const allowedRegimes = instance.config.allowedRegimes;
         if (Array.isArray(allowedRegimes) && allowedRegimes.length > 0) {
           const currentRegime = state.regime && state.regime.code;
@@ -695,16 +763,13 @@ class BotRunner extends EventEmitter {
             return;
           }
         }
-
         ctx.consensus = await ranker.rank(state, instance.symbol, { timeframe }).catch(() => null);
         ctx.prediction = await predictor.predict(instance.symbol, state, ctx.consensus, { timeframe }).catch(() => null);
         ctx.candles = await candleHistory.getHistory(instance.symbol, timeframe, 100).catch(() => []) || [];
-
       } else if (HIGH_PAYOUT_CLASSES.has(bot.contractClass)) {
         const state = await deepMarketState.compute(instance.symbol, timeframe, 200).catch(() => null);
         if (!state) { instance.lastReason = 'no deep state (candle history loading)'; return; }
         ctx.state = state;
-
         const allowedRegimes = instance.config.allowedRegimes;
         if (Array.isArray(allowedRegimes) && allowedRegimes.length > 0) {
           const currentRegime = state.regime && state.regime.code;
@@ -713,14 +778,11 @@ class BotRunner extends EventEmitter {
             return;
           }
         }
-
         ctx.consensus = await ranker.rank(state, instance.symbol, { timeframe }).catch(() => null);
         ctx.prediction = await predictor.predict(instance.symbol, state, ctx.consensus, { timeframe }).catch(() => null);
         ctx.candles = await candleHistory.getHistory(instance.symbol, timeframe, 100).catch(() => []) || [];
-
         const dv = digitAnalyzer.getView(instance.symbol);
         if (dv) ctx.digitView = dv;
-
       } else {
         const digitView = digitAnalyzer.getView(instance.symbol);
         if (!digitView) { instance.lastReason = 'no digit data'; return; }
@@ -740,7 +802,9 @@ class BotRunner extends EventEmitter {
       }
 
       if (result.action === 'ENTER') {
-        if (this._shadowEligible(instance) && instance.shadow.shadowRequired) {
+        const shadowCfg = this._shadowConfig(instance);
+
+        if (shadowCfg.gating) {
           if (instance.shadow.pending.length > 0) {
             instance.lastReason = 'Shadow pending (waiting for resolution)';
             return;
@@ -749,12 +813,16 @@ class BotRunner extends EventEmitter {
             this._recordShadowTrade(instance, result, ctx);
             return;
           }
-          logger.info(
-            `[BotRunner] ${instance.instanceId}: shadow gate MET ` +
-            `(${instance.shadow.consecutiveShadowWins}/${instance.shadow.currentGate}) → real fire`
-          );
+          logger.info(`[BotRunner] ${instance.instanceId}: shadow gate MET (${instance.shadow.consecutiveShadowWins}/${instance.shadow.currentGate}) → real fire`);
+          await this._execute(instance, result, ctx);
+
+        } else if (shadowCfg.tracking) {
+          this._recordShadowTrade(instance, result, ctx);
+          await this._execute(instance, result, ctx);
+
+        } else {
+          await this._execute(instance, result, ctx);
         }
-        await this._execute(instance, result, ctx);
       }
     } catch (err) {
       logger.error(`[BotRunner] ${instance.instanceId} cycle exception: ${err.message}`);
@@ -766,33 +834,22 @@ class BotRunner extends EventEmitter {
 
   _validateStake(instance, stake) {
     const requested = Number(stake);
-    if (!Number.isFinite(requested) || requested <= 0) {
-      return { ok: false, reason: `Invalid stake: ${stake}` };
-    }
+    if (!Number.isFinite(requested) || requested <= 0) return { ok: false, reason: `Invalid stake: ${stake}` };
     const rawMax = instance.config.maxStake;
     if (rawMax == null || rawMax === '') return { ok: true, stake: requested };
     const cap = Number(rawMax);
     if (cap === 0) {
-      logger.warn(
-        `[BotRunner] ${instance.instanceId}: maxStake=0 treated as "no cap" — verify this is intended`
-      );
+      logger.warn(`[BotRunner] ${instance.instanceId}: maxStake=0 treated as "no cap" — verify this is intended`);
       return { ok: true, stake: requested };
     }
-    if (!Number.isFinite(cap) || cap < 0) {
-      return { ok: false, reason: `Invalid maxStake config: ${rawMax}` };
-    }
-    if (requested > cap) {
-      return { ok: false, reason: `Stake ${requested} exceeds maxStake ${cap}` };
-    }
+    if (!Number.isFinite(cap) || cap < 0) return { ok: false, reason: `Invalid maxStake config: ${rawMax}` };
+    if (requested > cap) return { ok: false, reason: `Stake ${requested} exceeds maxStake ${cap}` };
     return { ok: true, stake: requested };
   }
 
   _validateRiskReward(instance, tradeParams, ctx, direction) {
     if (tradeParams.contractClass !== 'multiplier') return { ok: true };
-
-    const entryPrice =
-      (ctx && ctx.state && ctx.state.price && ctx.state.price.current) ||
-      Number(tradeParams.entryPrice) || null;
+    const entryPrice = (ctx && ctx.state && ctx.state.price && ctx.state.price.current) || Number(tradeParams.entryPrice) || null;
     const ko = Number(tradeParams.knockoutLevel);
     const tp = Number(tradeParams.takeProfitLevel);
     const dir = tradeParams.direction || direction || null;
@@ -801,15 +858,11 @@ class BotRunner extends EventEmitter {
       const isBuy = dir === 'BUY' || dir === 'MULTUP';
       if (Number.isFinite(ko)) {
         const wrongSide = isBuy ? ko >= entryPrice : ko <= entryPrice;
-        if (wrongSide) {
-          return { ok: false, reason: `KO ${ko} on wrong side of entry ${entryPrice} for ${dir}` };
-        }
+        if (wrongSide) return { ok: false, reason: `KO ${ko} on wrong side of entry ${entryPrice} for ${dir}` };
       }
       if (Number.isFinite(tp)) {
         const wrongSide = isBuy ? tp <= entryPrice : tp >= entryPrice;
-        if (wrongSide) {
-          return { ok: false, reason: `TP ${tp} on wrong side of entry ${entryPrice} for ${dir}` };
-        }
+        if (wrongSide) return { ok: false, reason: `TP ${tp} on wrong side of entry ${entryPrice} for ${dir}` };
       }
     }
 
@@ -817,18 +870,11 @@ class BotRunner extends EventEmitter {
     if (minRR <= 0) return { ok: true };
     if (!Number.isFinite(entryPrice) || entryPrice <= 0) return { ok: true };
     if (!Number.isFinite(ko) || !Number.isFinite(tp)) return { ok: true };
-
     const slDist = Math.abs(entryPrice - ko);
     const tpDist = Math.abs(tp - entryPrice);
-
-    if (slDist <= 0) {
-      return { ok: false, reason: 'SL distance is zero (invalid levels)' };
-    }
-
+    if (slDist <= 0) return { ok: false, reason: 'SL distance is zero (invalid levels)' };
     const rr = tpDist / slDist;
-    if (rr < minRR) {
-      return { ok: false, reason: `RR ${rr.toFixed(2)} < minRiskReward ${minRR}`, rr };
-    }
+    if (rr < minRR) return { ok: false, reason: `RR ${rr.toFixed(2)} < minRiskReward ${minRR}`, rr };
     return { ok: true, rr };
   }
 
@@ -851,51 +897,27 @@ class BotRunner extends EventEmitter {
       const st = ctx && ctx.state;
       const cons = ctx && ctx.consensus && ctx.consensus.consensus;
       return {
-        botId: instance.botId,
-        instanceId: instance.instanceId,
-        reasons: reasons || [],
-        edgeTest: isEdgeTest,
-        session,
-        flip: flipLabel,
-        phaseStats,
+        botId: instance.botId, instanceId: instance.instanceId,
+        reasons: reasons || [], edgeTest: isEdgeTest, session, flip: flipLabel, phaseStats,
         confidence: pred ? pred.calibratedConfidence : null,
         direction: pred ? pred.direction : null,
-        pattern: pred && pred.pattern ? {
-          bias: pred.pattern.bias,
-          confidence: pred.pattern.confidence,
-          patterns: pred.pattern.patterns,
-        } : null,
+        pattern: pred && pred.pattern ? { bias: pred.pattern.bias, confidence: pred.pattern.confidence, patterns: pred.pattern.patterns } : null,
         momentum: pred ? pred.momentum : null,
         volatility: pred ? pred.volatility : null,
         regime: st && st.regime ? st.regime.code : null,
         regimeConfidence: st && st.regime ? st.regime.confidence : null,
-        strategyConsensus: cons ? {
-          action: cons.action,
-          direction: cons.direction,
-          confidence: cons.confidence,
-          agreeing: cons.agreeing,
-        } : null,
+        strategyConsensus: cons ? { action: cons.action, direction: cons.direction, confidence: cons.confidence, agreeing: cons.agreeing } : null,
       };
     }
 
     const dv = ctx && ctx.digitView;
     return {
-      botId: instance.botId,
-      instanceId: instance.instanceId,
-      reasons: reasons || [],
-      edgeTest: isEdgeTest,
-      session,
-      flip: flipLabel,
-      phaseStats,
+      botId: instance.botId, instanceId: instance.instanceId,
+      reasons: reasons || [], edgeTest: isEdgeTest, session, flip: flipLabel, phaseStats,
       digitView: dv ? {
-        sampleSize: dv.sampleSize,
-        precision: dv.precision,
-        evenPct: dv.evenPct,
-        oddPct: dv.oddPct,
-        risePct: dv.risePct,
-        fallPct: dv.fallPct,
-        evenStreak: dv.evenStreak,
-        oddStreak: dv.oddStreak,
+        sampleSize: dv.sampleSize, precision: dv.precision,
+        evenPct: dv.evenPct, oddPct: dv.oddPct, risePct: dv.risePct, fallPct: dv.fallPct,
+        evenStreak: dv.evenStreak, oddStreak: dv.oddStreak,
       } : null,
     };
   }
@@ -904,27 +926,20 @@ class BotRunner extends EventEmitter {
     if (!err || !err.message) return false;
     const msg = String(err.message);
     return (
-      msg.includes('InvalidContractProposal') ||
-      msg.includes('timeout') ||
-      msg.includes('Timeout') ||
-      msg.includes('Auth closed') ||
-      msg.includes('Public closed') ||
-      msg.includes('Buy failed') ||
-      msg.includes('Request cancelled') ||
-      msg.includes('WebSocket')
+      msg.includes('InvalidContractProposal') || msg.includes('timeout') ||
+      msg.includes('Timeout') || msg.includes('Auth closed') ||
+      msg.includes('Public closed') || msg.includes('Buy failed') ||
+      msg.includes('Request cancelled') || msg.includes('WebSocket')
     );
   }
 
   async _reconcileOrphanPosition(instance, symbol, expectedSide, intendedStake) {
     this._metrics.reconcilePositionAttempts++;
-
     await new Promise(r => setTimeout(r, RECONCILE_POSITION_GRACE_MS));
-
     const broker = getBroker('deriv_cfd');
     const targetSymbol = normalizeSymbol(symbol);
     const submittedBefore = Date.now() - RECONCILE_POSITION_LOOKBACK_MS;
     const stakeNum = Math.abs(Number(intendedStake));
-
     if (broker._portfolioCache) broker._portfolioCache.at = 0;
 
     let positions;
@@ -946,15 +961,9 @@ class BotRunner extends EventEmitter {
 
     if (candidates.length === 0) return null;
     candidates.sort((a, b) => (b.openTime || 0) - (a.openTime || 0));
-
     this._metrics.reconcilePositionRecovered++;
     this._metrics.lastReconciledAt = new Date().toISOString();
-
-    logger.warn(
-      `[BotRunner] _reconcileOrphanPosition: RECOVERED contract ${candidates[0].id} ` +
-      `for ${instance.botId}/${instance.instanceId} — treating entry as success`
-    );
-
+    logger.warn(`[BotRunner] _reconcileOrphanPosition: RECOVERED contract ${candidates[0].id} for ${instance.botId}/${instance.instanceId} — treating entry as success`);
     return candidates[0];
   }
 
@@ -967,12 +976,8 @@ class BotRunner extends EventEmitter {
       originalGate: instance.shadow.originalGate,
       gateTightenCount: instance.shadow.gateTightenCount,
     } : {
-      shadowEnabled: false,
-      shadowSequence: [],
-      shadowStats: null,
-      gateAtEntry: null,
-      originalGate: null,
-      gateTightenCount: 0,
+      shadowEnabled: false, shadowSequence: [], shadowStats: null,
+      gateAtEntry: null, originalGate: null, gateTightenCount: 0,
     };
 
     const md = (result && result.metadata) || {};
@@ -988,9 +993,7 @@ class BotRunner extends EventEmitter {
         knockoutLevel: tradeParams.knockoutLevel != null ? Number(tradeParams.knockoutLevel) : null,
         reasons: reasons || [], openedAt: new Date(), status: 'OPEN',
         isEdgeTest: !!instance.config._edgeTest,
-        regimeCode: currentRegime,
-        session: currentSession,
-        entryThesis,
+        regimeCode: currentRegime, session: currentSession, entryThesis,
         ...shadowSnapshot,
         payoutPerPoint: md.payoutPerPoint != null ? Number(md.payoutPerPoint) : null,
         growthRate: md.growthRate != null ? Number(md.growthRate) : null,
@@ -999,10 +1002,7 @@ class BotRunner extends EventEmitter {
         touchDirection: md.touchDirection || null,
       });
     } catch (persistErr) {
-      logger.error(
-        `[BotRunner] BotRun persist failed for ${result.contractId} ` +
-        `(${instance.botId}/${instance.instanceId}): ${persistErr.message}`
-      );
+      logger.error(`[BotRunner] BotRun persist failed for ${result.contractId} (${instance.botId}/${instance.instanceId}): ${persistErr.message}`);
     }
   }
 
@@ -1010,11 +1010,10 @@ class BotRunner extends EventEmitter {
     const { tradeParams, direction, reasons } = signal;
     const lockSymbol = normalizeSymbol(tradeParams.symbol || instance.symbol);
 
-    const configStake = instance.config.stake;
-    const hasConfigStake =
-      configStake != null && configStake !== '' &&
-      Number.isFinite(Number(configStake)) && Number(configStake) > 0;
-    const effectiveStake = hasConfigStake ? Number(configStake) : tradeParams.stake;
+    // [FIX-COMPOUND-STAKE] Resolve stake via compound-aware helper.
+    // If compound is enabled → instance.compound.currentStake
+    // Else → config.stake or tradeParams.stake (unchanged behavior)
+    const effectiveStake = this._getEffectiveStake(instance, tradeParams);
 
     const stakeCheck = this._validateStake(instance, effectiveStake);
     if (!stakeCheck.ok) {
@@ -1054,24 +1053,7 @@ class BotRunner extends EventEmitter {
 
     try {
       const broker = getBroker('deriv_cfd');
-
-      // [FIX-STALE-CACHE] **Root cause fix for OpenPositionLimitExceeded.**
-      //
-      // The pre-check in _runCycle uses cached portfolio data (3s TTL).
-      // If bot-1 fired 1-2 seconds ago and its position is now live, but
-      // the cache was populated before bot-1's buy completed, the cache
-      // still shows empty. Bot-2 acquires the symbol lock (bot-1 shortened
-      // it to 5s after succeeding), reads the stale cache, sees no
-      // position, and proceeds to buy — which the broker rejects with
-      // OpenPositionLimitExceeded.
-      //
-      // Fix: after acquiring the lock, bust the portfolio cache to force
-      // a fresh fetch. If bot-1 has an inflight fetch, our call joins it
-      // and gets the same fresh result (via _portfolioInflight dedupe).
-      // If not, we trigger a new fetch. Either way, we see the up-to-date
-      // portfolio before committing to a buy.
       if (broker._portfolioCache) broker._portfolioCache.at = 0;
-
       const freshPositions = await broker.getOpenTrades().catch(() => []);
       if (freshPositions.some(p => normalizeSymbol(p.instrument) === lockSymbol)) {
         instance.lastReason = 'Execution blocked: position opened by concurrent bot';
@@ -1097,10 +1079,8 @@ class BotRunner extends EventEmitter {
         });
       } else if (HIGH_PAYOUT_CLASSES.has(tradeParams.contractClass)) {
         result = await contractService.placeContract({
-          ...tradeParams,
-          stake: stakeCheck.stake,
-          strategy: instance.botId,
-          regimeCode: instance.config.regimeCode || 'NEUTRAL',
+          ...tradeParams, stake: stakeCheck.stake,
+          strategy: instance.botId, regimeCode: instance.config.regimeCode || 'NEUTRAL',
           entryThesis,
         });
       } else {
@@ -1126,51 +1106,27 @@ class BotRunner extends EventEmitter {
     } catch (err) {
       const errMsg = String(err && err.message || '');
 
-      // [FIX-OPENPOS-BACKOFF] OpenPositionLimitExceeded means another bot
-      // (or a manual position) has an open contract on the same symbol.
-      // Bust the cache so the NEXT cycle's pre-check in _runCycle sees
-      // the conflict immediately, and use a longer backoff (60s) so we
-      // don't keep retrying and getting rejected.
       if (errMsg.includes('OpenPositionLimitExceeded')) {
         this._metrics.openPositionRejections++;
-        if (getBroker('deriv_cfd')._portfolioCache) {
-          getBroker('deriv_cfd')._portfolioCache.at = 0;
-        }
+        if (getBroker('deriv_cfd')._portfolioCache) getBroker('deriv_cfd')._portfolioCache.at = 0;
         instance._entryFailureBackoffUntil = Date.now() + OPEN_POSITION_BACKOFF_MS;
         instance.lastReason = `Symbol busy (OpenPositionLimitExceeded) — retry in ${OPEN_POSITION_BACKOFF_MS / 1000}s`;
-        logger.warn(
-          `[BotRunner] ${instance.instanceId}: OpenPositionLimitExceeded on ${lockSymbol} — ` +
-          `another position is open. Backoff ${OPEN_POSITION_BACKOFF_MS / 1000}s.`
-        );
-        this.emit('botError', {
-          instanceId: instance.instanceId, botId: instance.botId,
-          error: errMsg, reason: 'open_position_limit'
-        });
+        logger.warn(`[BotRunner] ${instance.instanceId}: OpenPositionLimitExceeded on ${lockSymbol} — another position is open. Backoff ${OPEN_POSITION_BACKOFF_MS / 1000}s.`);
+        this.emit('botError', { instanceId: instance.instanceId, botId: instance.botId, error: errMsg, reason: 'open_position_limit' });
         this._releaseSymbolLock(lockSymbol, instance.instanceId);
         return;
       }
 
       if (this._isAmbiguousError(err)) {
         this._metrics.lastOriginalError = errMsg;
-        logger.warn(
-          `[BotRunner] ${instance.botId}/${instance.instanceId} entry threw ` +
-          `"${errMsg}" — attempting recovery before declaring failure`
-        );
+        logger.warn(`[BotRunner] ${instance.botId}/${instance.instanceId} entry threw "${errMsg}" — attempting recovery before declaring failure`);
 
         let recovered = null;
-        try {
-          recovered = await this._reconcileOrphanPosition(
-            instance, lockSymbol, expectedSide, stakeCheck.stake
-          );
-        } catch (recErr) {
-          logger.warn(`[BotRunner] Recovery attempt failed: ${recErr.message}`);
-        }
+        try { recovered = await this._reconcileOrphanPosition(instance, lockSymbol, expectedSide, stakeCheck.stake); }
+        catch (recErr) { logger.warn(`[BotRunner] Recovery attempt failed: ${recErr.message}`); }
 
         if (recovered) {
-          logger.warn(
-            `[BotRunner] ${instance.botId}/${instance.instanceId}: RECOVERED ` +
-            `contract ${recovered.id} — treating as SUCCESS (no retry).`
-          );
+          logger.warn(`[BotRunner] ${instance.botId}/${instance.instanceId}: RECOVERED contract ${recovered.id} — treating as SUCCESS (no retry).`);
           instance.stats.entries++;
           instance._lastEntryTime = Date.now();
           instance.lastReason = 'TRADE PLACED (recovered)';
@@ -1181,11 +1137,7 @@ class BotRunner extends EventEmitter {
 
           await this._persistBotRun(
             instance,
-            {
-              contractId: recovered.id,
-              entryPrice: recovered.entryPrice,
-              purchasePrice: recovered.purchasePrice,
-            },
+            { contractId: recovered.id, entryPrice: recovered.entryPrice, purchasePrice: recovered.purchasePrice },
             tradeParams, direction, stakeCheck, reasons, entryThesis,
             currentRegime, currentSession
           );
@@ -1196,8 +1148,7 @@ class BotRunner extends EventEmitter {
             side: recovered.side || expectedSide || direction,
             entryPrice: recovered.entryPrice,
             stake: stakeCheck.stake, reasons, flipped: instance.stats.flipped,
-            reconciled: true,
-            originalError: errMsg,
+            reconciled: true, originalError: errMsg,
             timestamp: new Date().toISOString(),
           });
 
@@ -1205,10 +1156,7 @@ class BotRunner extends EventEmitter {
           return;
         }
 
-        logger.warn(
-          `[BotRunner] ${instance.botId}/${instance.instanceId}: recovery ` +
-          `found no matching contract — treating as genuine failure`
-        );
+        logger.warn(`[BotRunner] ${instance.botId}/${instance.instanceId}: recovery found no matching contract — treating as genuine failure`);
       }
 
       instance._entryFailureBackoffUntil = Date.now() + ENTRY_FAILURE_BACKOFF_MS;
@@ -1225,10 +1173,7 @@ class BotRunner extends EventEmitter {
       if (!contractId) return;
       const run = await BotRun.findOne({ contractId, status: 'OPEN' });
       if (!run) {
-        logger.warn(
-          `[BotRunner] _onTradeClosed: no OPEN BotRun for contract ${contractId} ` +
-          `(entry persist may have failed)`
-        );
+        logger.warn(`[BotRunner] _onTradeClosed: no OPEN BotRun for contract ${contractId} (entry persist may have failed)`);
         return;
       }
 
@@ -1246,13 +1191,8 @@ class BotRunner extends EventEmitter {
         instance.stats.pnl += realizedProfit;
         instance.stats.closedTrades++;
 
-        if (run.result === 'WIN') {
-          instance.stats.wins++;
-          instance.stats.consecutiveLosses = 0;
-        } else if (run.result === 'LOSS') {
-          instance.stats.losses++;
-          instance.stats.consecutiveLosses++;
-        }
+        if (run.result === 'WIN') { instance.stats.wins++; instance.stats.consecutiveLosses = 0; }
+        else if (run.result === 'LOSS') { instance.stats.losses++; instance.stats.consecutiveLosses++; }
 
         if (tradeWasFlipped) {
           instance.stats.flippedTrades++;
@@ -1270,6 +1210,12 @@ class BotRunner extends EventEmitter {
 
         if (instance._trailingPeaks) instance._trailingPeaks.delete(contractId);
 
+        // [FIX-COMPOUND-STAKE] Apply compound after WIN.
+        // Called AFTER stats are updated so the win counter is accurate.
+        // No-op for LOSS/BREAKEVEN or if compound not enabled.
+        this._applyCompoundAfterWin(instance, run);
+
+        // [FIX-SHADOW-MODES] Shadow gate adaptation (no-op in observational)
         this._adaptGateAfterReal(instance, run.result);
 
         this.emit('botResult', {
@@ -1278,6 +1224,14 @@ class BotRunner extends EventEmitter {
           flipped: instance.stats.flipped, tradeWasFlipped,
           phaseTrades: instance.stats.phaseTrades,
           phasePnl: Number(instance.stats.phasePnl.toFixed(2)),
+          // [FIX-COMPOUND-STAKE] Include compound state so downstream
+          // listeners (dashboard, notifications) can react
+          compound: instance.compound && instance.compound.enabled ? {
+            currentStake: Number(instance.compound.currentStake.toFixed(2)),
+            winsSinceReset: instance.compound.winsSinceReset,
+            growthCount: instance.compound.growthCount,
+            resetCount: instance.compound.resetCount,
+          } : null,
           timestamp: new Date().toISOString(),
         });
       }
@@ -1292,6 +1246,7 @@ class BotRunner extends EventEmitter {
 
     const shadowForSummary = instance.shadow && instance.shadow.enabled ? {
       enabled: true,
+      mode: instance.shadow.mode,
       currentGate: instance.shadow.currentGate,
       originalGate: instance.shadow.originalGate,
       shadowRequired: instance.shadow.shadowRequired,
@@ -1313,18 +1268,37 @@ class BotRunner extends EventEmitter {
         trackedContracts: tracked.length,
         activeTrailing: activePeaks.length,
         bestPeakProfit: tracked.length > 0
-          ? Number(Math.max(...tracked.map(t => t.peakProfit || 0)).toFixed(2))
-          : 0,
+          ? Number(Math.max(...tracked.map(t => t.peakProfit || 0)).toFixed(2)) : 0,
       };
     }
 
+    // [FIX-COMPOUND-STAKE] Expose compound state for the frontend.
+    // Null when compound is off so bots.js can skip rendering the block.
+    const compoundForSummary = instance.compound && instance.compound.enabled ? {
+      enabled: true,
+      baseStake: Number(instance.compound.baseStake.toFixed(2)),
+      currentStake: Number(instance.compound.currentStake.toFixed(2)),
+      maxStake: instance.compound.maxStake,
+      growthRatePct: instance.compound.growthRatePct,
+      startAfterWins: instance.compound.startAfterWins,
+      stopAfterWins: instance.compound.stopAfterWins,
+      resetAfterWins: instance.compound.resetAfterWins,
+      winsSinceReset: instance.compound.winsSinceReset,
+      growthCount: instance.compound.growthCount,
+      resetCount: instance.compound.resetCount,
+      lastGrowthAt: instance.compound.lastGrowthAt,
+      lastResetAt: instance.compound.lastResetAt,
+    } : null;
+
     return {
-      instanceId: instance.instanceId, botId: instance.botId, name: instance.name, assetClass: instance.assetClass,
-      contractClass: instance.contractClass, symbol: instance.symbol, status: instance.status, startedAt: instance.startedAt,
+      instanceId: instance.instanceId, botId: instance.botId, name: instance.name,
+      assetClass: instance.assetClass, contractClass: instance.contractClass,
+      symbol: instance.symbol, status: instance.status, startedAt: instance.startedAt,
       lastRunAt: instance.lastRunAt, lastReason: instance.lastReason, config: instance.config,
       stats: statsForSummary,
       shadow: shadowForSummary,
       trailing: trailingForSummary,
+      compound: compoundForSummary,
     };
   }
 }
