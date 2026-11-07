@@ -1,5 +1,5 @@
 // core/bots/registry.js
-// 17 bots. Multi-signal, adaptive, risk-enforced.
+// 21 bots. Multi-signal, adaptive, risk-enforced.
 //
 // [FIX-VOLHL] vol_high_low was emitting ONETOUCH/NOTOUCH without a barrier
 //   parameter, which Deriv rejects with `InvalidBarrierSingle`. The bot
@@ -15,40 +15,54 @@
 //
 // [FIX-SHADOW-CFG] shadowWinsRequired on the five synthetic binary bots.
 //
-// [FIX-HIGH-PAYOUT] Four new high-payout bots added:
-//   • touch_hunter       — Touch/No Touch (200–350% payout on far barriers)
+// [FIX-SHADOW-MODES] shadowObservational added to RISK_DEFAULTS.
+//   Three shadow modes per bot:
+//     wins=0, obs=false → OFF (fire immediate, no shadow)
+//     wins=0, obs=true  → OBSERVATIONAL (shadow + real in parallel)
+//     wins>0            → GATED (shadow gates real fires)
+//
+// [FIX-HIGH-PAYOUT] Four new high-payout bots:
+//   • touch_hunter       — Touch/No Touch (200-350% payout on far barriers)
 //   • vanilla_trend      — Vanilla Call/Put (uncapped, payout scales with move)
 //   • turbo_breakout     — Turbo Long/Short (payout_per_point × distance)
 //   • accumulator_scalper — Accumulator (exponential: 3%/tick compounds)
 //
-// [FIX-ACCU-TUNING] **Accumulator Scalper tuned after 0W/5L observation.**
-//   Original config (5%/tick, 0.15% max range) was too aggressive:
-//     • At 5% growth, R_100's implied ACCU range is ~0.1% wide
-//     • R_100 volatility ≈ 0.5–1.0 points/minute at ~523 price level
-//     • So the range was breached within 15–30s on almost every trade
-//     • Knockout happens before compounding can accumulate meaningful profit
-//     • Result: 0W/5L with every trade hitting knockout
-//   Fix:
-//     • growthRatePct 5 → 3 (range ~0.17% wide, survives ~90s)
-//     • maxRangePct 0.15 → 0.08 (only fire when truly compressed)
-//     • accumulatorTakeProfit null → 2 (auto-close at +$2 profit = 2× stake)
-//   At 3% growth × 30 ticks, max theoretical payout is 1.03^30 = 2.43× stake.
-//   TP of $2 locks in 200% before the contract can reverse into a knockout.
+// [FIX-ACCU-TUNING] Accumulator Scalper tuned after 0W/5L observation:
+//   • growthRatePct 5 → 3 (range ~0.17%, survives ~90s vs 15s)
+//   • maxRangePct 0.15 → 0.08 (only fire when truly compressed)
+//   • accumulatorTakeProfit null → 2 (auto-close at +$2 = 2× stake)
 //
-// [FIX-SESSION-STOPS] Session $ stops overridden to 0 (disabled) on the
-//   three truly high-variance bots — touch_hunter, vanilla_trend,
-//   turbo_breakout. Rationale: 20–30% win rate with 2–3.5× payoff means
-//   the session can rack up 5–8 consecutive losses ($5–$8 with default $1
-//   stake) before hitting the eventual win that pays 2–3.5× stake. A $10
-//   stop loss would end the session before that win arrives.
+// [FIX-SESSION-STOPS] Session $ stops disabled on touch/vanilla/turbo
+//   only. Accumulator keeps its safety net. Rationale: high-variance
+//   bots need room to run through losing streaks before the eventual win.
 //
-//   **Accumulator keeps session stops (TP+$20/SL-$10)** because its loss
-//   profile is different: capped at 100% of stake per trade, not a
-//   tail-risk knockout that eats 8× stake. With the ACCU tuning above
-//   (30–40% win rate, 2× payoff), the safety net helps more than hurts.
+// [FIX-COMPOUND-STAKE] **Compound stake system added to synthetic_binary
+//   bots only.** Six config fields appear in the bot start form for the
+//   9 synthetic_binary bots:
 //
-//   Users who want to disable stops on ACCU can set them to 0 in the form.
-//   Users who want to enable stops on the other three can set them manually.
+//     • compoundEnabled        (bool)   — master switch
+//     • compoundMaxStake       (num)    — hard ceiling on stake growth
+//     • compoundStartAfterWins (num)    — begin growing after N wins
+//     • compoundGrowthRatePct  (num)    — % growth per qualifying win
+//     • compoundStopAfterWins  (num)    — cap growth at N wins (0 = never)
+//     • compoundResetAfterWins (num)    — reset stake at N wins (0 = never)
+//
+//   Behavior:
+//     • Base stake = the `stake` field (unchanged)
+//     • On real WIN: winsSinceReset++
+//         - If reset threshold hit → stake resets to base, counter to 0
+//         - Else if growth gate met (wins > startAfter) AND not past stop:
+//             stake = min(stake × (1 + rate/100), maxStake)
+//     • On LOSS / BREAKEVEN: stake unchanged, counter unchanged
+//     • Bot restart: counter to 0, stake back to base (no persistence)
+//
+//   FX and digit bots NEVER see these fields — their stake stays fixed.
+//   Only the 9 synthetic_binary bots (5 classic + 4 high-payout) inherit
+//   COMPOUND_DEFAULTS via the post-merge pass below.
+//
+//   Cumulative wins, NOT consecutive. Losses don't reset the counter —
+//   only reaching compoundResetAfterWins does. This matches the literal
+//   "reset after N wins" semantics.
 
 'use strict';
 
@@ -292,10 +306,7 @@ function enterAccumulator(growthRate, config, reason) {
 // ════════════════════════════════════════════════════════════════
 const BOTS = {
 
-  // ============================================================
-  // FX MULTIPLIER BOTS (7) — UNCHANGED
-  // ============================================================
-
+  // ── FX Multiplier (7) — UNCHANGED ──
   trend_rider: {
     id: 'trend_rider', name: 'Trend Rider',
     description: 'FX Multiplier. Tight Stop, Wide Target. Requires strategy consensus.',
@@ -558,10 +569,7 @@ const BOTS = {
     },
   },
 
-  // ============================================================
-  // SYNTHETIC DIGIT BOTS (5) — UNCHANGED
-  // ============================================================
-
+  // ── Synthetic Digit (5) — UNCHANGED, NO COMPOUND FIELDS ──
   even_odd_trader: {
     id: 'even_odd_trader', name: 'Even/Odd Trader',
     description: 'Synthetic digit. EVEN/ODD on statistical extreme (|z| >= threshold). Flip NOT recommended (50/50).',
@@ -578,25 +586,15 @@ const BOTS = {
       if (dv.sampleSize < ctx.config.minSamples) return wait('Not enough samples');
       const zs = dv.zStats;
       if (!zs) return wait(`Not enough data for z-scores (${dv.sampleSize} ticks, need 30+)`);
-
       const zThreshold = Number(ctx.config.zThreshold) || 1.5;
       const { config, stats } = ctx;
-
       let normalDir = null, zUsed = 0;
       if (zs.evenZ >= zThreshold) { normalDir = 'DIGITEVEN'; zUsed = zs.evenZ; }
       else if (zs.evenZ <= -zThreshold) { normalDir = 'DIGITODD'; zUsed = -zs.evenZ; }
-
-      if (!normalDir) {
-        return wait(`evenZ=${zs.evenZ.toFixed(2)} (need |z| >= ${zThreshold}, N=${zs.windowSize})`);
-      }
-
+      if (!normalDir) return wait(`evenZ=${zs.evenZ.toFixed(2)} (need |z| >= ${zThreshold}, N=${zs.windowSize})`);
       const flip = shouldFlip(config, stats);
-      const finalDir = flip
-        ? (normalDir === 'DIGITEVEN' ? 'DIGITODD' : 'DIGITEVEN')
-        : normalDir;
-      const reason = flip
-        ? `${normalDir} FLIPPED → ${finalDir} (z=${zUsed.toFixed(2)})`
-        : `${normalDir.replace('DIGIT','')} z=${zUsed.toFixed(2)} N=${zs.windowSize}`;
+      const finalDir = flip ? (normalDir === 'DIGITEVEN' ? 'DIGITODD' : 'DIGITEVEN') : normalDir;
+      const reason = flip ? `${normalDir} FLIPPED → ${finalDir} (z=${zUsed.toFixed(2)})` : `${normalDir.replace('DIGIT','')} z=${zUsed.toFixed(2)} N=${zs.windowSize}`;
       return enterDigit(finalDir, config, reason);
     },
   },
@@ -617,33 +615,21 @@ const BOTS = {
       if (dv.sampleSize < ctx.config.minSamples) return wait('Not enough samples');
       const zs = dv.zStats;
       if (!zs) return wait(`Not enough data for z-scores (${dv.sampleSize} ticks, need 30+)`);
-
       const zThreshold = Number(ctx.config.zThreshold) || 1.5;
       const th = Number(ctx.config.threshold) || 8;
-
       const overZ = zs.overZ[th];
       const underZ = zs.underZ[1];
-
       let normalDir = null, barrier = null, zUsed = 0;
       if (overZ <= -zThreshold) { normalDir = 'DIGITOVER'; barrier = th; zUsed = overZ; }
       else if (underZ <= -zThreshold) { normalDir = 'DIGITUNDER'; barrier = 1; zUsed = underZ; }
-
-      if (!normalDir) {
-        return wait(
-          `overZ[${th}]=${overZ.toFixed(2)} underZ[1]=${underZ.toFixed(2)} ` +
-          `(need <= -${zThreshold}, N=${zs.windowSize})`
-        );
-      }
-
+      if (!normalDir) return wait(`overZ[${th}]=${overZ.toFixed(2)} underZ[1]=${underZ.toFixed(2)} (need <= -${zThreshold}, N=${zs.windowSize})`);
       const flip = shouldFlip(ctx.config, ctx.stats);
       let finalDir = normalDir;
       if (flip) {
         finalDir = normalDir === 'DIGITOVER' ? 'DIGITUNDER' : 'DIGITOVER';
         barrier = finalDir === 'DIGITOVER' ? th : 1;
       }
-      const reason = flip
-        ? `${normalDir} FLIPPED → ${finalDir} (z=${zUsed.toFixed(2)})`
-        : `${normalDir} barrier=${barrier} z=${zUsed.toFixed(2)} N=${zs.windowSize}`;
+      const reason = flip ? `${normalDir} FLIPPED → ${finalDir} (z=${zUsed.toFixed(2)})` : `${normalDir} barrier=${barrier} z=${zUsed.toFixed(2)} N=${zs.windowSize}`;
       return enterDigitBarrier(finalDir, barrier, ctx.config, reason);
     },
   },
@@ -664,20 +650,13 @@ const BOTS = {
       if (dv.sampleSize < ctx.config.minSamples) return wait('Not enough samples');
       const zs = dv.zStats;
       if (!zs) return wait(`Not enough data for z-scores (${dv.sampleSize} ticks, need 30+)`);
-
       const zThreshold = Number(ctx.config.zThreshold) || 1.5;
       const target = Number(ctx.config.targetDigit) || 5;
       const targetZ = zs.digitZ[target];
-
-      if (targetZ > -zThreshold) {
-        return wait(`digit ${target} z=${targetZ.toFixed(2)} (need <= -${zThreshold}, N=${zs.windowSize})`);
-      }
-
+      if (targetZ > -zThreshold) return wait(`digit ${target} z=${targetZ.toFixed(2)} (need <= -${zThreshold}, N=${zs.windowSize})`);
       const flip = shouldFlip(ctx.config, ctx.stats);
       const finalDir = flip ? 'DIGITDIFF' : 'DIGITMATCH';
-      const reason = flip
-        ? `digit ${target} cold z=${targetZ.toFixed(2)} FLIPPED → DIGITDIFF`
-        : `digit ${target} cold z=${targetZ.toFixed(2)} N=${zs.windowSize} → MATCH`;
+      const reason = flip ? `digit ${target} cold z=${targetZ.toFixed(2)} FLIPPED → DIGITDIFF` : `digit ${target} cold z=${targetZ.toFixed(2)} N=${zs.windowSize} → MATCH`;
       return enterDigitBarrier(finalDir, target, ctx.config, reason);
     },
   },
@@ -689,50 +668,35 @@ const BOTS = {
     baseRate: 0.50,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5,
-      minStreak: 8,
-      streakExtra: 0,
+      minStreak: 8, streakExtra: 0,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
       const dv = sanitizeDigitView(ctx.digitView);
       if (!dv) return wait('Corrupt or missing digit data');
-
       const zs = dv.zStats;
       const evenStreak = dv.evenStreak || 0;
       const oddStreak = dv.oddStreak || 0;
-
       let required = Number(ctx.config.minStreak) || 8;
       let expectedMax = null;
       if (zs && Number.isFinite(zs.expectedMaxStreak)) {
         expectedMax = zs.expectedMaxStreak;
         required = Math.ceil(expectedMax) + (Number(ctx.config.streakExtra) || 0);
       }
-
       let normalDir = null;
       if (evenStreak >= required) normalDir = 'DIGITODD';
       else if (oddStreak >= required) normalDir = 'DIGITEVEN';
-
-      if (!normalDir) {
-        return wait(
-          `Streak: even=${evenStreak} odd=${oddStreak} ` +
-          `(need ${required}${expectedMax != null ? `, expectedMax=${expectedMax.toFixed(1)}` : ''})`
-        );
-      }
-
+      if (!normalDir) return wait(`Streak: even=${evenStreak} odd=${oddStreak} (need ${required}${expectedMax != null ? `, expectedMax=${expectedMax.toFixed(1)}` : ''})`);
       const flip = shouldFlip(ctx.config, ctx.stats);
-      const finalDir = flip
-        ? (normalDir === 'DIGITEVEN' ? 'DIGITODD' : 'DIGITEVEN')
-        : normalDir;
-      const reason = flip
-        ? `${normalDir} fade FLIPPED → ${finalDir}`
-        : `${Math.max(evenStreak, oddStreak)}-streak — fade to ${finalDir.replace('DIGIT','')}`;
+      const finalDir = flip ? (normalDir === 'DIGITEVEN' ? 'DIGITODD' : 'DIGITEVEN') : normalDir;
+      const reason = flip ? `${normalDir} fade FLIPPED → ${finalDir}` : `${Math.max(evenStreak, oddStreak)}-streak — fade to ${finalDir.replace('DIGIT','')}`;
       return enterDigit(finalDir, ctx.config, reason);
     },
   },
 
   digit_hot_cold: {
     id: 'digit_hot_cold', name: 'Digit Hot/Cold',
-    description: 'Synthetic digit. OVER 8 / UNDER 1 on extreme z-score (more selective than Over/Under Trader). Flip changes barrier.',
+    description: 'Synthetic digit. OVER 8 / UNDER 1 on extreme z-score. Flip changes barrier.',
     assetClass: 'synthetic_digit', contractClass: 'digit',
     baseRate: 0.10,
     defaultConfig: {
@@ -746,39 +710,25 @@ const BOTS = {
       if (dv.sampleSize < ctx.config.minSamples) return wait('Not enough samples');
       const zs = dv.zStats;
       if (!zs) return wait(`Not enough data for z-scores (${dv.sampleSize} ticks, need 30+)`);
-
       const zThreshold = Number(ctx.config.zThreshold) || 2.0;
       const over8Z = zs.overZ[8];
       const under1Z = zs.underZ[1];
-
       let normalDir = null, barrier = null, zUsed = 0;
       if (over8Z <= -zThreshold) { normalDir = 'DIGITOVER'; barrier = 8; zUsed = over8Z; }
       else if (under1Z <= -zThreshold) { normalDir = 'DIGITUNDER'; barrier = 1; zUsed = under1Z; }
-
-      if (!normalDir) {
-        return wait(
-          `over8Z=${over8Z.toFixed(2)} under1Z=${under1Z.toFixed(2)} ` +
-          `(need <= -${zThreshold}, N=${zs.windowSize})`
-        );
-      }
-
+      if (!normalDir) return wait(`over8Z=${over8Z.toFixed(2)} under1Z=${under1Z.toFixed(2)} (need <= -${zThreshold}, N=${zs.windowSize})`);
       const flip = shouldFlip(ctx.config, ctx.stats);
       let finalDir = normalDir;
       if (flip) {
         finalDir = normalDir === 'DIGITOVER' ? 'DIGITUNDER' : 'DIGITOVER';
         barrier = finalDir === 'DIGITOVER' ? 8 : 1;
       }
-      const reason = flip
-        ? `${normalDir} FLIPPED → ${finalDir} (z=${zUsed.toFixed(2)})`
-        : `${normalDir} barrier=${barrier} z=${zUsed.toFixed(2)} N=${zs.windowSize}`;
+      const reason = flip ? `${normalDir} FLIPPED → ${finalDir} (z=${zUsed.toFixed(2)})` : `${normalDir} barrier=${barrier} z=${zUsed.toFixed(2)} N=${zs.windowSize}`;
       return enterDigitBarrier(finalDir, barrier, ctx.config, reason);
     },
   },
 
-  // ============================================================
-  // SYNTHETIC BINARY BOTS (3) — UNCHANGED
-  // ============================================================
-
+  // ── Synthetic Binary (5) — compound fields added post-merge ──
   rise_fall_momentum: {
     id: 'rise_fall_momentum', name: 'Rise/Fall Momentum',
     description: 'Synthetic CALL/PUT. Flip NOT recommended (50/50). Shadow-gated.',
@@ -801,12 +751,8 @@ const BOTS = {
       else if (fallPct >= config.minBias) normalDir = 'PUT';
       if (!normalDir) return wait(`Rise ${(risePct*100).toFixed(1)}% / Fall ${(fallPct*100).toFixed(1)}% (Need >=${config.minBias*100}%)`);
       const flip = shouldFlip(config, stats);
-      const finalDir = flip
-        ? (normalDir === 'CALL' ? 'PUT' : 'CALL')
-        : normalDir;
-      const reason = flip
-        ? `${normalDir} FLIPPED → ${finalDir}`
-        : `Bias ${((normalDir === 'CALL' ? risePct : fallPct) * 100).toFixed(1)}%`;
+      const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
+      const reason = flip ? `${normalDir} FLIPPED → ${finalDir}` : `Bias ${((normalDir === 'CALL' ? risePct : fallPct) * 100).toFixed(1)}%`;
       return enterBinary(finalDir, config, reason);
     },
   },
@@ -838,9 +784,7 @@ const BOTS = {
       const normalDir = lastDir === 'up' ? 'PUT' : 'CALL';
       const flip = shouldFlip(config, stats);
       const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
-      const reason = flip
-        ? `${streak}-tick ${lastDir}-streak FLIPPED → ${finalDir}`
-        : `${streak}-tick ${lastDir}-streak → fade to ${finalDir}`;
+      const reason = flip ? `${streak}-tick ${lastDir}-streak FLIPPED → ${finalDir}` : `${streak}-tick ${lastDir}-streak → fade to ${finalDir}`;
       return enterBinary(finalDir, config, reason);
     },
   },
@@ -863,22 +807,14 @@ const BOTS = {
       if (prices.length < 5) return wait('Not enough prices');
       const first = prices[0], last = prices[prices.length - 1];
       const movePct = ((last - first) / first) * 100;
-      if (Math.abs(movePct) < config.minMovePct) {
-        return wait(`Move ${movePct.toFixed(3)}% too small (Need ${config.minMovePct.toFixed(3)}%)`);
-      }
+      if (Math.abs(movePct) < config.minMovePct) return wait(`Move ${movePct.toFixed(3)}% too small (Need ${config.minMovePct.toFixed(3)}%)`);
       const normalDir = movePct > 0 ? 'CALL' : 'PUT';
       const flip = shouldFlip(config, stats);
       const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
-      const reason = flip
-        ? `Move ${movePct.toFixed(3)}% FLIPPED → ${finalDir}`
-        : `Move ${movePct.toFixed(3)}%`;
+      const reason = flip ? `Move ${movePct.toFixed(3)}% FLIPPED → ${finalDir}` : `Move ${movePct.toFixed(3)}%`;
       return enterBinary(finalDir, config, reason);
     },
   },
-
-  // ============================================================
-  // SYNTHETIC VOLATILITY BOTS (2) — UNCHANGED
-  // ============================================================
 
   vol_high_low: {
     id: 'vol_high_low', name: 'Volatility High/Low',
@@ -905,12 +841,8 @@ const BOTS = {
       else if (upBias < 0.45) normalDir = 'PUT';
       if (!normalDir) return wait(`Up bias ${(upBias * 100).toFixed(1)}% (Need >72% CALL or <45% PUT)`);
       const flip = shouldFlip(config, stats);
-      const finalDir = flip
-        ? (normalDir === 'CALL' ? 'PUT' : 'CALL')
-        : normalDir;
-      const reason = flip
-        ? `${normalDir} FLIPPED → ${finalDir}`
-        : `Direction bias ${(upBias * 100).toFixed(1)}% up → ${normalDir}`;
+      const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
+      const reason = flip ? `${normalDir} FLIPPED → ${finalDir}` : `Direction bias ${(upBias * 100).toFixed(1)}% up → ${normalDir}`;
       return enterBinary(finalDir, config, reason);
     },
   },
@@ -939,157 +871,89 @@ const BOTS = {
       if (!normalDir) return wait(`ups=${ups} downs=${downs}`);
       const flip = shouldFlip(config, stats);
       const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
-      const reason = flip
-        ? `5/5 ticks FLIPPED → ${finalDir}`
-        : `5/5 ticks ${normalDir === 'CALL' ? 'up' : 'down'}`;
+      const reason = flip ? `5/5 ticks FLIPPED → ${finalDir}` : `5/5 ticks ${normalDir === 'CALL' ? 'up' : 'down'}`;
       return enterBinary(finalDir, config, reason);
     },
   },
 
-  // ============================================================
-  // HIGH-PAYOUT BOTS (4)
-  // ============================================================
-
-  // ─────────────────────────────────────────────────────────────
-  // Bot 1 — Touch Hunter
-  // ─────────────────────────────────────────────────────────────
+  // ── High-Payout (4) — compound fields added post-merge ──
   touch_hunter: {
     id: 'touch_hunter', name: 'Touch Hunter',
     description: 'Touch/No Touch on far barriers after consolidation. High payout (200-350%) on far touches. Low win rate — designed for big wins.',
     assetClass: 'synthetic_binary', contractClass: 'touch',
     baseRate: 0.25,
     defaultConfig: {
-      symbol: 'R_100',
-      stake: 1,
-      barrierAtr: 2.0,
-      durationMinutes: 10,
-      touchDirection: 'TOUCH',
-      requireConsensus: true,
-      minSqueezeRatio: 0.8,
+      symbol: 'R_100', stake: 1, barrierAtr: 2.0, durationMinutes: 10,
+      touchDirection: 'TOUCH', requireConsensus: true, minSqueezeRatio: 0.8,
       shadowWinsRequired: 0,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
       const { state, consensus, config } = ctx;
       if (!state) return wait('No market state');
-
       const regime = state.regime && state.regime.code;
       const volRatio = state.volatility && state.volatility.ratio;
-      const isConsolidating =
-        regime === 'RANGING' ||
-        (Number.isFinite(volRatio) && volRatio < config.minSqueezeRatio);
-
-      if (!isConsolidating) {
-        return wait(
-          `Not consolidating: regime=${regime || '?'}, volRatio=${Number(volRatio).toFixed(2)} ` +
-          `(need RANGING or volRatio < ${config.minSqueezeRatio})`
-        );
-      }
-
+      const isConsolidating = regime === 'RANGING' || (Number.isFinite(volRatio) && volRatio < config.minSqueezeRatio);
+      if (!isConsolidating) return wait(`Not consolidating: regime=${regime || '?'}, volRatio=${Number(volRatio).toFixed(2)} (need RANGING or volRatio < ${config.minSqueezeRatio})`);
       const atr = state.volatility && state.volatility.atr;
       if (!atr || atr <= 0) return wait('No ATR available');
-
       let direction = null;
-      if (consensus && consensus.consensus && consensus.consensus.action === 'SIGNAL') {
-        direction = consensus.consensus.direction;
-      } else if (config.requireConsensus) {
-        return wait('No consensus direction — need BUY or SELL bias');
-      } else {
-        direction = (state.trend && state.trend.direction === 'bullish') ? 'BUY' : 'SELL';
-      }
-
+      if (consensus && consensus.consensus && consensus.consensus.action === 'SIGNAL') direction = consensus.consensus.direction;
+      else if (config.requireConsensus) return wait('No consensus direction — need BUY or SELL bias');
+      else direction = (state.trend && state.trend.direction === 'bullish') ? 'BUY' : 'SELL';
       const entry = state.price && state.price.current;
       if (!entry || entry <= 0) return wait('No entry price');
-
       const distance = atr * config.barrierAtr;
       const precision = getBarrierPrecision(config.symbol);
       const signedDistance = (direction === 'BUY' ? '+' : '-') + distance.toFixed(precision);
-
       const payout = config.touchDirection === 'TOUCH' ? '200-350%' : '~40-80%';
-      const reason =
-        `${config.touchDirection} ${direction} ${config.barrierAtr}ATR ` +
-        `(barrier=${signedDistance}, payout≈${payout})`;
-
+      const reason = `${config.touchDirection} ${direction} ${config.barrierAtr}ATR (barrier=${signedDistance}, payout≈${payout})`;
       return enterTouch(config.touchDirection, signedDistance, config, reason);
     },
   },
 
-  // ─────────────────────────────────────────────────────────────
-  // Bot 2 — Vanilla Trend Rider
-  // ─────────────────────────────────────────────────────────────
   vanilla_trend: {
     id: 'vanilla_trend', name: 'Vanilla Trend Rider',
-    description: 'Vanilla Call/Put in strong trends. Uncapped payout — payout grows with trend distance. Trailing exit locks in gains.',
+    description: 'Vanilla Call/Put in strong trends. Uncapped payout. Trailing exit locks in gains.',
     assetClass: 'synthetic_binary', contractClass: 'vanilla',
     baseRate: 0.35,
     defaultConfig: {
-      symbol: 'R_100',
-      stake: 1,
-      durationMinutes: 60,
-      requireStrongTrend: true,
-      minAtrRatio: 1.2,
-      minConsensusAgreeing: 2,
+      symbol: 'R_100', stake: 1, durationMinutes: 60,
+      requireStrongTrend: true, minAtrRatio: 1.2, minConsensusAgreeing: 2,
       barrier: '+0.00',
-      trailingEnabled: true,
-      trailingActivateAfterUSD: 5.0,
-      trailingRetracePct: 40,
+      trailingEnabled: true, trailingActivateAfterUSD: 5.0, trailingRetracePct: 40,
       shadowWinsRequired: 0,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
       const { state, consensus, config } = ctx;
       if (!state) return wait('No market state');
-
       const regime = state.regime && state.regime.code;
       const isStrongTrend = regime === 'STRONG_TREND_BULL' || regime === 'STRONG_TREND_BEAR';
-      if (config.requireStrongTrend && !isStrongTrend) {
-        return wait(`Not strong trend: regime=${regime || '?'}`);
-      }
-
+      if (config.requireStrongTrend && !isStrongTrend) return wait(`Not strong trend: regime=${regime || '?'}`);
       const volRatio = state.volatility && state.volatility.ratio;
-      if (Number.isFinite(volRatio) && volRatio < config.minAtrRatio) {
-        return wait(`ATR ratio ${volRatio.toFixed(2)} < ${config.minAtrRatio} (not expanding)`);
-      }
-
+      if (Number.isFinite(volRatio) && volRatio < config.minAtrRatio) return wait(`ATR ratio ${volRatio.toFixed(2)} < ${config.minAtrRatio} (not expanding)`);
       const c = consensus && consensus.consensus;
-      if (!c || c.action !== 'SIGNAL' || !c.direction) {
-        return wait('No consensus signal');
-      }
+      if (!c || c.action !== 'SIGNAL' || !c.direction) return wait('No consensus signal');
       const agreeing = (consensus && consensus.agreeing && consensus.agreeing.length) || 0;
-      if (agreeing < config.minConsensusAgreeing) {
-        return wait(`Only ${agreeing} strategies agree (need ${config.minConsensusAgreeing})`);
-      }
-
+      if (agreeing < config.minConsensusAgreeing) return wait(`Only ${agreeing} strategies agree (need ${config.minConsensusAgreeing})`);
       const direction = c.direction;
       const entry = state.price && state.price.current;
       if (!entry || entry <= 0) return wait('No entry price');
-
-      const reason =
-        `Vanilla ${direction} ATM strike=${config.barrier} ` +
-        `(regime=${regime}, ${agreeing} agree, ATR=${Number(state.volatility?.atr || 0).toFixed(4)})`;
-
+      const reason = `Vanilla ${direction} ATM strike=${config.barrier} (regime=${regime}, ${agreeing} agree, ATR=${Number(state.volatility?.atr || 0).toFixed(4)})`;
       return enterVanilla(direction, config.barrier, config, reason);
     },
   },
 
-  // ─────────────────────────────────────────────────────────────
-  // Bot 3 — Turbo Breakout
-  // ─────────────────────────────────────────────────────────────
   turbo_breakout: {
     id: 'turbo_breakout', name: 'Turbo Breakout',
-    description: 'Turbo Long/Short on confirmed breakouts. Uncapped payout (payout_per_point × distance). Trailing exit locks in gains.',
+    description: 'Turbo Long/Short on confirmed breakouts. Uncapped payout. Trailing exit locks in gains.',
     assetClass: 'synthetic_binary', contractClass: 'turbo',
     baseRate: 0.30,
     defaultConfig: {
-      symbol: 'R_100',
-      stake: 1,
-      durationMinutes: 15,
-      barrierAtrOffset: 0.5,
-      requireBreakoutPattern: true,
-      minAtrRatio: 1.3,
-      trailingEnabled: true,
-      trailingActivateAfterUSD: 2.0,
-      trailingRetracePct: 25,
+      symbol: 'R_100', stake: 1, durationMinutes: 15,
+      barrierAtrOffset: 0.5, requireBreakoutPattern: true, minAtrRatio: 1.3,
+      trailingEnabled: true, trailingActivateAfterUSD: 2.0, trailingRetracePct: 25,
       turboTakeProfit: null,
       shadowWinsRequired: 0,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
@@ -1097,127 +961,65 @@ const BOTS = {
     evaluate(ctx) {
       const { state, prediction, config } = ctx;
       if (!state || !prediction) return wait('No state/prediction');
-
       if (config.requireBreakoutPattern) {
         const patterns = (prediction.pattern && prediction.pattern.patterns) || [];
         const isUp = patterns.indexOf('breakout_up') >= 0;
         const isDown = patterns.indexOf('breakout_down') >= 0;
         if (!isUp && !isDown) return wait('No breakout pattern detected');
       }
-
       const volRatio = state.volatility && state.volatility.ratio;
-      if (Number.isFinite(volRatio) && volRatio < config.minAtrRatio) {
-        return wait(`ATR ratio ${volRatio.toFixed(2)} < ${config.minAtrRatio} (no expansion)`);
-      }
-
+      if (Number.isFinite(volRatio) && volRatio < config.minAtrRatio) return wait(`ATR ratio ${volRatio.toFixed(2)} < ${config.minAtrRatio} (no expansion)`);
       const atr = state.volatility && state.volatility.atr;
       if (!atr || atr <= 0) return wait('No ATR available');
-
       const entry = state.price && state.price.current;
       if (!entry || entry <= 0) return wait('No entry price');
-
       const direction = prediction.direction;
-      if (direction !== 'BUY' && direction !== 'SELL') {
-        return wait(`Prediction direction=${direction} (need BUY or SELL)`);
-      }
-
+      if (direction !== 'BUY' && direction !== 'SELL') return wait(`Prediction direction=${direction} (need BUY or SELL)`);
       const cushion = atr * config.barrierAtrOffset;
       const precision = getBarrierPrecision(config.symbol);
-      const signedBarrier =
-        (direction === 'BUY' ? '-' : '+') + cushion.toFixed(precision);
-
-      const reason =
-        `Turbo ${direction} barrier=${signedBarrier} ` +
-        `(ATR=${atr.toFixed(precision)}, breakout confirmed)`;
-
+      const signedBarrier = (direction === 'BUY' ? '-' : '+') + cushion.toFixed(precision);
+      const reason = `Turbo ${direction} barrier=${signedBarrier} (ATR=${atr.toFixed(precision)}, breakout confirmed)`;
       return enterTurbo(direction, signedBarrier, config, reason);
     },
   },
 
-  // ─────────────────────────────────────────────────────────────
-  // Bot 4 — Accumulator Scalper  [FIX-ACCU-TUNING]
-  // ─────────────────────────────────────────────────────────────
-  // **Tuned after 0W/5L on the initial 5%/0.15% config.**
-  //
-  // At 5% growth, R_100's implied ACCU range was ~0.1% wide. Given
-  // R_100's typical ~0.5-1.0 point/minute volatility at ~$523, that
-  // range was breached within 15-30s on nearly every trade — knockout
-  // before compounding could accumulate. Result: 0W/5L.
-  //
-  // Tuning:
-  //   • growthRatePct 5 → 3 (range ~0.17%, survives ~90s)
-  //   • maxRangePct 0.15 → 0.08 (only fire when truly compressed)
-  //   • accumulatorTakeProfit null → 2 (auto-close at +$2 = 2× stake)
-  //
-  // At 3% growth × 30 ticks, max theoretical payout is 1.03^30 = 2.43×
-  // stake. TP of $2 locks in 200% before the contract can reverse into
-  // a knockout. With TP=2 and expected 35-40% win rate post-fix:
-  //   EV = 0.375 × $2 - 0.625 × $1 = +$0.125 per trade → profitable.
   accumulator_scalper: {
     id: 'accumulator_scalper', name: 'Accumulator Scalper',
-    description: 'Accumulator on tight ranges. 3%/tick compounding, take-profit at 2× stake. One breakout knocks out the position.',
+    description: 'Accumulator on tight ranges. 3%/tick compounding, take-profit at 2x stake. One breakout knocks out the position.',
     assetClass: 'synthetic_binary', contractClass: 'accumulator',
     baseRate: 0.30,
     defaultConfig: {
-      symbol: 'R_100',
-      stake: 1,
-      // [FIX-ACCU-TUNING] 3%/tick (was 5%) — wider range, longer survival
-      growthRatePct: 3,
-      // Duration is moot when TP fires first; kept for audit / fallback
-      durationTicks: 30,
-      // [FIX-ACCU-TUNING] Auto-close at +$2 profit (2× stake) — was null
+      symbol: 'R_100', stake: 1,
+      growthRatePct: 3, durationTicks: 30,
       accumulatorTakeProfit: 2,
-      // [FIX-ACCU-TUNING] Only fire when range is TRULY tight — was 0.15%
-      maxRangePct: 0.08,
-      rangeLookbackTicks: 20,
+      maxRangePct: 0.08, rangeLookbackTicks: 20,
       shadowWinsRequired: 0,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
       const { state, digitView, config } = ctx;
       if (!state && !digitView) return wait('No market state');
-
-      const prices = digitView && Array.isArray(digitView.recentPrices)
-        ? digitView.recentPrices.slice(-config.rangeLookbackTicks)
-        : null;
-
-      if (!prices || prices.length < 10) {
-        return wait(`Not enough recent prices for range check (${prices ? prices.length : 0})`);
-      }
-
+      const prices = digitView && Array.isArray(digitView.recentPrices) ? digitView.recentPrices.slice(-config.rangeLookbackTicks) : null;
+      if (!prices || prices.length < 10) return wait(`Not enough recent prices for range check (${prices ? prices.length : 0})`);
       const highs = Math.max(...prices);
       const lows = Math.min(...prices);
       const mids = (highs + lows) / 2;
       if (!Number.isFinite(mids) || mids <= 0) return wait('Invalid price data');
-
       const rangePct = ((highs - lows) / mids) * 100;
-      if (rangePct > config.maxRangePct) {
-        return wait(
-          `Range ${rangePct.toFixed(3)}% > ${config.maxRangePct}% ` +
-          `(high=${highs.toFixed(2)}, low=${lows.toFixed(2)})`
-        );
-      }
-
+      if (rangePct > config.maxRangePct) return wait(`Range ${rangePct.toFixed(3)}% > ${config.maxRangePct}% (high=${highs.toFixed(2)}, low=${lows.toFixed(2)})`);
       const regime = state && state.regime && state.regime.code;
-      if (regime && regime !== 'RANGING' && regime !== 'WEAK_TREND') {
-        return wait(`Regime ${regime} (need RANGING or low-vol)`);
-      }
-
+      if (regime && regime !== 'RANGING' && regime !== 'WEAK_TREND') return wait(`Regime ${regime} (need RANGING or low-vol)`);
       const growthRate = (Number(config.growthRatePct) || 3) / 100;
       const ticks = Number(config.durationTicks) || 30;
       const maxMultiplier = Math.pow(1 + growthRate, ticks);
       const tp = config.accumulatorTakeProfit != null ? `$${config.accumulatorTakeProfit}` : 'none';
-      const reason =
-        `ACCU ${(growthRate * 100).toFixed(1)}%/tick × ${ticks}t TP=${tp} ` +
-        `(range=${rangePct.toFixed(3)}%, max ${maxMultiplier.toFixed(1)}× stake)`;
-
+      const reason = `ACCU ${(growthRate * 100).toFixed(1)}%/tick × ${ticks}t TP=${tp} (range=${rangePct.toFixed(3)}%, max ${maxMultiplier.toFixed(1)}× stake)`;
       return enterAccumulator(growthRate, config, reason);
     },
   },
-
 };
 
-// ── Session-level risk defaults ─────────────────────────────────
+// ── Session-level risk defaults (applied to ALL bots) ──
 const RISK_DEFAULTS = {
   botTakeProfit: 20,
   botStopLoss: 10,
@@ -1233,16 +1035,41 @@ const RISK_DEFAULTS = {
   flipMinTrades: 20,
   flipStableTrades: 20,
   shadowWinsRequired: 0,
+  // [FIX-SHADOW-MODES] When true AND shadowWinsRequired=0, shadow runs
+  // in parallel with real fires (observational mode). See runner.js
+  // _shadowModeForConfig for the 3-mode dispatch.
+  shadowObservational: false,
 };
 
 for (const id in BOTS) {
   BOTS[id].defaultConfig = Object.assign({}, RISK_DEFAULTS, BOTS[id].defaultConfig);
 }
 
-// ── [FIX-HIGH-PAYOUT] High-variance bot overrides (post-merge) ──
-// Truly high-variance strategies (touch/vanilla/turbo) need room to run
-// through losing streaks. A $10 stop loss would end the session before
-// the eventual 2-3.5× win arrives.
+// ── [FIX-COMPOUND-STAKE] Compound stake config — synthetic_binary ONLY ──
+// Injected post-merge so FX and digit bots never see these fields.
+// The bot form in bots.js renders every config field, so these 6 will
+// appear only on the 9 synthetic_binary bot forms.
+const COMPOUND_DEFAULTS = {
+  compoundEnabled: false,
+  compoundMaxStake: 10,
+  compoundStartAfterWins: 0,
+  compoundGrowthRatePct: 25,
+  compoundStopAfterWins: 0,
+  compoundResetAfterWins: 0,
+};
+
+for (const id in BOTS) {
+  if (BOTS[id].assetClass === 'synthetic_binary') {
+    // Merge COMPOUND_DEFAULTS as base, then bot's existing config on top.
+    // Since no synthetic bot defines compound* fields, all 6 get the
+    // COMPOUND_DEFAULTS values. If a specific bot later wants different
+    // defaults, they can add compound* fields to their own defaultConfig
+    // and those will override.
+    BOTS[id].defaultConfig = Object.assign({}, COMPOUND_DEFAULTS, BOTS[id].defaultConfig);
+  }
+}
+
+// ── High-variance overrides (applied post-RISK_DEFAULTS merge) ──
 BOTS.touch_hunter.defaultConfig.stopAfterLosses = 0;
 BOTS.touch_hunter.defaultConfig.botTakeProfit = 0;
 BOTS.touch_hunter.defaultConfig.botStopLoss = 0;
@@ -1255,11 +1082,6 @@ BOTS.turbo_breakout.defaultConfig.stopAfterLosses = 0;
 BOTS.turbo_breakout.defaultConfig.botTakeProfit = 0;
 BOTS.turbo_breakout.defaultConfig.botStopLoss = 0;
 
-// **Accumulator intentionally KEEPS its session stops (TP+$20/SL-$10).**
-// Its loss is capped at 100% of stake per trade (not a tail-risk knockout
-// that eats 8× stake), and the tuning above (3%/tick, TP=2) should get it
-// to a viable win rate without needing unlimited runway.
-// [FIX-ACCU-TUNING] Only stopAfterLosses is relaxed, not $ stops.
 BOTS.accumulator_scalper.defaultConfig.stopAfterLosses = 5;
 
 function getBot(id) { return BOTS[id] || null; }
@@ -1269,6 +1091,7 @@ function listEnabledBots() { return Object.values(BOTS); }
 module.exports = {
   BOTS,
   RISK_DEFAULTS,
+  COMPOUND_DEFAULTS,
   getBot,
   listBots,
   listEnabledBots,
