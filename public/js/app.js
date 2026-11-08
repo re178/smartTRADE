@@ -1,16 +1,26 @@
 // public/js/app.js – Dashboard logic
 // Renders all widgets. Live updates come from live.js.
 //
-// [FIX-STAKE-EDIT] `executeLiveSignal` now uses `prompt()` instead of
-//   `confirm()`, showing the opportunity's proposed stake (which defaults
-//   to $1 via STAKE_MODE=fixed in opportunityEngine.js) as an editable
-//   default. The edited value is what gets sent to /api/trade.
+// [FIX-STAKE-EDIT] `executeLiveSignal` uses `prompt()` with editable stake.
 //
-// [FIX-BROKER-ERR-FE] `showOrderOutcome` is async. On BROKER_ERROR (or
-//   HTTP 5xx), it refreshes positions first and checks whether the
-//   contract exists in the portfolio. If it does, shows an accurate
-//   "Contract is LIVE" alert (different from "purchase may have completed").
-//   Also handles `recovered: true` on CONFIRMED_RECORD_FAILED responses.
+// [FIX-BROKER-ERR-FE] `showOrderOutcome` is async and reconciles on BROKER_ERROR.
+//
+// [FIX-SWITCH-UI] **Account switch toggle sync.**
+//   Added `_deriveAccountType(acc)` — derives 'demo' | 'real' from the
+//   account object with a more reliable priority chain than the old
+//   badge logic:
+//     1. acc.accountType ('demo' | 'real' — from broker.getAccount())
+//     2. acc.tradeMode (0 = real, 1 = demo — from enhanceAccount)
+//     3. acc.server (contains 'virtual' or 'demo' = demo, else real)
+//   The old logic only checked `server.includes('demo')` which is
+//   incorrect — Deriv demo accounts have landing_company_name = 'virtual',
+//   so the badge was showing REAL for demo accounts.
+//
+//   Added `_syncAccountSwitch(accountType)` — updates the DEMO/REAL toggle
+//   active state. Called from:
+//     • updateAccountBadge()  → fires on WS 'account' pushes
+//     • refreshAllData()      → fires on HTTP refresh
+//   Keeps the toggle coherent with reality automatically.
 //
 // All rendering logic, widgets, and event wiring preserved.
 
@@ -85,6 +95,52 @@ function symbolToDisplay(sym) {
   const clean = formatSymbol(sym);
   if (clean.length === 6) return clean.slice(0, 3) + '/' + clean.slice(3);
   return clean;
+}
+
+// ================================================================
+// [FIX-SWITCH-UI] Account type derivation + toggle sync helpers
+// ================================================================
+
+/**
+ * Derive 'demo' | 'real' from an account object using the most reliable
+ * signal available. Priority:
+ *   1. acc.accountType  — direct from broker.getAccount()
+ *   2. acc.tradeMode    — 0 = real, 1 = demo (from enhanceAccount)
+ *   3. acc.server       — Deriv landing_company_name ('virtual' = demo)
+ * Returns null if nothing reliable is available.
+ */
+function _deriveAccountType(acc) {
+  if (!acc) return null;
+
+  const at = String(acc.accountType || '').toLowerCase();
+  if (at === 'demo') return 'demo';
+  if (at === 'real') return 'real';
+
+  if (acc.tradeMode === 1) return 'demo';
+  if (acc.tradeMode === 0) return 'real';
+
+  const srv = String(acc.server || '').toLowerCase();
+  if (srv) {
+    if (srv.includes('demo') || srv.includes('virtual')) return 'demo';
+    return 'real';
+  }
+
+  return null;
+}
+
+/**
+ * Update the DEMO/REAL toggle's active state to match the given type.
+ * Safe no-op if the toggle isn't in the DOM yet.
+ */
+function _syncAccountSwitch(accountType) {
+  if (!accountType) return;
+  const container = document.getElementById('accountSwitch');
+  if (!container) return;
+
+  const type = String(accountType).toLowerCase() === 'real' ? 'real' : 'demo';
+  container.querySelectorAll('button[data-account-type]').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.accountType === type);
+  });
 }
 
 // ================================================================
@@ -187,7 +243,6 @@ function renderPositionsWidget() {
     return;
   }
 
-  // RESPONSIVE FIX: wrapped in table-responsive so it scrolls on mobile
   let html = `<div class="table-responsive"><table class="table table-striped mb-0"><thead><tr>
     <th>ID</th><th>Pair</th><th>Side</th><th>Entry</th><th>Paid</th>
     <th>Current</th><th>Units</th><th>P/L</th>
@@ -202,7 +257,7 @@ function renderPositionsWidget() {
     const live = dashboardState.contractStates[cid];
     const otie = dashboardState.otieStates[cid];
     const status = live?.status || t.status || 'OPEN';
-    const canClose = status !== 'CLOSED'; // Always show close button unless explicitly CLOSED
+    const canClose = status !== 'CLOSED';
     const plClass = pl > 0 ? 'text-success' : pl < 0 ? 'text-danger' : 'text-muted';
 
     let otieCell = '<span class="text-muted small">—</span>';
@@ -556,11 +611,6 @@ function renderSignalCard(sym, consensus, prediction, opportunity) {
   </div>`;
 }
 
-// [FIX-STAKE-EDIT] Replace confirm() with prompt() so the user can edit
-// the stake per trade. The default comes from opportunity.stake, which is
-// $1 via STAKE_MODE=fixed in opportunityEngine.js. The edited value is
-// what gets sent to /api/trade — no more "calculated stake can't be
-// changed" problem.
 window.executeLiveSignal = async function (symbol) {
   const sym = formatSymbol(symbol);
   const opportunity = dashboardState.signalOpportunities[sym];
@@ -571,12 +621,8 @@ window.executeLiveSignal = async function (symbol) {
   const strategy = stratInfo.anchorStrategy || opportunity.prediction?.strategyConsensus?.anchorStrategy || consensus?.anchorStrategy || null;
   const regimeCode = opportunity.prediction?.regime || consensus?.regime || null;
 
-  // Default stake: prefer opportunity.stake (which is $1 from File 2),
-  // fall back to 1 if missing/invalid.
   const defaultStake = Number(opportunity.stake) > 0 ? Number(opportunity.stake) : 1;
 
-  // Compose the prompt message. `prompt()` gives us a single-line text
-  // input with this as the default — the user can edit it in place.
   const promptMsg =
     `Execute ${opportunity.direction} ${symbolToDisplay(sym)}?\n\n` +
     `Entry:  ${formatPrice(opportunity.entryPrice)}\n` +
@@ -589,7 +635,7 @@ window.executeLiveSignal = async function (symbol) {
     `\n\nStake (USD) — edit if needed:`;
 
   const stakeInput = prompt(promptMsg, String(defaultStake));
-  if (stakeInput === null) return;      // user cancelled
+  if (stakeInput === null) return;
   const stake = parseFloat(stakeInput);
   if (!Number.isFinite(stake) || stake <= 0) {
     alert('Invalid stake — no trade placed.');
@@ -599,7 +645,7 @@ window.executeLiveSignal = async function (symbol) {
   const body = {
     pair: symbol.replace(/_/g, '/'),
     side: opportunity.direction,
-    stake,                                // <-- EDITED stake goes to server
+    stake,
     multiplier: opportunity.multiplier,
     duration: opportunity.duration,
     knockoutLevel: opportunity.knockoutLevel,
@@ -747,6 +793,7 @@ function renderHistoryTable() {
 
 // ================================================================
 // Manual refresh
+// [FIX-SWITCH-UI] Also syncs the DEMO/REAL toggle from the fetched account
 // ================================================================
 async function refreshAllData() {
   try {
@@ -756,7 +803,12 @@ async function refreshAllData() {
       fetchJson('/api/trade-history').catch(() => []),
       fetchJson('/api/pending-orders').catch(() => []),
     ]);
-    if (account) dashboardState.account = account;
+    if (account) {
+      dashboardState.account = account;
+      // Keep toggle in sync with reality
+      const derived = _deriveAccountType(account);
+      if (derived) _syncAccountSwitch(derived);
+    }
     if (Array.isArray(positions)) dashboardState.positions = positions;
     if (Array.isArray(history)) dashboardState.history = history;
     if (Array.isArray(pending)) dashboardState.pendingOrders = pending;
@@ -806,10 +858,6 @@ async function cancelPending(orderId) {
 // ================================================================
 // Order outcome — reconcile-aware
 // ================================================================
-// [FIX-BROKER-ERR-FE] This is now async: on BROKER_ERROR (or HTTP 5xx) it
-// refreshes positions first, then checks whether the contract exists in
-// the portfolio. If it does, shows a "contract is LIVE" message (accurate).
-// If it doesn't, shows the "no contract found, safe to retry" message.
 async function showOrderOutcome(result) {
   const status = result.body?.status;
   const contractId = result.body?.contractId ? String(result.body.contractId) : null;
@@ -841,9 +889,6 @@ async function showOrderOutcome(result) {
 
   if (status === 'BROKER_ERROR' || result.httpStatus >= 500) {
     SoundManager.danger();
-    // Refresh positions so we can check whether the contract landed
-    // despite the error. Backend now reconciles too, but older
-    // deployments may still return raw BROKER_ERROR.
     await refreshAllData();
     const positions = dashboardState.positions || [];
     const suspectedLive = contractId
@@ -855,9 +900,6 @@ async function showOrderOutcome(result) {
       return;
     }
 
-    // No matching contract — genuinely ambiguous. Server-side reconcile
-    // already ran (per File 6); if it found nothing, there really is
-    // nothing. But give the user one more chance to check manually.
     alert(`❗ Broker error — purchase may NOT have completed.\n\n${result.body?.error || ''}\n\nNo matching contract was found in Open Positions.\nWait 10s, refresh, and check again before retrying.`);
     return;
   }
@@ -890,6 +932,16 @@ window.updateApiStatus = function (connected) {
   if (dot) dot.className = 'dot ' + (connected ? 'connected' : 'disconnected');
   if (text) text.textContent = connected ? 'Connected' : 'Disconnected';
 };
+
+/**
+ * [FIX-SWITCH-UI] Update the account badge AND keep the DEMO/REAL toggle
+ * in sync. Called on every WS 'account' push and after HTTP refresh.
+ *
+ * The badge derivation uses the more reliable `_deriveAccountType()` chain
+ * (accountType → tradeMode → server). The old code only checked
+ * `server.includes('demo')` which was incorrect for Deriv demo accounts
+ * (their landing_company_name is 'virtual', not 'demo').
+ */
 window.updateAccountBadge = function (acc) {
   if (!acc) return;
   const idEl = document.getElementById('accountId');
@@ -897,12 +949,14 @@ window.updateAccountBadge = function (acc) {
   const curEl = document.getElementById('accountCurrency');
   if (idEl) idEl.textContent = acc.id || acc.login || '—';
   if (curEl) curEl.textContent = acc.currency || 'USD';
-  if (typeEl) {
-    const srv = (acc.server || '').toLowerCase();
-    const type = srv.includes('demo') ? 'demo' : 'real';
-    typeEl.textContent = type.toUpperCase();
-    typeEl.className = 'account-type ' + type;
+
+  const derived = _deriveAccountType(acc);
+  if (typeEl && derived) {
+    typeEl.textContent = derived.toUpperCase();
+    typeEl.className = 'account-type ' + derived;
   }
+
+  if (derived) _syncAccountSwitch(derived);
 };
 
 // [NOTE] `executeSignalFromCard` is defined but currently unreachable —
@@ -921,7 +975,7 @@ window.executeSignalFromCard = function (btn) {
   if (!pair || !sideSel) { alert('Trade form not available.'); return; }
   pair.value = sym;
   sideSel.value = side === 'SELL' ? 'SELL' : 'BUY';
-  if (stakeIn && !stakeIn.value) stakeIn.value = '1';   // default to 1 USD
+  if (stakeIn && !stakeIn.value) stakeIn.value = '1';
   const tab = document.querySelector('.sidebar-nav .nav-item[data-section="trading"]');
   if (tab) tab.click();
 };
@@ -1025,4 +1079,4 @@ document.addEventListener('DOMContentLoaded', async function () {
   renderLiveSignalPanel();
 });
 
-console.log('✅ app.js loaded — Live Signal Engine + OTIE V6 trajectory panel active (with editable stake + reconcile-aware error handling).');
+console.log('✅ app.js loaded — Live Signal Engine + OTIE V6 + account switch toggle sync active.');
