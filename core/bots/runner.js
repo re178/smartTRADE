@@ -76,7 +76,6 @@ class BotRunner extends EventEmitter {
       trailingExits: 0,
       trailingSkipped: 0,
       openPositionRejections: 0,
-      // [FIX-COMPOUND-STAKE] Aggregate compound diagnostics
       compoundGrowths: 0,
       compoundResets: 0,
     };
@@ -104,8 +103,6 @@ class BotRunner extends EventEmitter {
       pending: [],
     } : null;
 
-    // [FIX-COMPOUND-STAKE] Build compound state for synthetic_binary bots
-    // with compoundEnabled=true. State is per-instance (no persistence).
     const compound = this._buildCompoundState(finalConfig, bot);
 
     const instance = {
@@ -139,7 +136,7 @@ class BotRunner extends EventEmitter {
     logger.info(
       `[BotRunner] Started ${bot.name} (${instanceId}) on ${symbol}` +
       (finalConfig._edgeTest ? ' [EDGE TEST]' : '') +
-      (mode !== 'off' ? ` [SHADOW ${mode.toUpperCase()}${mode === 'gated' ? ` gate=${shadow.currentGate}` : ''}]` : '') +
+      (mode !== 'off' ? ` [SHADOW ${mode.toUpperCase()}${mode === 'gated' ? ` gate=${shadow.currentGate} stake=$${finalConfig.shadowStake}` : ''}]` : '') +
       (TRAIL_ELIGIBLE_CLASSES.has(bot.contractClass) && finalConfig.trailingEnabled ? ' [TRAILING]' : '') +
       (compound ? ` [COMPOUND base=$${compound.baseStake} max=$${compound.maxStake} rate=${compound.growthRatePct}%]` : '')
     );
@@ -149,7 +146,6 @@ class BotRunner extends EventEmitter {
     return summary;
   }
 
-  // [FIX-COMPOUND-STAKE] Build compound state — null if not applicable.
   _buildCompoundState(config, bot) {
     if (!bot || bot.assetClass !== 'synthetic_binary') return null;
     if (!config.compoundEnabled) return null;
@@ -205,8 +201,6 @@ class BotRunner extends EventEmitter {
       if (lock.instanceId === instanceId) this._symbolLocks.delete(sym);
     }
     if (instance._trailingPeaks) instance._trailingPeaks.clear();
-    // [FIX-COMPOUND-STAKE] compound state is discarded with the instance
-    // (no persistence across restart, per spec)
     this._instances.delete(instanceId);
     logger.info(`[BotRunner] Stopped ${instance.name} (${instanceId})`);
     const summary = this._summarize(instance);
@@ -261,15 +255,9 @@ class BotRunner extends EventEmitter {
   }
 
   // ─────────────────────────────────────────────────────────────
-  //  [FIX-COMPOUND-STAKE] Stake resolution + post-win adaptation
+  //  Compound stake
   // ─────────────────────────────────────────────────────────────
 
-  /**
-   * Resolve the stake to use for the NEXT trade.
-   *
-   * If compound is enabled → return instance.compound.currentStake
-   * Else → config.stake if set, else tradeParams.stake (bot's own value)
-   */
   _getEffectiveStake(instance, tradeParams) {
     if (instance.compound && instance.compound.enabled) {
       return instance.compound.currentStake;
@@ -281,32 +269,17 @@ class BotRunner extends EventEmitter {
     return hasConfigStake ? Number(configStake) : (tradeParams ? tradeParams.stake : 1);
   }
 
-  /**
-   * [FIX-COMPOUND-STAKE] Apply compound rules after a real trade settles.
-   *
-   * Called from _onTradeClosed. Only acts on WIN results.
-   * On LOSS / BREAKEVEN / anything else → no change (counter and stake
-   * stay where they were).
-   *
-   * Cycle logic on WIN:
-   *   1. winsSinceReset += 1
-   *   2. If resetAfterWins > 0 && winsSinceReset >= resetAfterWins:
-   *        → reset stake to base, counter to 0, resetCount++
-   *        → return (reset takes priority over growth)
-   *   3. If winsSinceReset > startAfterWins:
-   *        a. If stopAfterWins > 0 && winsSinceReset > stopAfterWins:
-   *             → return (growth capped, no further change)
-   *        b. Grow: newStake = min(currentStake * (1 + rate/100), maxStake)
-   *             → if newStake > currentStake, adopt it, growthCount++
-   */
   _applyCompoundAfterWin(instance, run) {
     if (!instance.compound || !instance.compound.enabled) return;
     if (!run || run.result !== 'WIN') return;
+    // [FIX-SHADOW-PHASE] Compound only advances on REAL (non-shadow) wins.
+    // Shadow-phase trades are $0.35 validation fires and must not grow the
+    // compound ladder.
+    if (run.shadowPhase) return;
 
     const c = instance.compound;
     c.winsSinceReset += 1;
 
-    // Step 2 — reset check FIRST (highest priority)
     if (c.resetAfterWins > 0 && c.winsSinceReset >= c.resetAfterWins) {
       const oldStake = c.currentStake;
       c.currentStake = Math.min(c.baseStake, c.maxStake);
@@ -330,16 +303,9 @@ class BotRunner extends EventEmitter {
       return;
     }
 
-    // Step 3a — growth gate not yet met
     if (c.winsSinceReset <= c.startAfterWins) return;
+    if (c.stopAfterWins > 0 && c.winsSinceReset > c.stopAfterWins) return;
 
-    // Step 3b — stop gate
-    if (c.stopAfterWins > 0 && c.winsSinceReset > c.stopAfterWins) {
-      // At or past stop ceiling — stake stays at whatever it reached
-      return;
-    }
-
-    // Step 3b — grow
     const oldStake = c.currentStake;
     const factor = 1 + c.growthRatePct / 100;
     const grownRaw = oldStake * factor;
@@ -459,8 +425,18 @@ class BotRunner extends EventEmitter {
     }
   }
 
+  // ─────────────────────────────────────────────────────────────
+  //  Shadow — reconstruction path (dead code kept for safety)
+  //
+  //  These methods (pending queue + tick-based resolution) were used by
+  //  gated mode before [FIX-SHADOW-PHASE]. Now gated mode fires real
+  //  trades at shadowStake, so they're no longer called. Kept in place
+  //  because removing them risks unintended side effects if future code
+  //  references them. They are safe no-ops when never invoked.
+  // ─────────────────────────────────────────────────────────────
   _resolvePendingShadows(instance) {
-    if (!instance.shadow || instance.shadow.pending.length === 0) return;
+    if (!instance.shadow || instance.shadow.mode !== 'gated') return;
+    if (instance.shadow.pending.length === 0) return;
 
     const dv = digitAnalyzer.getView(instance.symbol);
     if (!dv) return;
@@ -480,59 +456,21 @@ class BotRunner extends EventEmitter {
         continue;
       }
 
-      if (feedStalled && !ticksReady) {
-        logger.warn(
-          `[BotRunner] ${instance.instanceId}: shadow force-resolved after ` +
-          `${SHADOW_STALL_TIMEOUT_MS}ms stall (${ticksElapsed}/${shadow.durationTicks} ticks) — ` +
-          `tick feed may be interrupted`
-        );
-      }
-
       const exitPrice = Number(dv.price);
       let outcome;
       if (shadow.prediction === 'CALL') outcome = exitPrice > shadow.entryPrice ? 'W' : 'L';
       else if (shadow.prediction === 'PUT') outcome = exitPrice < shadow.entryPrice ? 'W' : 'L';
-      else {
-        logger.warn(`[BotRunner] ${instance.instanceId}: shadow with unknown prediction "${shadow.prediction}" — treating as loss`);
-        outcome = 'L';
-      }
+      else outcome = 'L';
 
       instance.shadow.sequence.push(outcome);
       if (instance.shadow.sequence.length > SHADOW_SEQUENCE_MAX) instance.shadow.sequence.shift();
-
       instance.shadow.stats.total++;
-      if (outcome === 'W') {
-        instance.shadow.consecutiveShadowWins++;
-        instance.shadow.stats.wins++;
-        this._metrics.shadowWins++;
-      } else {
-        instance.shadow.consecutiveShadowWins = 0;
-        instance.shadow.stats.losses++;
-        this._metrics.shadowLosses++;
-      }
+      if (outcome === 'W') { instance.shadow.consecutiveShadowWins++; instance.shadow.stats.wins++; this._metrics.shadowWins++; }
+      else { instance.shadow.consecutiveShadowWins = 0; instance.shadow.stats.losses++; this._metrics.shadowLosses++; }
       instance.shadow.stats.winRate = instance.shadow.stats.total > 0
         ? Number((instance.shadow.stats.wins / instance.shadow.stats.total).toFixed(3))
         : 0;
-
       this._metrics.shadowResolved++;
-
-      logger.info(
-        `[BotRunner] ${instance.instanceId}: shadow ${shadow.prediction} RESOLVED ${outcome} ` +
-        `(entry=${shadow.entryPrice} exit=${exitPrice}, ticks=${ticksElapsed}/${shadow.durationTicks}) — ` +
-        `consecutive=${instance.shadow.consecutiveShadowWins}/${instance.shadow.currentGate || '-'}`
-      );
-
-      try {
-        this.emit('botShadowResolved', {
-          instanceId: instance.instanceId, botId: instance.botId,
-          outcome, prediction: shadow.prediction,
-          entryPrice: shadow.entryPrice, exitPrice, ticksElapsed,
-          durationTicks: shadow.durationTicks,
-          consecutiveShadowWins: instance.shadow.consecutiveShadowWins,
-          currentGate: instance.shadow.currentGate,
-          timestamp: new Date().toISOString(),
-        });
-      } catch (_) {}
     }
 
     instance.shadow.pending = remaining;
@@ -543,55 +481,72 @@ class BotRunner extends EventEmitter {
     const { tradeParams } = signal;
     const dv = ctx && ctx.digitView;
     if (!dv) return false;
-
     const prediction = tradeParams.contractType;
     if (prediction !== 'CALL' && prediction !== 'PUT') return false;
 
-    const entryPrice = Number(dv.price);
-    const entryTickNum = Number(dv.sampleSize);
-    const durationTicks = Number(tradeParams.duration) || 5;
-
     instance.shadow.pending.push({
-      prediction, entryPrice, entryTickNum, durationTicks,
+      prediction,
+      entryPrice: Number(dv.price),
+      entryTickNum: Number(dv.sampleSize),
+      durationTicks: Number(tradeParams.duration) || 5,
       startedAt: Date.now(),
     });
-
     this._metrics.shadowPlaced++;
-
-    logger.info(
-      `[BotRunner] ${instance.instanceId}: shadow ${prediction} placed ` +
-      `price=${entryPrice} tick#${entryTickNum} dur=${durationTicks} ` +
-      `(mode=${instance.shadow.mode}, gate=${instance.shadow.currentGate || '-'})`
-    );
-
-    try {
-      this.emit('botShadowPlaced', {
-        instanceId: instance.instanceId, botId: instance.botId,
-        prediction, entryPrice, entryTickNum, durationTicks,
-        consecutiveShadowWins: instance.shadow.consecutiveShadowWins,
-        currentGate: instance.shadow.currentGate,
-        mode: instance.shadow.mode,
-        timestamp: new Date().toISOString(),
-      });
-    } catch (_) {}
     return true;
   }
 
+  // [FIX-SHADOW-ACCURACY] Observational mode — mirror real result.
+  _applyObservationalShadow(instance, run) {
+    if (!instance.shadow || instance.shadow.mode !== 'observational') return;
+    if (!run || !run.result) return;
+    if (run.result !== 'WIN' && run.result !== 'LOSS') return;
+
+    const outcome = run.result === 'WIN' ? 'W' : 'L';
+
+    instance.shadow.sequence.push(outcome);
+    if (instance.shadow.sequence.length > SHADOW_SEQUENCE_MAX) instance.shadow.sequence.shift();
+    instance.shadow.stats.total++;
+    if (outcome === 'W') { instance.shadow.consecutiveShadowWins++; instance.shadow.stats.wins++; this._metrics.shadowWins++; }
+    else { instance.shadow.consecutiveShadowWins = 0; instance.shadow.stats.losses++; this._metrics.shadowLosses++; }
+    instance.shadow.stats.winRate = instance.shadow.stats.total > 0
+      ? Number((instance.shadow.stats.wins / instance.shadow.stats.total).toFixed(3))
+      : 0;
+    this._metrics.shadowResolved++;
+
+    logger.info(
+      `[BotRunner] ${instance.instanceId}: SHADOW (observational) ${run.contractId} RESOLVED ${outcome} — ` +
+      `${instance.shadow.stats.wins}W/${instance.shadow.stats.losses}L (${(instance.shadow.stats.winRate * 100).toFixed(0)}%)`
+    );
+
+    try {
+      this.emit('botShadowResolved', {
+        instanceId: instance.instanceId, botId: instance.botId,
+        contractId: run.contractId, outcome,
+        source: 'observational_real',
+        shadowStats: { ...instance.shadow.stats },
+        timestamp: new Date().toISOString(),
+      });
+    } catch (_) {}
+  }
+
+  // [FIX-SHADOW-PHASE] Real-trade gate adaptation.
+  // Only called from _onTradeClosed when run.shadowPhase === false.
+  // (Shadow-phase WIN/LOSS is handled inline in _onTradeClosed.)
   _adaptGateAfterReal(instance, result) {
     if (!instance.shadow || !instance.shadow.enabled) return;
     if (instance.shadow.mode !== 'gated') return;
 
-    instance.shadow.consecutiveShadowWins = 0;
-
     if (result === 'WIN') {
+      instance.shadow.consecutiveShadowWins = 0;
       instance.shadow.shadowRequired = false;
-      logger.info(`[BotRunner] ${instance.instanceId}: real WIN → continue trading (gate stays at ${instance.shadow.currentGate})`);
+      logger.info(`[BotRunner] ${instance.instanceId}: REAL WIN → continue trading real (gate stays at ${instance.shadow.currentGate})`);
     } else if (result === 'LOSS') {
+      instance.shadow.consecutiveShadowWins = 0;
       instance.shadow.shadowRequired = true;
       const oldGate = instance.shadow.currentGate;
       instance.shadow.currentGate = Math.min(10, oldGate + 1);
       instance.shadow.gateTightenCount++;
-      logger.info(`[BotRunner] ${instance.instanceId}: real LOSS → gate tightened ${oldGate} → ${instance.shadow.currentGate} (total tightens=${instance.shadow.gateTightenCount})`);
+      logger.info(`[BotRunner] ${instance.instanceId}: REAL LOSS → back to shadow phase, gate ${oldGate} → ${instance.shadow.currentGate}`);
     }
   }
 
@@ -667,7 +622,7 @@ class BotRunner extends EventEmitter {
 
     try {
       this._updateFlipState(instance);
-      this._resolvePendingShadows(instance);
+      this._resolvePendingShadows(instance);   // no-op in real-shadow mode
 
       try { await this._manageTrailingExits(instance); }
       catch (trErr) { logger.warn(`[BotRunner] ${instance.instanceId}: trailing check failed: ${trErr.message}`); }
@@ -804,25 +759,38 @@ class BotRunner extends EventEmitter {
       if (result.action === 'ENTER') {
         const shadowCfg = this._shadowConfig(instance);
 
+        // [FIX-SHADOW-PHASE] Gated mode dispatch — fires REAL shadow-phase
+        // trades at shadowStake for validation. 100% accurate outcomes.
         if (shadowCfg.gating) {
-          if (instance.shadow.pending.length > 0) {
-            instance.lastReason = 'Shadow pending (waiting for resolution)';
+          const gateMet = instance.shadow.consecutiveShadowWins >= instance.shadow.currentGate;
+
+          if (instance.shadow.shadowRequired && !gateMet) {
+            // Shadow phase: fire validation trade at shadowStake
+            instance.lastReason = `Shadow phase ${instance.shadow.consecutiveShadowWins}/${instance.shadow.currentGate} → firing $${instance.config.shadowStake}`;
+            logger.info(
+              `[BotRunner] ${instance.instanceId}: SHADOW-PHASE fire ` +
+              `(${instance.shadow.consecutiveShadowWins}/${instance.shadow.currentGate} wins, ` +
+              `stake=$${instance.config.shadowStake})`
+            );
+            await this._execute(instance, result, ctx, 'shadow');
             return;
           }
-          if (instance.shadow.consecutiveShadowWins < instance.shadow.currentGate) {
-            this._recordShadowTrade(instance, result, ctx);
-            return;
+
+          if (gateMet && instance.shadow.shadowRequired) {
+            logger.info(
+              `[BotRunner] ${instance.instanceId}: SHADOW GATE MET ` +
+              `(${instance.shadow.consecutiveShadowWins}/${instance.shadow.currentGate}) → REAL fire`
+            );
+            instance.lastReason = `Shadow gate met (${instance.shadow.consecutiveShadowWins}/${instance.shadow.currentGate}) → REAL trade`;
           }
-          logger.info(`[BotRunner] ${instance.instanceId}: shadow gate MET (${instance.shadow.consecutiveShadowWins}/${instance.shadow.currentGate}) → real fire`);
-          await this._execute(instance, result, ctx);
-
-        } else if (shadowCfg.tracking) {
-          this._recordShadowTrade(instance, result, ctx);
-          await this._execute(instance, result, ctx);
-
-        } else {
-          await this._execute(instance, result, ctx);
+          // gateMet=true, shadowRequired=true → fire real
+          // OR shadowRequired=false (post-win) → fire real
+          await this._execute(instance, result, ctx, 'real');
+          return;
         }
+
+        // Non-gated modes (observational / off) → always fire real
+        await this._execute(instance, result, ctx, 'real');
       }
     } catch (err) {
       logger.error(`[BotRunner] ${instance.instanceId} cycle exception: ${err.message}`);
@@ -967,7 +935,7 @@ class BotRunner extends EventEmitter {
     return candidates[0];
   }
 
-  async _persistBotRun(instance, result, tradeParams, direction, stakeCheck, reasons, entryThesis, currentRegime, currentSession) {
+  async _persistBotRun(instance, result, tradeParams, direction, stakeCheck, reasons, entryThesis, currentRegime, currentSession, shadowPhase = false) {
     const shadowSnapshot = instance.shadow && instance.shadow.enabled ? {
       shadowEnabled: true,
       shadowSequence: instance.shadow.sequence.slice(-SHADOW_SEQUENCE_MAX),
@@ -995,6 +963,7 @@ class BotRunner extends EventEmitter {
         isEdgeTest: !!instance.config._edgeTest,
         regimeCode: currentRegime, session: currentSession, entryThesis,
         ...shadowSnapshot,
+        shadowPhase: !!shadowPhase,
         payoutPerPoint: md.payoutPerPoint != null ? Number(md.payoutPerPoint) : null,
         growthRate: md.growthRate != null ? Number(md.growthRate) : null,
         strikePrice: md.strikePrice != null ? Number(md.strikePrice) : null,
@@ -1006,14 +975,17 @@ class BotRunner extends EventEmitter {
     }
   }
 
-  async _execute(instance, signal, ctx) {
+  // [FIX-SHADOW-PHASE] `phase` determines the stake and the BotRun tag:
+  //   'shadow' → use config.shadowStake, tag shadowPhase:true
+  //   'real'   → use compound/effective stake, tag shadowPhase:false
+  async _execute(instance, signal, ctx, phase = 'real') {
+    const isShadowPhase = phase === 'shadow';
     const { tradeParams, direction, reasons } = signal;
     const lockSymbol = normalizeSymbol(tradeParams.symbol || instance.symbol);
 
-    // [FIX-COMPOUND-STAKE] Resolve stake via compound-aware helper.
-    // If compound is enabled → instance.compound.currentStake
-    // Else → config.stake or tradeParams.stake (unchanged behavior)
-    const effectiveStake = this._getEffectiveStake(instance, tradeParams);
+    const effectiveStake = isShadowPhase
+      ? Math.max(0.01, Number(instance.config.shadowStake) || 0.35)
+      : this._getEffectiveStake(instance, tradeParams);
 
     const stakeCheck = this._validateStake(instance, effectiveStake);
     if (!stakeCheck.ok) {
@@ -1039,7 +1011,6 @@ class BotRunner extends EventEmitter {
     }
 
     const entryThesis = this._buildEntryThesis(instance, reasons, ctx);
-    const isEdgeTest = !!instance.config._edgeTest;
     const currentSession = detectSession();
     const currentRegime = ctx && ctx.state && ctx.state.regime ? ctx.state.regime.code : null;
 
@@ -1089,16 +1060,23 @@ class BotRunner extends EventEmitter {
 
       instance.stats.entries++;
       instance._lastEntryTime = Date.now();
-      instance.lastReason = 'TRADE PLACED';
+      instance.lastReason = isShadowPhase
+        ? `SHADOW-PHASE TRADE PLACED ($${stakeCheck.stake})`
+        : 'TRADE PLACED (REAL)';
       instance._entryFailureBackoffUntil = 0;
+      if (isShadowPhase) this._metrics.shadowPlaced++;
 
-      await this._persistBotRun(instance, result, tradeParams, direction, stakeCheck, reasons, entryThesis, currentRegime, currentSession);
+      await this._persistBotRun(
+        instance, result, tradeParams, direction, stakeCheck, reasons, entryThesis,
+        currentRegime, currentSession, isShadowPhase
+      );
 
       this.emit('botEntry', {
         instanceId: instance.instanceId, botId: instance.botId,
         contractId: String(result.contractId), symbol: instance.config.symbol,
         side: tradeParams.contractType || direction, entryPrice: result.entryPrice,
         stake: stakeCheck.stake, reasons, flipped: instance.stats.flipped,
+        shadowPhase: isShadowPhase,
         timestamp: new Date().toISOString(),
       });
 
@@ -1112,25 +1090,26 @@ class BotRunner extends EventEmitter {
         instance._entryFailureBackoffUntil = Date.now() + OPEN_POSITION_BACKOFF_MS;
         instance.lastReason = `Symbol busy (OpenPositionLimitExceeded) — retry in ${OPEN_POSITION_BACKOFF_MS / 1000}s`;
         logger.warn(`[BotRunner] ${instance.instanceId}: OpenPositionLimitExceeded on ${lockSymbol} — another position is open. Backoff ${OPEN_POSITION_BACKOFF_MS / 1000}s.`);
-        this.emit('botError', { instanceId: instance.instanceId, botId: instance.botId, error: errMsg, reason: 'open_position_limit' });
+        this.emit('botError', { instanceId: instance.instanceId, botId: instance.botId, error: errMsg, reason: 'open_position_limit', shadowPhase: isShadowPhase });
         this._releaseSymbolLock(lockSymbol, instance.instanceId);
         return;
       }
 
       if (this._isAmbiguousError(err)) {
         this._metrics.lastOriginalError = errMsg;
-        logger.warn(`[BotRunner] ${instance.botId}/${instance.instanceId} entry threw "${errMsg}" — attempting recovery before declaring failure`);
+        logger.warn(`[BotRunner] ${instance.botId}/${instance.instanceId} ${isShadowPhase ? 'SHADOW-PHASE' : 'REAL'} entry threw "${errMsg}" — attempting recovery`);
 
         let recovered = null;
         try { recovered = await this._reconcileOrphanPosition(instance, lockSymbol, expectedSide, stakeCheck.stake); }
         catch (recErr) { logger.warn(`[BotRunner] Recovery attempt failed: ${recErr.message}`); }
 
         if (recovered) {
-          logger.warn(`[BotRunner] ${instance.botId}/${instance.instanceId}: RECOVERED contract ${recovered.id} — treating as SUCCESS (no retry).`);
+          logger.warn(`[BotRunner] ${instance.botId}/${instance.instanceId}: RECOVERED contract ${recovered.id} — treating as SUCCESS.`);
           instance.stats.entries++;
           instance._lastEntryTime = Date.now();
-          instance.lastReason = 'TRADE PLACED (recovered)';
+          instance.lastReason = isShadowPhase ? 'SHADOW-PHASE TRADE PLACED (recovered)' : 'TRADE PLACED (recovered)';
           instance._entryFailureBackoffUntil = 0;
+          if (isShadowPhase) this._metrics.shadowPlaced++;
 
           const broker = getBroker('deriv_cfd');
           broker._subscribeOpenContract(recovered.id).catch(() => {});
@@ -1139,7 +1118,7 @@ class BotRunner extends EventEmitter {
             instance,
             { contractId: recovered.id, entryPrice: recovered.entryPrice, purchasePrice: recovered.purchasePrice },
             tradeParams, direction, stakeCheck, reasons, entryThesis,
-            currentRegime, currentSession
+            currentRegime, currentSession, isShadowPhase
           );
 
           this.emit('botEntry', {
@@ -1149,6 +1128,7 @@ class BotRunner extends EventEmitter {
             entryPrice: recovered.entryPrice,
             stake: stakeCheck.stake, reasons, flipped: instance.stats.flipped,
             reconciled: true, originalError: errMsg,
+            shadowPhase: isShadowPhase,
             timestamp: new Date().toISOString(),
           });
 
@@ -1156,13 +1136,13 @@ class BotRunner extends EventEmitter {
           return;
         }
 
-        logger.warn(`[BotRunner] ${instance.botId}/${instance.instanceId}: recovery found no matching contract — treating as genuine failure`);
+        logger.warn(`[BotRunner] ${instance.botId}/${instance.instanceId}: recovery found no matching contract — genuine failure`);
       }
 
       instance._entryFailureBackoffUntil = Date.now() + ENTRY_FAILURE_BACKOFF_MS;
-      logger.error(`[BotRunner] ${instance.botId}/${instance.instanceId} entry failed: ${errMsg}`);
+      logger.error(`[BotRunner] ${instance.botId}/${instance.instanceId} ${isShadowPhase ? 'shadow-phase' : 'real'} entry failed: ${errMsg}`);
       instance.lastReason = `Execution failed: ${errMsg}`;
-      this.emit('botError', { instanceId: instance.instanceId, botId: instance.botId, error: errMsg });
+      this.emit('botError', { instanceId: instance.instanceId, botId: instance.botId, error: errMsg, shadowPhase: isShadowPhase });
       this._releaseSymbolLock(lockSymbol, instance.instanceId);
     }
   }
@@ -1177,6 +1157,8 @@ class BotRunner extends EventEmitter {
         return;
       }
 
+      const isShadowPhase = !!run.shadowPhase;
+
       const realizedProfit = Number(data.realizedProfit || 0);
       run.pnl = realizedProfit; run.realizedProfit = realizedProfit;
       run.result = realizedProfit > 0 ? 'WIN' : realizedProfit < 0 ? 'LOSS' : 'BREAKEVEN';
@@ -1188,11 +1170,22 @@ class BotRunner extends EventEmitter {
       if (instance) {
         const tradeWasFlipped = run.entryThesis && run.entryThesis.flip === 'FLIPPED';
 
+        // PnL and general counters — count ALL trades (real money spent)
         instance.stats.pnl += realizedProfit;
         instance.stats.closedTrades++;
 
-        if (run.result === 'WIN') { instance.stats.wins++; instance.stats.consecutiveLosses = 0; }
-        else if (run.result === 'LOSS') { instance.stats.losses++; instance.stats.consecutiveLosses++; }
+        if (run.result === 'WIN') {
+          instance.stats.wins++;
+          // [FIX-SHADOW-PHASE] Only real wins reset consecutive losses.
+          // Shadow-phase wins don't count toward circuit breaker reset.
+          if (!isShadowPhase) instance.stats.consecutiveLosses = 0;
+        } else if (run.result === 'LOSS') {
+          instance.stats.losses++;
+          // [FIX-SHADOW-PHASE] Only real losses increment consecutive losses.
+          // Shadow-phase losses are part of the validation process and
+          // shouldn't trigger the stopAfterLosses circuit breaker.
+          if (!isShadowPhase) instance.stats.consecutiveLosses++;
+        }
 
         if (tradeWasFlipped) {
           instance.stats.flippedTrades++;
@@ -1210,13 +1203,59 @@ class BotRunner extends EventEmitter {
 
         if (instance._trailingPeaks) instance._trailingPeaks.delete(contractId);
 
-        // [FIX-COMPOUND-STAKE] Apply compound after WIN.
-        // Called AFTER stats are updated so the win counter is accurate.
-        // No-op for LOSS/BREAKEVEN or if compound not enabled.
-        this._applyCompoundAfterWin(instance, run);
+        // [FIX-SHADOW-PHASE] Phase-specific handling
+        if (isShadowPhase) {
+          // Shadow-phase trade settled: update shadow counter/sequence.
+          // NO compound (only real wins grow compound).
+          // NO _adaptGateAfterReal (that's for real trades only).
+          // NO _applyObservationalShadow (this IS the shadow).
+          if (instance.shadow) {
+            if (run.result === 'WIN') {
+              instance.shadow.consecutiveShadowWins++;
+              instance.shadow.stats.wins++;
+              this._metrics.shadowWins++;
+            } else if (run.result === 'LOSS') {
+              instance.shadow.consecutiveShadowWins = 0;
+              instance.shadow.stats.losses++;
+              this._metrics.shadowLosses++;
+            }
+            if (run.result === 'WIN' || run.result === 'LOSS') {
+              instance.shadow.stats.total++;
+              instance.shadow.stats.winRate = instance.shadow.stats.total > 0
+                ? Number((instance.shadow.stats.wins / instance.shadow.stats.total).toFixed(3))
+                : 0;
+              instance.shadow.sequence.push(run.result === 'WIN' ? 'W' : 'L');
+              if (instance.shadow.sequence.length > SHADOW_SEQUENCE_MAX) {
+                instance.shadow.sequence.shift();
+              }
+              this._metrics.shadowResolved++;
 
-        // [FIX-SHADOW-MODES] Shadow gate adaptation (no-op in observational)
-        this._adaptGateAfterReal(instance, run.result);
+              logger.info(
+                `[BotRunner] ${instance.instanceId}: SHADOW-PHASE ${run.contractId} settled ${run.result} — ` +
+                `consecutive=${instance.shadow.consecutiveShadowWins}/${instance.shadow.currentGate} ` +
+                `(total ${instance.shadow.stats.wins}W/${instance.shadow.stats.losses}L)`
+              );
+
+              try {
+                this.emit('botShadowResolved', {
+                  instanceId: instance.instanceId, botId: instance.botId,
+                  contractId: run.contractId,
+                  outcome: run.result === 'WIN' ? 'W' : 'L',
+                  source: 'shadow_phase_real_trade',
+                  consecutiveShadowWins: instance.shadow.consecutiveShadowWins,
+                  currentGate: instance.shadow.currentGate,
+                  shadowStats: { ...instance.shadow.stats },
+                  timestamp: new Date().toISOString(),
+                });
+              } catch (_) {}
+            }
+          }
+        } else {
+          // Real trade settled: apply compound + gate adaptation + observational mirror
+          this._applyCompoundAfterWin(instance, run);
+          this._adaptGateAfterReal(instance, run.result);
+          this._applyObservationalShadow(instance, run);
+        }
 
         this.emit('botResult', {
           instanceId: run.instanceId, botId: run.botId, contractId,
@@ -1224,8 +1263,7 @@ class BotRunner extends EventEmitter {
           flipped: instance.stats.flipped, tradeWasFlipped,
           phaseTrades: instance.stats.phaseTrades,
           phasePnl: Number(instance.stats.phasePnl.toFixed(2)),
-          // [FIX-COMPOUND-STAKE] Include compound state so downstream
-          // listeners (dashboard, notifications) can react
+          shadowPhase: isShadowPhase,
           compound: instance.compound && instance.compound.enabled ? {
             currentStake: Number(instance.compound.currentStake.toFixed(2)),
             winsSinceReset: instance.compound.winsSinceReset,
@@ -1255,6 +1293,13 @@ class BotRunner extends EventEmitter {
       pending: instance.shadow.pending.length,
       sequence: instance.shadow.sequence.slice(-10),
       stats: instance.shadow.stats,
+      shadowStake: Number(instance.config.shadowStake) || 0.35,
+      // [FIX-SHADOW-PHASE] Both modes are now 100% accurate via real trades:
+      //   gated        → fires real shadow-phase trades at shadowStake
+      //   observational → mirrors real trade result as shadow result
+      outcomeSource: instance.shadow.mode === 'gated'
+        ? 'real_shadow_phase_trades_100pct'
+        : (instance.shadow.mode === 'observational' ? 'real_trade_result_mirrored_100pct' : null),
     } : null;
 
     let trailingForSummary = null;
@@ -1272,8 +1317,6 @@ class BotRunner extends EventEmitter {
       };
     }
 
-    // [FIX-COMPOUND-STAKE] Expose compound state for the frontend.
-    // Null when compound is off so bots.js can skip rendering the block.
     const compoundForSummary = instance.compound && instance.compound.enabled ? {
       enabled: true,
       baseStake: Number(instance.compound.baseStake.toFixed(2)),
