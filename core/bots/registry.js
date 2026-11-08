@@ -15,8 +15,7 @@
 //
 // [FIX-SHADOW-CFG] shadowWinsRequired on the five synthetic binary bots.
 //
-// [FIX-SHADOW-MODES] shadowObservational added to RISK_DEFAULTS.
-//   Three shadow modes per bot:
+// [FIX-SHADOW-MODES] Three shadow modes per bot:
 //     wins=0, obs=false → OFF (fire immediate, no shadow)
 //     wins=0, obs=true  → OBSERVATIONAL (shadow + real in parallel)
 //     wins>0            → GATED (shadow gates real fires)
@@ -36,33 +35,38 @@
 //   only. Accumulator keeps its safety net. Rationale: high-variance
 //   bots need room to run through losing streaks before the eventual win.
 //
-// [FIX-COMPOUND-STAKE] **Compound stake system added to synthetic_binary
-//   bots only.** Six config fields appear in the bot start form for the
-//   9 synthetic_binary bots:
+// [FIX-COMPOUND-STAKE] Compound stake system added to synthetic_binary
+//   bots only. Six config fields (compoundEnabled, compoundMaxStake,
+//   compoundStartAfterWins, compoundGrowthRatePct, compoundStopAfterWins,
+//   compoundResetAfterWins) appear in the bot form for the 9
+//   synthetic_binary bots. Behavior: grows stake on WIN (past start
+//   threshold), caps at max, resets after N wins. Cumulative wins
+//   counter. No persistence across bot restart.
 //
-//     • compoundEnabled        (bool)   — master switch
-//     • compoundMaxStake       (num)    — hard ceiling on stake growth
-//     • compoundStartAfterWins (num)    — begin growing after N wins
-//     • compoundGrowthRatePct  (num)    — % growth per qualifying win
-//     • compoundStopAfterWins  (num)    — cap growth at N wins (0 = never)
-//     • compoundResetAfterWins (num)    — reset stake at N wins (0 = never)
+// [FIX-SHADOW-PHASE] **Real-shadow gated mode.**
 //
-//   Behavior:
-//     • Base stake = the `stake` field (unchanged)
-//     • On real WIN: winsSinceReset++
-//         - If reset threshold hit → stake resets to base, counter to 0
-//         - Else if growth gate met (wins > startAfter) AND not past stop:
-//             stake = min(stake × (1 + rate/100), maxStake)
-//     • On LOSS / BREAKEVEN: stake unchanged, counter unchanged
-//     • Bot restart: counter to 0, stake back to base (no persistence)
+//   Previous gated shadow reconstructed outcomes from tick data — ~5-15%
+//   error because Deriv enters at tick N+2 while shadow entered at tick N.
 //
-//   FX and digit bots NEVER see these fields — their stake stays fixed.
-//   Only the 9 synthetic_binary bots (5 classic + 4 high-payout) inherit
-//   COMPOUND_DEFAULTS via the post-merge pass below.
+//   The fix: shadow-phase trades are now REAL contracts at shadowStake
+//   (default $0.35). Every outcome is 100% accurate because it IS a real
+//   trade. Gate flow:
+//     • Rule fires during shadow phase → place real trade at shadowStake
+//     • WIN → shadow consecutive counter++; at gate → real fire at stake
+//     • LOSS → shadow counter resets; gate tightens by +1 (cap 10)
+//     • Real trade WIN → stay in real mode, normal stake
+//     • Real trade LOSS → back to shadow phase, tighten gate
 //
-//   Cumulative wins, NOT consecutive. Losses don't reset the counter —
-//   only reaching compoundResetAfterWins does. This matches the literal
-//   "reset after N wins" semantics.
+//   `shadowStake` config field added to RISK_DEFAULTS below. FX and
+//   digit bots see it in the form but never read it (their shadow mode
+//   is always off since assetClass !== 'synthetic_binary').
+//
+//   IMPORTANT — economic viability:
+//     Shadow phase costs real money (shadowStake × number of fires
+//     before gate opens). Only profitable on bots with payout > 2×:
+//       ✅ MATCH/DIFF, OVER/UNDER, TOUCH, VANILLA, TURBO, ACCU
+//       ❌ EVEN/ODD, RISE/FALL, VOL_* (0.88× payout — costs exceed wins)
+//     Set shadowWinsRequired: 0 on the ❌ bots to disable.
 
 'use strict';
 
@@ -569,7 +573,7 @@ const BOTS = {
     },
   },
 
-  // ── Synthetic Digit (5) — UNCHANGED, NO COMPOUND FIELDS ──
+  // ── Synthetic Digit (5) — UNCHANGED ──
   even_odd_trader: {
     id: 'even_odd_trader', name: 'Even/Odd Trader',
     description: 'Synthetic digit. EVEN/ODD on statistical extreme (|z| >= threshold). Flip NOT recommended (50/50).',
@@ -728,7 +732,7 @@ const BOTS = {
     },
   },
 
-  // ── Synthetic Binary (5) — compound fields added post-merge ──
+  // ── Synthetic Binary (5) ──
   rise_fall_momentum: {
     id: 'rise_fall_momentum', name: 'Rise/Fall Momentum',
     description: 'Synthetic CALL/PUT. Flip NOT recommended (50/50). Shadow-gated.',
@@ -876,7 +880,7 @@ const BOTS = {
     },
   },
 
-  // ── High-Payout (4) — compound fields added post-merge ──
+  // ── High-Payout (4) ──
   touch_hunter: {
     id: 'touch_hunter', name: 'Touch Hunter',
     description: 'Touch/No Touch on far barriers after consolidation. High payout (200-350%) on far touches. Low win rate — designed for big wins.',
@@ -1035,20 +1039,23 @@ const RISK_DEFAULTS = {
   flipMinTrades: 20,
   flipStableTrades: 20,
   shadowWinsRequired: 0,
-  // [FIX-SHADOW-MODES] When true AND shadowWinsRequired=0, shadow runs
-  // in parallel with real fires (observational mode). See runner.js
-  // _shadowModeForConfig for the 3-mode dispatch.
   shadowObservational: false,
+  // [FIX-SHADOW-PHASE] Stake used for shadow-phase validation trades in
+  // gated mode. Every rule-fire during shadow phase places a REAL contract
+  // at this stake. Outcomes are 100% accurate (it IS the real trade).
+  // Default 0.35 — small enough that 3-10 validation fires cost
+  // $1.05-$3.50 to open the gate. Change per-bot in the form.
+  //
+  // Only read by synthetic_binary bots in gated mode. FX and digit bots
+  // see the field in their form but never use it.
+  shadowStake: 0.35,
 };
 
 for (const id in BOTS) {
   BOTS[id].defaultConfig = Object.assign({}, RISK_DEFAULTS, BOTS[id].defaultConfig);
 }
 
-// ── [FIX-COMPOUND-STAKE] Compound stake config — synthetic_binary ONLY ──
-// Injected post-merge so FX and digit bots never see these fields.
-// The bot form in bots.js renders every config field, so these 6 will
-// appear only on the 9 synthetic_binary bot forms.
+// ── [FIX-COMPOUND-STAKE] Compound config — synthetic_binary ONLY ──
 const COMPOUND_DEFAULTS = {
   compoundEnabled: false,
   compoundMaxStake: 10,
@@ -1060,16 +1067,11 @@ const COMPOUND_DEFAULTS = {
 
 for (const id in BOTS) {
   if (BOTS[id].assetClass === 'synthetic_binary') {
-    // Merge COMPOUND_DEFAULTS as base, then bot's existing config on top.
-    // Since no synthetic bot defines compound* fields, all 6 get the
-    // COMPOUND_DEFAULTS values. If a specific bot later wants different
-    // defaults, they can add compound* fields to their own defaultConfig
-    // and those will override.
     BOTS[id].defaultConfig = Object.assign({}, COMPOUND_DEFAULTS, BOTS[id].defaultConfig);
   }
 }
 
-// ── High-variance overrides (applied post-RISK_DEFAULTS merge) ──
+// ── High-variance overrides ──
 BOTS.touch_hunter.defaultConfig.stopAfterLosses = 0;
 BOTS.touch_hunter.defaultConfig.botTakeProfit = 0;
 BOTS.touch_hunter.defaultConfig.botStopLoss = 0;
