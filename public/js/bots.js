@@ -9,24 +9,30 @@
 //   • Checkbox state submitted as real booleans on Start.
 //   • Running-bot cards show current flip state (NORMAL / FLIPPED).
 //
-// [FIX-SHADOW-UI] Shadow trading display:
-//   • shadowWinsRequired grouped under its own form section.
-//   • Running-bot cards show a shadow badge + gate detail line +
-//     last-10 W/L sequence for Rise/Fall & Volatility bots.
-//   • Runs table gets a "Shadow" column showing gate-at-entry per trade.
+// [FIX-SHADOW-UI] Shadow trading display — grouped config section, running
+//   card detail line, sequence badges, gate-at-entry column in runs table.
 //
-// [FIX-COMPOUND-UI] **Compound stake display:**
-//   • 6 compound fields grouped under "Compound Stake" section in the
-//     bot start form. Only rendered for synthetic_binary bots (those
-//     with `compoundEnabled` in defaultConfig).
-//   • Running-bot cards show a compound status line:
-//       Comp: stake $1.00 → $2.44 · 5/8 wins · max $10 · 4↑ 1↺
-//     Plus a small progress bar showing winsSinceReset / resetAfterWins
-//     when resetAfterWins > 0.
-//   • Recent Runs table already shows the actual `stake` used per trade
-//     (from BotRun.stake) — no change needed there.
-//   • 12 non-synthetic_binary bots (7 FX + 5 digit) show no compound UI
-//     because their defaultConfig never includes compoundEnabled.
+// [FIX-COMPOUND-UI] Compound stake — grouped config section, status line
+//   with growth/reset counters, progress bar toward reset.
+//
+// [FIX-SHADOW-PHASE-UI] **Real-shadow-phase display.**
+//
+//   Gated shadow mode now fires REAL trades at shadowStake ($0.35) for
+//   validation, then fires real trades at normal stake once the gate is
+//   met. This UI reflects that dual-phase behavior:
+//
+//     Running card shadow section states:
+//       • SHADOW PHASE (accumulating) — "2/3 wins → next fire $0.35"
+//       • GATE MET (ready to fire real) — "3/3 wins → next fire $<stake>"
+//       • REAL MODE (post-win) — "Direct trading, real losses trigger re-shadow"
+//       • OBSERVATIONAL — unchanged (observing without gating)
+//
+//     Runs table stake cell shows:
+//       • $0.35 [S]  → shadow-phase validation trade
+//       • $<stake>   → real signal execution
+//
+//     Progress bar tracks consecutiveShadowWins / currentGate, fills green
+//     at 100%. `next fire` stake computed from the current state.
 
 'use strict';
 
@@ -37,8 +43,7 @@
 
   // Fields grouped under their own section headers in the start form
   const FLIP_FIELDS = ['flipEnabled', 'flipBelowPct', 'flipMinTrades', 'flipStableTrades'];
-  const SHADOW_FIELDS = ['shadowWinsRequired', 'shadowObservational'];
-  // [FIX-COMPOUND-UI] Compound stake fields — synthetic_binary only
+  const SHADOW_FIELDS = ['shadowWinsRequired', 'shadowObservational', 'shadowStake'];
   const COMPOUND_FIELDS = [
     'compoundEnabled',
     'compoundMaxStake',
@@ -145,14 +150,11 @@
     });
   }
 
-  // [FIX-SHADOW-UI] buildField accepts an optional `extras` object of extra
-  // HTML attributes. Used for compound field min/max/step and shadow range.
   function buildField(key, val, extras) {
     const extrasAttr = extras
       ? Object.entries(extras).map(([k, v]) => `${k}="${v}"`).join(' ')
       : '';
 
-    // Checkbox
     if (typeof val === 'boolean') {
       const id = `botfield_${key}`;
       return `<div class="col-6 col-md-4">
@@ -162,14 +164,12 @@
         </div>
       </div>`;
     }
-    // Number
     if (typeof val === 'number') {
       return `<div class="col-6 col-md-4">
         <label class="form-label small text-muted mb-1">${key}</label>
         <input class="form-control form-control-sm" name="${key}" value="${val}" type="number" step="any" ${extrasAttr} />
       </div>`;
     }
-    // String (or null — filtered out before this function is called)
     return `<div class="col-6 col-md-4">
       <label class="form-label small text-muted mb-1">${key}</label>
       <input class="form-control form-control-sm" name="${key}" value="${val}" type="text" ${extrasAttr} />
@@ -188,7 +188,6 @@
 
     if (fields) {
       const cfg = _selectedBot.defaultConfig || {};
-      // Partition config into: compound, shadow, flip, main
       const compoundEntries = [];
       const shadowEntries = [];
       const flipEntries = [];
@@ -203,8 +202,7 @@
 
       let html = mainEntries.map(([key, val]) => buildField(key, val)).join('');
 
-      // [FIX-COMPOUND-UI] Compound group — only render if the bot has
-      // compound fields (synthetic_binary bots do, everything else doesn't)
+      // Compound group
       if (compoundEntries.length > 0) {
         html += `<div class="col-12 mt-3 mb-1">
           <hr class="mt-1 mb-2"/>
@@ -217,7 +215,6 @@
             Restarts of the bot reset the counter and current stake back to base.
           </div>
         </div>`;
-        // Render each compound field with sensible input bounds
         for (const [key, val] of compoundEntries) {
           const extras = { min: 0, step: 'any' };
           if (key === 'compoundGrowthRatePct') { extras.min = 0; extras.max = 100; extras.step = 1; }
@@ -229,26 +226,30 @@
         }
       }
 
-      // Shadow group — only if the bot has shadow fields
+      // Shadow group
       if (shadowEntries.length > 0) {
         html += `<div class="col-12 mt-3 mb-1">
           <hr class="mt-1 mb-2"/>
           <div class="small fw-bold text-uppercase text-muted" style="letter-spacing:0.05em;">
-            <i class="fas fa-user-secret me-1"></i> Shadow Trading (paper-trade gate)
+            <i class="fas fa-user-secret me-1"></i> Shadow Trading (real-money validation phase)
           </div>
           <div class="small text-muted mb-2">
-            <strong>shadowWinsRequired &gt; 0</strong> → GATED mode: fire real trade only after N consecutive shadow wins.<br>
-            <strong>wins=0 + shadowObservational=true</strong> → OBSERVATIONAL mode: shadow runs in parallel with every real fire (data collection).<br>
-            <strong>wins=0 + obs=false</strong> → OFF: fire immediately, no shadow.
+            <strong>shadowWinsRequired &gt; 0</strong> → GATED: first N fires place real trades at <code>shadowStake</code> (e.g. $0.35).
+            After N consecutive shadow-phase wins, fires real trades at <code>stake</code> until a real loss.<br>
+            <strong>wins=0 + shadowObservational=true</strong> → OBSERVATIONAL: fires real immediately, mirrors outcome for shadow stats.<br>
+            <strong>wins=0 + obs=false</strong> → OFF: no shadow.
+            <br><em>⚠️ Gated shadow costs real money — only profitable on bots with payout &gt; 2× (MATCH/DIFF, OVER/UNDER, TOUCH, VANILLA, TURBO, ACCU).</em>
           </div>
         </div>`;
         html += shadowEntries.map(([key, val]) => {
-          const extras = (key === 'shadowWinsRequired') ? { min: 0, max: 10, step: 1 } : null;
+          let extras = null;
+          if (key === 'shadowWinsRequired') extras = { min: 0, max: 10, step: 1 };
+          if (key === 'shadowStake') extras = { min: 0.01, step: 0.01 };
           return buildField(key, val, extras);
         }).join('');
       }
 
-      // Flip group — only if the bot has flip fields
+      // Flip group
       if (flipEntries.length > 0) {
         html += `<div class="col-12 mt-3 mb-1">
           <hr class="mt-1 mb-2"/>
@@ -268,81 +269,123 @@
     if (form) { form.style.display = 'block'; form.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
   }
 
-  // [FIX-SHADOW-UI] Helper: shadow present and enabled
+  // ─────────────────────────────────────────────────────────────
+  //  Helpers
+  // ─────────────────────────────────────────────────────────────
   function hasShadow(inst) {
     return !!(inst && inst.shadow && inst.shadow.enabled);
   }
 
-  // [FIX-COMPOUND-UI] Helper: compound present and enabled
   function hasCompound(inst) {
     return !!(inst && inst.compound && inst.compound.enabled);
   }
 
-  function renderShadowBadge(shadow) {
-    if (!shadow) return '';
-    if (shadow.pending > 0) {
-      return `<span class="badge bg-info text-dark ms-1" title="A shadow trade is awaiting resolution">SHADOW (pending)</span>`;
+  // [FIX-SHADOW-PHASE-UI] Resolve the stake that the NEXT fire will use.
+  // Gated + accumulating → shadowStake
+  // Gated + gate met or post-win → real stake (compound or config)
+  // Observational / off → real stake
+  function nextFireStake(inst) {
+    const shadow = inst.shadow;
+    const compound = inst.compound;
+    const cfg = inst.config || {};
+    const realStake = compound && compound.enabled
+      ? Number(compound.currentStake)
+      : (Number(cfg.stake) || 1);
+    if (!shadow || shadow.mode !== 'gated') return realStake;
+    if (shadow.shadowRequired && (shadow.consecutiveShadowWins || 0) < (shadow.currentGate || 0)) {
+      return Number(cfg.shadowStake) || 0.35;
     }
-    if (shadow.shadowRequired === false) {
-      return `<span class="badge bg-success ms-1" title="Post-win: firing directly while rules hold">LIVE</span>`;
-    }
-    if (shadow.consecutiveShadowWins >= shadow.currentGate) {
-      return `<span class="badge bg-success ms-1" title="Shadow gate met — will fire on next rules hit">GATE MET</span>`;
-    }
-    const mode = shadow.mode === 'observational' ? 'OBS' : 'SHADOW';
-    return `<span class="badge bg-secondary ms-1" title="Accumulating shadow wins (${mode})">${mode} ${shadow.consecutiveShadowWins}/${shadow.currentGate}</span>`;
+    return realStake;
   }
 
-  function renderShadowDetailLine(shadow) {
-    if (!shadow) return '';
-    const parts = [];
-    const gate = Number(shadow.currentGate) || 0;
-    const origGate = Number(shadow.originalGate) || 0;
-    const tightens = Number(shadow.gateTightenCount) || 0;
+  // ─────────────────────────────────────────────────────────────
+  //  Shadow rendering — state-aware
+  // ─────────────────────────────────────────────────────────────
+  function renderShadowBlock(inst) {
+    if (!hasShadow(inst)) return { badge: '', detail: '', sequence: '', progress: '' };
 
-    if (shadow.mode === 'observational') {
-      parts.push(`observational (no gating)`);
-    } else if (tightens > 0) {
-      parts.push(`gate <strong>${gate}</strong> (from ${origGate}, ${tightens} tighten${tightens === 1 ? '' : 's'})`);
-    } else {
-      parts.push(`gate <strong>${gate}</strong>`);
-    }
-
+    const shadow = inst.shadow;
     const stats = shadow.stats || { wins: 0, losses: 0, total: 0, winRate: 0 };
-    if (stats.total > 0) {
-      const wr = Number(stats.winRate * 100).toFixed(0);
-      parts.push(`${stats.wins}W/${stats.losses}L shadows (${wr}%)`);
-    } else {
-      parts.push('no shadow history yet');
+    const gate = Number(shadow.currentGate) || 0;
+    const wins = Number(shadow.consecutiveShadowWins) || 0;
+    const shadowStake = Number(inst.config && inst.config.shadowStake) || 0.35;
+    const realStake = nextFireStake(inst);
+
+    // Observational mode — unchanged rendering from before
+    if (shadow.mode === 'observational') {
+      const badge = `<span class="badge bg-secondary ms-1" title="Observing real outcomes without gating">OBS</span>`;
+      const detail = `<div class="small text-muted mt-1" style="font-size:0.72rem;">
+        <i class="fas fa-user-secret me-1"></i>Observational · ${stats.wins}W/${stats.losses}L shadows (${(stats.winRate * 100).toFixed(0)}%)
+      </div>`;
+      const seq = renderSequence(shadow.sequence);
+      return { badge, detail, sequence: seq, progress: '' };
     }
 
-    if (shadow.pending > 0) {
-      parts.push(`<span class="text-info">${shadow.pending} pending</span>`);
+    // Gated mode — three sub-states
+    const gateMet = gate > 0 && wins >= gate;
+
+    // State A: post-win real mode (shadowRequired = false)
+    if (shadow.shadowRequired === false) {
+      const badge = `<span class="badge bg-success ms-1" title="Real wins continue directly; only a real loss triggers re-shadow">REAL</span>`;
+      const detail = `<div class="small text-success mt-1" style="font-size:0.72rem;">
+        <i class="fas fa-rocket me-1"></i>Real mode · next fire <strong>$${realStake.toFixed(2)}</strong> · real loss triggers re-shadow
+        ${stats.total > 0 ? ` · ${stats.wins}W/${stats.losses}L shadows` : ''}
+      </div>`;
+      return { badge, detail, sequence: renderSequence(shadow.sequence), progress: '' };
     }
 
-    return `<div class="small text-muted mt-1" style="font-size:0.72rem;">
-      <i class="fas fa-user-secret me-1"></i>${parts.join(' · ')}
+    // State B: gate met (ready to fire real)
+    if (gateMet) {
+      const badge = `<span class="badge bg-success ms-1" title="Gate met — next fire is a real trade">GATE MET</span>`;
+      const detail = `<div class="small text-success mt-1" style="font-size:0.72rem;">
+        <i class="fas fa-check-circle me-1"></i>${wins}/${gate} shadow wins · next fire <strong>REAL $${realStake.toFixed(2)}</strong>
+      </div>`;
+      const progress = renderProgressBar(wins, gate, true);
+      return { badge, detail, sequence: renderSequence(shadow.sequence), progress };
+    }
+
+    // State C: accumulating shadow wins
+    const badge = `<span class="badge bg-warning text-dark ms-1" title="Accumulating shadow-phase wins">SHADOW ${wins}/${gate}</span>`;
+    const detail = `<div class="small text-warning mt-1" style="font-size:0.72rem;">
+      <i class="fas fa-user-secret me-1"></i>Shadow phase · <strong>${wins}/${gate}</strong> wins · next fire <strong>$${shadowStake.toFixed(2)}</strong>
+      ${stats.total > 0 ? ` · ${stats.wins}W/${stats.losses}L total` : ''}
     </div>`;
+    const progress = renderProgressBar(wins, gate, false);
+    return { badge, detail, sequence: renderSequence(shadow.sequence), progress };
   }
 
-  function renderShadowSequence(shadow) {
-    if (!shadow || !Array.isArray(shadow.sequence) || shadow.sequence.length === 0) return '';
-    const badges = shadow.sequence.slice(-10).map(o => {
+  function renderSequence(sequence) {
+    if (!Array.isArray(sequence) || sequence.length === 0) return '';
+    const badges = sequence.slice(-10).map(o => {
       const cls = o === 'W' ? 'bg-success' : 'bg-danger';
       return `<span class="badge ${cls}" style="font-size:0.6em; padding:2px 5px;">${o}</span>`;
     }).join(' ');
-    return `<div class="mt-1" style="font-size:0.7rem;" title="Last ${shadow.sequence.length} shadow outcomes (oldest → newest)">
+    return `<div class="mt-1" style="font-size:0.7rem;" title="Last ${Math.min(sequence.length, 10)} shadow outcomes (oldest → newest)">
       <span class="text-muted">Sequence:</span> ${badges}
     </div>`;
   }
 
-  // [FIX-COMPOUND-UI] Compound detail line.
-  // Example outputs:
-  //   No growth yet:   "stake $1.00 · 0/8 wins · max $10"
-  //   After growth:    "stake $1.00 → $2.44 · 5/8 wins · max $10 · 4↑ 1↺"
-  //   No reset config: "stake $1.00 → $3.05 · 6W · max $10 · 5↑"
-  function renderCompoundDetailLine(compound) {
-    if (!compound) return '';
+  // [FIX-SHADOW-PHASE-UI] Progress bar for gate accumulation.
+  // Hidden in post-win real mode (gate isn't "filling"). Visible while
+  // accumulating or when gate met (shows full green).
+  function renderProgressBar(wins, gate, met) {
+    if (gate <= 0) return '';
+    const pct = Math.min(100, (wins / gate) * 100);
+    const barColor = met ? '#00b894' : (pct >= 66 ? '#f39c12' : '#eab308');
+    return `<div class="mt-1" title="${wins} of ${gate} consecutive shadow wins">
+      <div style="height:4px; background:#e9edf2; border-radius:2px; overflow:hidden;">
+        <div style="height:100%; width:${pct.toFixed(1)}%; background:${barColor}; transition:width 0.3s ease;"></div>
+      </div>
+    </div>`;
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  //  Compound rendering
+  // ─────────────────────────────────────────────────────────────
+  function renderCompoundBlock(inst) {
+    if (!hasCompound(inst)) return { detail: '', progress: '' };
+
+    const compound = inst.compound;
     const base = Number(compound.baseStake) || 0;
     const cur = Number(compound.currentStake) || 0;
     const max = Number(compound.maxStake) || 0;
@@ -351,43 +394,37 @@
     const grows = Number(compound.growthCount) || 0;
     const resets = Number(compound.resetCount) || 0;
 
-    // Stake display: if current differs from base, show "base → current", else "current"
     const stakePart = (cur > base + 0.001)
       ? `stake <strong>$${base.toFixed(2)} → $${cur.toFixed(2)}</strong>`
       : `stake <strong>$${cur.toFixed(2)}</strong>`;
+    const winsPart = resetAfter > 0 ? `${wins}/${resetAfter} wins` : `${wins}W`;
 
-    // Wins counter: show progress toward reset if reset configured
-    const winsPart = resetAfter > 0
-      ? `${wins}/${resetAfter} wins`
-      : `${wins}W`;
-
-    // Growth/reset counts (only if any)
     const countParts = [];
     if (grows > 0) countParts.push(`${grows}↑`);
     if (resets > 0) countParts.push(`${resets}↺`);
     const countStr = countParts.length > 0 ? ` · ${countParts.join(' ')}` : '';
 
-    return `<div class="small text-success mt-1" style="font-size:0.72rem;">
+    const detail = `<div class="small text-success mt-1" style="font-size:0.72rem;">
       <i class="fas fa-chart-line me-1"></i>${stakePart} · ${winsPart} · max $${max}${countStr}
     </div>`;
+
+    let progress = '';
+    if (resetAfter > 0) {
+      const pct = Math.min(100, (wins / resetAfter) * 100);
+      const barColor = pct >= 100 ? '#e74c5e' : (pct >= 75 ? '#f39c12' : '#00b894');
+      progress = `<div class="mt-1" title="${wins} of ${resetAfter} wins until stake resets to base">
+        <div style="height:4px; background:#e9edf2; border-radius:2px; overflow:hidden;">
+          <div style="height:100%; width:${pct.toFixed(1)}%; background:${barColor}; transition:width 0.3s ease;"></div>
+        </div>
+      </div>`;
+    }
+
+    return { detail, progress };
   }
 
-  // [FIX-COMPOUND-UI] Progress bar toward reset.
-  // Only rendered when resetAfterWins > 0. Fill = winsSinceReset / resetAfterWins.
-  function renderCompoundProgress(compound) {
-    if (!compound) return '';
-    const resetAfter = Number(compound.resetAfterWins) || 0;
-    if (resetAfter <= 0) return '';    // no reset configured → no bar
-    const wins = Number(compound.winsSinceReset) || 0;
-    const pct = Math.min(100, (wins / resetAfter) * 100);
-    const barColor = pct >= 100 ? '#e74c5e' : (pct >= 75 ? '#f39c12' : '#00b894');
-    return `<div class="mt-1" title="${wins} of ${resetAfter} wins until stake resets to base">
-      <div style="height:4px; background:#e9edf2; border-radius:2px; overflow:hidden;">
-        <div style="height:100%; width:${pct.toFixed(1)}%; background:${barColor}; transition:width 0.3s ease;"></div>
-      </div>
-    </div>`;
-  }
-
+  // ─────────────────────────────────────────────────────────────
+  //  Running bot card
+  // ─────────────────────────────────────────────────────────────
   function renderRunningBots() {
     const container = document.getElementById('runningBotsContainer');
     if (!container) return;
@@ -410,7 +447,7 @@
         peak > 0 ? `Peak +$${peak.toFixed(2)}` : null,
       ].filter(Boolean).join(' · ');
 
-      // Flip status: shown only if flip is enabled on this bot
+      // Flip status
       const flipEnabled = !!cfg.flipEnabled;
       const flipped = !!s.flipped;
       const flipBadge = flipEnabled
@@ -428,22 +465,17 @@
            </div>`
         : '';
 
-      // [FIX-SHADOW-UI] Shadow state for eligible bots
-      const shadowEnabled = hasShadow(inst);
-      const shadowBadge = shadowEnabled ? renderShadowBadge(inst.shadow) : '';
-      const shadowDetail = shadowEnabled ? renderShadowDetailLine(inst.shadow) : '';
-      const shadowSeq = shadowEnabled ? renderShadowSequence(inst.shadow) : '';
+      // Shadow block (state-aware)
+      const shadowBlock = renderShadowBlock(inst);
 
-      // [FIX-COMPOUND-UI] Compound state for eligible bots
-      const compoundEnabled = hasCompound(inst);
-      const compoundDetail = compoundEnabled ? renderCompoundDetailLine(inst.compound) : '';
-      const compoundProgress = compoundEnabled ? renderCompoundProgress(inst.compound) : '';
+      // Compound block
+      const compoundBlock = renderCompoundBlock(inst);
 
       return `<div class="card mb-2" style="border-left:3px solid #00b894;">
         <div class="card-body p-3">
           <div class="d-flex justify-content-between align-items-start">
             <div style="flex:1;">
-              <h6 class="mb-1">${inst.name} ${flipBadge}${shadowBadge} <span class="badge bg-success ms-2">RUNNING</span></h6>
+              <h6 class="mb-1">${inst.name} ${flipBadge}${shadowBlock.badge} <span class="badge bg-success ms-2">RUNNING</span></h6>
               <div class="small text-muted">${inst.symbol} · ${inst.instanceId}</div>
               <div class="small mt-1">
                 Runs <strong>${s.runs}</strong> · Entries <strong>${s.entries}</strong> ·
@@ -454,10 +486,11 @@
                 <i class="fas fa-shield-halved me-1"></i>${riskLine || 'no risk limits'}
               </div>
               ${phaseLine}
-              ${shadowDetail}
-              ${shadowSeq}
-              ${compoundDetail}
-              ${compoundProgress}
+              ${shadowBlock.detail}
+              ${shadowBlock.progress}
+              ${shadowBlock.sequence}
+              ${compoundBlock.detail}
+              ${compoundBlock.progress}
               <div class="small text-muted mt-1 fw-bold" style="font-size:0.75rem;">${inst.lastReason || ''}</div>
             </div>
             <button class="btn btn-sm btn-danger" data-stop="${inst.instanceId}">
@@ -477,10 +510,9 @@
     });
   }
 
-  // [FIX-SHADOW-UI] Runs table gains a Shadow column.
-  // [FIX-COMPOUND-UI] Stake column already shows the ACTUAL stake used per
-  // trade (BotRun.stake comes from stakeCheck.stake in runner), so compound
-  // growth is visible in the table without any change needed here.
+  // ─────────────────────────────────────────────────────────────
+  //  Runs table — [FIX-SHADOW-PHASE-UI] tagged stake cell
+  // ─────────────────────────────────────────────────────────────
   function renderRuns(runs) {
     const container = document.getElementById('botRunsContainer');
     if (!container) return;
@@ -496,7 +528,7 @@
         ? '<span class="badge bg-warning text-dark">F</span>'
         : '<span class="text-muted small">N</span>';
 
-      // [FIX-SHADOW-UI] Shadow gate-at-entry indicator
+      // Shadow gate-at-entry indicator (existing)
       let shadowLabel = '<span class="text-muted small">—</span>';
       if (r.shadowEnabled) {
         const gate = Number(r.gateAtEntry) || 0;
@@ -508,6 +540,14 @@
         shadowLabel = `<span class="badge bg-secondary" title="${title}" style="font-size:0.75em;">G${gate}</span>`;
       }
 
+      // [FIX-SHADOW-PHASE-UI] Stake cell — tag shadow-phase trades
+      const stakeNum = Number(r.stake) || 0;
+      const isShadowPhase = !!r.shadowPhase;
+      const shadowPhaseBadge = isShadowPhase
+        ? ` <span class="badge bg-info text-dark" style="font-size:0.65em; vertical-align:middle;" title="Shadow-phase validation trade at shadowStake">S</span>`
+        : '';
+      const stakeCell = `$${stakeNum.toFixed(2)}${shadowPhaseBadge}`;
+
       return `<tr>
         <td>${new Date(r.openedAt).toLocaleString()}</td>
         <td><strong>${r.botId}</strong></td>
@@ -515,7 +555,7 @@
         <td>${r.side}</td>
         <td class="text-center">${flipLabel}</td>
         <td class="text-center">${shadowLabel}</td>
-        <td>$${(r.stake || 0).toFixed(2)}</td>
+        <td>${stakeCell}</td>
         <td>${r.multiplier ? r.multiplier + 'x' : (r.duration ? r.duration + 't' : '—')}</td>
         <td>${r.entryPrice ? r.entryPrice.toFixed(5) : '—'}</td>
         <td class="${pnlClass}">${r.pnl >= 0 ? '+' : ''}${(r.pnl || 0).toFixed(2)}</td>
@@ -526,8 +566,9 @@
     container.innerHTML = `<table class="table table-sm table-striped mb-0">
       <thead style="position:sticky; top:0; background:#fff; z-index:2;">
         <tr><th>Opened</th><th>Bot</th><th>Symbol</th><th>Side</th><th>Flip</th>
-            <th title="Shadow gate at entry (— for non-shadow bots)">Shadow</th>
-            <th>Stake</th><th>Mult</th><th>Entry</th><th>P/L</th><th>Result</th></tr>
+            <th title="Shadow gate at entry">Shadow</th>
+            <th title="Stake used · S badge = shadow-phase validation trade">Stake</th>
+            <th>Mult</th><th>Entry</th><th>P/L</th><th>Result</th></tr>
       </thead>
       <tbody>${rows}</tbody>
     </table>`;
@@ -542,7 +583,6 @@
     const form = document.getElementById('botConfigForm');
     const config = {};
 
-    // Read all fields — handle checkboxes separately so we send real booleans
     form.querySelectorAll('input[name]').forEach(f => {
       const name = f.name;
       const type = f.type;
@@ -553,7 +593,7 @@
       }
 
       const raw = f.value.trim();
-      if (raw === '') return;  // let default win on empty fields
+      if (raw === '') return;
       const n = Number(raw);
       config[name] = Number.isFinite(n) ? n : raw;
     });
@@ -581,10 +621,11 @@
       const runs = await res.json();
       if (!runs || runs.length === 0) { alert('No runs to export.'); return; }
 
-      let csv = 'Date,Bot,Symbol,Type,Stake,Entry,PnL,Result,Reason\n';
+      let csv = 'Date,Bot,Symbol,Type,Stake,ShadowPhase,Entry,PnL,Result,Reason\n';
       runs.forEach(r => {
         const reason = (r.reasons || []).join(' | ').replace(/,/g, ';');
-        csv += `${new Date(r.openedAt).toISOString()},${r.botId},${r.symbol},${r.side},${r.stake},${r.entryPrice || ''},${r.pnl || 0},${r.result || 'OPEN'},"${reason}"\n`;
+        const phase = r.shadowPhase ? 'shadow' : 'real';
+        csv += `${new Date(r.openedAt).toISOString()},${r.botId},${r.symbol},${r.side},${r.stake},${phase},${r.entryPrice || ''},${r.pnl || 0},${r.result || 'OPEN'},"${reason}"\n`;
       });
 
       const blob = new Blob([csv], { type: 'text/csv' });
