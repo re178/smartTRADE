@@ -5,29 +5,44 @@
 // populated by runner.js when config._edgeTest === true, consumed by
 // edgeTest.js for statistical edge validation and CSV export.
 //
-// [FIX-SHADOW-AUDIT] Shadow-trading audit fields added:
-//   • shadowEnabled       — true when shadow gate was applied to this fire
-//   • shadowSequence      — last ≤20 shadow outcomes ('W'/'L') at entry
+// [FIX-SHADOW-AUDIT] Shadow-trading audit fields:
+//   • shadowEnabled       — true when bot instance is in shadow mode
+//   • shadowSequence      — last ≤20 shadow-phase outcomes ('W'/'L')
 //   • shadowStats         — { wins, losses, total, winRate } at entry
-//   • gateAtEntry         — currentGate value when trade fired (3, 4, 5...)
+//   • gateAtEntry         — currentGate value at fire time
 //   • originalGate        — config.shadowWinsRequired at bot start
-//   • gateTightenCount    — number of losses that tightened the gate
+//   • gateTightenCount    — number of real losses that tightened the gate
 //   • shadowSummaryFor()  — aggregate shadow-win analysis per bot
 //
-// [FIX-HIGH-PAYOUT] New-contract-type metadata added:
-//   • payoutPerPoint      — Turbo: $ per point of distance from barrier
-//   • growthRate          — Accumulator: % growth per tick (1–5)
-//   • strikePrice         — Vanilla/Turbo: the strike at entry
-//   • touchBarrier        — Touch/No Touch: the barrier price at entry
-//   • touchDirection      — Touch/No Touch: 'TOUCH' or 'NO_TOUCH'
-//   • highPayoutSummaryFor() — aggregate stats across the 4 new bot types
+// [FIX-HIGH-PAYOUT] High-payout contract metadata:
+//   • payoutPerPoint, growthRate, strikePrice, touchBarrier, touchDirection
+//   • highPayoutSummaryFor() — aggregate stats across the 4 new bots
 //
-//   These fields are null for the 17 existing bot types. The 4 new bots
-//   (touch_hunter, vanilla_trend, turbo_breakout, accumulator_scalper)
-//   populate them so post-hoc analysis can compare:
-//     • "which barrier distance produced the best ROI?"
-//     • "at what growth_rate did accumulators survive the longest?"
-//     • "did strike placement matter for vanilla/turbo outcomes?"
+// [FIX-SHADOW-PHASE] **Real-shadow gated mode.**
+//
+//   Previously gated shadow mode reconstructed the shadow outcome from tick
+//   data (entry price at tick N, exit at tick N+duration). Reconstruction
+//   had 5-15% error because:
+//     • Shadow entry was recorded at tick N (bot's decision tick)
+//     • Real Deriv trade entered at tick N+2 (network + acceptance lag)
+//     • Different windows → different outcomes in fast markets
+//     • Digit contracts especially: outcome depends on the digit AT the
+//       exit tick, not on prices — different exit ticks = different digits
+//
+//   The fix: shadow-phase trades are now REAL contracts at shadowStake
+//   (default $0.35). Each is a genuine Deriv trade with a genuine
+//   settlement. Outcome is 100% accurate because it IS the real trade.
+//
+//   This field (`shadowPhase`) tags each BotRun so downstream analysis can
+//   distinguish:
+//     • shadowPhase=true  → validation trade at shadowStake
+//     • shadowPhase=false → real signal execution at normal stake
+//
+//   Behaviour:
+//     • Both types count in stats.pnl (real money spent)
+//     • Only shadowPhase=true advances the shadow gate counter
+//     • Only shadowPhase=false advances compound stake
+//     • Both types visible in Recent Runs (tagged for filtering)
 
 'use strict';
 
@@ -38,12 +53,12 @@ const BotRunSchema = new mongoose.Schema({
   instanceId: { type: String, required: true, index: true },
   contractId: { type: String, required: true, index: true, unique: true },
   symbol: { type: String, required: true, index: true },
-  side: { type: String, required: true },              // BUY/SELL/EVEN/ODD/CALL/PUT/DIGITOVER...
-  contractType: { type: String, default: null },        // MULTUP / DIGITEVEN / CALL / ONETOUCH / VANILLALONGCALL / TURBOSLONG / ACCU
+  side: { type: String, required: true },
+  contractType: { type: String, default: null },
   stake: { type: Number, required: true },
   multiplier: { type: Number, default: null },
   duration: { type: Number, default: null },
-  durationUnit: { type: String, default: null },        // 't' ticks, 's' seconds, 'm' minutes, 'h' hours
+  durationUnit: { type: String, default: null },
   barrier: { type: String, default: null },
   entryPrice: { type: Number, default: null },
   closePrice: { type: Number, default: null },
@@ -57,20 +72,13 @@ const BotRunSchema = new mongoose.Schema({
   result: { type: String, enum: ['WIN', 'LOSS', 'BREAKEVEN', null], default: null },
   status: { type: String, enum: ['OPEN', 'CLOSED'], default: 'OPEN', index: true },
 
-  // ── Edge-test metadata ─────────────────────────────────────────
-  // Populated when bot was started via edgeTest.start() (config._edgeTest = true)
+  // ── Edge-test metadata ──
   isEdgeTest: { type: Boolean, default: false, index: true },
   regimeCode: { type: String, default: null, index: true },
   session:    { type: String, default: null, index: true },
-  // Full prediction / digitView snapshot at entry — populated for
-  // every trade (edge test or normal), so post-hoc analysis can
-  // correlate conditions with outcome.
   entryThesis: { type: mongoose.Schema.Types.Mixed, default: null },
 
-  // ── [FIX-SHADOW-AUDIT] Shadow-trading metadata ─────────────────
-  // Applied only to Rise/Fall and Volatility bots when
-  // config.shadowWinsRequired > 0. Digit and FX bots always have
-  // shadowEnabled=false and all other shadow fields null/empty.
+  // ── Shadow metadata ──
   shadowEnabled: { type: Boolean, default: false, index: true },
   shadowSequence: [{ type: String }],
   shadowStats: { type: mongoose.Schema.Types.Mixed, default: null },
@@ -78,46 +86,37 @@ const BotRunSchema = new mongoose.Schema({
   originalGate: { type: Number, default: null },
   gateTightenCount: { type: Number, default: 0 },
 
-  // ── [FIX-HIGH-PAYOUT] High-payout contract metadata ────────────
-  // Populated only by the 4 new bots. Null for all 17 existing bots.
+  // [FIX-SHADOW-PHASE] Tags this specific trade as a shadow-phase
+  // validation trade (true) or a real signal execution (false).
+  // Only true when shadow mode is 'gated' AND gate not yet met at fire
+  // time. In observational mode this is always false (shadow stats are
+  // derived from real trade result — no separate shadow trades placed).
+  shadowPhase: { type: Boolean, default: false, index: true },
 
-  // Turbo contracts: payout per point of distance from barrier.
-  // e.g. 0.5 = $0.50 profit per point above strike (for TURBOSLONG).
+  // ── High-payout metadata ──
   payoutPerPoint: { type: Number, default: null },
-
-  // Accumulator contracts: % growth per tick (1–5).
-  // e.g. 5 = 5% stake growth per tick that stays in range.
   growthRate: { type: Number, default: null },
-
-  // Vanilla/Turbo: strike price at entry. Stored as number so we can
-  // compute "distance from strike" post-hoc.
   strikePrice: { type: Number, default: null },
-
-  // Touch/No Touch: the barrier price at entry. Different from
-  // `strikePrice` because touch contracts use a specific barrier value,
-  // not a strike. Stored separately for clarity.
   touchBarrier: { type: Number, default: null },
-
-  // Touch/No Touch: which side of the bet it was.
-  // 'TOUCH'    — predict price WILL touch the barrier
-  // 'NO_TOUCH' — predict price will NOT touch the barrier
   touchDirection: { type: String, enum: ['TOUCH', 'NO_TOUCH', null], default: null },
 }, { timestamps: true });
 
 BotRunSchema.index({ botId: 1, openedAt: -1 });
 BotRunSchema.index({ instanceId: 1, openedAt: -1 });
 BotRunSchema.index({ status: 1, openedAt: -1 });
-// Compound index — every edge query hits this triple
 BotRunSchema.index({ isEdgeTest: 1, botId: 1, status: 1 });
 BotRunSchema.index({ isEdgeTest: 1, status: 1, openedAt: 1 });
-// [FIX-SHADOW-AUDIT] Shadow-specific queries — filter by bot + shadow + time
 BotRunSchema.index({ botId: 1, shadowEnabled: 1, openedAt: -1 });
-// [FIX-HIGH-PAYOUT] High-payout bot queries — filter by contract type + time
 BotRunSchema.index({ contractType: 1, openedAt: -1 });
+// [FIX-SHADOW-PHASE] Filter shadow-phase vs real trades per bot
+BotRunSchema.index({ botId: 1, shadowPhase: 1, openedAt: -1 });
 
 /**
  * Aggregate stats for one bot (optionally since a date).
  * Returns: { trades, wins, losses, totalPnL, avgPnL, winRate, profitFactor }
+ *
+ * NOTE: This counts ALL trades (shadow-phase + real). For shadow-specific
+ * or real-specific breakdowns, use shadowSummaryFor or realTradesFor.
  */
 BotRunSchema.statics.statsFor = async function (botId, since = null) {
   const match = { botId };
@@ -153,20 +152,9 @@ BotRunSchema.statics.statsFor = async function (botId, since = null) {
 };
 
 /**
- * [FIX-SHADOW-AUDIT] Aggregate shadow-trading performance for one bot.
- *
- * Only counts trades where shadowEnabled=true (Rise/Fall + Volatility
- * bots with shadowWinsRequired > 0). Digit and FX bots are excluded.
- *
- * Returns:
- *   {
- *     trades, wins, losses, winRate,       — real-trade outcomes
- *     avgGateAtEntry,                      — average gate value when firing
- *     minGateAtEntry, maxGateAtEntry,      — gate range this session span
- *     shadowWins, shadowLosses, shadowWinRate,  — total shadows observed
- *     totalTightens,                       — total loss-tightens applied
- *     totalTradesEverShadowed,             — same as `trades`, for clarity
- *   }
+ * Shadow-trading performance for one bot. Counts only shadow-phase trades.
+ * Returns: { trades, wins, losses, winRate, avgGateAtEntry, totalTightens,
+ *            totalShadowWins, totalShadowLosses, shadowWinRate }
  */
 BotRunSchema.statics.shadowSummaryFor = async function (botId, since = null) {
   const match = { botId, shadowEnabled: true };
@@ -217,23 +205,49 @@ BotRunSchema.statics.shadowSummaryFor = async function (botId, since = null) {
 };
 
 /**
- * [FIX-HIGH-PAYOUT] Aggregate performance for the 4 high-payout bots.
+ * [FIX-SHADOW-PHASE] Real (non-shadow-phase) trade performance for one bot.
+ * Returns: { trades, wins, losses, winRate, totalPnL, avgPnL,
+ *            shadowPhaseTrades, shadowPhasePnL }
  *
- * Filters by contractType ∈ {ONETOUCH, NOTOUCH, VANILLALONGCALL,
- * VANILLALONGPUT, TURBOSLONG, TURBOSSHORT, ACCU}.
- *
- * Returns:
- *   {
- *     trades, wins, losses, winRate,
- *     totalPnL, avgPnL, profitFactor,
- *     avgStake, avgBarrierDistancePct,      — how far was the barrier?
- *     avgPayoutPerPoint,                    — Turbo only
- *     avgGrowthRate,                        — Accumulator only
- *     touchWinRate, touchTrades,            — Touch/No Touch subset
- *     vanillaWinRate, vanillaTrades,        — Vanilla subset
- *     turboWinRate, turboTrades,            — Turbo subset
- *     accumulatorWinRate, accumulatorTrades — Accumulator subset
- *   }
+ * The `shadowPhaseTrades` and `shadowPhasePnL` fields are informational —
+ * they show how many validation trades happened and how much they cost.
+ */
+BotRunSchema.statics.realTradesFor = async function (botId, since = null) {
+  const match = { botId };
+  if (since) match.openedAt = { $gte: since };
+
+  const result = await this.aggregate([
+    { $match: match },
+    {
+      $group: {
+        _id: '$shadowPhase',
+        trades: { $sum: 1 },
+        wins: { $sum: { $cond: [{ $eq: ['$result', 'WIN'] }, 1, 0] } },
+        losses: { $sum: { $cond: [{ $eq: ['$result', 'LOSS'] }, 1, 0] } },
+        totalPnL: { $sum: '$pnl' },
+      },
+    },
+  ]);
+
+  const realBucket = result.find(r => r._id === false) || { trades: 0, wins: 0, losses: 0, totalPnL: 0 };
+  const shadowBucket = result.find(r => r._id === true) || { trades: 0, wins: 0, losses: 0, totalPnL: 0 };
+
+  return {
+    trades: realBucket.trades,
+    wins: realBucket.wins,
+    losses: realBucket.losses,
+    winRate: realBucket.trades > 0 ? Number((realBucket.wins / realBucket.trades).toFixed(3)) : 0,
+    totalPnL: Number((realBucket.totalPnL || 0).toFixed(2)),
+    avgPnL: realBucket.trades > 0 ? Number(((realBucket.totalPnL || 0) / realBucket.trades).toFixed(2)) : 0,
+    shadowPhaseTrades: shadowBucket.trades,
+    shadowPhaseWins: shadowBucket.wins,
+    shadowPhaseLosses: shadowBucket.losses,
+    shadowPhasePnL: Number((shadowBucket.totalPnL || 0).toFixed(2)),
+  };
+};
+
+/**
+ * High-payout bot performance. Filters by contractType.
  */
 BotRunSchema.statics.highPayoutSummaryFor = async function (botId, since = null) {
   const HIGH_PAYOUT_TYPES = [
@@ -261,77 +275,35 @@ BotRunSchema.statics.highPayoutSummaryFor = async function (botId, since = null)
         avgPayoutPerPoint: { $avg: '$payoutPerPoint' },
         avgGrowthRate: { $avg: '$growthRate' },
 
-        // Touch/No Touch subset
-        touchTrades: {
-          $sum: { $cond: [{ $in: ['$contractType', ['ONETOUCH', 'NOTOUCH']] }, 1, 0] },
-        },
-        touchWins: {
-          $sum: {
-            $cond: [
-              { $and: [
-                { $in: ['$contractType', ['ONETOUCH', 'NOTOUCH']] },
-                { $eq: ['$result', 'WIN'] },
-              ] },
-              1, 0,
-            ],
-          },
-        },
+        touchTrades: { $sum: { $cond: [{ $in: ['$contractType', ['ONETOUCH', 'NOTOUCH']] }, 1, 0] } },
+        touchWins: { $sum: { $cond: [{ $and: [
+          { $in: ['$contractType', ['ONETOUCH', 'NOTOUCH']] },
+          { $eq: ['$result', 'WIN'] },
+        ] }, 1, 0] } },
 
-        // Vanilla subset
-        vanillaTrades: {
-          $sum: { $cond: [{ $in: ['$contractType', ['VANILLALONGCALL', 'VANILLALONGPUT']] }, 1, 0] },
-        },
-        vanillaWins: {
-          $sum: {
-            $cond: [
-              { $and: [
-                { $in: ['$contractType', ['VANILLALONGCALL', 'VANILLALONGPUT']] },
-                { $eq: ['$result', 'WIN'] },
-              ] },
-              1, 0,
-            ],
-          },
-        },
+        vanillaTrades: { $sum: { $cond: [{ $in: ['$contractType', ['VANILLALONGCALL', 'VANILLALONGPUT']] }, 1, 0] } },
+        vanillaWins: { $sum: { $cond: [{ $and: [
+          { $in: ['$contractType', ['VANILLALONGCALL', 'VANILLALONGPUT']] },
+          { $eq: ['$result', 'WIN'] },
+        ] }, 1, 0] } },
 
-        // Turbo subset
-        turboTrades: {
-          $sum: { $cond: [{ $in: ['$contractType', ['TURBOSLONG', 'TURBOSSHORT']] }, 1, 0] },
-        },
-        turboWins: {
-          $sum: {
-            $cond: [
-              { $and: [
-                { $in: ['$contractType', ['TURBOSLONG', 'TURBOSSHORT']] },
-                { $eq: ['$result', 'WIN'] },
-              ] },
-              1, 0,
-            ],
-          },
-        },
+        turboTrades: { $sum: { $cond: [{ $in: ['$contractType', ['TURBOSLONG', 'TURBOSSHORT']] }, 1, 0] } },
+        turboWins: { $sum: { $cond: [{ $and: [
+          { $in: ['$contractType', ['TURBOSLONG', 'TURBOSSHORT']] },
+          { $eq: ['$result', 'WIN'] },
+        ] }, 1, 0] } },
 
-        // Accumulator subset
-        accumulatorTrades: {
-          $sum: { $cond: [{ $eq: ['$contractType', 'ACCU'] }, 1, 0] },
-        },
-        accumulatorWins: {
-          $sum: {
-            $cond: [
-              { $and: [
-                { $eq: ['$contractType', 'ACCU'] },
-                { $eq: ['$result', 'WIN'] },
-              ] },
-              1, 0,
-            ],
-          },
-        },
+        accumulatorTrades: { $sum: { $cond: [{ $eq: ['$contractType', 'ACCU'] }, 1, 0] } },
+        accumulatorWins: { $sum: { $cond: [{ $and: [
+          { $eq: ['$contractType', 'ACCU'] },
+          { $eq: ['$result', 'WIN'] },
+        ] }, 1, 0] } },
       },
     },
   ]);
 
   const r = result[0] || {};
-
-  const safeRate = (wins, trades) =>
-    trades > 0 ? Number(((wins || 0) / trades).toFixed(3)) : 0;
+  const safeRate = (wins, trades) => trades > 0 ? Number(((wins || 0) / trades).toFixed(3)) : 0;
 
   return {
     trades: r.trades || 0,
