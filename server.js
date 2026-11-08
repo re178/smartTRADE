@@ -13,27 +13,35 @@
 // [FIX-S11] connectDB() awaited BEFORE ensureAdmin() and server.listen()
 // [FIX-S12] /health and /health/pipeline report database state; 503 when
 //           MongoDB is disconnected
-// [FIX-S13] RTS startup email notification. After server.listen succeeds
-//           (which requires the awaited MongoDB connection from S11), an
-//           email is sent listing every private LAN IPv4 address the laptop
-//           is reachable on, so the phone can connect from the same network.
-//           Uses services/emailService.js (Brevo-only, self-loading .env,
-//           send-time key read, HTTP-status surfaced on failure).
-//           Recipient is taken from env (RTS_NOTIFY_EMAIL / ALERT_EMAIL /
-//           SUPPORT_EMAIL). Failures are logged with the exact Brevo cause
-//           but never crash startup: the notification is a convenience,
-//           not a critical path.
-// [FIX-S14] Notification is fired inside server.listen() callback so it
-//           only runs after the port is actually bound. Combined with S11,
-//           this guarantees the email only goes out when MongoDB AND
-//           Express AND broker bootstrap have all succeeded.
-// [FIX-S15] Switched email provider from ./shared/emailProvider to
-//           ./services/emailService. The old module read BREVO_API_KEY at
-//           module-load time (before dotenv ran) and fell back to a dead
-//           Gmail transporter, which caused silent "email failed" logs.
-//           services/emailService.js loads .env itself, reads the key at
-//           send-time, and returns { success, provider, error, httpStatus,
-//           diagnostics } so failures are now diagnosable.
+// [FIX-S13/S14/S15] RTS startup email via services/emailService.js
+//
+// [FIX-AUTH] **Full dashboard login wall.**
+//   Env vars (required for auth to be active):
+//     • DASHBOARD_USERNAME       — login username
+//     • DASHBOARD_PASSWORD       — plaintext password (or use hash below)
+//     • SESSION_SECRET           — HMAC signing key (32+ hex chars)
+//   Env vars (optional, for maximum security):
+//     • DASHBOARD_PASSWORD_HASH  — scrypt hash, format "scrypt$<salt>$<hash>"
+//                                   If set, takes precedence over plaintext.
+//                                   Generate with:
+//                                     node -e "const c=require('crypto');const s=c.randomBytes(16).toString('hex');const h=c.scryptSync(process.argv[1],s,64).toString('hex');console.log('scrypt$'+s+'$'+h)" 'your-password'
+//     • DASHBOARD_ALLOWED_IPS    — comma-separated IP allowlist for /api/login
+//                                   If set, only these IPs can attempt login.
+//
+//   If any required env var is missing, the app still boots (health checks
+//   still pass for Render), but the dashboard is unreachable. A clear
+//   misconfiguration message appears at /login.
+//
+//   Security model:
+//     • Session cookie: HMAC-signed, httpOnly, sameSite=lax, secure in prod
+//     • 7-day TTL, no server-side session store (self-validating token)
+//     • Constant-time comparison for both username and password
+//     • Login rate limiter: 5 failures per IP per 15 min
+//     • All routes except /login, /api/login, /api/logout, /api/auth/me,
+//       /health, /health/pipeline require auth
+//     • WebSocket upgrade is auth-checked before handshake (Part 2)
+//
+// [FIX-SWITCH] POST /api/account/switch (Part 2) — demo ⇄ real.
 
 require('dotenv').config();
 
@@ -43,10 +51,11 @@ const path = require('path');
 const mongoose = require('mongoose');
 const WebSocket = require('ws');
 const http = require('http');
-const os = require('os');                             // [FIX-S13]
+const os = require('os');
+const crypto = require('crypto');                      // [FIX-AUTH]
 
 const logger = require('./infrastructure/logger') || console;
-const { sendEmail } = require('./shared/emailProvider'); // [FIX-S13/S15]
+const { sendEmail } = require('./shared/emailProvider');
 
 const dashboardClients = new Set();
 
@@ -104,7 +113,6 @@ const balanceGuard = require('./core/risk/balanceGuard');
 
 const { getBroker } = require('./core/execution/brokerFactory');
 
-// --- OTIE lazily initialised ---
 let otie = null;
 
 function normalizeSymbol(symbol) {
@@ -138,7 +146,269 @@ const WATCHED_SYMBOLS = (process.env.WATCHED_SYMBOLS || DEFAULT_WATCHED.join(','
   .map(s => normalizeSymbol(s))
   .filter(Boolean);
 
-// [FIX-S11] connectDB() is awaited inside startServer() — do not add it here.
+// ============================================================
+// [FIX-AUTH] Configuration
+// ============================================================
+
+const AUTH_USERNAME        = process.env.DASHBOARD_USERNAME || '';
+const AUTH_PASSWORD        = process.env.DASHBOARD_PASSWORD || '';
+const AUTH_PASSWORD_HASH   = process.env.DASHBOARD_PASSWORD_HASH || '';  // format: scrypt$<salt>$<hash>
+const SESSION_SECRET       = process.env.SESSION_SECRET || '';
+const AUTH_ALLOWED_IPS_RAW = process.env.DASHBOARD_ALLOWED_IPS || '';
+
+const AUTH_ALLOWED_IPS = AUTH_ALLOWED_IPS_RAW
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+const AUTH_CONFIGURED = !!(
+  AUTH_USERNAME &&
+  SESSION_SECRET &&
+  (AUTH_PASSWORD || AUTH_PASSWORD_HASH)
+);
+
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const IS_PROD = process.env.NODE_ENV === 'production';
+const COOKIE_NAME = 'rts_session';
+
+if (!AUTH_CONFIGURED) {
+  logger.error('[Auth] ============================================');
+  logger.error('[Auth] MISSING REQUIRED ENV VARS:');
+  logger.error('[Auth]   Required: DASHBOARD_USERNAME, SESSION_SECRET,');
+  logger.error('[Auth]             DASHBOARD_PASSWORD (or DASHBOARD_PASSWORD_HASH)');
+  logger.error('[Auth] Dashboard will be INACCESSIBLE until these are set.');
+  logger.error('[Auth] Generate SESSION_SECRET with: openssl rand -hex 32');
+  logger.error('[Auth] ============================================');
+} else {
+  logger.info(`[Auth] Dashboard auth enabled for user "${AUTH_USERNAME}" · TTL 7d`);
+  if (AUTH_PASSWORD_HASH) logger.info('[Auth] Password hashing: scrypt (hash configured)');
+  else logger.info('[Auth] Password hashing: plaintext (set DASHBOARD_PASSWORD_HASH for max security)');
+  if (AUTH_ALLOWED_IPS.length > 0) {
+    logger.info(`[Auth] IP allowlist active: [${AUTH_ALLOWED_IPS.join(', ')}]`);
+  }
+}
+
+// ---- Constant-time comparison (mitigates timing attacks) ----
+function safeEq(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const ba = Buffer.from(a, 'utf8');
+  const bb = Buffer.from(b, 'utf8');
+  if (ba.length !== bb.length) {
+    try { crypto.timingSafeEqual(ba, ba); } catch (_) {}
+    return false;
+  }
+  try { return crypto.timingSafeEqual(ba, bb); } catch (_) { return false; }
+}
+
+// ---- Password verification: scrypt hash OR constant-time plaintext ----
+function verifyPassword(plaintext, hashField, plaintextField) {
+  if (hashField && hashField.startsWith('scrypt$')) {
+    const parts = hashField.split('$');
+    if (parts.length !== 3) return false;
+    const [, saltHex, hashHex] = parts;
+    try {
+      const expected = Buffer.from(hashHex, 'hex');
+      const actual = crypto.scryptSync(plaintext, Buffer.from(saltHex, 'hex'), expected.length);
+      return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+    } catch (_) { return false; }
+  }
+  if (plaintextField) return safeEq(plaintext, plaintextField);
+  return false;
+}
+
+// ---- Session: HMAC-signed token = base64url(payload).base64url(hmac) ----
+function signSession(userId) {
+  const payload = { uid: userId, exp: Date.now() + SESSION_TTL_MS };
+  const p64 = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(p64).digest('base64url');
+  return `${p64}.${sig}`;
+}
+
+function verifySession(token) {
+  if (!token || typeof token !== 'string') return null;
+  const dot = token.lastIndexOf('.');
+  if (dot < 1) return null;
+  const p64 = token.slice(0, dot);
+  const sig = token.slice(dot + 1);
+  const expected = crypto.createHmac('sha256', SESSION_SECRET).update(p64).digest('base64url');
+  if (!safeEq(sig, expected)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(p64, 'base64url').toString('utf8'));
+    if (!payload.exp || payload.exp < Date.now()) return null;
+    return payload;
+  } catch (_) { return null; }
+}
+
+function parseCookies(req) {
+  const out = {};
+  const h = req.headers.cookie;
+  if (!h) return out;
+  for (const pair of h.split(';')) {
+    const i = pair.indexOf('=');
+    if (i < 0) continue;
+    const k = pair.slice(0, i).trim();
+    const v = pair.slice(i + 1).trim();
+    if (!k) continue;
+    try { out[k] = decodeURIComponent(v); } catch (_) { out[k] = v; }
+  }
+  return out;
+}
+
+function getSession(req) {
+  const cookies = parseCookies(req);
+  return verifySession(cookies[COOKIE_NAME]);
+}
+
+// ---- Login rate limiter: 5 failures / 15 min per IP ----
+const LOGIN_RATE_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_RATE_MAX = 5;
+const _loginAttempts = new Map();   // ip -> { count, firstAt, lockedUntil }
+
+function getClientIp(req) {
+  const fwd = req.headers['x-forwarded-for'];
+  if (typeof fwd === 'string' && fwd.length > 0) return fwd.split(',')[0].trim();
+  return req.ip || (req.connection && req.connection.remoteAddress) || 'unknown';
+}
+
+function checkLoginRateLimit(ip) {
+  const now = Date.now();
+  const rec = _loginAttempts.get(ip);
+  if (!rec) return { allowed: true };
+  if (rec.lockedUntil && now < rec.lockedUntil) {
+    return { allowed: false, retryInMs: rec.lockedUntil - now };
+  }
+  if (now - rec.firstAt > LOGIN_RATE_WINDOW_MS) {
+    _loginAttempts.delete(ip);
+    return { allowed: true };
+  }
+  return { allowed: true };
+}
+
+function recordLoginFailure(ip) {
+  const now = Date.now();
+  const rec = _loginAttempts.get(ip) || { count: 0, firstAt: now, lockedUntil: 0 };
+  if (now - rec.firstAt > LOGIN_RATE_WINDOW_MS) {
+    rec.count = 0;
+    rec.firstAt = now;
+    rec.lockedUntil = 0;
+  }
+  rec.count++;
+  if (rec.count >= LOGIN_RATE_MAX) {
+    rec.lockedUntil = now + LOGIN_RATE_WINDOW_MS;
+  }
+  _loginAttempts.set(ip, rec);
+}
+
+function clearLoginFailures(ip) {
+  _loginAttempts.delete(ip);
+}
+
+// ---- IP allowlist check for login ----
+function isIpAllowed(ip) {
+  if (AUTH_ALLOWED_IPS.length === 0) return true;
+  return AUTH_ALLOWED_IPS.includes(ip);
+}
+
+// ---- Login page HTML (self-contained, no external JS deps) ----
+const LOGIN_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>RTS · Sign In</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet" />
+<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet" />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+<style>
+  * { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
+  body { margin: 0; min-height: 100vh; background: #0f1e33;
+         display: flex; align-items: center; justify-content: center; color: #1e2a41; }
+  .wrap { width: 100%; max-width: 380px; padding: 20px; }
+  .brand { text-align: center; color: #fff; margin-bottom: 28px; }
+  .brand i { color: #1a73e8; font-size: 2.4rem; }
+  .brand h1 { font-size: 1.4rem; font-weight: 800; margin: 10px 0 2px; }
+  .brand small { color: #94a3b8; font-size: 0.7rem; letter-spacing: 0.05em; }
+  .card { background: #fff; border-radius: 12px; padding: 30px 26px;
+          box-shadow: 0 10px 40px rgba(0,0,0,0.35); }
+  .card h2 { font-size: 1.1rem; font-weight: 600; margin-bottom: 20px; }
+  .form-label { font-size: 0.8rem; font-weight: 600; color: #6b7a8f; }
+  .form-control { border-radius: 8px; border-color: #e9edf2; padding: 10px 14px; }
+  .form-control:focus { border-color: #1a73e8; box-shadow: 0 0 0 0.2rem rgba(26,115,232,0.15); }
+  .btn-primary { background: #1a73e8; border: none; border-radius: 8px; padding: 11px; font-weight: 600; }
+  .btn-primary:hover { background: #1557b0; }
+  .btn-primary:disabled { background: #94a3b8; }
+  .err { background: #fef2f2; border: 1px solid #fecaca; color: #991b1b;
+         padding: 10px 14px; border-radius: 8px; font-size: 0.85rem;
+         margin-bottom: 16px; display: none; }
+  .err.show { display: block; }
+  .footer { text-align: center; margin-top: 20px; color: #5a6f8a; font-size: 0.7rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">
+    <i class="fas fa-chart-line"></i>
+    <h1>RTS</h1>
+    <small>v2.0 · LIVE TRADING</small>
+  </div>
+  <div class="card">
+    <h2><i class="fas fa-lock me-2" style="color:#1a73e8;"></i>Sign In</h2>
+    <div id="error" class="err"></div>
+    <form id="loginForm" autocomplete="off">
+      <div class="mb-3">
+        <label class="form-label">Username</label>
+        <input type="text" class="form-control" id="username" required autofocus />
+      </div>
+      <div class="mb-3">
+        <label class="form-label">Password</label>
+        <input type="password" class="form-control" id="password" required />
+      </div>
+      <button type="submit" class="btn btn-primary w-100" id="submitBtn">
+        <i class="fas fa-sign-in-alt me-1"></i> Sign In
+      </button>
+    </form>
+  </div>
+  <div class="footer">Ray Trading Systems · Authorized access only</div>
+</div>
+<script>
+(function() {
+  var form = document.getElementById('loginForm');
+  var errEl = document.getElementById('error');
+  var btn = document.getElementById('submitBtn');
+  function showErr(m) { errEl.textContent = m; errEl.classList.add('show'); }
+
+  form.addEventListener('submit', async function(e) {
+    e.preventDefault();
+    errEl.classList.remove('show');
+    var u = document.getElementById('username').value;
+    var p = document.getElementById('password').value;
+    if (!u || !p) return;
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i> Signing in...';
+    try {
+      var r = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: u, password: p })
+      });
+      var d = {};
+      try { d = await r.json(); } catch (_) {}
+      if (r.ok && d.success) { window.location.href = '/'; return; }
+      showErr(d.error || 'Login failed');
+    } catch (err) {
+      showErr('Network error: ' + err.message);
+    }
+    btn.disabled = false;
+    btn.innerHTML = '<i class="fas fa-sign-in-alt me-1"></i> Sign In';
+  });
+})();
+</script>
+</body>
+</html>`;
+
+// ============================================================
+// [FIX-S11] connectDB() is awaited inside startServer()
+// ============================================================
 
 const _consensusCache = new Map();
 const _predictionCache = new Map();
@@ -159,54 +429,35 @@ dataOrchestrator.publish = function (key, data, metadata) {
       _regimePublishCounts[data.symbol][code] =
         (_regimePublishCounts[data.symbol][code] || 0) + 1;
     }
-  } catch (_) { /* never break publish */ }
+  } catch (_) {}
   return _originalPublish(key, data, metadata);
 };
 
 // ============================================================
-// [FIX-S13] RTS startup email notification helpers
+// [FIX-S13] RTS startup email notification
 // ============================================================
 
-/**
- * Enumerate private LAN IPv4 addresses the machine is reachable on.
- * Filters out loopback and public IPs. Returns an array of
- * { interface, ip, url } objects.
- */
 function getRTSLanAddresses(port) {
   const interfaces = os.networkInterfaces();
   const addresses = [];
-
   for (const [interfaceName, entries] of Object.entries(interfaces)) {
     for (const entry of entries || []) {
       if (entry.internal || entry.family !== 'IPv4') continue;
-
       const ip = entry.address;
       const isPrivate =
         ip.startsWith('10.') ||
         ip.startsWith('192.168.') ||
         /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(ip);
-
       if (isPrivate) {
-        addresses.push({
-          interface: interfaceName,
-          ip,
-          url: `http://${ip}:${port}`,
-        });
+        addresses.push({ interface: interfaceName, ip, url: `http://${ip}:${port}` });
       }
     }
   }
-
   return addresses;
 }
 
-/**
- * Send the RTS startup email. Non-throwing — failures are logged with
- * the exact Brevo cause but never interrupt startup.
- * Called from inside server.listen() callback in startServer().
- */
 async function sendRTSStartupNotification(port) {
   const addresses = getRTSLanAddresses(port);
-
   const addressHTML = addresses.length
     ? addresses.map(item => `
         <p>
@@ -219,143 +470,70 @@ async function sendRTSStartupNotification(port) {
 
   const html = `
     <h2>RTS Laptop Startup Successful</h2>
-
     <p>Your Ray Trading Hub server has started successfully.</p>
-
     <p><strong>Status:</strong> ONLINE</p>
     <p><strong>Database:</strong> CONNECTED</p>
+    <p><strong>Auth:</strong> ${AUTH_CONFIGURED ? 'ENABLED' : 'MISCONFIGURED'}</p>
     <p><strong>Port:</strong> ${port}</p>
     <p><strong>Time:</strong> ${new Date().toLocaleString()}</p>
-
     <hr>
-
     <h3>Current Laptop Network Addresses</h3>
-
     ${addressHTML}
-
     <hr>
+    <p>RTS Automatic Startup Notification</p>`;
 
-    <p>Open one of the addresses above from your phone
-    when both devices are connected to the same network.</p>
-
-    <p>RTS Automatic Startup Notification</p>
-  `;
-
-  // [FIX-S15] Recipient from env, not hardcoded.
-  const to =
-    process.env.RTS_NOTIFY_EMAIL ||
-    process.env.ALERT_EMAIL ||
-    process.env.SUPPORT_EMAIL;
-
-  if (!to) {
-    logger.error(
-      '[Notify] No recipient configured. Set RTS_NOTIFY_EMAIL ' +
-      '(or ALERT_EMAIL / SUPPORT_EMAIL) in .env'
-    );
-    return;
-  }
-
+  const to = process.env.RTS_NOTIFY_EMAIL || process.env.ALERT_EMAIL || process.env.SUPPORT_EMAIL;
+  if (!to) { logger.error('[Notify] No recipient configured. Set RTS_NOTIFY_EMAIL (or ALERT_EMAIL / SUPPORT_EMAIL).'); return; }
   const keyPresent = !!process.env.BREVO_API_KEY;
-  const sender     = process.env.SUPPORT_EMAIL || 'support@voxtraapp.com';
-
-  logger.info(
-    `[Notify] Sending startup email -> to=${to} sender=${sender} ` +
-    `keyPresent=${keyPresent} keyLength=${(process.env.BREVO_API_KEY || '').length}`
-  );
-
-  if (!keyPresent) {
-    logger.error(
-      '[Notify] BREVO_API_KEY missing in .env. Startup email skipped. ' +
-      'Add BREVO_API_KEY=xkeysib-... and restart.'
-    );
-    return;
-  }
-
+  const sender = process.env.SUPPORT_EMAIL || 'support@voxtraapp.com';
+  logger.info(`[Notify] Sending startup email -> to=${to} sender=${sender} keyPresent=${keyPresent}`);
+  if (!keyPresent) { logger.error('[Notify] BREVO_API_KEY missing in .env. Startup email skipped.'); return; }
   try {
-    const result = await sendEmail(
-      to,
-      'RTS is ONLINE - Laptop Startup Notification',
-      html
-    );
-
+    const result = await sendEmail(to, 'RTS is ONLINE - Laptop Startup Notification', html);
     if (result && result.success) {
-      logger.info(
-        `[Notify] Startup email SENT via ${result.provider || 'unknown'} ` +
-        `(messageId=${result.messageId || 'n/a'}) to ${to}`
-      );
+      logger.info(`[Notify] Startup email SENT via ${result.provider || 'unknown'} to ${to}`);
       return;
     }
-
-    const status = (result && result.httpStatus) || '';
-    const errMsg = (result && result.error) || 'unknown error';
-    logger.error(`[Notify] Startup email FAILED: ${errMsg}`);
-
-    if (status === 401 || status === 403) {
-      logger.error('[Notify] => BREVO_API_KEY is wrong or revoked. Regenerate in Brevo dashboard.');
-    } else if (status === 400) {
-      logger.error(
-        `[Notify] => Sender "${sender}" is not verified in Brevo. ` +
-        'Verify at https://app.brevo.com/sender'
-      );
-    } else if (/ENOTFOUND|ECONNREFUSED|ETIMEDOUT|timeout/i.test(errMsg)) {
-      logger.error('[Notify] => Cannot reach api.brevo.com. Check firewall / DNS / internet.');
-    } else if (result && result.diagnostics) {
-      logger.error(`[Notify] Diagnostics: ${JSON.stringify(result.diagnostics)}`);
-    }
+    logger.error(`[Notify] Startup email FAILED: ${(result && result.error) || 'unknown'}`);
   } catch (error) {
     logger.error(`[Notify] Startup email threw: ${error.message}`);
   }
 }
 
 // ============================================================
-// Flatten consensus (unchanged from prior version)
+// Helpers
 // ============================================================
 function flattenConsensus(consensus) {
   if (!consensus || !consensus.consensus) return null;
   const c = consensus.consensus;
   return {
-    symbol: consensus.symbol,
-    timeframe: consensus.timeframe,
-    regime: consensus.regime,
-    evaluatedAt: consensus.evaluatedAt,
-    action: c.action,
-    direction: c.direction,
-    confidence: c.confidence,
-    anchorStrategy: c.anchorStrategy,
-    agreeing: c.agreeing || [],
-    conflicting: c.conflicting || [],
-    buyWeight: c.buyWeight,
-    sellWeight: c.sellWeight,
-    activeCount: c.activeCount,
-    silentCount: c.silentCount,
-    flaggedCount: c.flaggedCount,
+    symbol: consensus.symbol, timeframe: consensus.timeframe, regime: consensus.regime,
+    evaluatedAt: consensus.evaluatedAt, action: c.action, direction: c.direction,
+    confidence: c.confidence, anchorStrategy: c.anchorStrategy,
+    agreeing: c.agreeing || [], conflicting: c.conflicting || [],
+    buyWeight: c.buyWeight, sellWeight: c.sellWeight,
+    activeCount: c.activeCount, silentCount: c.silentCount, flaggedCount: c.flaggedCount,
     reasons: c.reasons || [],
     strategies: (consensus.strategies || []).map(r => ({
-      name: r.name,
-      signalSide: r.signalSide,
-      status: r.status,
+      name: r.name, signalSide: r.signalSide, status: r.status,
       weight: Number((r.weight || 0).toFixed(3)),
       effectiveWinRate: Number((r.effectiveWinRate || 0).toFixed(3)),
-      trades: r.trades || 0,
-      flagged: !!r.flagged,
+      trades: r.trades || 0, flagged: !!r.flagged,
     })),
   };
 }
 
 async function ensureAdmin() {
   try {
-    const adminId = 'admin';
-    let admin = await User.findOne({ userId: adminId });
+    let admin = await User.findOne({ userId: 'admin' });
     if (!admin) {
-      admin = new User({ userId: adminId, tradingProduct: 'deriv_cfd' });
+      admin = new User({ userId: 'admin', tradingProduct: 'deriv_cfd' });
       await admin.save();
     } else if (admin.tradingProduct === 'mt5') {
       admin.tradingProduct = 'deriv_cfd';
       await admin.save();
     }
-  } catch (err) {
-    logger.error('[Admin] Creation failed:', err.message);
-  }
+  } catch (err) { logger.error('[Admin] Creation failed:', err.message); }
 }
 
 function repairJson(raw) {
@@ -388,7 +566,6 @@ app.use((req, res, next) => {
     rawBody = rawBody.replace(/\0/g, '');
     const trimmed = rawBody.trim();
     req.rawBody = trimmed;
-
     const contentType = req.headers['content-type'] || '';
     if (contentType.includes('application/json') && trimmed.length > 0) {
       let parsed = null;
@@ -406,6 +583,117 @@ app.use((req, res, next) => {
   req.on('error', (err) => { next(err); });
 });
 
+// ============================================================
+// [FIX-AUTH] Login/logout/auth-check routes (public)
+// ============================================================
+
+app.get('/login', (req, res) => {
+  const session = getSession(req);
+  if (session) return res.redirect('/');
+  res.type('html').send(LOGIN_HTML);
+});
+
+app.post('/api/login', (req, res) => {
+  if (!AUTH_CONFIGURED) {
+    return res.status(503).json({
+      error: 'Server not configured. Set DASHBOARD_USERNAME, SESSION_SECRET, DASHBOARD_PASSWORD on Render.',
+    });
+  }
+
+  const ip = getClientIp(req);
+
+  // IP allowlist check (before rate limit — no wasted limiter slots on banned IPs)
+  if (!isIpAllowed(ip)) {
+    logger.warn(`[Auth] Login blocked by IP allowlist: ${ip}`);
+    return res.status(403).json({ error: 'Access denied from this IP' });
+  }
+
+  // Rate limit check
+  const rateCheck = checkLoginRateLimit(ip);
+  if (!rateCheck.allowed) {
+    const retryMin = Math.ceil((rateCheck.retryInMs || 0) / 60000);
+    logger.warn(`[Auth] Login rate-limited for ${ip} (retry in ${retryMin}m)`);
+    return res.status(429).json({
+      error: `Too many failed attempts. Try again in ${retryMin} minute(s).`,
+    });
+  }
+
+  const { username, password } = req.body || {};
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password required' });
+  }
+
+  const uOk = safeEq(String(username), AUTH_USERNAME);
+  const pOk = verifyPassword(String(password), AUTH_PASSWORD_HASH, AUTH_PASSWORD);
+
+  if (!uOk || !pOk) {
+    recordLoginFailure(ip);
+    logger.warn(`[Auth] Failed login from ${ip} (user="${String(username).slice(0, 32)}")`);
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+
+  clearLoginFailures(ip);
+  const token = signSession('admin');
+  const cookieParts = [
+    `${COOKIE_NAME}=${encodeURIComponent(token)}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    `Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`,
+  ];
+  if (IS_PROD) cookieParts.push('Secure');
+  res.setHeader('Set-Cookie', cookieParts.join('; '));
+
+  logger.info(`[Auth] Login OK from ${ip}`);
+  return res.json({ success: true, user: { id: 'admin' } });
+});
+
+app.post('/api/logout', (req, res) => {
+  const cookieParts = [`${COOKIE_NAME}=`, 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0'];
+  if (IS_PROD) cookieParts.push('Secure');
+  res.setHeader('Set-Cookie', cookieParts.join('; '));
+  logger.info(`[Auth] Logout from ${getClientIp(req)}`);
+  return res.json({ success: true });
+});
+
+app.get('/api/auth/me', (req, res) => {
+  const session = getSession(req);
+  if (!session) return res.status(401).json({ error: 'Unauthorized' });
+  return res.json({ user: { id: session.uid }, configured: AUTH_CONFIGURED });
+});
+
+// ============================================================
+// [FIX-AUTH] Global auth gate
+// Public: /login, /api/login, /api/logout, /api/auth/me, /health,
+//         /health/pipeline, /favicon.ico
+// Protected: everything else, including /js/*, /css/*
+// ============================================================
+const PUBLIC_PATHS = new Set([
+  '/login',
+  '/api/login',
+  '/api/logout',
+  '/api/auth/me',
+  '/health',
+  '/health/pipeline',
+  '/favicon.ico',
+]);
+
+app.use((req, res, next) => {
+  if (PUBLIC_PATHS.has(req.path)) return next();
+  const session = getSession(req);
+  if (session) {
+    req.user = { id: session.uid };
+    return next();
+  }
+  if (req.path.startsWith('/api/')) {
+    return res.status(401).json({ error: 'Unauthorized', redirect: '/login' });
+  }
+  return res.redirect('/login');
+});
+
+// ============================================================
+// Static + user context
+// ============================================================
 app.use(express.static('public'));
 
 app.use(async (req, res, next) => {
@@ -416,36 +704,39 @@ app.use(async (req, res, next) => {
       admin = new User({ userId: 'admin', tradingProduct: defaultProduct });
       await admin.save();
     }
-    req.user = { id: 'admin', tradingProduct: admin.tradingProduct };
+    if (!req.user) req.user = { id: 'admin' };
+    req.user.tradingProduct = admin.tradingProduct;
     next();
   } catch (err) {
-    req.user = { id: 'admin', tradingProduct: process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd' };
+    if (!req.user) req.user = { id: 'admin' };
+    req.user.tradingProduct = process.env.DEFAULT_TRADING_PRODUCT || 'deriv_cfd';
     next();
   }
 });
 
+// Mounted API routers
 app.use('/api', apiRoutes);
 app.use('/api', botRoutes);
 app.use('/api/edge-test', require('./api/edgeController'));
 
-// [FIX-S12] Health endpoint reports database state.
+// ============================================================
+// Health endpoints (public — see PUBLIC_PATHS)
+// ============================================================
 app.get('/health', (req, res) => {
   const databaseConnected = mongoose.connection.readyState === 1;
-
   if (!databaseConnected) {
     return res.status(503).json({
-      status: 'STARTING',
-      database: 'DISCONNECTED',
+      status: 'STARTING', database: 'DISCONNECTED',
       message: 'RTS is waiting for MongoDB',
       readyState: mongoose.connection.readyState,
+      authConfigured: AUTH_CONFIGURED,
       timestamp: new Date().toISOString(),
     });
   }
-
   res.status(200).json({
-    status: 'OK',
-    database: 'CONNECTED',
+    status: 'OK', database: 'CONNECTED',
     message: 'RTS is running with Deriv broker',
+    authConfigured: AUTH_CONFIGURED,
     timestamp: new Date().toISOString(),
   });
 });
@@ -461,19 +752,16 @@ app.get('/health/pipeline', async (req, res) => {
     const dbConnected = mongoose.connection.readyState === 1;
     const healthy = connected && hasMarketData && hasConsensus && dbConnected;
     res.status(healthy ? 200 : 503).json({
-      healthy,
-      brokerConnected: connected,
-      databaseConnected: dbConnected,
-      marketCachePopulated: hasMarketData,
-      strategyConsensusActive: hasConsensus,
-      runningBots: hasBots,
-      timestamp: new Date().toISOString(),
+      healthy, brokerConnected: connected, databaseConnected: dbConnected,
+      marketCachePopulated: hasMarketData, strategyConsensusActive: hasConsensus,
+      runningBots: hasBots, timestamp: new Date().toISOString(),
     });
-  } catch (err) {
-    res.status(500).json({ error: err.message, healthy: false });
-  }
+  } catch (err) { res.status(500).json({ error: err.message, healthy: false }); }
 });
 
+// ============================================================
+// Existing endpoints (all protected by auth middleware above)
+// ============================================================
 app.get('/api/balance-guard', (req, res) => {
   try { res.json(balanceGuard.getState()); }
   catch (err) { res.status(500).json({ error: err.message }); }
@@ -488,6 +776,106 @@ app.post('/api/balance-guard/reset', (req, res) => {
   }
 });
 
+// ============================================================
+// [FIX-SWITCH] POST /api/account/switch
+// Demo ⇄ real account switch. Guards on open positions + running bots.
+// Delegates the actual switch to broker.switchAccountType().
+// ============================================================
+app.post('/api/account/switch', async (req, res) => {
+  const { accountType } = req.body || {};
+  if (accountType !== 'demo' && accountType !== 'real') {
+    return res.status(400).json({ success: false, error: 'accountType must be "demo" or "real"' });
+  }
+
+  let broker;
+  try { broker = getBroker('deriv_cfd'); }
+  catch (err) {
+    return res.status(500).json({ success: false, error: 'Broker not initialized' });
+  }
+
+  if (typeof broker.switchAccountType !== 'function') {
+    return res.status(501).json({
+      success: false,
+      error: 'Broker does not support account switching. Deploy updated core/execution/broker.js first.',
+    });
+  }
+
+  // Guard 1: open positions
+  let positions = [];
+  try { positions = await broker.getOpenTrades(); }
+  catch (_) { positions = []; }
+  if (Array.isArray(positions) && positions.length > 0) {
+    return res.status(400).json({
+      success: false,
+      error: `Cannot switch: ${positions.length} open position(s). Close all positions on the current account first.`,
+      positions: positions.map(p => ({
+        id: p.id, instrument: p.instrument, side: p.side,
+        units: p.units, unrealizedPL: p.unrealizedPL,
+      })),
+    });
+  }
+
+  // Guard 2: running bots
+  let running = [];
+  try { running = botRunner.list() || []; }
+  catch (_) { running = []; }
+  if (Array.isArray(running) && running.length > 0) {
+    return res.status(400).json({
+      success: false,
+      error: `Cannot switch: ${running.length} bot(s) running. Stop all bots first.`,
+      runningBots: running.map(b => ({
+        instanceId: b.instanceId, botId: b.botId, name: b.name, symbol: b.symbol,
+      })),
+    });
+  }
+
+  try {
+    logger.info(`[Switch] API request: → ${accountType}`);
+    const result = await broker.switchAccountType(accountType);
+    logger.info(`[Switch] API success: now on ${result.accountType} (changed=${result.changed})`);
+
+    // Broadcast new account state to dashboards
+    try {
+      broadcastToDashboards('account', {
+        id: result.account?.id,
+        balance: result.account?.balance,
+        currency: result.account?.currency,
+        accountType: result.account?.accountType || accountType,
+        equity: result.account?.equity,
+        server: (result.account?.accountType === 'demo') ? 'demo' : 'real',
+      });
+    } catch (_) {}
+
+    return res.json({
+      success: true,
+      changed: result.changed,
+      previousAccountType: result.previousAccountType,
+      accountType: result.accountType,
+      account: result.account,
+    });
+  } catch (err) {
+    logger.error(`[Switch] API failed: ${err.message}`);
+
+    if (err.code === 'OPEN_POSITIONS') {
+      return res.status(400).json({
+        success: false,
+        error: err.message,
+        positions: err.positions || [],
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      error: err.message,
+      previousAccountType: err.previousAccountType || null,
+      targetAccountType: err.targetAccountType || accountType,
+    });
+  }
+});
+
+// ============================================================
+// Debug endpoints
+// ============================================================
 app.get('/debug/pipeline', async (req, res) => {
   try {
     const broker = getBroker('deriv_cfd');
@@ -503,20 +891,22 @@ app.get('/debug/pipeline', async (req, res) => {
     } catch (_) {}
 
     let dashboardMetrics = {};
-    try {
-      dashboardMetrics = analyticsDashboard.getMetrics ? analyticsDashboard.getMetrics() : {};
-    } catch (_) {}
+    try { dashboardMetrics = analyticsDashboard.getMetrics ? analyticsDashboard.getMetrics() : {}; } catch (_) {}
 
     let otieState = {};
-    try {
-      otieState = otie && otie.getAllStates ? otie.getAllStates() : {};
-    } catch (_) {}
+    try { otieState = otie && otie.getAllStates ? otie.getAllStates() : {}; } catch (_) {}
 
     res.json({
       timestamp: new Date().toISOString(),
       database: {
         connected: mongoose.connection.readyState === 1,
         readyState: mongoose.connection.readyState,
+      },
+      auth: {
+        configured: AUTH_CONFIGURED,
+        passwordHashing: AUTH_PASSWORD_HASH ? 'scrypt' : 'plaintext',
+        ipAllowlist: AUTH_ALLOWED_IPS,
+        failedAttempts: _loginAttempts.size,
       },
       broker: {
         connected: broker.isConnected ? broker.isConnected() : false,
@@ -526,12 +916,10 @@ app.get('/debug/pipeline', async (req, res) => {
         accountLoaded: brokerHealth.accountLoaded,
         portfolioDiagnostics: brokerHealth.portfolioDiagnostics,
         limitOrderDiagnostics: brokerHealth.limitOrderDiagnostics,
+        accountType: brokerHealth.accountType,
       },
       marketCache: { symbolCount: cache.size, symbols: Array.from(cache.keys()) },
-      deepState: {
-        bufferCount: deepBuffers,
-        diagnostics: deepDiagnostics,
-      },
+      deepState: { bufferCount: deepBuffers, diagnostics: deepDiagnostics },
       pipeline: { timerRunning: !!pipelineTimer },
       analyticsDashboard: {
         hasMetrics: Object.keys(dashboardMetrics).length > 0,
@@ -760,6 +1148,9 @@ app.get('/debug/status', (req, res) => {
   });
 });
 
+// ============================================================
+// SPA catch-all (protected — auth middleware above already ran)
+// ============================================================
 app.get('*', (req, res) => {
   if (!req.path.startsWith('/api')) {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
@@ -768,8 +1159,25 @@ app.get('*', (req, res) => {
   }
 });
 
+// ============================================================
+// HTTP + WebSocket servers
+// [FIX-AUTH] WebSocket uses noServer:true + manual upgrade handler
+// that validates the session cookie BEFORE handshake.
+// ============================================================
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+  const session = getSession(req);
+  if (!session) {
+    try { socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); } catch (_) {}
+    try { socket.destroy(); } catch (_) {}
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, req);
+  });
+});
 
 const WS_PING_INTERVAL = 30000;
 let wsPingTimer = null;
@@ -860,6 +1268,9 @@ async function sendDashboardInitialState(ws) {
   }
 }
 
+// ============================================================
+// Event subscriptions → broadcast to dashboards
+// ============================================================
 awarenessEngine.on('marketAwareness', (data) => broadcast('marketAwareness', data));
 deepRegime.on('regime', (regime) => broadcast('regime', regime));
 decisionEngine.on('decision', (decision) => broadcast('decision', decision));
@@ -868,6 +1279,7 @@ eventBus.on('trade.closed', (data) => broadcast('tradeClosed', data));
 eventBus.on('order.placed', (data) => broadcast('trade.placed', data));
 eventBus.on('position.updated', (data) => broadcast('positions', data));
 
+// StrategyPerformance recording
 eventBus.on('trade.closed', async (data) => {
   const contractId = data?.contractId;
   const strategy = data?.strategy;
@@ -897,6 +1309,7 @@ eventBus.on('trade.closed', async (data) => {
   }
 });
 
+// PerformanceMonitor recording
 eventBus.on('trade.closed', async (data) => {
   try {
     const trade = await Trade.findOne({ contractId: String(data.contractId) });
@@ -911,6 +1324,9 @@ performanceMonitor.on('thresholdsUpdated', (thresholds) => {
   }
 });
 
+// ============================================================
+// Prediction pipeline
+// ============================================================
 function logPipelineResult(symbol, reason, opportunity, level = 'info') {
   const now = Date.now();
   const prev = _pipelineLogThrottle.get(symbol);
@@ -1022,9 +1438,7 @@ async function runPredictionPipelineAll() {
       ctx.account = await broker.getAccount();
       ctx.positions = await broker.getOpenTrades();
     }
-  } catch (e) {
-    // fall back to per-symbol fetch
-  }
+  } catch (e) {}
 
   let ok = 0;
   const reasons = {};
@@ -1081,6 +1495,20 @@ async function startDerivBroker() {
     broker.on('positions', (positions) => broadcastToDashboards('positions', positions));
     broker.on('orderUpdate', (data) => broadcastToDashboards('orderUpdate', data));
     broker.on('_portfolioUpdated', (positions) => broadcastToDashboards('positions', positions));
+
+    // [FIX-SWITCH] Broadcast account switches triggered programmatically
+    broker.on('accountSwitched', (data) => {
+      logger.info(`[Deriv] Account switched: ${data.previousAccountType} → ${data.newAccountType}`);
+      broadcastToDashboards('account', {
+        id: data.account?.id,
+        balance: data.account?.balance,
+        currency: data.account?.currency,
+        accountType: data.account?.accountType || data.newAccountType,
+        equity: data.account?.equity,
+        server: data.newAccountType,
+      });
+    });
+
     await broker.connect();
     logger.info('[Deriv] Broker connected.');
     return broker;
@@ -1126,35 +1554,29 @@ async function waitForBrokerReady(broker, timeoutMs = 30000) {
   return !!(broker.isConnected && broker.isConnected());
 }
 
+// ============================================================
+// [FIX-S11] startServer — await DB, then admin, then listen
+// ============================================================
 async function startServer() {
-  // [FIX-S11] MongoDB must connect successfully before RTS starts.
   await connectDB();
-
-  // Only create/check the admin after database connection.
   await ensureAdmin();
 
   server.listen(PORT, () => {
     console.log('==============================================');
     console.log(`RTS server running on http://localhost:${PORT}`);
     console.log(`Database:       MongoDB connected`);
+    console.log(`Auth:           ${AUTH_CONFIGURED ? 'ENABLED' : 'MISCONFIGURED — set DASHBOARD_USERNAME, DASHBOARD_PASSWORD, SESSION_SECRET'}`);
+    if (AUTH_PASSWORD_HASH) console.log(`Password mode:  scrypt (hashed)`);
+    else if (AUTH_PASSWORD) console.log(`Password mode:  plaintext (set DASHBOARD_PASSWORD_HASH for max security)`);
+    if (AUTH_ALLOWED_IPS.length > 0) console.log(`IP allowlist:   [${AUTH_ALLOWED_IPS.join(', ')}]`);
+    console.log(`Login:          http://localhost:${PORT}/login`);
     console.log(`Dashboard:      http://localhost:${PORT}`);
     console.log(`API base:       http://localhost:${PORT}/api`);
-    console.log(`Signals:        http://localhost:${PORT}/api/signal/active`);
-    console.log(`Bots:           http://localhost:${PORT}/api/bots`);
-    console.log(`Edge test:      http://localhost:${PORT}/api/edge-test/status`);
-    console.log(`Digits:         http://localhost:${PORT}/api/digit`);
-    console.log(`Balance guard:  http://localhost:${PORT}/api/balance-guard`);
-    console.log(`Strategies:     http://localhost:${PORT}/debug/strategies`);
-    console.log(`Regime:         http://localhost:${PORT}/debug/regime`);
-    console.log(`Orchestrator:   http://localhost:${PORT}/debug/orchestrator`);
-    console.log(`Regime publish: http://localhost:${PORT}/debug/regime-publish`);
     console.log(`Health:         http://localhost:${PORT}/health`);
     console.log(`Health full:    http://localhost:${PORT}/health/pipeline`);
-    console.log(`Debug:          http://localhost:${PORT}/debug/pipeline`);
     console.log('==============================================');
 
-    // [FIX-S13/S14] Send startup email — fires AFTER port is bound,
-    // which (given S11) also means MongoDB is connected. Non-blocking.
+    // [FIX-S13/S14] Send startup email (after port is bound)
     sendRTSStartupNotification(PORT).catch(err => {
       logger.error('[Notify] sendRTSStartupNotification threw:', err.message);
     });
@@ -1191,6 +1613,11 @@ async function startServer() {
       botRunner.on('botResult', (d) => broadcastToDashboards('botResult', d));
       botRunner.on('botCycle', (d) => broadcastToDashboards('botCycle', d));
       botRunner.on('botError', (d) => broadcastToDashboards('botError', d));
+      botRunner.on('botShadowPlaced', (d) => broadcastToDashboards('botShadowPlaced', d));
+      botRunner.on('botShadowResolved', (d) => broadcastToDashboards('botShadowResolved', d));
+      botRunner.on('botCompoundGrow', (d) => broadcastToDashboards('botCompoundGrow', d));
+      botRunner.on('botCompoundReset', (d) => broadcastToDashboards('botCompoundReset', d));
+      botRunner.on('botTrailingExit', (d) => broadcastToDashboards('botTrailingExit', d));
       logger.info('Bot runner wired to dashboards.');
     } catch (err) {
       logger.error('Bot runner wiring failed:', err.message);
@@ -1240,6 +1667,7 @@ async function startServer() {
       try {
         const broker = getBroker('deriv_cfd');
         console.log(`   Broker:            ${broker.isConnected() ? 'connected' : 'disconnected'}`);
+        console.log(`   Account type:      ${broker.config.accountType}`);
       } catch (_) { console.log('   Broker:            not initialized'); }
       console.log(`   Pipeline timer:    ${pipelineTimer ? 'running' : 'stopped'}`);
       console.log(`   StrategyRanker:    ${_consensusCache.size > 0 ? _consensusCache.size + ' symbol(s)' : 'waiting'}`);
@@ -1249,6 +1677,7 @@ async function startServer() {
       console.log(`   OTIE observers:    ${(otie && otie.observerCount) || 0} contract(s)`);
       try { console.log(`   Market cache:      ${marketStateCache._cache.size} symbols`); } catch (_) {}
       console.log(`   Balance guard:     ${balanceGuard.getState().enabled ? 'active' : 'disabled'}`);
+      console.log(`   Auth:              ${AUTH_CONFIGURED ? 'enabled' : 'MISCONFIGURED'}`);
       console.log('==============================================');
     }, 20000);
   });
