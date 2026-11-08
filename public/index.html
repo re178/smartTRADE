@@ -55,6 +55,49 @@
     #autoExecuteBanner i { color: var(--danger); font-size: 1.1rem; }
 
     /* ============================================================ */
+    /* [FIX-SWITCH-UI] Demo/Real account toggle + logout button      */
+    /* ============================================================ */
+    .account-switch {
+      display: inline-flex; align-items: center;
+      background: #e9edf2; border-radius: 30px; padding: 3px; gap: 2px;
+    }
+    .account-switch button {
+      background: transparent; border: none; border-radius: 20px;
+      padding: 4px 14px; font-size: 0.72rem; font-weight: 600;
+      letter-spacing: 0.03em; color: #6b7a8f; cursor: pointer;
+      transition: all 0.15s ease; line-height: 1.4;
+    }
+    .account-switch button:hover:not(:disabled):not(.active) {
+      background: rgba(255,255,255,0.6); color: #1e2a41;
+    }
+    .account-switch button.active {
+      background: #fff; color: #1e2a41;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    .account-switch button.active.demo { color: #b45309; }
+    .account-switch button.active.real { color: #047857; }
+    .account-switch button:disabled { cursor: not-allowed; opacity: 0.5; }
+    .account-switch button.loading { position: relative; color: transparent; }
+    .account-switch button.loading::after {
+      content: ''; position: absolute; left: 50%; top: 50%;
+      width: 12px; height: 12px; margin: -6px 0 0 -6px;
+      border: 2px solid rgba(26,115,232,0.2); border-top-color: #1a73e8;
+      border-radius: 50%; animation: spin 0.6s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .btn-logout {
+      background: transparent; border: 1px solid var(--border-light);
+      border-radius: 20px; padding: 4px 12px;
+      font-size: 0.72rem; font-weight: 600; color: #6b7a8f;
+      cursor: pointer; transition: all 0.15s ease;
+      display: inline-flex; align-items: center; gap: 6px;
+    }
+    .btn-logout:hover {
+      background: #fef2f2; border-color: #fecaca; color: #991b1b;
+    }
+
+    /* ============================================================ */
     /* SIDEBAR & MOBILE OVERLAY                                      */
     /* ============================================================ */
     .sidebar-overlay {
@@ -269,7 +312,7 @@
       .stat-card { padding: 12px 16px; }
       .stat-value { font-size: 1.1rem; }
       .card-body { padding: 16px; }
-      
+
       .table th, .table td { font-size: 0.8rem; padding: 8px; }
       .chart-toolbar { justify-content: flex-start; }
       .chart-toolbar .btn { padding: 4px 8px; font-size: 0.75rem; }
@@ -346,6 +389,14 @@
       </h1>
     </div>
     <div class="header-actions">
+
+      <!-- [FIX-SWITCH-UI] Demo / Real account switch -->
+      <div class="account-switch" id="accountSwitch" role="group" aria-label="Account type switch">
+        <button type="button" data-account-type="demo" class="demo" title="Switch to DEMO account">DEMO</button>
+        <button type="button" data-account-type="real" class="real" title="Switch to REAL account">REAL</button>
+      </div>
+
+      <!-- Account badge (balance-driven) -->
       <div class="account-badge">
         <i class="fas fa-user-circle"></i>
         <span id="accountId">—</span>
@@ -366,6 +417,11 @@
         <button class="btn btn-outline-secondary btn-sm" id="exportCSVBtn" title="Export CSV"><i class="fas fa-file-csv"></i></button>
         <button class="btn btn-outline-primary btn-sm" id="reportModalBtn" title="Report"><i class="fas fa-file-pdf"></i> Report</button>
       </div>
+
+      <!-- [FIX-SWITCH-UI] Logout button -->
+      <button type="button" class="btn-logout" id="logoutBtn" title="Sign out of the dashboard">
+        <i class="fas fa-sign-out-alt"></i> Logout
+      </button>
     </div>
   </header>
 
@@ -952,6 +1008,7 @@
 
 <!-- ============================================================ -->
 <!-- INLINE: NAVIGATION, MOBILE SIDEBAR, AUTO-EXECUTE SAFETY       -->
+<!-- [FIX-SWITCH-UI] Account switch + logout handlers               -->
 <!-- ============================================================ -->
 <script>
 (function () {
@@ -993,7 +1050,6 @@
     }
   }
 
-  // Initial state — always OFF on page load (no persistence)
   if (autoToggle) {
     setAutoVisualState(autoToggle.checked);
     autoToggle.addEventListener('change', function () {
@@ -1016,13 +1072,139 @@
     });
   }
 
-  // Exposed for the "Disable" button inside the banner
   window._disableAutoExecute = function () {
     if (autoToggle) {
       autoToggle.checked = false;
       setAutoVisualState(false);
     }
   };
+
+  // ============================================================
+  // [FIX-SWITCH-UI] Demo / Real account switch
+  // ============================================================
+  const accountSwitch = document.getElementById('accountSwitch');
+  const accountTypeLabel = document.getElementById('accountTypeLabel');
+
+  function getCurrentAccountTypeFromBadge() {
+    if (!accountTypeLabel) return 'demo';
+    const txt = (accountTypeLabel.textContent || '').trim().toLowerCase();
+    if (txt === 'real') return 'real';
+    return 'demo';
+  }
+
+  function setActiveAccountButton(type) {
+    if (!accountSwitch) return;
+    accountSwitch.querySelectorAll('button').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.accountType === type);
+    });
+  }
+
+  function setSwitchLoading(loading) {
+    if (!accountSwitch) return;
+    accountSwitch.querySelectorAll('button').forEach(btn => {
+      btn.disabled = loading;
+      if (loading && btn.dataset.accountType !== getCurrentAccountTypeFromBadge()) {
+        btn.classList.add('loading');
+      } else {
+        btn.classList.remove('loading');
+      }
+    });
+  }
+
+  // Initialize: read current account type from the badge
+  setActiveAccountButton(getCurrentAccountTypeFromBadge());
+
+  if (accountSwitch) {
+    accountSwitch.addEventListener('click', async (e) => {
+      const btn = e.target.closest('button[data-account-type]');
+      if (!btn) return;
+      const targetType = btn.dataset.accountType;
+      const currentType = getCurrentAccountTypeFromBadge();
+      if (targetType === currentType) return;
+
+      const confirmed = confirm(
+        `Switch account type to ${targetType.toUpperCase()}?\n\n` +
+        `This will:\n` +
+        `  • Close the current authenticated session\n` +
+        `  • Reconnect to your ${targetType.toUpperCase()} account\n` +
+        `  • Load the new balance and portfolio\n\n` +
+        `Requirements:\n` +
+        `  • NO open positions on the current account\n` +
+        `  • NO bots running\n\n` +
+        `Proceed with switch?`
+      );
+      if (!confirmed) return;
+
+      setSwitchLoading(true);
+
+      try {
+        const res = await fetch('/api/account/switch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ accountType: targetType }),
+        });
+
+        let data = {};
+        try { data = await res.json(); } catch (_) {}
+
+        if (!res.ok || !data.success) {
+          // Surface guard failures clearly
+          let msg = data.error || `HTTP ${res.status}`;
+          if (Array.isArray(data.positions) && data.positions.length > 0) {
+            msg += '\n\nOpen positions:\n' + data.positions
+              .map(p => `  • ${p.instrument || '?'} ${p.side || ''} #${p.id || '?'} P/L=${(p.unrealizedPL || 0).toFixed(2)}`)
+              .join('\n');
+          }
+          if (Array.isArray(data.runningBots) && data.runningBots.length > 0) {
+            msg += '\n\nRunning bots:\n' + data.runningBots
+              .map(b => `  • ${b.name || b.botId} (${b.symbol || '?'}) ${b.instanceId || ''}`)
+              .join('\n');
+          }
+          alert(`❌ Switch failed\n\n${msg}`);
+          setSwitchLoading(false);
+          return;
+        }
+
+        if (data.changed === false) {
+          alert(`Already on ${targetType.toUpperCase()} — no change needed.`);
+          setActiveAccountButton(targetType);
+          setSwitchLoading(false);
+          return;
+        }
+
+        // Success — update UI and refresh dashboard data
+        setActiveAccountButton(targetType);
+        alert(
+          `✅ Switched to ${targetType.toUpperCase()}\n\n` +
+          `Account: ${data.account?.id || '?'}\n` +
+          `Balance: ${data.account?.balance || '?'} ${data.account?.currency || 'USD'}`
+        );
+        // Full refresh so all widgets reflect the new account
+        if (typeof window.refreshDashboard === 'function') {
+          try { await window.refreshDashboard(); } catch (_) {}
+        }
+        setSwitchLoading(false);
+      } catch (err) {
+        alert(`❌ Switch error\n\n${err.message}`);
+        setSwitchLoading(false);
+      }
+    });
+  }
+
+  // ============================================================
+  // [FIX-SWITCH-UI] Logout button
+  // ============================================================
+  const logoutBtn = document.getElementById('logoutBtn');
+  if (logoutBtn) {
+    logoutBtn.addEventListener('click', async () => {
+      const ok = confirm('Sign out of the dashboard?\n\nYou will need to log in again to access it.');
+      if (!ok) return;
+      try {
+        await fetch('/api/logout', { method: 'POST' });
+      } catch (_) {}
+      window.location.href = '/login';
+    });
+  }
 
   // ============================================================
   // Navigation between sections
@@ -1085,15 +1267,7 @@
     });
   });
 
-  // [FIX-EXPORT-DUP] Duplicate exportCSVBtn handler REMOVED.
-  // The handler in app.js (via window.exportHistoryCSV) is now the
-  // single source of truth. Previously BOTH this inline handler AND
-  // app.js's handler fired on click → two CSV downloads per click,
-  // two "No history to export" alerts when empty.
-
   document.getElementById('reportModalBtn')?.addEventListener('click', function () {
-    // The POST /api/report endpoint exists (controllers.generateReport)
-    // but isn't routed. This handler stays as-is until the route is wired.
     alert('Report generation: the backend handler exists at POST /api/report.\nAsk your maintainer to register the route to enable PDF reports.');
   });
 })();
