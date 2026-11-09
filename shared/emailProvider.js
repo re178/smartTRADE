@@ -1,4 +1,4 @@
-// services/emailService.js - VIRALOOP Email System (Brevo-only, self-loading, diagnostic)
+// shared/emailProvider.js - RTS Email System (Brevo-only, self-loading, diagnostic)
 
 const path = require('path');
 
