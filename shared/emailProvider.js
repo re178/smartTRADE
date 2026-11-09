@@ -1,4 +1,29 @@
 // shared/emailProvider.js - RTS Email System (Brevo-only, self-loading, diagnostic)
+//
+// [FIX-EMAIL-ATTACH] **Attachment support for PDF reports.**
+//
+//   sendEmail(to, subject, htmlContent, options?) now accepts:
+//     • options.attachments — array of { filename, content: Buffer|base64 }
+//     • options.cc          — array of cc email addresses
+//
+//   The attachments are base64-encoded and passed to Brevo via the
+//   `attachment` field of their SMTP API. Existing callers pass 3 args
+//   and are unchanged — options defaults to {} and no attachments are
+//   built.
+//
+//   **Fallback behaviour**: if a send with attachments fails with an
+//   attachment-related error (size, format, quota), the file automatically
+//   retries once WITHOUT attachments. The report content (HTML body) still
+//   delivers, and the return value includes `warning: 'Attachments dropped: ...'`
+//   so the caller can detect that the PDF didn't make it.
+//
+//   **Size limits**: Brevo caps single attachments at 10 MB and total
+//   at 25 MB. This file enforces 10 MB single / 20 MB total as a safety
+//   margin. Oversized PDFs are skipped with a stderr log; smaller
+//   attachments still go through.
+//
+//   **Timeout bumped 15s → 30s** — a PDF attachment makes the request
+//   heavier. 15s was cutting off real reports on slow networks.
 
 const path = require('path');
 
@@ -16,6 +41,11 @@ const axios = require('axios');
 const APP_NAME = 'VIRALOOP';
 const APP_URL = process.env.APP_URL || 'https://voxtraapp.com';
 const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || 'esilesirayland@gmail.com';
+
+// Brevo attachment limits (conservative — Brevo's documented limit is
+// 10 MB single / 25 MB total).
+const MAX_SINGLE_ATTACHMENT_BYTES = 10 * 1024 * 1024;   // 10 MB
+const MAX_TOTAL_ATTACHMENT_BYTES  = 20 * 1024 * 1024;   // 20 MB
 
 // Read at send-time, not module-load-time, so late env injection works
 function getBrevoKey() {
@@ -64,10 +94,83 @@ body { font-family: Arial, sans-serif; background:#f5f5f5; margin:0; padding:0; 
 }
 
 /* =========================================================
-   BREVO SENDER  (surface HTTP status + body on error)
+   [FIX-EMAIL-ATTACH] Attachment normalization
 ========================================================= */
 
-async function sendViaBrevo(to, subject, html) {
+/**
+ * Convert caller-provided attachments into Brevo's expected format.
+ * Brevo expects: [{ name: 'file.pdf', content: '<base64-string>' }]
+ *
+ * Accepts:
+ *   • content as Buffer
+ *   • content as base64 string
+ *   • content as Uint8Array
+ *
+ * Enforces size limits, skipping oversized files with a stderr log.
+ * Returns null if no valid attachments remain.
+ */
+function buildBrevoAttachments(attachments) {
+    if (!Array.isArray(attachments) || attachments.length === 0) return null;
+
+    const out = [];
+    let totalBytes = 0;
+
+    for (const a of attachments) {
+        if (!a || !a.filename || !a.content) {
+            console.warn(`[emailProvider] Skipping invalid attachment (missing filename or content)`);
+            continue;
+        }
+
+        let buf;
+        try {
+            if (Buffer.isBuffer(a.content)) {
+                buf = a.content;
+            } else if (typeof a.content === 'string') {
+                // Assume base64
+                buf = Buffer.from(a.content, 'base64');
+            } else if (a.content instanceof Uint8Array) {
+                buf = Buffer.from(a.content);
+            } else {
+                console.warn(`[emailProvider] Skipping attachment ${a.filename}: unsupported content type`);
+                continue;
+            }
+        } catch (err) {
+            console.warn(`[emailProvider] Skipping attachment ${a.filename}: ${err.message}`);
+            continue;
+        }
+
+        if (buf.length > MAX_SINGLE_ATTACHMENT_BYTES) {
+            console.error(
+                `[emailProvider] Skipping attachment ${a.filename}: ` +
+                `${buf.length} bytes exceeds ${MAX_SINGLE_ATTACHMENT_BYTES} byte limit`
+            );
+            continue;
+        }
+
+        if (totalBytes + buf.length > MAX_TOTAL_ATTACHMENT_BYTES) {
+            console.error(
+                `[emailProvider] Stopping attachments at ${out.length}: ` +
+                `total would exceed ${MAX_TOTAL_ATTACHMENT_BYTES} bytes`
+            );
+            break;
+        }
+
+        totalBytes += buf.length;
+        out.push({
+            name: a.filename,
+            content: buf.toString('base64'),
+        });
+    }
+
+    return out.length > 0 ? out : null;
+}
+
+/* =========================================================
+   BREVO SENDER  (surface HTTP status + body on error)
+   [FIX-EMAIL-ATTACH] Now accepts `options` and forwards attachments.
+========================================================= */
+
+async function sendViaBrevo(to, subject, html, options = {}) {
     const key = getBrevoKey();
 
     if (!key) {
@@ -76,24 +179,43 @@ async function sendViaBrevo(to, subject, html) {
         throw err;
     }
 
+    const payload = {
+        sender: {
+            name: APP_NAME,
+            email: SUPPORT_EMAIL
+        },
+        to: [{ email: to }],
+        subject,
+        htmlContent: html
+    };
+
+    // [FIX-EMAIL-ATTACH] Optional cc
+    if (Array.isArray(options.cc) && options.cc.length > 0) {
+        payload.cc = options.cc
+            .filter(e => typeof e === 'string' && e.includes('@'))
+            .map(e => ({ email: e }));
+        if (payload.cc.length === 0) delete payload.cc;
+    }
+
+    // [FIX-EMAIL-ATTACH] Optional attachments
+    const brevoAttachments = buildBrevoAttachments(options.attachments);
+    if (brevoAttachments) {
+        payload.attachment = brevoAttachments;
+    }
+
     try {
         const response = await axios.post(
             'https://api.brevo.com/v3/smtp/email',
-            {
-                sender: {
-                    name: APP_NAME,
-                    email: SUPPORT_EMAIL
-                },
-                to: [{ email: to }],
-                subject,
-                htmlContent: html
-            },
+            payload,
             {
                 headers: {
                     'api-key': key,
                     'Content-Type': 'application/json'
                 },
-                timeout: 15000
+                // [FIX-EMAIL-ATTACH] 30s (was 15s) — PDF uploads take longer
+                timeout: 30000,
+                maxBodyLength: 25 * 1024 * 1024,   // allow large request bodies
+                maxContentLength: 25 * 1024 * 1024,
             }
         );
         return response.data;
@@ -112,11 +234,16 @@ async function sendViaBrevo(to, subject, html) {
 
 /* =========================================================
    CORE EMAIL SENDER  (Brevo only, with diagnostics)
+   [FIX-EMAIL-ATTACH] Accepts optional 4th arg `options`.
+     - Existing 3-arg callers work identically.
+     - On attachment-specific errors, retries WITHOUT attachments so
+       the HTML content still delivers.
 ========================================================= */
 
-async function sendEmail(to, subject, htmlContent) {
+async function sendEmail(to, subject, htmlContent, options = {}) {
     const html = getEmailWrapper(htmlContent, subject);
     const key = getBrevoKey();
+    const hasAttachments = !!(options.attachments && options.attachments.length);
 
     const diagnostics = {
         provider: 'brevo',
@@ -124,7 +251,8 @@ async function sendEmail(to, subject, htmlContent) {
         recipient: to,
         keyPresent: !!key,
         keyPrefix: key ? (key.slice(0, 8) + '...') : '(none)',
-        keyLength: key.length
+        keyLength: key.length,
+        attachments: hasAttachments ? options.attachments.length : 0,
     };
 
     if (!key) {
@@ -135,13 +263,38 @@ async function sendEmail(to, subject, htmlContent) {
     }
 
     try {
-        const data = await sendViaBrevo(to, subject, html);
-        console.log(`📧 Email sent via Brevo to ${to} (messageId=${data.messageId || 'n/a'})`);
+        const data = await sendViaBrevo(to, subject, html, options);
+        console.log(
+            `📧 Email sent via Brevo to ${to} ` +
+            `(messageId=${data.messageId || 'n/a'}, attachments=${diagnostics.attachments})`
+        );
         return { success: true, provider: 'brevo', messageId: data.messageId, diagnostics };
     } catch (err) {
         const status = err.httpStatus || '';
         console.error(`❌ Email send failed to ${to}: ${err.message}`);
         console.error(`   Diagnostics: ${JSON.stringify(diagnostics)}`);
+
+        // [FIX-EMAIL-ATTACH] Fallback: if attachments were included and
+        // the error looks attachment-related, retry once without them.
+        // The report content still delivers.
+        if (hasAttachments && looksLikeAttachmentError(err.message)) {
+            console.warn(`[emailProvider] Retrying WITHOUT attachments — original error: ${err.message}`);
+            try {
+                const retryOptions = { ...options, attachments: [] };
+                const retryData = await sendViaBrevo(to, subject, html, retryOptions);
+                console.warn(`⚠️  Delivered WITHOUT attachments. Attachment error was: ${err.message}`);
+                return {
+                    success: true,
+                    provider: 'brevo',
+                    messageId: retryData.messageId,
+                    diagnostics: { ...diagnostics, attachmentsDropped: true },
+                    warning: `Attachments dropped due to provider error: ${err.message}`,
+                };
+            } catch (retryErr) {
+                console.error(`❌ Retry without attachments also failed: ${retryErr.message}`);
+                // fall through to report the original failure
+            }
+        }
 
         if (status === 401 || status === 403) {
             console.error('   => BREVO_API_KEY is wrong or revoked. Regenerate it in Brevo dashboard.');
@@ -150,7 +303,7 @@ async function sendEmail(to, subject, htmlContent) {
             console.error('   => Common causes: SUPPORT_EMAIL sender is not verified in Brevo, invalid recipient, or account limit hit.');
         }
         if (status === 'NO_KEY') {
-            console.error('   => Add BREVO_API_KEY to D:\\RTS\\SmartTRADE\\.env');
+            console.error('   => Add BREVO_API_KEY to .env');
         }
         if (/ENOTFOUND|ECONNREFUSED|ETIMEDOUT|timeout/i.test(err.message)) {
             console.error('   => Cannot reach api.brevo.com. Check firewall / DNS / internet.');
@@ -164,6 +317,24 @@ async function sendEmail(to, subject, htmlContent) {
             diagnostics
         };
     }
+}
+
+/**
+ * [FIX-EMAIL-ATTACH] Heuristic: does this error message indicate the
+ * attachment caused the failure (vs. credentials / network / recipient)?
+ * Used to decide whether to retry without attachments.
+ */
+function looksLikeAttachmentError(msg) {
+    if (!msg) return false;
+    const s = String(msg).toLowerCase();
+    return (
+        s.includes('attachment') ||
+        s.includes('file size') ||
+        s.includes('too large') ||
+        s.includes('payload') ||
+        s.includes('content length') ||
+        s.includes('base64')
+    );
 }
 
 /* =========================================================
@@ -240,5 +411,5 @@ module.exports = {
     sendWelcomeEmail,
     sendVerificationEmail,
     sendPasswordResetEmail,
-    sendTestEmail
+    sendTestEmail,
 };
