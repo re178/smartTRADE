@@ -1800,30 +1800,48 @@ async function startServer() {
       }, 2000);
     })();
 
-    setTimeout(() => {
-      console.log('==============================================');
-      console.log('RTS Subsystem Status:');
-      console.log(`   Database:          ${mongoose.connection.readyState === 1 ? 'connected' : 'DISCONNECTED'}`);
+       setTimeout(() => {
       try {
-        const broker = getBroker('deriv_cfd');
-        console.log(`   Broker:            ${broker.isConnected() ? 'connected' : 'disconnected'}`);
-        console.log(`   Account type:      ${broker.config.accountType}`);
-      } catch (_) { console.log('   Broker:            not initialized'); }
-      console.log(`   Pipeline timer:    ${pipelineTimer ? 'running' : 'stopped'}`);
-      console.log(`   StrategyRanker:    ${_consensusCache.size > 0 ? _consensusCache.size + ' symbol(s)' : 'waiting'}`);
-      console.log(`   Predictions:       ${_predictionCache.size} symbol(s)`);
-      console.log(`   Opportunities:     ${_opportunityCache.size} symbol(s)`);
-      console.log(`   Running bots:      ${botRunner.list().length}`);
-      console.log(`   OTIE observers:    ${(otie && otie.observerCount) || 0} contract(s)`);
-      try { console.log(`   Market cache:      ${marketStateCache._cache.size} symbols`); } catch (_) {}
-      console.log(`   Balance guard:     ${balanceGuard.getState().enabled ? 'active' : 'disabled'}`);
-      console.log(`   Auth:              ${AUTH_CONFIGURED ? 'enabled' : 'MISCONFIGURED'}`);
-      const rs = reportScheduler.getStatus();
-      const sm = securityMonitor.getStatus();
-      console.log(`   Report scheduler:  ${rs.running ? 'running' : 'stopped'} (next daily in ${rs.nextDailyInMs ? Math.round(rs.nextDailyInMs / 60000) + 'm' : '—'})`);
-      console.log(`   Security monitor:  ${sm.running ? 'running' : 'stopped'} (alerts sent: ${sm.alerts.sent}, failed: ${sm.alerts.failed})`);
-      console.log('==============================================');
-    }, 20000);
+        console.log('==============================================');
+        console.log('RTS Subsystem Status:');
+        console.log(`   Database:          ${mongoose.connection.readyState === 1 ? 'connected' : 'DISCONNECTED'}`);
+        try {
+          const broker = getBroker('deriv_cfd');
+          console.log(`   Broker:            ${broker.isConnected() ? 'connected' : 'disconnected'}`);
+          console.log(`   Account type:      ${broker.config.accountType}`);
+        } catch (_) { console.log('   Broker:            not initialized'); }
+        console.log(`   Pipeline timer:    ${pipelineTimer ? 'running' : 'stopped'}`);
+        console.log(`   StrategyRanker:    ${_consensusCache.size > 0 ? _consensusCache.size + ' symbol(s)' : 'waiting'}`);
+        console.log(`   Predictions:       ${_predictionCache.size} symbol(s)`);
+        console.log(`   Opportunities:     ${_opportunityCache.size} symbol(s)`);
+        console.log(`   Running bots:      ${botRunner.list().length}`);
+        console.log(`   OTIE observers:    ${(otie && otie.observerCount) || 0} contract(s)`);
+        try { console.log(`   Market cache:      ${marketStateCache._cache.size} symbols`); } catch (_) {}
+        console.log(`   Balance guard:     ${balanceGuard.getState().enabled ? 'active' : 'disabled'}`);
+        console.log(`   Auth:              ${AUTH_CONFIGURED ? 'enabled' : 'MISCONFIGURED'}`);
+
+        // [FIX-STATUS-LOG] Defensive — no debug log should crash the process.
+        let rs = {};
+        try { rs = reportScheduler.getStatus() || {}; } catch (e) { rs = { error: e.message }; }
+        let sm = {};
+        try { sm = securityMonitor.getStatus() || {}; } catch (e) { sm = { error: e.message }; }
+        const smAlerts = (sm && sm.alerts) || {};
+
+        if (rs.error) {
+          console.log(`   Report scheduler:  ERROR — ${rs.error}`);
+        } else {
+          console.log(`   Report scheduler:  ${rs.running ? 'running' : 'stopped'} (next daily in ${rs.nextDailyInMs ? Math.round(rs.nextDailyInMs / 60000) + 'm' : '—'})`);
+        }
+        if (sm.error) {
+          console.log(`   Security monitor:  ERROR — ${sm.error}`);
+        } else {
+          console.log(`   Security monitor:  ${sm.running ? 'running' : 'stopped'} (alerts sent: ${smAlerts.sent ?? 0}, failed: ${smAlerts.failed ?? 0})`);
+        }
+        console.log('==============================================');
+      } catch (outerErr) {
+        console.error('[Startup] Status log itself failed (non-fatal):', outerErr.message);
+      }
+    }, 20000); 
   });
 
   async function shutdown(signal) {
