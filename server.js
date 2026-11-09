@@ -1,47 +1,48 @@
-// server.js – RTS Entry Point (Deriv-only, pattern-based, with balance guard)
+// server.js – RTS Entry Point
 //
 // [FIX-S1]  Shared logger instead of raw console.*
 // [FIX-S2]  WATCHED_SYMBOLS configurable via env var
 // [FIX-S3]  Pipeline in-flight 60s timeout
 // [FIX-S4]  /debug/regime endpoint
 // [FIX-S5]  /debug/orchestrator + /debug/regime-publish endpoints
-// [FIX-S6]  dataOrchestrator.publish wrapper for regime publish diagnostics
+// [FIX-S6]  dataOrchestrator.publish wrapper for diagnostics
 // [FIX-S7]  Pipeline NO_TRADE log throttling
 // [FIX-S8]  Explicit null-state logging in runPredictionPipeline
 // [FIX-S9]  sendDashboardInitialState broker calls wrapped in 5s timeout
 // [FIX-S10] marketStateUpdate broadcasts to dashboards
 // [FIX-S11] connectDB() awaited BEFORE ensureAdmin() and server.listen()
-// [FIX-S12] /health and /health/pipeline report database state; 503 when
-//           MongoDB is disconnected
-// [FIX-S13/S14/S15] RTS startup email via services/emailService.js
+// [FIX-S12] /health and /health/pipeline report database state; 503 when DB is down
+// [FIX-S13/S14/S15] RTS startup email via shared/emailProvider
 //
-// [FIX-AUTH] **Full dashboard login wall.**
-//   Env vars (required for auth to be active):
-//     • DASHBOARD_USERNAME       — login username
-//     • DASHBOARD_PASSWORD       — plaintext password (or use hash below)
-//     • SESSION_SECRET           — HMAC signing key (32+ hex chars)
-//   Env vars (optional, for maximum security):
-//     • DASHBOARD_PASSWORD_HASH  — scrypt hash, format "scrypt$<salt>$<hash>"
-//                                   If set, takes precedence over plaintext.
-//                                   Generate with:
-//                                     node -e "const c=require('crypto');const s=c.randomBytes(16).toString('hex');const h=c.scryptSync(process.argv[1],s,64).toString('hex');console.log('scrypt$'+s+'$'+h)" 'your-password'
-//     • DASHBOARD_ALLOWED_IPS    — comma-separated IP allowlist for /api/login
-//                                   If set, only these IPs can attempt login.
+// [FIX-AUTH] Full dashboard login wall (HMAC session, optional scrypt hash,
+//           optional IP allowlist, login rate limiter, 7d TTL).
 //
-//   If any required env var is missing, the app still boots (health checks
-//   still pass for Render), but the dashboard is unreachable. A clear
-//   misconfiguration message appears at /login.
+// [FIX-SWITCH] POST /api/account/switch — demo ⇄ real with guards.
 //
-//   Security model:
-//     • Session cookie: HMAC-signed, httpOnly, sameSite=lax, secure in prod
-//     • 7-day TTL, no server-side session store (self-validating token)
-//     • Constant-time comparison for both username and password
-//     • Login rate limiter: 5 failures per IP per 15 min
-//     • All routes except /login, /api/login, /api/logout, /api/auth/me,
-//       /health, /health/pipeline require auth
-//     • WebSocket upgrade is auth-checked before handshake (Part 2)
+// [FIX-COMMS] **Communication department integration.**
 //
-// [FIX-SWITCH] POST /api/account/switch (Part 2) — demo ⇄ real.
+//   Adds:
+//     • reportScheduler.start()  → daily reports at 00:00 EAT, weekly Fri 23:59 EAT
+//     • securityMonitor.start()  → suspicious-login alerts + audit recording
+//     • POST /api/reports/send-now   — manual trigger (daily|weekly|custom)
+//     • GET  /api/reports/status     — scheduler diagnostics
+//     • GET  /api/security/status    — security monitor diagnostics
+//     • GET  /api/security/events    — paginated security audit trail
+//
+//   Auth events are piped into the monitor:
+//     /api/login       → onLoginSuccess / onLoginFailure / onLoginRateLimited
+//     /api/logout      → onLogout
+//     /api/account/switch → onAccountSwitch
+//
+//   Reports fire independently of bot/pipeline activity — they summarize
+//   whatever happened in the closed period. A quiet account still gets a
+//   "no trades this period" report so you know the system was alive.
+//
+//   Both subsystems start AFTER MongoDB connects and stop during graceful
+//   shutdown. Report catch-up runs on boot to backfill missed periods.
+//
+//   Endpoint auth: all new /api/reports/* and /api/security/* routes are
+//   protected by the global auth middleware — no separate checks needed.
 
 require('dotenv').config();
 
@@ -52,10 +53,14 @@ const mongoose = require('mongoose');
 const WebSocket = require('ws');
 const http = require('http');
 const os = require('os');
-const crypto = require('crypto');                      // [FIX-AUTH]
+const crypto = require('crypto');
 
 const logger = require('./infrastructure/logger') || console;
 const { sendEmail } = require('./shared/emailProvider');
+
+// [FIX-COMMS] Communication department
+const reportScheduler = require('./services/communications/reportScheduler');
+const securityMonitor = require('./services/communications/securityMonitor');
 
 const dashboardClients = new Set();
 
@@ -85,6 +90,8 @@ const User = require('./models/User');
 
 const Trade = require('./models/Trade');
 const StrategyPerformance = require('./models/StrategyPerformance');
+const SecurityEvent = require('./models/SecurityEvent');
+const ReportLog = require('./models/ReportLog');
 
 const priceBuffer = require('./core/data/priceBuffer');
 const candleStore = require('./core/data/candleStore');
@@ -152,7 +159,7 @@ const WATCHED_SYMBOLS = (process.env.WATCHED_SYMBOLS || DEFAULT_WATCHED.join(','
 
 const AUTH_USERNAME        = process.env.DASHBOARD_USERNAME || '';
 const AUTH_PASSWORD        = process.env.DASHBOARD_PASSWORD || '';
-const AUTH_PASSWORD_HASH   = process.env.DASHBOARD_PASSWORD_HASH || '';  // format: scrypt$<salt>$<hash>
+const AUTH_PASSWORD_HASH   = process.env.DASHBOARD_PASSWORD_HASH || '';
 const SESSION_SECRET       = process.env.SESSION_SECRET || '';
 const AUTH_ALLOWED_IPS_RAW = process.env.DASHBOARD_ALLOWED_IPS || '';
 
@@ -188,7 +195,6 @@ if (!AUTH_CONFIGURED) {
   }
 }
 
-// ---- Constant-time comparison (mitigates timing attacks) ----
 function safeEq(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
   const ba = Buffer.from(a, 'utf8');
@@ -200,7 +206,6 @@ function safeEq(a, b) {
   try { return crypto.timingSafeEqual(ba, bb); } catch (_) { return false; }
 }
 
-// ---- Password verification: scrypt hash OR constant-time plaintext ----
 function verifyPassword(plaintext, hashField, plaintextField) {
   if (hashField && hashField.startsWith('scrypt$')) {
     const parts = hashField.split('$');
@@ -216,7 +221,6 @@ function verifyPassword(plaintext, hashField, plaintextField) {
   return false;
 }
 
-// ---- Session: HMAC-signed token = base64url(payload).base64url(hmac) ----
 function signSession(userId) {
   const payload = { uid: userId, exp: Date.now() + SESSION_TTL_MS };
   const p64 = Buffer.from(JSON.stringify(payload)).toString('base64url');
@@ -259,10 +263,9 @@ function getSession(req) {
   return verifySession(cookies[COOKIE_NAME]);
 }
 
-// ---- Login rate limiter: 5 failures / 15 min per IP ----
 const LOGIN_RATE_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_RATE_MAX = 5;
-const _loginAttempts = new Map();   // ip -> { count, firstAt, lockedUntil }
+const _loginAttempts = new Map();
 
 function getClientIp(req) {
   const fwd = req.headers['x-forwarded-for'];
@@ -303,13 +306,11 @@ function clearLoginFailures(ip) {
   _loginAttempts.delete(ip);
 }
 
-// ---- IP allowlist check for login ----
 function isIpAllowed(ip) {
   if (AUTH_ALLOWED_IPS.length === 0) return true;
   return AUTH_ALLOWED_IPS.includes(ip);
 }
 
-// ---- Login page HTML (self-contained, no external JS deps) ----
 const LOGIN_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -407,7 +408,7 @@ const LOGIN_HTML = `<!DOCTYPE html>
 </html>`;
 
 // ============================================================
-// [FIX-S11] connectDB() is awaited inside startServer()
+// Cache + pipeline state
 // ============================================================
 
 const _consensusCache = new Map();
@@ -434,7 +435,7 @@ dataOrchestrator.publish = function (key, data, metadata) {
 };
 
 // ============================================================
-// [FIX-S13] RTS startup email notification
+// Startup email
 // ============================================================
 
 function getRTSLanAddresses(port) {
@@ -483,26 +484,22 @@ async function sendRTSStartupNotification(port) {
     <p>RTS Automatic Startup Notification</p>`;
 
   const to = process.env.RTS_NOTIFY_EMAIL || process.env.ALERT_EMAIL || process.env.SUPPORT_EMAIL;
-  if (!to) { logger.error('[Notify] No recipient configured. Set RTS_NOTIFY_EMAIL (or ALERT_EMAIL / SUPPORT_EMAIL).'); return; }
+  if (!to) { logger.error('[Notify] No recipient configured'); return; }
   const keyPresent = !!process.env.BREVO_API_KEY;
   const sender = process.env.SUPPORT_EMAIL || 'support@voxtraapp.com';
   logger.info(`[Notify] Sending startup email -> to=${to} sender=${sender} keyPresent=${keyPresent}`);
-  if (!keyPresent) { logger.error('[Notify] BREVO_API_KEY missing in .env. Startup email skipped.'); return; }
+  if (!keyPresent) { logger.error('[Notify] BREVO_API_KEY missing'); return; }
   try {
     const result = await sendEmail(to, 'RTS is ONLINE - Laptop Startup Notification', html);
-    if (result && result.success) {
-      logger.info(`[Notify] Startup email SENT via ${result.provider || 'unknown'} to ${to}`);
-      return;
-    }
+    if (result && result.success) { logger.info(`[Notify] Startup email SENT to ${to}`); return; }
     logger.error(`[Notify] Startup email FAILED: ${(result && result.error) || 'unknown'}`);
-  } catch (error) {
-    logger.error(`[Notify] Startup email threw: ${error.message}`);
-  }
+  } catch (error) { logger.error(`[Notify] Startup email threw: ${error.message}`); }
 }
 
 // ============================================================
-// Helpers
+// Utilities
 // ============================================================
+
 function flattenConsensus(consensus) {
   if (!consensus || !consensus.consensus) return null;
   const c = consensus.consensus;
@@ -584,7 +581,9 @@ app.use((req, res, next) => {
 });
 
 // ============================================================
-// [FIX-AUTH] Login/logout/auth-check routes (public)
+// [FIX-AUTH] Login / logout / auth-check (public)
+// Each auth hook also feeds securityMonitor so suspicious activity
+// is recorded + alerted automatically.
 // ============================================================
 
 app.get('/login', (req, res) => {
@@ -593,7 +592,7 @@ app.get('/login', (req, res) => {
   res.type('html').send(LOGIN_HTML);
 });
 
-app.post('/api/login', (req, res) => {
+app.post('/api/login', async (req, res) => {
   if (!AUTH_CONFIGURED) {
     return res.status(503).json({
       error: 'Server not configured. Set DASHBOARD_USERNAME, SESSION_SECRET, DASHBOARD_PASSWORD on Render.',
@@ -601,18 +600,19 @@ app.post('/api/login', (req, res) => {
   }
 
   const ip = getClientIp(req);
+  const userAgent = req.headers['user-agent'] || null;
 
-  // IP allowlist check (before rate limit — no wasted limiter slots on banned IPs)
   if (!isIpAllowed(ip)) {
     logger.warn(`[Auth] Login blocked by IP allowlist: ${ip}`);
+    try { await securityMonitor.onLoginFailure(ip, userAgent, 'IP not in allowlist', null); } catch (_) {}
     return res.status(403).json({ error: 'Access denied from this IP' });
   }
 
-  // Rate limit check
   const rateCheck = checkLoginRateLimit(ip);
   if (!rateCheck.allowed) {
     const retryMin = Math.ceil((rateCheck.retryInMs || 0) / 60000);
     logger.warn(`[Auth] Login rate-limited for ${ip} (retry in ${retryMin}m)`);
+    try { await securityMonitor.onLoginRateLimited(ip, userAgent, req.body?.username || null); } catch (_) {}
     return res.status(429).json({
       error: `Too many failed attempts. Try again in ${retryMin} minute(s).`,
     });
@@ -629,6 +629,7 @@ app.post('/api/login', (req, res) => {
   if (!uOk || !pOk) {
     recordLoginFailure(ip);
     logger.warn(`[Auth] Failed login from ${ip} (user="${String(username).slice(0, 32)}")`);
+    try { await securityMonitor.onLoginFailure(ip, userAgent, 'Invalid credentials', String(username)); } catch (_) {}
     return res.status(401).json({ error: 'Invalid credentials' });
   }
 
@@ -636,23 +637,29 @@ app.post('/api/login', (req, res) => {
   const token = signSession('admin');
   const cookieParts = [
     `${COOKIE_NAME}=${encodeURIComponent(token)}`,
-    'Path=/',
-    'HttpOnly',
-    'SameSite=Lax',
+    'Path=/', 'HttpOnly', 'SameSite=Lax',
     `Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`,
   ];
   if (IS_PROD) cookieParts.push('Secure');
   res.setHeader('Set-Cookie', cookieParts.join('; '));
 
   logger.info(`[Auth] Login OK from ${ip}`);
+  // Non-blocking — security hooks must not delay login response
+  securityMonitor.onLoginSuccess(ip, userAgent, String(username)).catch(err => {
+    logger.warn(`[Auth] securityMonitor.onLoginSuccess failed: ${err.message}`);
+  });
   return res.json({ success: true, user: { id: 'admin' } });
 });
 
-app.post('/api/logout', (req, res) => {
+app.post('/api/logout', async (req, res) => {
+  const ip = getClientIp(req);
   const cookieParts = [`${COOKIE_NAME}=`, 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0'];
   if (IS_PROD) cookieParts.push('Secure');
   res.setHeader('Set-Cookie', cookieParts.join('; '));
-  logger.info(`[Auth] Logout from ${getClientIp(req)}`);
+  logger.info(`[Auth] Logout from ${ip}`);
+  securityMonitor.onLogout(ip).catch(err => {
+    logger.warn(`[Auth] securityMonitor.onLogout failed: ${err.message}`);
+  });
   return res.json({ success: true });
 });
 
@@ -664,18 +671,10 @@ app.get('/api/auth/me', (req, res) => {
 
 // ============================================================
 // [FIX-AUTH] Global auth gate
-// Public: /login, /api/login, /api/logout, /api/auth/me, /health,
-//         /health/pipeline, /favicon.ico
-// Protected: everything else, including /js/*, /css/*
 // ============================================================
 const PUBLIC_PATHS = new Set([
-  '/login',
-  '/api/login',
-  '/api/logout',
-  '/api/auth/me',
-  '/health',
-  '/health/pipeline',
-  '/favicon.ico',
+  '/login', '/api/login', '/api/logout', '/api/auth/me',
+  '/health', '/health/pipeline', '/favicon.ico',
 ]);
 
 app.use((req, res, next) => {
@@ -714,14 +713,232 @@ app.use(async (req, res, next) => {
   }
 });
 
-// Mounted API routers
 app.use('/api', apiRoutes);
 app.use('/api', botRoutes);
 app.use('/api/edge-test', require('./api/edgeController'));
 
 // ============================================================
+// [FIX-COMMS] Reports endpoints
+// ============================================================
+
+app.post('/api/reports/send-now', async (req, res) => {
+  try {
+    const { type, from, to } = req.body || {};
+    if (!['daily', 'weekly', 'custom'].includes(type)) {
+      return res.status(400).json({ error: 'type must be daily, weekly, or custom' });
+    }
+    const result = await reportScheduler.triggerReport({
+      type,
+      from: from ? new Date(from) : null,
+      to: to ? new Date(to) : null,
+      trigger: 'manual',
+    });
+    return res.json({ success: true, result });
+  } catch (err) {
+    logger.error(`[Reports] send-now failed: ${err.message}`);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/reports/status', async (req, res) => {
+  try {
+    const status = reportScheduler.getStatus();
+    const lastDaily = await ReportLog.lastSuccessful('daily');
+    const lastWeekly = await ReportLog.lastSuccessful('weekly');
+    const recentFailures = await ReportLog.find({ status: 'failed' })
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .select({ type: 1, periodStart: 1, periodEnd: 1, error: 1, createdAt: 1 })
+      .lean();
+    res.json({
+      scheduler: status,
+      lastDaily: lastDaily ? {
+        sentAt: lastDaily.sentAt,
+        periodStart: lastDaily.periodStart,
+        periodEnd: lastDaily.periodEnd,
+      } : null,
+      lastWeekly: lastWeekly ? {
+        sentAt: lastWeekly.sentAt,
+        periodStart: lastWeekly.periodStart,
+        periodEnd: lastWeekly.periodEnd,
+      } : null,
+      recentFailures: recentFailures.map(f => ({
+        type: f.type,
+        periodStart: f.periodStart,
+        periodEnd: f.periodEnd,
+        error: f.error,
+        at: f.createdAt,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// [FIX-COMMS] Security endpoints
+// ============================================================
+
+app.get('/api/security/status', (req, res) => {
+  try { res.json(securityMonitor.getStatus()); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/security/events', async (req, res) => {
+  try {
+    const {
+      since, eventType, severity, ip,
+      limit = 100, skip = 0,
+    } = req.query;
+
+    const query = {};
+    if (since) query.createdAt = { $gte: new Date(since) };
+    if (eventType) query.eventType = eventType;
+    if (severity) query.severity = severity;
+    if (ip) query.ip = ip;
+
+    const lim = Math.min(Math.max(1, parseInt(limit) || 100), 500);
+    const sk = Math.max(0, parseInt(skip) || 0);
+
+    const [events, total] = await Promise.all([
+      SecurityEvent.find(query)
+        .sort({ createdAt: -1 })
+        .limit(lim)
+        .skip(sk)
+        .lean(),
+      SecurityEvent.countDocuments(query),
+    ]);
+
+    res.json({
+      total,
+      limit: lim,
+      skip: sk,
+      events: events.map(e => ({
+        id: String(e._id),
+        ip: e.ip,
+        userId: e.userId,
+        username: e.username,
+        eventType: e.eventType,
+        severity: e.severity,
+        message: e.message,
+        context: e.context,
+        alerted: e.alerted,
+        alertedAt: e.alertedAt,
+        alertError: e.alertError,
+        at: e.createdAt,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// [FIX-SWITCH] POST /api/account/switch
+// ============================================================
+
+app.post('/api/account/switch', async (req, res) => {
+  const { accountType } = req.body || {};
+  if (accountType !== 'demo' && accountType !== 'real') {
+    return res.status(400).json({ success: false, error: 'accountType must be "demo" or "real"' });
+  }
+
+  const ip = getClientIp(req);
+
+  let broker;
+  try { broker = getBroker('deriv_cfd'); }
+  catch (err) {
+    return res.status(500).json({ success: false, error: 'Broker not initialized' });
+  }
+
+  if (typeof broker.switchAccountType !== 'function') {
+    return res.status(501).json({
+      success: false,
+      error: 'Broker does not support account switching. Deploy updated core/execution/broker.js first.',
+    });
+  }
+
+  const previousType = broker.config?.accountType || 'demo';
+
+  let positions = [];
+  try { positions = await broker.getOpenTrades(); }
+  catch (_) { positions = []; }
+  if (Array.isArray(positions) && positions.length > 0) {
+    securityMonitor.onAccountSwitch(ip, previousType, accountType, false).catch(() => {});
+    return res.status(400).json({
+      success: false,
+      error: `Cannot switch: ${positions.length} open position(s). Close all positions on the current account first.`,
+      positions: positions.map(p => ({
+        id: p.id, instrument: p.instrument, side: p.side,
+        units: p.units, unrealizedPL: p.unrealizedPL,
+      })),
+    });
+  }
+
+  let running = [];
+  try { running = botRunner.list() || []; }
+  catch (_) { running = []; }
+  if (Array.isArray(running) && running.length > 0) {
+    securityMonitor.onAccountSwitch(ip, previousType, accountType, false).catch(() => {});
+    return res.status(400).json({
+      success: false,
+      error: `Cannot switch: ${running.length} bot(s) running. Stop all bots first.`,
+      runningBots: running.map(b => ({
+        instanceId: b.instanceId, botId: b.botId, name: b.name, symbol: b.symbol,
+      })),
+    });
+  }
+
+  try {
+    logger.info(`[Switch] API request: → ${accountType}`);
+    const result = await broker.switchAccountType(accountType);
+    logger.info(`[Switch] API success: now on ${result.accountType} (changed=${result.changed})`);
+
+    securityMonitor.onAccountSwitch(ip, previousType, accountType, true).catch(() => {});
+
+    try {
+      broadcastToDashboards('account', {
+        id: result.account?.id,
+        balance: result.account?.balance,
+        currency: result.account?.currency,
+        accountType: result.account?.accountType || accountType,
+        equity: result.account?.equity,
+        server: (result.account?.accountType === 'demo') ? 'demo' : 'real',
+      });
+    } catch (_) {}
+
+    return res.json({
+      success: true,
+      changed: result.changed,
+      previousAccountType: result.previousAccountType,
+      accountType: result.accountType,
+      account: result.account,
+    });
+  } catch (err) {
+    logger.error(`[Switch] API failed: ${err.message}`);
+    securityMonitor.onAccountSwitch(ip, previousType, accountType, false).catch(() => {});
+
+    if (err.code === 'OPEN_POSITIONS') {
+      return res.status(400).json({
+        success: false,
+        error: err.message,
+        positions: err.positions || [],
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      error: err.message,
+      previousAccountType: err.previousAccountType || null,
+      targetAccountType: err.targetAccountType || accountType,
+    });
+  }
+});
+
+// ============================================================
 // Health endpoints (public — see PUBLIC_PATHS)
 // ============================================================
+
 app.get('/health', (req, res) => {
   const databaseConnected = mongoose.connection.readyState === 1;
   if (!databaseConnected) {
@@ -762,6 +979,7 @@ app.get('/health/pipeline', async (req, res) => {
 // ============================================================
 // Existing endpoints (all protected by auth middleware above)
 // ============================================================
+
 app.get('/api/balance-guard', (req, res) => {
   try { res.json(balanceGuard.getState()); }
   catch (err) { res.status(500).json({ error: err.message }); }
@@ -777,105 +995,9 @@ app.post('/api/balance-guard/reset', (req, res) => {
 });
 
 // ============================================================
-// [FIX-SWITCH] POST /api/account/switch
-// Demo ⇄ real account switch. Guards on open positions + running bots.
-// Delegates the actual switch to broker.switchAccountType().
-// ============================================================
-app.post('/api/account/switch', async (req, res) => {
-  const { accountType } = req.body || {};
-  if (accountType !== 'demo' && accountType !== 'real') {
-    return res.status(400).json({ success: false, error: 'accountType must be "demo" or "real"' });
-  }
-
-  let broker;
-  try { broker = getBroker('deriv_cfd'); }
-  catch (err) {
-    return res.status(500).json({ success: false, error: 'Broker not initialized' });
-  }
-
-  if (typeof broker.switchAccountType !== 'function') {
-    return res.status(501).json({
-      success: false,
-      error: 'Broker does not support account switching. Deploy updated core/execution/broker.js first.',
-    });
-  }
-
-  // Guard 1: open positions
-  let positions = [];
-  try { positions = await broker.getOpenTrades(); }
-  catch (_) { positions = []; }
-  if (Array.isArray(positions) && positions.length > 0) {
-    return res.status(400).json({
-      success: false,
-      error: `Cannot switch: ${positions.length} open position(s). Close all positions on the current account first.`,
-      positions: positions.map(p => ({
-        id: p.id, instrument: p.instrument, side: p.side,
-        units: p.units, unrealizedPL: p.unrealizedPL,
-      })),
-    });
-  }
-
-  // Guard 2: running bots
-  let running = [];
-  try { running = botRunner.list() || []; }
-  catch (_) { running = []; }
-  if (Array.isArray(running) && running.length > 0) {
-    return res.status(400).json({
-      success: false,
-      error: `Cannot switch: ${running.length} bot(s) running. Stop all bots first.`,
-      runningBots: running.map(b => ({
-        instanceId: b.instanceId, botId: b.botId, name: b.name, symbol: b.symbol,
-      })),
-    });
-  }
-
-  try {
-    logger.info(`[Switch] API request: → ${accountType}`);
-    const result = await broker.switchAccountType(accountType);
-    logger.info(`[Switch] API success: now on ${result.accountType} (changed=${result.changed})`);
-
-    // Broadcast new account state to dashboards
-    try {
-      broadcastToDashboards('account', {
-        id: result.account?.id,
-        balance: result.account?.balance,
-        currency: result.account?.currency,
-        accountType: result.account?.accountType || accountType,
-        equity: result.account?.equity,
-        server: (result.account?.accountType === 'demo') ? 'demo' : 'real',
-      });
-    } catch (_) {}
-
-    return res.json({
-      success: true,
-      changed: result.changed,
-      previousAccountType: result.previousAccountType,
-      accountType: result.accountType,
-      account: result.account,
-    });
-  } catch (err) {
-    logger.error(`[Switch] API failed: ${err.message}`);
-
-    if (err.code === 'OPEN_POSITIONS') {
-      return res.status(400).json({
-        success: false,
-        error: err.message,
-        positions: err.positions || [],
-      });
-    }
-
-    return res.status(500).json({
-      success: false,
-      error: err.message,
-      previousAccountType: err.previousAccountType || null,
-      targetAccountType: err.targetAccountType || accountType,
-    });
-  }
-});
-
-// ============================================================
 // Debug endpoints
 // ============================================================
+
 app.get('/debug/pipeline', async (req, res) => {
   try {
     const broker = getBroker('deriv_cfd');
@@ -907,6 +1029,10 @@ app.get('/debug/pipeline', async (req, res) => {
         passwordHashing: AUTH_PASSWORD_HASH ? 'scrypt' : 'plaintext',
         ipAllowlist: AUTH_ALLOWED_IPS,
         failedAttempts: _loginAttempts.size,
+      },
+      comms: {
+        reportScheduler: reportScheduler.getStatus(),
+        securityMonitor: securityMonitor.getStatus(),
       },
       broker: {
         connected: broker.isConnected ? broker.isConnected() : false,
@@ -1135,6 +1261,8 @@ app.get('/debug/status', (req, res) => {
       botRunner: botRunner ? 'running' : 'not loaded',
       digitAnalyzer: digitAnalyzer ? 'running' : 'not loaded',
       balanceGuard: balanceGuard ? 'running' : 'not loaded',
+      reportScheduler: reportScheduler.getStatus().running ? 'running' : 'stopped',
+      securityMonitor: securityMonitor.getStatus().running ? 'running' : 'stopped',
     },
     database: {
       connected: mongoose.connection.readyState === 1,
@@ -1149,7 +1277,7 @@ app.get('/debug/status', (req, res) => {
 });
 
 // ============================================================
-// SPA catch-all (protected — auth middleware above already ran)
+// SPA catch-all
 // ============================================================
 app.get('*', (req, res) => {
   if (!req.path.startsWith('/api')) {
@@ -1160,9 +1288,7 @@ app.get('*', (req, res) => {
 });
 
 // ============================================================
-// HTTP + WebSocket servers
-// [FIX-AUTH] WebSocket uses noServer:true + manual upgrade handler
-// that validates the session cookie BEFORE handshake.
+// HTTP + WebSocket servers (auth-checked upgrade)
 // ============================================================
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
@@ -1269,8 +1395,9 @@ async function sendDashboardInitialState(ws) {
 }
 
 // ============================================================
-// Event subscriptions → broadcast to dashboards
+// Event subscriptions
 // ============================================================
+
 awarenessEngine.on('marketAwareness', (data) => broadcast('marketAwareness', data));
 deepRegime.on('regime', (regime) => broadcast('regime', regime));
 decisionEngine.on('decision', (decision) => broadcast('decision', decision));
@@ -1279,7 +1406,6 @@ eventBus.on('trade.closed', (data) => broadcast('tradeClosed', data));
 eventBus.on('order.placed', (data) => broadcast('trade.placed', data));
 eventBus.on('position.updated', (data) => broadcast('positions', data));
 
-// StrategyPerformance recording
 eventBus.on('trade.closed', async (data) => {
   const contractId = data?.contractId;
   const strategy = data?.strategy;
@@ -1309,7 +1435,6 @@ eventBus.on('trade.closed', async (data) => {
   }
 });
 
-// PerformanceMonitor recording
 eventBus.on('trade.closed', async (data) => {
   try {
     const trade = await Trade.findOne({ contractId: String(data.contractId) });
@@ -1327,6 +1452,7 @@ performanceMonitor.on('thresholdsUpdated', (thresholds) => {
 // ============================================================
 // Prediction pipeline
 // ============================================================
+
 function logPipelineResult(symbol, reason, opportunity, level = 'info') {
   const now = Date.now();
   const prev = _pipelineLogThrottle.get(symbol);
@@ -1496,7 +1622,6 @@ async function startDerivBroker() {
     broker.on('orderUpdate', (data) => broadcastToDashboards('orderUpdate', data));
     broker.on('_portfolioUpdated', (positions) => broadcastToDashboards('positions', positions));
 
-    // [FIX-SWITCH] Broadcast account switches triggered programmatically
     broker.on('accountSwitched', (data) => {
       logger.info(`[Deriv] Account switched: ${data.previousAccountType} → ${data.newAccountType}`);
       broadcastToDashboards('account', {
@@ -1555,7 +1680,7 @@ async function waitForBrokerReady(broker, timeoutMs = 30000) {
 }
 
 // ============================================================
-// [FIX-S11] startServer — await DB, then admin, then listen
+// startServer
 // ============================================================
 async function startServer() {
   await connectDB();
@@ -1572,14 +1697,29 @@ async function startServer() {
     console.log(`Login:          http://localhost:${PORT}/login`);
     console.log(`Dashboard:      http://localhost:${PORT}`);
     console.log(`API base:       http://localhost:${PORT}/api`);
+    console.log(`Reports:        /api/reports/status`);
+    console.log(`Security:       /api/security/status`);
     console.log(`Health:         http://localhost:${PORT}/health`);
-    console.log(`Health full:    http://localhost:${PORT}/health/pipeline`);
     console.log('==============================================');
 
-    // [FIX-S13/S14] Send startup email (after port is bound)
+    // Startup email — fire-and-forget after port bound
     sendRTSStartupNotification(PORT).catch(err => {
       logger.error('[Notify] sendRTSStartupNotification threw:', err.message);
     });
+
+    // [FIX-COMMS] Start report scheduler + security monitor AFTER DB + admin
+    try {
+      reportScheduler.start();
+      logger.info('[Comms] Report scheduler started');
+    } catch (err) {
+      logger.error('[Comms] Report scheduler failed to start:', err.message);
+    }
+    try {
+      securityMonitor.start();
+      logger.info('[Comms] Security monitor started');
+    } catch (err) {
+      logger.error('[Comms] Security monitor failed to start:', err.message);
+    }
 
     startWSPing();
 
@@ -1678,6 +1818,10 @@ async function startServer() {
       try { console.log(`   Market cache:      ${marketStateCache._cache.size} symbols`); } catch (_) {}
       console.log(`   Balance guard:     ${balanceGuard.getState().enabled ? 'active' : 'disabled'}`);
       console.log(`   Auth:              ${AUTH_CONFIGURED ? 'enabled' : 'MISCONFIGURED'}`);
+      const rs = reportScheduler.getStatus();
+      const sm = securityMonitor.getStatus();
+      console.log(`   Report scheduler:  ${rs.running ? 'running' : 'stopped'} (next daily in ${rs.nextDailyInMs ? Math.round(rs.nextDailyInMs / 60000) + 'm' : '—'})`);
+      console.log(`   Security monitor:  ${sm.running ? 'running' : 'stopped'} (alerts sent: ${sm.alerts.sent}, failed: ${sm.alerts.failed})`);
       console.log('==============================================');
     }, 20000);
   });
@@ -1687,6 +1831,8 @@ async function startServer() {
     if (wsPingTimer) clearInterval(wsPingTimer);
     if (pipelineTimer) clearInterval(pipelineTimer);
     try { botRunner.stopAll(); } catch (_) {}
+    try { reportScheduler.stop(); } catch (_) {}
+    try { securityMonitor.stop(); } catch (_) {}
     try {
       await dataOrchestrator.shutdown();
       if (otie && typeof otie.stop === 'function') otie.stop();
