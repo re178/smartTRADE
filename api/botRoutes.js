@@ -180,6 +180,32 @@ router.post('/bots/instance/:instanceId/stop', (req, res) => {
   }
 });
 
+// [FIX-FORCE-REAL] Manual real-trade override.
+// Fires ONE cycle on the instance with the force-real flag set; if the
+// bot's evaluate() returns ENTER, it bypasses the shadow gate and places
+// a REAL trade at full stake. If it returns WAIT, nothing fires.
+//
+// Response shapes:
+//   200 { success: true,  fired: true,  reason, lastReason }
+//   400 { success: false, fired: false, error }   ← no signal this cycle, busy, cooldown
+//   404 { success: false, error: 'Instance not found' }
+//   500 { success: false, error }
+//
+// MUST be declared before GET /bots/:botId (see below) so the more
+// specific /bots/instance/... path is matched first.
+router.post('/bots/instance/:instanceId/force-real', async (req, res) => {
+  try {
+    const result = await botRunner.forceRealTrade(req.params.instanceId);
+    if (result.error === 'Instance not found') {
+      return res.status(404).json(result);
+    }
+    return res.status(result.success ? 200 : 400).json(result);
+  } catch (err) {
+    logger.error('[botRoutes] force-real failed:', err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 router.get('/bots/:botId', (req, res) => {
   const bot = getBot(req.params.botId);
   if (!bot) return res.status(404).json({ error: 'Bot not found' });
