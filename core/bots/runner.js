@@ -16,6 +16,22 @@ const logger = require('../../infrastructure/logger') || console;
 
 function normalizeSymbol(s) { return String(s || '').replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase(); }
 
+// [FIX-COMPOUND-ROUND] Centralised 2-decimal rounding for money values.
+// All compound stake arithmetic must go through this to avoid float
+// drift (e.g. 1 * 1.25 * 1.25 * 1.25 = 1.953125) which Deriv rejects
+// (needs cent-level stakes) and which breaks maxStake comparisons.
+function round2(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return 0;
+  return Math.round(v * 100) / 100;
+}
+
+// Money-cents integer view of a 2dp-rounded value — used for "did the
+// stake actually grow by at least 1 cent?" comparisons.
+function toCents(n) {
+  return Math.round(Number(n) * 100);
+}
+
 const SESSION_RANGES = [
   { code: 'ASIAN',               start: 0,  end: 7  },
   { code: 'LONDON',              start: 7,  end: 12 },
@@ -150,14 +166,16 @@ class BotRunner extends EventEmitter {
     if (!bot || bot.assetClass !== 'synthetic_binary') return null;
     if (!config.compoundEnabled) return null;
 
-    const baseStake = Math.max(0.01, Number(config.stake) || 1);
-    const maxStake = Math.max(baseStake, Number(config.compoundMaxStake) || 10);
+    // [FIX-COMPOUND-ROUND] Round base and max to 2dp at construction so
+    // every downstream arithmetic step works with cent-level values.
+    const baseStake = Math.max(0.01, round2(Number(config.stake) || 1));
+    const maxStake = Math.max(baseStake, round2(Number(config.compoundMaxStake) || 10));
     const growthRatePct = Math.max(0, Number(config.compoundGrowthRatePct) || 0);
 
     return {
       enabled: true,
       baseStake,
-      currentStake: Math.min(baseStake, maxStake),
+      currentStake: Math.min(baseStake, maxStake),   // both 2dp → result 2dp
       maxStake,
       startAfterWins: Math.max(0, Number(config.compoundStartAfterWins) || 0),
       growthRatePct,
@@ -296,7 +314,10 @@ class BotRunner extends EventEmitter {
 
   _getEffectiveStake(instance, tradeParams) {
     if (instance.compound && instance.compound.enabled) {
-      return instance.compound.currentStake;
+      // [FIX-COMPOUND-ROUND] Defensive round — currentStake is set via
+      // round2() everywhere, but re-round here so no stale state can
+      // leak a non-2dp value into an order.
+      return round2(instance.compound.currentStake);
     }
     const configStake = instance.config.stake;
     const hasConfigStake =
@@ -317,8 +338,10 @@ class BotRunner extends EventEmitter {
     c.winsSinceReset += 1;
 
     if (c.resetAfterWins > 0 && c.winsSinceReset >= c.resetAfterWins) {
+      // [FIX-COMPOUND-ROUND] Reset restores base (already 2dp) — round
+      // defensively and clamp to max in case user updated max downward.
       const oldStake = c.currentStake;
-      c.currentStake = Math.min(c.baseStake, c.maxStake);
+      c.currentStake = Math.min(round2(c.baseStake), c.maxStake);
       const oldWins = c.winsSinceReset;
       c.winsSinceReset = 0;
       c.resetCount++;
@@ -342,11 +365,17 @@ class BotRunner extends EventEmitter {
     if (c.winsSinceReset <= c.startAfterWins) return;
     if (c.stopAfterWins > 0 && c.winsSinceReset > c.stopAfterWins) return;
 
-    const oldStake = c.currentStake;
+    // [FIX-COMPOUND-ROUND] Round the raw growth BEFORE clamping to max,
+    // so a value like 1.953125 becomes 1.95 (not 2.00) and never
+    // accidentally exceeds maxStake after rounding up.
+    const oldStake = round2(c.currentStake);
     const factor = 1 + c.growthRatePct / 100;
-    const grownRaw = oldStake * factor;
+    const grownRaw = round2(oldStake * factor);
     const grown = Math.min(grownRaw, c.maxStake);
-    if (grown > oldStake + 0.0001) {
+
+    // Only count as growth if the cent-level value actually increased.
+    // A rate that rounds to the same cent produces no change.
+    if (toCents(grown) > toCents(oldStake)) {
       c.currentStake = grown;
       c.growthCount++;
       c.lastGrowthAt = new Date().toISOString();
