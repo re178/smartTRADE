@@ -217,6 +217,42 @@ class BotRunner extends EventEmitter {
   list() { return Array.from(this._instances.values()).map(i => this._summarize(i)); }
   get(instanceId) { const i = this._instances.get(instanceId); return i ? this._summarize(i) : null; }
 
+  // ─────────────────────────────────────────────────────────────
+  //  [FIX-FORCE-REAL] Manual one-shot override.
+  //
+  //  Fires ONE cycle immediately with `_forceRealOnce = true`. In _runCycle
+  //  that flag makes the next ENTER execute as phase='real' (bypassing the
+  //  shadow gate). If the bot's evaluate() returns WAIT, no trade fires and
+  //  the flag is discarded. All other state (shadow counters, compound,
+  //  stats) is untouched — the resulting trade behaves exactly like a
+  //  normal real trade on close (WIN → real mode; LOSS → gate tightens +1).
+  // ─────────────────────────────────────────────────────────────
+  async forceRealTrade(instanceId) {
+    const instance = this._instances.get(instanceId);
+    if (!instance) return { success: false, error: 'Instance not found' };
+    if (instance.status !== 'RUNNING') return { success: false, error: 'Bot is not running' };
+    if (instance._running) return { success: false, error: 'A cycle is already in progress — try again in a moment' };
+    if (instance._lastEntryTime && Date.now() - instance._lastEntryTime < 15000) {
+      return { success: false, error: 'Recent entry — wait 15s before forcing another' };
+    }
+
+    const entriesBefore = instance.stats.entries;
+    instance._forceRealOnce = true;
+    try {
+      await this._runCycle(instance);
+    } catch (err) {
+      instance._forceRealOnce = false;
+      return { success: false, error: `Cycle error: ${err.message}` };
+    }
+    instance._forceRealOnce = false;
+
+    const fired = instance.stats.entries > entriesBefore;
+    if (fired) {
+      return { success: true, fired: true, reason: 'REAL trade fired (manual override)', lastReason: instance.lastReason };
+    }
+    return { success: false, fired: false, error: instance.lastReason || 'No ENTER signal on this cycle (WAIT)' };
+  }
+
   getStats() {
     return {
       reconcilePosition: {
@@ -757,6 +793,18 @@ class BotRunner extends EventEmitter {
       }
 
       if (result.action === 'ENTER') {
+        // ── [FIX-FORCE-REAL] Manual override — bypass shadow gate for one fire.
+        // The resulting trade is tagged shadowPhase=false, so on close it
+        // flows through _adaptGateAfterReal exactly like a normal real trade:
+        // WIN → shadowRequired=false (gate bypassed); LOSS → gate tightens +1.
+        if (instance._forceRealOnce) {
+          instance._forceRealOnce = false;
+          logger.info(`[BotRunner] ${instance.instanceId}: FORCE REAL override — bypassing shadow gate`);
+          instance.lastReason = 'FORCED REAL trade (manual override)';
+          await this._execute(instance, result, ctx, 'real');
+          return;
+        }
+
         const shadowCfg = this._shadowConfig(instance);
 
         // [FIX-SHADOW-PHASE] Gated mode dispatch — fires REAL shadow-phase
