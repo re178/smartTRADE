@@ -33,6 +33,13 @@
 //
 //     Progress bar tracks consecutiveShadowWins / currentGate, fills green
 //     at 100%. `next fire` stake computed from the current state.
+//
+// [FIX-FORCE-REAL-UI] Manual "Force Real" button on gated-shadow cards.
+//   Clicking it asks the server to fire the next ENTER signal as a REAL
+//   trade at full stake (bypassing the shadow gate for that single fire).
+//   The resulting trade behaves like any real trade: WIN → real mode,
+//   LOSS → gate tightens +1. Button only shown when the instance is in
+//   gated shadow mode.
 
 'use strict';
 
@@ -471,6 +478,18 @@
       // Compound block
       const compoundBlock = renderCompoundBlock(inst);
 
+      // [FIX-FORCE-REAL-UI] Manual override button — only on gated-shadow cards.
+      // Fires the next ENTER signal as a REAL trade at full stake, bypassing
+      // the gate for that single fire. Trade close behaves normally:
+      // WIN → real mode; LOSS → gate tightens +1.
+      const showForceReal = !!(inst.shadow && inst.shadow.mode === 'gated');
+      const forceRealBtn = showForceReal
+        ? `<button class="btn btn-sm btn-warning w-100" data-force-real="${inst.instanceId}"
+             title="Fire the next ENTER signal as a REAL trade (skips shadow gate)">
+             <i class="fas fa-bolt"></i> Force Real
+           </button>`
+        : '';
+
       return `<div class="card mb-2" style="border-left:3px solid #00b894;">
         <div class="card-body p-3">
           <div class="d-flex justify-content-between align-items-start">
@@ -493,9 +512,12 @@
               ${compoundBlock.progress}
               <div class="small text-muted mt-1 fw-bold" style="font-size:0.75rem;">${inst.lastReason || ''}</div>
             </div>
-            <button class="btn btn-sm btn-danger" data-stop="${inst.instanceId}">
-              <i class="fas fa-stop"></i> Stop
-            </button>
+            <div class="d-flex flex-column gap-1 ms-2" style="flex-shrink:0;">
+              ${forceRealBtn}
+              <button class="btn btn-sm btn-danger" data-stop="${inst.instanceId}">
+                <i class="fas fa-stop"></i> Stop
+              </button>
+            </div>
           </div>
         </div>
       </div>`;
@@ -506,6 +528,35 @@
         if (!confirm('Stop this bot? Open positions remain under OTIE management.')) return;
         await fetch(`/api/bots/instance/${btn.dataset.stop}/stop`, { method: 'POST' });
         fetchRunning();
+      });
+    });
+
+    // [FIX-FORCE-REAL-UI] Wire the manual override button.
+    // Server may return 400 if evaluate() was WAIT that cycle or if the bot
+    // is currently mid-cycle — show the reason from the response.
+    container.querySelectorAll('button[data-force-real]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const id = btn.dataset.forceReal;
+        if (!confirm('Force the next ENTER signal to fire as a REAL trade at full stake?\n\nOnly works if the bot has an active signal this cycle.')) return;
+        const orig = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Forcing…';
+        try {
+          const res = await fetch(`/api/bots/instance/${id}/force-real`, { method: 'POST' });
+          const data = await res.json().catch(() => ({}));
+          if (data.success && data.fired) {
+            alert('✅ Force-real fired. Trade is open at real stake.');
+          } else {
+            alert('⚠️ No trade fired: ' + (data.error || data.lastReason || 'unknown'));
+          }
+        } catch (e) {
+          alert('Force failed: ' + e.message);
+        } finally {
+          btn.disabled = false;
+          btn.innerHTML = orig;
+          fetchRunning();
+          fetchRuns();
+        }
       });
     });
   }
