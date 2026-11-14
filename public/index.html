@@ -418,6 +418,20 @@
         <button class="btn btn-outline-primary btn-sm" id="reportModalBtn" title="Report"><i class="fas fa-file-pdf"></i> Report</button>
       </div>
 
+      <!-- ============================================================ -->
+      <!-- CASHIER BUTTONS — frontend-only Deriv Options cashier redirect -->
+      <!-- ============================================================ -->
+      <div class="btn-group" role="group" aria-label="Cashier">
+        <button type="button" class="btn btn-success btn-sm" id="cashierDepositBtn"
+                title="Open Deriv cashier — Deposit (M-Pesa via Payment Agent)">
+          <i class="fas fa-arrow-down"></i> Deposit
+        </button>
+        <button type="button" class="btn btn-outline-success btn-sm" id="cashierWithdrawBtn"
+                title="Open Deriv cashier — Withdraw (M-Pesa via Payment Agent)">
+          <i class="fas fa-arrow-up"></i> Withdraw
+        </button>
+      </div>
+
       <!-- [FIX-SWITCH-UI] Logout button -->
       <button type="button" class="btn-logout" id="logoutBtn" title="Sign out of the dashboard">
         <i class="fas fa-sign-out-alt"></i> Logout
@@ -1005,6 +1019,7 @@
 <script src="js/live.js"></script>
 <script src="js/analytics.js"></script>
 <script src="js/edge.js"></script>
+<script src="js/cashier.js"></script>   <!-- Frontend-only cashier redirect -->
 
 <!-- ============================================================ -->
 <!-- INLINE: NAVIGATION, MOBILE SIDEBAR, AUTO-EXECUTE SAFETY       -->
