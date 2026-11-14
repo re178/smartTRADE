@@ -53,16 +53,22 @@ const RECONCILE_POSITION_GRACE_MS = 2500;
 const RECONCILE_POSITION_LOOKBACK_MS = 60_000;
 
 // Settlement-aware re-entry guards (replaces the old blind 15s cooldown).
-//  • MIN_REENTRY_MS: a small safety net to prevent stutter-fire.
-//  • POST_CLOSE_BUFFER_MS: brief pause after a trade settles so the broker
-//    portfolio cache can reflect the closure before the next evaluation.
-//  The open-position check is the PRIMARY guard; these are secondary.
 const MIN_REENTRY_MS = 3_000;
 const POST_CLOSE_BUFFER_MS = 1_000;
 
 // Short-TTL positions cache — prevents duplicated getOpenTrades() calls
 // inside a single cycle without ever skipping the pre-order freshness check.
 const POSITIONS_CACHE_TTL_MS = 1_500;
+
+// [FIX-HANG-WATCHDOG] A cycle stuck for this long is presumed hung.
+// The watchdog force-clears `_running` and emits `botWatchdogReset`.
+const WATCHDOG_INTERVAL_MS = 5_000;
+const WATCHDOG_STALE_THRESHOLD_MS = 30_000;
+
+// [FIX-STALE-FEED] Warn if no new tick for this long. Below it, short-
+// circuit is normal. Above it, feed is stalled.
+const STALE_FEED_WARN_MS = 30_000;
+const SLOW_FEED_WARN_MS  = 10_000;
 
 const BUY_CONTRACT_TYPES = new Set([
   'MULTUP', 'CALL', 'DIGITEVEN', 'DIGITOVER', 'DIGITMATCH', 'ONETOUCH',
@@ -86,6 +92,7 @@ class BotRunner extends EventEmitter {
     this._nextInstanceId = 1;
     this._symbolLocks = new Map();
     this._positionsCache = { at: 0, data: null, ttl: POSITIONS_CACHE_TTL_MS };
+    this._botStaleFeedThrottle = new Map();
     this._metrics = {
       reconcilePositionAttempts: 0,
       reconcilePositionRecovered: 0,
@@ -100,6 +107,8 @@ class BotRunner extends EventEmitter {
       openPositionRejections: 0,
       compoundGrowths: 0,
       compoundResets: 0,
+      watchdogResets: 0,
+      autoStops: 0,
     };
   }
 
@@ -133,12 +142,18 @@ class BotRunner extends EventEmitter {
       timer: null, _running: false, _lastEntryTime: 0,
       _lastCloseTime: 0,
       _lastEvaluatedSampleSize: 0,
+      _runningSince: 0,
+      _cycleCounter: 0,
+      _lastCycleAt: 0,
+      _stopReason: null,
+      _stalenessWarnAt: 0,
+      _watchdog: null,
       _entryFailureBackoffUntil: 0,
       shadow,
       compound,
       _trailingPeaks: new Map(),
       stats: {
-        runs: 0, entries: 0, wins: 0, losses: 0, pnl: 0, peakPnl: 0, consecutiveLosses: 0,
+        runs: 0, cycles: 0, entries: 0, wins: 0, losses: 0, pnl: 0, peakPnl: 0, consecutiveLosses: 0,
         closedTrades: 0,
 
         normalTrades: 0, normalWins: 0, normalPnl: 0,
@@ -152,11 +167,35 @@ class BotRunner extends EventEmitter {
       },
     };
 
-    // Faster cadence for non-FX — combats the old "up to 5s of stale signal"
-    // problem. The per-cycle tick short-circuit prevents busy-spinning.
+    // Faster cadence for non-FX — the per-cycle tick short-circuit prevents
+    // busy-spinning while keeping signal→evaluation latency near one tick.
     const intervalMs = bot.assetClass === 'fx' ? 15000 : 1000;
     instance.timer = setInterval(() => { this._runCycle(instance).catch(() => {}); }, intervalMs);
     if (typeof instance.timer.unref === 'function') instance.timer.unref();
+
+    // [FIX-HANG-WATCHDOG] If any async cycle gets stuck (broker hang, DNS,
+    // unhandled reject chain), _running stays true forever and the bot
+    // "disappears" from working. Force-clear after 30s and log loudly.
+    instance._watchdog = setInterval(() => {
+      if (!instance._running || !instance._runningSince) return;
+      const stuck = Date.now() - instance._runningSince;
+      if (stuck < WATCHDOG_STALE_THRESHOLD_MS) return;
+      logger.error(
+        `[BotRunner] ${instance.instanceId}: WATCHDOG — cycle stuck ${Math.floor(stuck / 1000)}s, force-reset`
+      );
+      instance._cycleCounter = (instance._cycleCounter || 0) + 1;
+      instance._running = false;
+      instance._runningSince = 0;
+      instance.lastReason = `Watchdog reset (cycle stuck ${Math.floor(stuck / 1000)}s)`;
+      this._metrics.watchdogResets++;
+      this.emit('botWatchdogReset', {
+        instanceId: instance.instanceId,
+        botId: instance.botId,
+        stuckForMs: stuck,
+        timestamp: new Date().toISOString(),
+      });
+    }, WATCHDOG_INTERVAL_MS);
+    if (typeof instance._watchdog.unref === 'function') instance._watchdog.unref();
 
     this._instances.set(instanceId, instance);
     logger.info(
@@ -197,15 +236,9 @@ class BotRunner extends EventEmitter {
     };
   }
 
-  // ─────────────────────────────────────────────────────────────
-  //  Shadow mode resolution.
-  //
-  //  [FIX-SHADOW-LOWPAYOUT] Binary contracts (~0.88× payout) cannot
-  //  sustain real-money shadow validation. They are forced into
-  //  'observational' mode (mirror real trade result) regardless of the
-  //  legacy shadowWinsRequired flag — prevents the costly real-money
-  //  gate on rise/fall and vol bots.
-  // ─────────────────────────────────────────────────────────────
+  // [FIX-SHADOW-LOWPAYOUT] Binary contracts (~0.88× payout) cannot sustain
+  // real-money shadow validation. Forced into 'observational' mode
+  // regardless of the legacy shadowWinsRequired flag.
   _shadowModeForConfig(config, bot) {
     if (!bot || bot.assetClass !== 'synthetic_binary') return 'off';
     if (config._edgeTest) return 'off';
@@ -213,7 +246,6 @@ class BotRunner extends EventEmitter {
     if (bot.contractClass === 'binary') {
       const obs = !!config.shadowObservational;
       const wins = Number(config.shadowWinsRequired) || 0;
-      // Even a legacy config with wins > 0 is downgraded to observational.
       if (wins > 0 || obs) return 'observational';
       return 'off';
     }
@@ -235,10 +267,12 @@ class BotRunner extends EventEmitter {
     };
   }
 
-  stop(instanceId) {
+  stop(instanceId, opts = {}) {
     const instance = this._instances.get(instanceId);
     if (!instance) return null;
     if (instance.timer) clearInterval(instance.timer);
+    if (instance._watchdog) clearInterval(instance._watchdog);
+    if (opts && opts.autoStopReason) instance._stopReason = opts.autoStopReason;
     instance.status = 'STOPPED';
     instance.stoppedAt = new Date();
     for (const [sym, lock] of this._symbolLocks) {
@@ -246,7 +280,8 @@ class BotRunner extends EventEmitter {
     }
     if (instance._trailingPeaks) instance._trailingPeaks.clear();
     this._instances.delete(instanceId);
-    logger.info(`[BotRunner] Stopped ${instance.name} (${instanceId})`);
+    logger.info(`[BotRunner] Stopped ${instance.name} (${instanceId})` +
+      (instance._stopReason ? ` — ${instance._stopReason}` : ''));
     const summary = this._summarize(instance);
     this.emit('botStopped', summary);
     return summary;
@@ -317,6 +352,10 @@ class BotRunner extends EventEmitter {
         instancesWithCompound: Array.from(this._instances.values())
           .filter(i => i.compound && i.compound.enabled)
           .length,
+      },
+      health: {
+        watchdogResets: this._metrics.watchdogResets,
+        autoStops: this._metrics.autoStops,
       },
       openPositionRejections: this._metrics.openPositionRejections,
       runningInstances: this._instances.size,
@@ -521,7 +560,7 @@ class BotRunner extends EventEmitter {
     }
   }
 
-  // (Shadow reconstruction methods — kept as no-ops for safety, unchanged.)
+  // Shadow reconstruction methods — kept as no-ops for safety, unchanged.
   _resolvePendingShadows(instance) {
     if (!instance.shadow || instance.shadow.mode !== 'gated') return;
     if (instance.shadow.pending.length === 0) return;
@@ -699,10 +738,76 @@ class BotRunner extends EventEmitter {
     if (s.flipHistory.length > FLIP_HISTORY_MAX) s.flipHistory = s.flipHistory.slice(-FLIP_HISTORY_MAX);
   }
 
+  // [FIX-AUTOSTOP-VISIBILITY] Explicit auto-stop with a caller-provided
+  // reason. Emits an event the UI can surface, so the bot doesn't silently
+  // "disappear" — the user sees WHY it stopped.
+  _autoStop(instance, reason) {
+    instance._stopReason = reason;
+    this._metrics.autoStops++;
+    try {
+      this.emit('botAutoStopped', {
+        instanceId: instance.instanceId,
+        botId: instance.botId,
+        reason,
+        stats: this._summarize(instance).stats,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (_) {}
+    logger.warn(`[BotRunner] ${instance.instanceId}: AUTO-STOP — ${reason}`);
+    this.stop(instance.instanceId, { autoStopReason: reason });
+  }
+
+  // [FIX-EXIT-VISIBILITY] Live progress toward each exit threshold.
+  // The summary exposes this so the UI can show "2/3 losses, 40% to SL,"
+  // etc. — the bot's own rules are checked every cycle, this makes it
+  // VISIBLE.
+  _buildExitStatus(instance) {
+    const s = instance.stats;
+    const tp = Number(instance.config.botTakeProfit) || 0;
+    const slAmt = Math.abs(Number(instance.config.botStopLoss) || 0);
+    const trailPct = Number(instance.config.trailingDrawdownPct) || 0;
+    const maxLosses = Number(instance.config.stopAfterLosses) || 0;
+    const trailFloor = trailPct > 0 && s.peakPnl > 0
+      ? Number((s.peakPnl * (1 - trailPct / 100)).toFixed(2))
+      : null;
+    return {
+      pnl: Number(s.pnl.toFixed(2)),
+      peakPnl: Number(s.peakPnl.toFixed(2)),
+      consecutiveLosses: s.consecutiveLosses,
+      tp: {
+        target: tp,
+        progressPct: tp > 0 && s.pnl > 0 ? Number(((s.pnl / tp) * 100).toFixed(1)) : 0,
+        remaining: tp > 0 ? Number((tp - s.pnl).toFixed(2)) : null,
+      },
+      sl: {
+        target: -slAmt,
+        progressPct: slAmt > 0 && s.pnl < 0 ? Number(((Math.abs(s.pnl) / slAmt) * 100).toFixed(1)) : 0,
+        remaining: slAmt > 0 ? Number((-slAmt - s.pnl).toFixed(2)) : null,
+      },
+      trailing: {
+        pct: trailPct,
+        floor: trailFloor,
+        active: trailFloor != null,
+        distanceToFloor: trailFloor != null ? Number((s.pnl - trailFloor).toFixed(2)) : null,
+      },
+      losses: {
+        limit: maxLosses,
+        current: s.consecutiveLosses,
+        remaining: maxLosses > 0 ? maxLosses - s.consecutiveLosses : null,
+      },
+    };
+  }
+
   async _runCycle(instance) {
     if (instance.status !== 'RUNNING') return;
     if (instance._running) return;
+
+    const cycleId = (instance._cycleCounter || 0) + 1;
+    instance._cycleCounter = cycleId;
     instance._running = true;
+    instance._runningSince = Date.now();
+    instance._lastCycleAt = Date.now();
+    instance.stats.cycles = (instance.stats.cycles || 0) + 1;
 
     try {
       this._updateFlipState(instance);
@@ -719,8 +824,6 @@ class BotRunner extends EventEmitter {
         return;
       }
 
-      // Settlement-aware re-entry guards (replaced the old 15s blind cooldown).
-      // The open-position check below is the PRIMARY guard; these are secondary.
       if (instance._lastEntryTime && Date.now() - instance._lastEntryTime < MIN_REENTRY_MS) {
         instance.lastReason = 'Reentry buffer (post-entry)';
         return;
@@ -730,11 +833,10 @@ class BotRunner extends EventEmitter {
         return;
       }
 
+      // ── Exit checks — run every cycle, before anything heavy ──
       const maxLosses = Number(instance.config.stopAfterLosses) || 0;
       if (maxLosses > 0 && instance.stats.consecutiveLosses >= maxLosses) {
-        instance.lastReason = `Stopped: ${instance.stats.consecutiveLosses} consecutive losses (limit ${maxLosses})`;
-        logger.warn(`[BotRunner] ${instance.instanceId} — ${instance.lastReason}`);
-        this.stop(instance.instanceId);
+        this._autoStop(instance, `Consecutive losses ${instance.stats.consecutiveLosses}/${maxLosses}`);
         return;
       }
 
@@ -744,24 +846,19 @@ class BotRunner extends EventEmitter {
       const trailPct = Number(instance.config.trailingDrawdownPct) || 0;
 
       if (s.pnl > s.peakPnl) s.peakPnl = s.pnl;
+
       if (tp > 0 && s.pnl >= tp) {
-        instance.lastReason = `Stopped: Take profit hit (+$${s.pnl.toFixed(2)} >= +$${tp})`;
-        logger.info(`[BotRunner] ${instance.instanceId} — ${instance.lastReason}`);
-        this.stop(instance.instanceId);
+        this._autoStop(instance, `Take profit hit (+$${s.pnl.toFixed(2)} ≥ +$${tp})`);
         return;
       }
       if (slAmt > 0 && s.pnl <= -slAmt) {
-        instance.lastReason = `Stopped: Stop loss hit (${s.pnl.toFixed(2)} <= -$${slAmt})`;
-        logger.info(`[BotRunner] ${instance.instanceId} — ${instance.lastReason}`);
-        this.stop(instance.instanceId);
+        this._autoStop(instance, `Stop loss hit ($${s.pnl.toFixed(2)} ≤ −$${slAmt})`);
         return;
       }
       if (trailPct > 0 && s.peakPnl > 0) {
         const trailFloor = s.peakPnl * (1 - trailPct / 100);
         if (s.pnl <= trailFloor) {
-          instance.lastReason = `Stopped: Trailing drawdown (${s.pnl.toFixed(2)} <= ${trailFloor.toFixed(2)}, peak +$${s.peakPnl.toFixed(2)})`;
-          logger.info(`[BotRunner] ${instance.instanceId} — ${instance.lastReason}`);
-          this.stop(instance.instanceId);
+          this._autoStop(instance, `Trailing drawdown ($${s.pnl.toFixed(2)} ≤ $${trailFloor.toFixed(2)}, peak +$${s.peakPnl.toFixed(2)})`);
           return;
         }
       }
@@ -779,8 +876,6 @@ class BotRunner extends EventEmitter {
       const broker = getBroker('deriv_cfd');
       if (!broker.isConnected()) { instance.lastReason = 'broker disconnected'; return; }
 
-      // Cached positions (short TTL) — never duplicates the pre-order freshness
-      // check inside _execute (that call passes forceFresh=true).
       const positions = await this._getPositions();
       if (positions.some(p => normalizeSymbol(p.instrument) === instance.symbol)) {
         instance.lastReason = 'waiting for current trade to close';
@@ -795,7 +890,6 @@ class BotRunner extends EventEmitter {
 
       const bot = getBot(instance.botId);
       const timeframe = instance.config.timeframe || 'M5';
-
       const ctx = { config: instance.config, stats: instance.stats };
 
       if (bot.assetClass === 'fx') {
@@ -836,13 +930,38 @@ class BotRunner extends EventEmitter {
         ctx.digitView = digitView;
       }
 
-      // Tick short-circuit for lightweight digit bots: if no new tick has
-      // arrived since the last evaluation, there is no new signal — skip.
-      // This is what makes a 1-second polling cadence safe.
+      // ── Tick short-circuit — but now with staleness detection ──
       if (bot.assetClass !== 'fx' && !HIGH_PAYOUT_CLASSES.has(bot.contractClass)) {
         if (ctx.digitView && ctx.digitView.sampleSize &&
             ctx.digitView.sampleSize === instance._lastEvaluatedSampleSize) {
-          instance.lastReason = 'No new tick since last evaluation';
+          const tickAge = ctx.digitView.tickAgeMs;
+
+          if (tickAge == null) {
+            instance.lastReason = 'No tick timestamp (analyzer cold)';
+          } else if (tickAge > STALE_FEED_WARN_MS) {
+            instance.lastReason = `⚠ TICK FEED STALLED (${Math.floor(tickAge / 1000)}s since last tick) — check broker`;
+            const now = Date.now();
+            if (!instance._stalenessWarnAt || (now - instance._stalenessWarnAt) > 60_000) {
+              instance._stalenessWarnAt = now;
+              this._botStaleFeedThrottle.set(instance.instanceId, now);
+              logger.warn(
+                `[BotRunner] ${instance.instanceId}: TICK FEED STALLED — ${Math.floor(tickAge / 1000)}s since last tick on ${instance.symbol}`
+              );
+              try {
+                this.emit('botStaleFeed', {
+                  instanceId: instance.instanceId,
+                  botId: instance.botId,
+                  symbol: instance.symbol,
+                  tickAgeMs: tickAge,
+                  timestamp: new Date().toISOString(),
+                });
+              } catch (_) {}
+            }
+          } else if (tickAge > SLOW_FEED_WARN_MS) {
+            instance.lastReason = `Slow feed (${Math.floor(tickAge / 1000)}s since last tick)`;
+          } else {
+            instance.lastReason = `No new tick (${tickAge}ms ago)`;
+          }
           return;
         }
       }
@@ -861,7 +980,6 @@ class BotRunner extends EventEmitter {
         instance._lastEvaluatedSampleSize = ctx.digitView.sampleSize;
       }
 
-      // NULL-SAFE WAIT branch — evaluate may legitimately return undefined.
       if (!result || result.action === 'WAIT') {
         instance.lastReason = (result && result.reasons && result.reasons[0]) || 'WAIT';
         this.emit('botCycle', {
@@ -884,39 +1002,29 @@ class BotRunner extends EventEmitter {
         }
 
         const shadowCfg = this._shadowConfig(instance);
-
         if (shadowCfg.gating) {
           const gateMet = instance.shadow.consecutiveShadowWins >= instance.shadow.currentGate;
-
           if (instance.shadow.shadowRequired && !gateMet) {
             instance.lastReason = `Shadow phase ${instance.shadow.consecutiveShadowWins}/${instance.shadow.currentGate} → firing $${instance.config.shadowStake}`;
-            logger.info(
-              `[BotRunner] ${instance.instanceId}: SHADOW-PHASE fire ` +
-              `(${instance.shadow.consecutiveShadowWins}/${instance.shadow.currentGate} wins, ` +
-              `stake=$${instance.config.shadowStake})`
-            );
             await this._execute(instance, result, ctx, 'shadow');
             return;
           }
-
           if (gateMet && instance.shadow.shadowRequired) {
-            logger.info(
-              `[BotRunner] ${instance.instanceId}: SHADOW GATE MET ` +
-              `(${instance.shadow.consecutiveShadowWins}/${instance.shadow.currentGate}) → REAL fire`
-            );
             instance.lastReason = `Shadow gate met (${instance.shadow.consecutiveShadowWins}/${instance.shadow.currentGate}) → REAL trade`;
           }
           await this._execute(instance, result, ctx, 'real');
           return;
         }
-
         await this._execute(instance, result, ctx, 'real');
       }
     } catch (err) {
       logger.error(`[BotRunner] ${instance.instanceId} cycle exception: ${err.message}`);
       instance.lastReason = `cycle error: ${err.message}`;
     } finally {
-      instance._running = false;
+      if (instance._cycleCounter === cycleId) {
+        instance._running = false;
+        instance._runningSince = 0;
+      }
     }
   }
 
@@ -1047,6 +1155,7 @@ class BotRunner extends EventEmitter {
         oddStreak: dv.oddStreak,
         sampleSize: dv.sampleSize,
         precision: dv.precision,
+        tickAgeMs: dv.tickAgeMs,
       } : null,
       predictedDirection: direction || null,
       entryTickNum: dv ? dv.sampleSize : null,
@@ -1185,7 +1294,6 @@ class BotRunner extends EventEmitter {
     }
 
     try {
-      // Fresh portfolio check — bypasses the cache to guarantee pre-order freshness.
       const freshPositions = await this._getPositions(true);
       if (freshPositions.some(p => normalizeSymbol(p.instrument) === lockSymbol)) {
         instance.lastReason = 'Execution blocked: position opened by concurrent bot';
@@ -1490,6 +1598,9 @@ class BotRunner extends EventEmitter {
       assetClass: instance.assetClass, contractClass: instance.contractClass,
       symbol: instance.symbol, status: instance.status, startedAt: instance.startedAt,
       lastRunAt: instance.lastRunAt, lastReason: instance.lastReason, config: instance.config,
+      lastCycleAt: instance._lastCycleAt ? new Date(instance._lastCycleAt).toISOString() : null,
+      stopReason: instance._stopReason || null,
+      exitStatus: this._buildExitStatus(instance),
       stats: statsForSummary,
       shadow: shadowForSummary,
       trailing: trailingForSummary,
