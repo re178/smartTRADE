@@ -16,28 +16,21 @@ const logger = require('../../infrastructure/logger') || console;
 
 function normalizeSymbol(s) { return String(s || '').replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase(); }
 
-// [FIX-COMPOUND-ROUND] Centralised 2-decimal rounding for money values.
-// All compound stake arithmetic must go through this to avoid float
-// drift (e.g. 1 * 1.25 * 1.25 * 1.25 = 1.953125) which Deriv rejects
-// (needs cent-level stakes) and which breaks maxStake comparisons.
 function round2(n) {
   const v = Number(n);
   if (!Number.isFinite(v)) return 0;
   return Math.round(v * 100) / 100;
 }
-
-// Money-cents integer view of a 2dp-rounded value — used for "did the
-// stake actually grow by at least 1 cent?" comparisons.
 function toCents(n) {
   return Math.round(Number(n) * 100);
 }
 
 const SESSION_RANGES = [
-  { code: 'ASIAN',               start: 0,  end: 7  },
-  { code: 'LONDON',              start: 7,  end: 12 },
-  { code: 'LONDON_NY_OVERLAP',   start: 12, end: 16 },
-  { code: 'NEW_YORK',            start: 16, end: 21 },
-  { code: 'AFTER_HOURS',         start: 21, end: 24 },
+  { code: 'ASIAN',             start: 0,  end: 7  },
+  { code: 'LONDON',            start: 7,  end: 12 },
+  { code: 'LONDON_NY_OVERLAP', start: 12, end: 16 },
+  { code: 'NEW_YORK',          start: 16, end: 21 },
+  { code: 'AFTER_HOURS',       start: 21, end: 24 },
 ];
 
 function detectSession(date = new Date()) {
@@ -59,13 +52,25 @@ const OPEN_POSITION_BACKOFF_MS = 60_000;
 const RECONCILE_POSITION_GRACE_MS = 2500;
 const RECONCILE_POSITION_LOOKBACK_MS = 60_000;
 
+// Settlement-aware re-entry guards (replaces the old blind 15s cooldown).
+//  • MIN_REENTRY_MS: a small safety net to prevent stutter-fire.
+//  • POST_CLOSE_BUFFER_MS: brief pause after a trade settles so the broker
+//    portfolio cache can reflect the closure before the next evaluation.
+//  The open-position check is the PRIMARY guard; these are secondary.
+const MIN_REENTRY_MS = 3_000;
+const POST_CLOSE_BUFFER_MS = 1_000;
+
+// Short-TTL positions cache — prevents duplicated getOpenTrades() calls
+// inside a single cycle without ever skipping the pre-order freshness check.
+const POSITIONS_CACHE_TTL_MS = 1_500;
+
 const BUY_CONTRACT_TYPES = new Set([
   'MULTUP', 'CALL', 'DIGITEVEN', 'DIGITOVER', 'DIGITMATCH', 'ONETOUCH',
   'VANILLALONGCALL', 'TURBOSLONG',
 ]);
 const SELL_CONTRACT_TYPES = new Set([
   'MULTDOWN', 'PUT', 'DIGITODD', 'DIGITUNDER', 'DIGITDIFF', 'NOTOUCH',
-  'VANILLALONGPUT', 'TURBOSSHORT',
+  'VANILLALONGPUT', 'TURBOSHORT',
 ]);
 
 const SHADOW_STALL_TIMEOUT_MS = 30_000;
@@ -80,6 +85,7 @@ class BotRunner extends EventEmitter {
     this._instances = new Map();
     this._nextInstanceId = 1;
     this._symbolLocks = new Map();
+    this._positionsCache = { at: 0, data: null, ttl: POSITIONS_CACHE_TTL_MS };
     this._metrics = {
       reconcilePositionAttempts: 0,
       reconcilePositionRecovered: 0,
@@ -125,6 +131,8 @@ class BotRunner extends EventEmitter {
       instanceId, botId, name: bot.name, assetClass: bot.assetClass, contractClass: bot.contractClass,
       symbol, config: finalConfig, status: 'RUNNING', startedAt: new Date(), lastRunAt: null, lastReason: null,
       timer: null, _running: false, _lastEntryTime: 0,
+      _lastCloseTime: 0,
+      _lastEvaluatedSampleSize: 0,
       _entryFailureBackoffUntil: 0,
       shadow,
       compound,
@@ -144,7 +152,9 @@ class BotRunner extends EventEmitter {
       },
     };
 
-    const intervalMs = bot.assetClass === 'fx' ? 15000 : 5000;
+    // Faster cadence for non-FX — combats the old "up to 5s of stale signal"
+    // problem. The per-cycle tick short-circuit prevents busy-spinning.
+    const intervalMs = bot.assetClass === 'fx' ? 15000 : 1000;
     instance.timer = setInterval(() => { this._runCycle(instance).catch(() => {}); }, intervalMs);
     if (typeof instance.timer.unref === 'function') instance.timer.unref();
 
@@ -158,7 +168,7 @@ class BotRunner extends EventEmitter {
     );
     const summary = this._summarize(instance);
     this.emit('botStarted', summary);
-    setTimeout(() => { this._runCycle(instance).catch(() => {}); }, 1000);
+    setTimeout(() => { this._runCycle(instance).catch(() => {}); }, 500);
     return summary;
   }
 
@@ -166,8 +176,6 @@ class BotRunner extends EventEmitter {
     if (!bot || bot.assetClass !== 'synthetic_binary') return null;
     if (!config.compoundEnabled) return null;
 
-    // [FIX-COMPOUND-ROUND] Round base and max to 2dp at construction so
-    // every downstream arithmetic step works with cent-level values.
     const baseStake = Math.max(0.01, round2(Number(config.stake) || 1));
     const maxStake = Math.max(baseStake, round2(Number(config.compoundMaxStake) || 10));
     const growthRatePct = Math.max(0, Number(config.compoundGrowthRatePct) || 0);
@@ -175,7 +183,7 @@ class BotRunner extends EventEmitter {
     return {
       enabled: true,
       baseStake,
-      currentStake: Math.min(baseStake, maxStake),   // both 2dp → result 2dp
+      currentStake: Math.min(baseStake, maxStake),
       maxStake,
       startAfterWins: Math.max(0, Number(config.compoundStartAfterWins) || 0),
       growthRatePct,
@@ -189,9 +197,27 @@ class BotRunner extends EventEmitter {
     };
   }
 
+  // ─────────────────────────────────────────────────────────────
+  //  Shadow mode resolution.
+  //
+  //  [FIX-SHADOW-LOWPAYOUT] Binary contracts (~0.88× payout) cannot
+  //  sustain real-money shadow validation. They are forced into
+  //  'observational' mode (mirror real trade result) regardless of the
+  //  legacy shadowWinsRequired flag — prevents the costly real-money
+  //  gate on rise/fall and vol bots.
+  // ─────────────────────────────────────────────────────────────
   _shadowModeForConfig(config, bot) {
     if (!bot || bot.assetClass !== 'synthetic_binary') return 'off';
     if (config._edgeTest) return 'off';
+
+    if (bot.contractClass === 'binary') {
+      const obs = !!config.shadowObservational;
+      const wins = Number(config.shadowWinsRequired) || 0;
+      // Even a legacy config with wins > 0 is downgraded to observational.
+      if (wins > 0 || obs) return 'observational';
+      return 'off';
+    }
+
     const wins = Number(config.shadowWinsRequired) || 0;
     if (wins > 0) return 'gated';
     if (!!config.shadowObservational) return 'observational';
@@ -204,7 +230,7 @@ class BotRunner extends EventEmitter {
     const obs = !!instance.config.shadowObservational;
     return {
       mode: instance.shadow.mode,
-      gating: wins > 0,
+      gating: wins > 0 && instance.shadow.mode === 'gated',
       tracking: wins > 0 || obs,
     };
   }
@@ -235,23 +261,13 @@ class BotRunner extends EventEmitter {
   list() { return Array.from(this._instances.values()).map(i => this._summarize(i)); }
   get(instanceId) { const i = this._instances.get(instanceId); return i ? this._summarize(i) : null; }
 
-  // ─────────────────────────────────────────────────────────────
-  //  [FIX-FORCE-REAL] Manual one-shot override.
-  //
-  //  Fires ONE cycle immediately with `_forceRealOnce = true`. In _runCycle
-  //  that flag makes the next ENTER execute as phase='real' (bypassing the
-  //  shadow gate). If the bot's evaluate() returns WAIT, no trade fires and
-  //  the flag is discarded. All other state (shadow counters, compound,
-  //  stats) is untouched — the resulting trade behaves exactly like a
-  //  normal real trade on close (WIN → real mode; LOSS → gate tightens +1).
-  // ─────────────────────────────────────────────────────────────
   async forceRealTrade(instanceId) {
     const instance = this._instances.get(instanceId);
     if (!instance) return { success: false, error: 'Instance not found' };
     if (instance.status !== 'RUNNING') return { success: false, error: 'Bot is not running' };
     if (instance._running) return { success: false, error: 'A cycle is already in progress — try again in a moment' };
-    if (instance._lastEntryTime && Date.now() - instance._lastEntryTime < 15000) {
-      return { success: false, error: 'Recent entry — wait 15s before forcing another' };
+    if (instance._lastEntryTime && Date.now() - instance._lastEntryTime < MIN_REENTRY_MS) {
+      return { success: false, error: `Recent entry — wait ${Math.ceil((MIN_REENTRY_MS - (Date.now() - instance._lastEntryTime)) / 1000)}s before forcing another` };
     }
 
     const entriesBefore = instance.stats.entries;
@@ -309,14 +325,39 @@ class BotRunner extends EventEmitter {
   }
 
   // ─────────────────────────────────────────────────────────────
+  //  Positions cache — shared across a single cycle, short TTL.
+  // ─────────────────────────────────────────────────────────────
+  async _getPositions(forceFresh = false) {
+    const now = Date.now();
+    if (!forceFresh && this._positionsCache.data && (now - this._positionsCache.at) < this._positionsCache.ttl) {
+      return this._positionsCache.data;
+    }
+    const broker = getBroker('deriv_cfd');
+    if (forceFresh && broker._portfolioCache) broker._portfolioCache.at = 0;
+    try {
+      const data = await broker.getOpenTrades();
+      this._positionsCache = {
+        at: now,
+        data: Array.isArray(data) ? data : [],
+        ttl: POSITIONS_CACHE_TTL_MS,
+      };
+      return this._positionsCache.data;
+    } catch (_) {
+      return this._positionsCache.data || [];
+    }
+  }
+
+  _invalidatePositions() {
+    this._positionsCache = { at: 0, data: null, ttl: POSITIONS_CACHE_TTL_MS };
+    const broker = getBroker('deriv_cfd');
+    if (broker && broker._portfolioCache) broker._portfolioCache.at = 0;
+  }
+
+  // ─────────────────────────────────────────────────────────────
   //  Compound stake
   // ─────────────────────────────────────────────────────────────
-
   _getEffectiveStake(instance, tradeParams) {
     if (instance.compound && instance.compound.enabled) {
-      // [FIX-COMPOUND-ROUND] Defensive round — currentStake is set via
-      // round2() everywhere, but re-round here so no stale state can
-      // leak a non-2dp value into an order.
       return round2(instance.compound.currentStake);
     }
     const configStake = instance.config.stake;
@@ -329,17 +370,12 @@ class BotRunner extends EventEmitter {
   _applyCompoundAfterWin(instance, run) {
     if (!instance.compound || !instance.compound.enabled) return;
     if (!run || run.result !== 'WIN') return;
-    // [FIX-SHADOW-PHASE] Compound only advances on REAL (non-shadow) wins.
-    // Shadow-phase trades are $0.35 validation fires and must not grow the
-    // compound ladder.
     if (run.shadowPhase) return;
 
     const c = instance.compound;
     c.winsSinceReset += 1;
 
     if (c.resetAfterWins > 0 && c.winsSinceReset >= c.resetAfterWins) {
-      // [FIX-COMPOUND-ROUND] Reset restores base (already 2dp) — round
-      // defensively and clamp to max in case user updated max downward.
       const oldStake = c.currentStake;
       c.currentStake = Math.min(round2(c.baseStake), c.maxStake);
       const oldWins = c.winsSinceReset;
@@ -365,16 +401,11 @@ class BotRunner extends EventEmitter {
     if (c.winsSinceReset <= c.startAfterWins) return;
     if (c.stopAfterWins > 0 && c.winsSinceReset > c.stopAfterWins) return;
 
-    // [FIX-COMPOUND-ROUND] Round the raw growth BEFORE clamping to max,
-    // so a value like 1.953125 becomes 1.95 (not 2.00) and never
-    // accidentally exceeds maxStake after rounding up.
     const oldStake = round2(c.currentStake);
     const factor = 1 + c.growthRatePct / 100;
     const grownRaw = round2(oldStake * factor);
     const grown = Math.min(grownRaw, c.maxStake);
 
-    // Only count as growth if the cent-level value actually increased.
-    // A rate that rounds to the same cent produces no change.
     if (toCents(grown) > toCents(oldStake)) {
       c.currentStake = grown;
       c.growthCount++;
@@ -430,9 +461,8 @@ class BotRunner extends EventEmitter {
     if (instance.config._edgeTest) return;
     if (!TRAIL_ELIGIBLE_CLASSES.has(instance.contractClass)) return;
 
-    const broker = getBroker('deriv_cfd');
     let positions;
-    try { positions = await broker.getOpenTrades(); }
+    try { positions = await this._getPositions(); }
     catch (_) { return; }
     if (!Array.isArray(positions) || positions.length === 0) {
       if (instance._trailingPeaks.size > 0) instance._trailingPeaks.clear();
@@ -472,10 +502,11 @@ class BotRunner extends EventEmitter {
       if (currentProfit <= closeBelow) {
         logger.info(`[BotRunner] ${instance.instanceId}: trailing EXIT on ${contractId} (peak=$${tracking.peakProfit.toFixed(2)} current=$${currentProfit.toFixed(2)} retrace=$${(tracking.peakProfit - currentProfit).toFixed(2)} ≥ ${retracePct}% of peak)`);
         try {
-          await broker.closeTrade(contractId);
+          await getBroker('deriv_cfd').closeTrade(contractId);
           this._metrics.trailingExits++;
           instance._trailingPeaks.delete(contractId);
           instance.lastReason = `Trailing exit ${contractId} (peak $${tracking.peakProfit.toFixed(2)})`;
+          this._invalidatePositions();
           this.emit('botTrailingExit', {
             instanceId: instance.instanceId, botId: instance.botId, contractId,
             peakProfit: Number(tracking.peakProfit.toFixed(2)),
@@ -490,15 +521,7 @@ class BotRunner extends EventEmitter {
     }
   }
 
-  // ─────────────────────────────────────────────────────────────
-  //  Shadow — reconstruction path (dead code kept for safety)
-  //
-  //  These methods (pending queue + tick-based resolution) were used by
-  //  gated mode before [FIX-SHADOW-PHASE]. Now gated mode fires real
-  //  trades at shadowStake, so they're no longer called. Kept in place
-  //  because removing them risks unintended side effects if future code
-  //  references them. They are safe no-ops when never invoked.
-  // ─────────────────────────────────────────────────────────────
+  // (Shadow reconstruction methods — kept as no-ops for safety, unchanged.)
   _resolvePendingShadows(instance) {
     if (!instance.shadow || instance.shadow.mode !== 'gated') return;
     if (instance.shadow.pending.length === 0) return;
@@ -560,7 +583,6 @@ class BotRunner extends EventEmitter {
     return true;
   }
 
-  // [FIX-SHADOW-ACCURACY] Observational mode — mirror real result.
   _applyObservationalShadow(instance, run) {
     if (!instance.shadow || instance.shadow.mode !== 'observational') return;
     if (!run || !run.result) return;
@@ -594,9 +616,6 @@ class BotRunner extends EventEmitter {
     } catch (_) {}
   }
 
-  // [FIX-SHADOW-PHASE] Real-trade gate adaptation.
-  // Only called from _onTradeClosed when run.shadowPhase === false.
-  // (Shadow-phase WIN/LOSS is handled inline in _onTradeClosed.)
   _adaptGateAfterReal(instance, result) {
     if (!instance.shadow || !instance.shadow.enabled) return;
     if (instance.shadow.mode !== 'gated') return;
@@ -687,7 +706,7 @@ class BotRunner extends EventEmitter {
 
     try {
       this._updateFlipState(instance);
-      this._resolvePendingShadows(instance);   // no-op in real-shadow mode
+      this._resolvePendingShadows(instance);
 
       try { await this._manageTrailingExits(instance); }
       catch (trErr) { logger.warn(`[BotRunner] ${instance.instanceId}: trailing check failed: ${trErr.message}`); }
@@ -700,8 +719,14 @@ class BotRunner extends EventEmitter {
         return;
       }
 
-      if (instance._lastEntryTime && Date.now() - instance._lastEntryTime < 15000) {
-        instance.lastReason = 'Awaiting trade settlement...';
+      // Settlement-aware re-entry guards (replaced the old 15s blind cooldown).
+      // The open-position check below is the PRIMARY guard; these are secondary.
+      if (instance._lastEntryTime && Date.now() - instance._lastEntryTime < MIN_REENTRY_MS) {
+        instance.lastReason = 'Reentry buffer (post-entry)';
+        return;
+      }
+      if (instance._lastCloseTime && Date.now() - instance._lastCloseTime < POST_CLOSE_BUFFER_MS) {
+        instance.lastReason = 'Awaiting settlement buffer';
         return;
       }
 
@@ -754,7 +779,9 @@ class BotRunner extends EventEmitter {
       const broker = getBroker('deriv_cfd');
       if (!broker.isConnected()) { instance.lastReason = 'broker disconnected'; return; }
 
-      const positions = await broker.getOpenTrades().catch(() => []);
+      // Cached positions (short TTL) — never duplicates the pre-order freshness
+      // check inside _execute (that call passes forceFresh=true).
+      const positions = await this._getPositions();
       if (positions.some(p => normalizeSymbol(p.instrument) === instance.symbol)) {
         instance.lastReason = 'waiting for current trade to close';
         return;
@@ -809,23 +836,45 @@ class BotRunner extends EventEmitter {
         ctx.digitView = digitView;
       }
 
+      // Tick short-circuit for lightweight digit bots: if no new tick has
+      // arrived since the last evaluation, there is no new signal — skip.
+      // This is what makes a 1-second polling cadence safe.
+      if (bot.assetClass !== 'fx' && !HIGH_PAYOUT_CLASSES.has(bot.contractClass)) {
+        if (ctx.digitView && ctx.digitView.sampleSize &&
+            ctx.digitView.sampleSize === instance._lastEvaluatedSampleSize) {
+          instance.lastReason = 'No new tick since last evaluation';
+          return;
+        }
+      }
+
       instance.stats.runs++;
 
       let result;
       try { result = await bot.evaluate(ctx); }
-      catch (evalErr) { instance.lastReason = `evaluate error: ${evalErr.message}`; return; }
+      catch (evalErr) {
+        instance.lastReason = `evaluate error: ${evalErr.message}`;
+        logger.warn(`[BotRunner] ${instance.instanceId}: evaluate threw — ${evalErr.message}`);
+        return;
+      }
 
+      if (ctx.digitView && ctx.digitView.sampleSize) {
+        instance._lastEvaluatedSampleSize = ctx.digitView.sampleSize;
+      }
+
+      // NULL-SAFE WAIT branch — evaluate may legitimately return undefined.
       if (!result || result.action === 'WAIT') {
         instance.lastReason = (result && result.reasons && result.reasons[0]) || 'WAIT';
-        this.emit('botCycle', { instanceId: instance.instanceId, botId: instance.botId, action: 'WAIT', reasons: result.reasons || [], symbol: instance.symbol });
+        this.emit('botCycle', {
+          instanceId: instance.instanceId,
+          botId: instance.botId,
+          action: 'WAIT',
+          reasons: (result && result.reasons) || [],
+          symbol: instance.symbol,
+        });
         return;
       }
 
       if (result.action === 'ENTER') {
-        // ── [FIX-FORCE-REAL] Manual override — bypass shadow gate for one fire.
-        // The resulting trade is tagged shadowPhase=false, so on close it
-        // flows through _adaptGateAfterReal exactly like a normal real trade:
-        // WIN → shadowRequired=false (gate bypassed); LOSS → gate tightens +1.
         if (instance._forceRealOnce) {
           instance._forceRealOnce = false;
           logger.info(`[BotRunner] ${instance.instanceId}: FORCE REAL override — bypassing shadow gate`);
@@ -836,13 +885,10 @@ class BotRunner extends EventEmitter {
 
         const shadowCfg = this._shadowConfig(instance);
 
-        // [FIX-SHADOW-PHASE] Gated mode dispatch — fires REAL shadow-phase
-        // trades at shadowStake for validation. 100% accurate outcomes.
         if (shadowCfg.gating) {
           const gateMet = instance.shadow.consecutiveShadowWins >= instance.shadow.currentGate;
 
           if (instance.shadow.shadowRequired && !gateMet) {
-            // Shadow phase: fire validation trade at shadowStake
             instance.lastReason = `Shadow phase ${instance.shadow.consecutiveShadowWins}/${instance.shadow.currentGate} → firing $${instance.config.shadowStake}`;
             logger.info(
               `[BotRunner] ${instance.instanceId}: SHADOW-PHASE fire ` +
@@ -860,13 +906,10 @@ class BotRunner extends EventEmitter {
             );
             instance.lastReason = `Shadow gate met (${instance.shadow.consecutiveShadowWins}/${instance.shadow.currentGate}) → REAL trade`;
           }
-          // gateMet=true, shadowRequired=true → fire real
-          // OR shadowRequired=false (post-win) → fire real
           await this._execute(instance, result, ctx, 'real');
           return;
         }
 
-        // Non-gated modes (observational / off) → always fire real
         await this._execute(instance, result, ctx, 'real');
       }
     } catch (err) {
@@ -923,7 +966,7 @@ class BotRunner extends EventEmitter {
     return { ok: true, rr };
   }
 
-  _buildEntryThesis(instance, reasons, ctx) {
+  _buildEntryThesis(instance, reasons, ctx, direction, tradeParams) {
     const isEdgeTest = !!instance.config._edgeTest;
     const session = detectSession();
     const flipLabel = instance.stats && instance.stats.flipped ? 'FLIPPED' : 'NORMAL';
@@ -945,7 +988,20 @@ class BotRunner extends EventEmitter {
         botId: instance.botId, instanceId: instance.instanceId,
         reasons: reasons || [], edgeTest: isEdgeTest, session, flip: flipLabel, phaseStats,
         confidence: pred ? pred.calibratedConfidence : null,
-        direction: pred ? pred.direction : null,
+        direction: pred ? pred.direction : (direction || null),
+        predictedDirection: pred ? pred.direction : (direction || null),
+        entryTickNum: null,
+        expiry: tradeParams && tradeParams.duration ? {
+          ticks: Number(tradeParams.duration),
+          unit: tradeParams.durationUnit || null,
+          at: (() => {
+            const dur = Number(tradeParams.duration);
+            const unit = tradeParams.durationUnit || 't';
+            if (!Number.isFinite(dur) || dur <= 0) return null;
+            const msPer = unit === 't' ? 2000 : unit === 's' ? 1000 : unit === 'm' ? 60000 : unit === 'h' ? 3600000 : 0;
+            return msPer ? new Date(Date.now() + dur * msPer).toISOString() : null;
+          })(),
+        } : null,
         pattern: pred && pred.pattern ? { bias: pred.pattern.bias, confidence: pred.pattern.confidence, patterns: pred.pattern.patterns } : null,
         momentum: pred ? pred.momentum : null,
         volatility: pred ? pred.volatility : null,
@@ -956,14 +1012,45 @@ class BotRunner extends EventEmitter {
     }
 
     const dv = ctx && ctx.digitView;
+    const expiry = tradeParams ? (() => {
+      const dur = Number(tradeParams.duration);
+      const unit = tradeParams.durationUnit || 't';
+      if (!Number.isFinite(dur) || dur <= 0) return null;
+      const msPer = unit === 't' ? 2000 : unit === 's' ? 1000 : unit === 'm' ? 60000 : unit === 'h' ? 3600000 : 0;
+      return {
+        ticks: unit === 't' ? dur : null,
+        unit,
+        at: msPer ? new Date(Date.now() + dur * msPer).toISOString() : null,
+      };
+    })() : null;
+
     return {
       botId: instance.botId, instanceId: instance.instanceId,
       reasons: reasons || [], edgeTest: isEdgeTest, session, flip: flipLabel, phaseStats,
+      // Backward-compatible snapshot (still consumed by existing dashboards).
       digitView: dv ? {
         sampleSize: dv.sampleSize, precision: dv.precision,
         evenPct: dv.evenPct, oddPct: dv.oddPct, risePct: dv.risePct, fallPct: dv.fallPct,
         evenStreak: dv.evenStreak, oddStreak: dv.oddStreak,
       } : null,
+      // Complete measurement record — which calculation wins/loses daily.
+      measurementSnapshot: dv ? {
+        arrow: dv.arrow,
+        directionalStreak: dv.directionalStreak,
+        movement: dv.movement,
+        windows: dv.windows,
+        risePct: dv.risePct,
+        fallPct: dv.fallPct,
+        evenPct: dv.evenPct,
+        oddPct: dv.oddPct,
+        evenStreak: dv.evenStreak,
+        oddStreak: dv.oddStreak,
+        sampleSize: dv.sampleSize,
+        precision: dv.precision,
+      } : null,
+      predictedDirection: direction || null,
+      entryTickNum: dv ? dv.sampleSize : null,
+      expiry,
     };
   }
 
@@ -986,6 +1073,7 @@ class BotRunner extends EventEmitter {
     const submittedBefore = Date.now() - RECONCILE_POSITION_LOOKBACK_MS;
     const stakeNum = Math.abs(Number(intendedStake));
     if (broker._portfolioCache) broker._portfolioCache.at = 0;
+    this._invalidatePositions();
 
     let positions;
     try { positions = await broker.getOpenTrades(); }
@@ -1052,9 +1140,6 @@ class BotRunner extends EventEmitter {
     }
   }
 
-  // [FIX-SHADOW-PHASE] `phase` determines the stake and the BotRun tag:
-  //   'shadow' → use config.shadowStake, tag shadowPhase:true
-  //   'real'   → use compound/effective stake, tag shadowPhase:false
   async _execute(instance, signal, ctx, phase = 'real') {
     const isShadowPhase = phase === 'shadow';
     const { tradeParams, direction, reasons } = signal;
@@ -1087,7 +1172,7 @@ class BotRunner extends EventEmitter {
       return;
     }
 
-    const entryThesis = this._buildEntryThesis(instance, reasons, ctx);
+    const entryThesis = this._buildEntryThesis(instance, reasons, ctx, direction, tradeParams);
     const currentSession = detectSession();
     const currentRegime = ctx && ctx.state && ctx.state.regime ? ctx.state.regime.code : null;
 
@@ -1100,9 +1185,8 @@ class BotRunner extends EventEmitter {
     }
 
     try {
-      const broker = getBroker('deriv_cfd');
-      if (broker._portfolioCache) broker._portfolioCache.at = 0;
-      const freshPositions = await broker.getOpenTrades().catch(() => []);
+      // Fresh portfolio check — bypasses the cache to guarantee pre-order freshness.
+      const freshPositions = await this._getPositions(true);
       if (freshPositions.some(p => normalizeSymbol(p.instrument) === lockSymbol)) {
         instance.lastReason = 'Execution blocked: position opened by concurrent bot';
         this._releaseSymbolLock(lockSymbol, instance.instanceId);
@@ -1142,6 +1226,7 @@ class BotRunner extends EventEmitter {
         : 'TRADE PLACED (REAL)';
       instance._entryFailureBackoffUntil = 0;
       if (isShadowPhase) this._metrics.shadowPlaced++;
+      this._invalidatePositions();
 
       await this._persistBotRun(
         instance, result, tradeParams, direction, stakeCheck, reasons, entryThesis,
@@ -1163,7 +1248,7 @@ class BotRunner extends EventEmitter {
 
       if (errMsg.includes('OpenPositionLimitExceeded')) {
         this._metrics.openPositionRejections++;
-        if (getBroker('deriv_cfd')._portfolioCache) getBroker('deriv_cfd')._portfolioCache.at = 0;
+        this._invalidatePositions();
         instance._entryFailureBackoffUntil = Date.now() + OPEN_POSITION_BACKOFF_MS;
         instance.lastReason = `Symbol busy (OpenPositionLimitExceeded) — retry in ${OPEN_POSITION_BACKOFF_MS / 1000}s`;
         logger.warn(`[BotRunner] ${instance.instanceId}: OpenPositionLimitExceeded on ${lockSymbol} — another position is open. Backoff ${OPEN_POSITION_BACKOFF_MS / 1000}s.`);
@@ -1187,9 +1272,10 @@ class BotRunner extends EventEmitter {
           instance.lastReason = isShadowPhase ? 'SHADOW-PHASE TRADE PLACED (recovered)' : 'TRADE PLACED (recovered)';
           instance._entryFailureBackoffUntil = 0;
           if (isShadowPhase) this._metrics.shadowPlaced++;
+          this._invalidatePositions();
 
           const broker = getBroker('deriv_cfd');
-          broker._subscribeOpenContract(recovered.id).catch(() => {});
+          if (broker._subscribeOpenContract) broker._subscribeOpenContract(recovered.id).catch(() => {});
 
           await this._persistBotRun(
             instance,
@@ -1220,6 +1306,7 @@ class BotRunner extends EventEmitter {
       logger.error(`[BotRunner] ${instance.botId}/${instance.instanceId} ${isShadowPhase ? 'shadow-phase' : 'real'} entry failed: ${errMsg}`);
       instance.lastReason = `Execution failed: ${errMsg}`;
       this.emit('botError', { instanceId: instance.instanceId, botId: instance.botId, error: errMsg, shadowPhase: isShadowPhase });
+      this._invalidatePositions();
       this._releaseSymbolLock(lockSymbol, instance.instanceId);
     }
   }
@@ -1243,24 +1330,21 @@ class BotRunner extends EventEmitter {
       run.closedAt = new Date(); run.status = 'CLOSED';
       await run.save();
 
+      this._invalidatePositions();
+
       const instance = this._instances.get(run.instanceId);
       if (instance) {
+        instance._lastCloseTime = Date.now();
         const tradeWasFlipped = run.entryThesis && run.entryThesis.flip === 'FLIPPED';
 
-        // PnL and general counters — count ALL trades (real money spent)
         instance.stats.pnl += realizedProfit;
         instance.stats.closedTrades++;
 
         if (run.result === 'WIN') {
           instance.stats.wins++;
-          // [FIX-SHADOW-PHASE] Only real wins reset consecutive losses.
-          // Shadow-phase wins don't count toward circuit breaker reset.
           if (!isShadowPhase) instance.stats.consecutiveLosses = 0;
         } else if (run.result === 'LOSS') {
           instance.stats.losses++;
-          // [FIX-SHADOW-PHASE] Only real losses increment consecutive losses.
-          // Shadow-phase losses are part of the validation process and
-          // shouldn't trigger the stopAfterLosses circuit breaker.
           if (!isShadowPhase) instance.stats.consecutiveLosses++;
         }
 
@@ -1280,12 +1364,7 @@ class BotRunner extends EventEmitter {
 
         if (instance._trailingPeaks) instance._trailingPeaks.delete(contractId);
 
-        // [FIX-SHADOW-PHASE] Phase-specific handling
         if (isShadowPhase) {
-          // Shadow-phase trade settled: update shadow counter/sequence.
-          // NO compound (only real wins grow compound).
-          // NO _adaptGateAfterReal (that's for real trades only).
-          // NO _applyObservationalShadow (this IS the shadow).
           if (instance.shadow) {
             if (run.result === 'WIN') {
               instance.shadow.consecutiveShadowWins++;
@@ -1328,7 +1407,6 @@ class BotRunner extends EventEmitter {
             }
           }
         } else {
-          // Real trade settled: apply compound + gate adaptation + observational mirror
           this._applyCompoundAfterWin(instance, run);
           this._adaptGateAfterReal(instance, run.result);
           this._applyObservationalShadow(instance, run);
@@ -1371,9 +1449,6 @@ class BotRunner extends EventEmitter {
       sequence: instance.shadow.sequence.slice(-10),
       stats: instance.shadow.stats,
       shadowStake: Number(instance.config.shadowStake) || 0.35,
-      // [FIX-SHADOW-PHASE] Both modes are now 100% accurate via real trades:
-      //   gated        → fires real shadow-phase trades at shadowStake
-      //   observational → mirrors real trade result as shadow result
       outcomeSource: instance.shadow.mode === 'gated'
         ? 'real_shadow_phase_trades_100pct'
         : (instance.shadow.mode === 'observational' ? 'real_trade_result_mirrored_100pct' : null),
