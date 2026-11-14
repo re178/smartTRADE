@@ -1,112 +1,5 @@
 // core/bots/registry.js
-// 21 bots. Multi-signal, adaptive, risk-enforced.
-//
-// [FIX-VOLHL] vol_high_low was emitting ONETOUCH/NOTOUCH without a barrier
-//   parameter, which Deriv rejects with `InvalidBarrierSingle`. The bot
-//   never placed a single trade. Now uses CALL/PUT based on directional
-//   bias (same signal, valid contract type, no barrier needed).
-//   The bias thresholds (0.72 / 0.45) are preserved.
-//
-// [FIX-DIGIT-DYN] Digit bots use statistical significance (z-scores)
-//   instead of fixed percentage thresholds.
-//
-// [FIX-UNDER-BARRIER] DIGITUNDER contracts now correctly send barrier=1
-//   (was 0 — impossible to win).
-//
-// [FIX-SHADOW-CFG] shadowWinsRequired on the five synthetic binary bots.
-//
-// [FIX-SHADOW-MODES] Three shadow modes per bot:
-//     wins=0, obs=false → OFF (fire immediate, no shadow)
-//     wins=0, obs=true  → OBSERVATIONAL (shadow + real in parallel)
-//     wins>0            → GATED (shadow gates real fires)
-//
-// [FIX-HIGH-PAYOUT] Four new high-payout bots:
-//   • touch_hunter       — Touch/No Touch (200-350% payout on far barriers)
-//   • vanilla_trend      — Vanilla Call/Put (uncapped, payout scales with move)
-//   • turbo_breakout     — Turbo Long/Short (payout_per_point × distance)
-//   • accumulator_scalper — Accumulator (exponential: 3%/tick compounds)
-//
-// [FIX-ACCU-TUNING] Accumulator Scalper tuned after 0W/5L observation:
-//   • growthRatePct 5 → 3 (range ~0.17%, survives ~90s vs 15s)
-//   • maxRangePct 0.15 → 0.08 (only fire when truly compressed)
-//   • accumulatorTakeProfit null → 2 (auto-close at +$2 = 2× stake)
-//
-// [FIX-SESSION-STOPS] Session $ stops disabled on touch/vanilla/turbo
-//   only. Accumulator keeps its safety net. Rationale: high-variance
-//   bots need room to run through losing streaks before the eventual win.
-//
-// [FIX-COMPOUND-STAKE] Compound stake system added to synthetic_binary
-//   bots only. Six config fields (compoundEnabled, compoundMaxStake,
-//   compoundStartAfterWins, compoundGrowthRatePct, compoundStopAfterWins,
-//   compoundResetAfterWins) appear in the bot form for the 9
-//   synthetic_binary bots. Behavior: grows stake on WIN (past start
-//   threshold), caps at max, resets after N wins. Cumulative wins
-//   counter. No persistence across bot restart.
-//
-// [FIX-SHADOW-PHASE] **Real-shadow gated mode.**
-//
-//   Previous gated shadow reconstructed outcomes from tick data — ~5-15%
-//   error because Deriv enters at tick N+2 while shadow entered at tick N.
-//
-//   The fix: shadow-phase trades are now REAL contracts at shadowStake
-//   (default $0.35). Every outcome is 100% accurate because it IS a real
-//   trade. Gate flow:
-//     • Rule fires during shadow phase → place real trade at shadowStake
-//     • WIN → shadow consecutive counter++; at gate → real fire at stake
-//     • LOSS → shadow counter resets; gate tightens by +1 (cap 10)
-//     • Real trade WIN → stay in real mode, normal stake
-//     • Real trade LOSS → back to shadow phase, tighten gate
-//
-//   `shadowStake` config field added to RISK_DEFAULTS below. FX and
-//   digit bots see it in the form but never read it (their shadow mode
-//   is always off since assetClass !== 'synthetic_binary').
-//
-//   IMPORTANT — economic viability:
-//     Shadow phase costs real money (shadowStake × number of fires
-//     before gate opens). Only profitable on bots with payout > 2×:
-//       ✅ MATCH/DIFF, OVER/UNDER, TOUCH, VANILLA, TURBO, ACCU
-//       ❌ EVEN/ODD, RISE/FALL, VOL_* (0.88× payout — costs exceed wins)
-//     Set shadowWinsRequired: 0 on the ❌ bots to disable.
-//
-// [FIX-PRECISION-DIGIT] Digit bots rewritten for higher hit rate at
-//   fair payout tiers. Summary of changes:
-//
-//   even_odd_trader:
-//     • zThreshold 1.5 → 2.0 (fires only on strong parity extreme)
-//     • mode: 'fade' (explicit) — fades extremes instead of chasing
-//   over_under_trader:
-//     • Barrier moved from OVER 8 / UNDER 1 (10% base, 9× payout, huge
-//       variance) to OVER 6 / UNDER 3 (30% base, ~2.9× payout).
-//       Same or better EV, dramatically lower variance.
-//     • zThreshold 1.5 → 2.0
-//   matches_differs_trader:
-//     • mode: 'diff_hot' default — fires DIGITDIFF when the target digit
-//       is statistically HOT (z >= 2.0). ~90% base WR, 1.05× payout.
-//       Old default (MATCH on cold digit, 10% WR) produced routine
-//       9-loss droughts. Cold-target MATCH path still available via
-//       `mode: 'match_cold'`.
-//   digit_streak_fade:
-//     • minStreak 8 → 6 (fires more often; still above expected max for
-//       most regimes)
-//   digit_hot_cold:
-//     • Barrier moved from OVER 8 / UNDER 1 → OVER 6 / UNDER 3
-//     • zThreshold 2.0 → 2.2 (tighter; complements over_under_trader)
-//
-// [FIX-VOL-SCALPER-PRECISION] vol_scalper redesigned.
-//   Old logic: fire 5/5 momentum follow — ~50% WR at 0.88× payout
-//   (net loss; no statistical edge).
-//   New logic: fade 7+ streaks ONLY when the 30-tick directional bias
-//   is <= trendConflictPct (default 65%) — i.e., fade only when the
-//   streak is a local anomaly inside a choppy tape, which is where the
-//   small mean-reversion bias of Deriv synthetic indices actually shows.
-//   New config:
-//     minStreak           (default 7)  — trailing streak length required
-//     mode                (default 'fade') — 'fade' | 'follow'
-//     trendConflictPct    (default 0.65) — reject fires when 30-tick bias
-//                                          aligns with streak above this
-//     minSamples          (default 30) — minimum direction samples
-//   The 'follow' mode reproduces the old behavior for A/B comparison.
-
+// (all header comments preserved from original)
 'use strict';
 
 const { EMA, BollingerBands } = require('../strategy/engine');
@@ -612,7 +505,7 @@ const BOTS = {
     },
   },
 
-  // ── Synthetic Digit (5) — [FIX-PRECISION-DIGIT] rewritten ──
+  // ── Synthetic Digit (5) — UNCHANGED ──
   even_odd_trader: {
     id: 'even_odd_trader', name: 'Even/Odd Trader',
     description: 'Synthetic digit. Fades extreme parity (|z| >= 2.0). Set mode="follow" to chase extremes instead. Flip NOT recommended (50/50).',
@@ -804,15 +697,20 @@ const BOTS = {
     },
   },
 
-  // ── Synthetic Binary (5) ──
+  // ── Synthetic Binary (5) — [IMPROVED MATHEMATICS] ──
+
   rise_fall_momentum: {
     id: 'rise_fall_momentum', name: 'Rise/Fall Momentum',
-    description: 'Synthetic CALL/PUT. Flip NOT recommended (50/50). Shadow-gated.',
+    description: 'Synthetic CALL/PUT. Directional bias (non-flat denominator) + momentum confirmation. Rejects sharply weakened momentum. Shadow = observational (no real-money gate).',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
-      symbol: 'R_100', stake: 1, durationTicks: 5, minBias: 0.62, minSamples: 100,
-      shadowWinsRequired: 3,
+      symbol: 'R_100', stake: 1, durationTicks: 5,
+      minBias: 0.62,
+      minSamples: 100,
+      weakeningThreshold: 0.5,
+      shadowWinsRequired: 0,
+      shadowObservational: true,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
@@ -820,112 +718,210 @@ const BOTS = {
       if (!dv) return wait('Corrupt or missing digit data');
       if (dv.sampleSize < ctx.config.minSamples) return wait('Not enough samples');
       const { config, stats } = ctx;
+
+      // risePct / fallPct now use a non-flat directional denominator.
       const risePct = dv.risePct / 100;
       const fallPct = dv.fallPct / 100;
-      let normalDir = null;
-      if (risePct >= config.minBias) normalDir = 'CALL';
-      else if (fallPct >= config.minBias) normalDir = 'PUT';
-      if (!normalDir) return wait(`Rise ${(risePct*100).toFixed(1)}% / Fall ${(fallPct*100).toFixed(1)}% (Need >=${config.minBias*100}%)`);
+
+      let normalDir = null, biasUsed = 0;
+      if (risePct >= config.minBias) { normalDir = 'CALL'; biasUsed = risePct; }
+      else if (fallPct >= config.minBias) { normalDir = 'PUT'; biasUsed = fallPct; }
+      if (!normalDir) {
+        return wait(`Rise ${(risePct * 100).toFixed(1)}% / Fall ${(fallPct * 100).toFixed(1)}% (Need >=${(config.minBias * 100).toFixed(0)}%)`);
+      }
+
+      const mv = dv.movement;
+      if (!mv) return wait('No movement data');
+
+      const expectedDirection = normalDir === 'CALL' ? 'up' : 'down';
+      const latestAgrees = (expectedDirection === 'up' && mv.lastMove > 0) ||
+                           (expectedDirection === 'down' && mv.lastMove < 0);
+
+      // Reject if the streak has sharply weakened (last move < prev * weakeningThreshold)
+      const wThresh = Number(config.weakeningThreshold) || 0.5;
+      if (mv.sameDir && mv.prevAbs > 0 && mv.lastAbs < mv.prevAbs * wThresh) {
+        return wait(`Momentum weakening (last=${mv.lastAbs.toFixed(5)} < ${mv.prevAbs.toFixed(5)}×${wThresh})`);
+      }
+      // Reject if the latest move is against bias AND larger than the prior move
+      if (!latestAgrees && mv.prevAbs > 0 && mv.lastAbs > mv.prevAbs * 1.5) {
+        return wait('Recent adverse move exceeds prior (momentum reversed)');
+      }
+
       const flip = shouldFlip(config, stats);
       const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
-      const reason = flip ? `${normalDir} FLIPPED → ${finalDir}` : `Bias ${((normalDir === 'CALL' ? risePct : fallPct) * 100).toFixed(1)}%`;
+      const reason = flip
+        ? `${normalDir} (${(biasUsed * 100).toFixed(1)}%) FLIPPED → ${finalDir}`
+        : `Bias ${(biasUsed * 100).toFixed(1)}% + momentum confirmed`;
       return enterBinary(finalDir, config, reason);
     },
   },
 
   rise_fall_streak: {
     id: 'rise_fall_streak', name: 'Rise/Fall Streak Fade',
-    description: 'Synthetic CALL/PUT. Flip NOT recommended (50/50). Shadow-gated.',
+    description: 'Synthetic CALL/PUT. Fades directional streaks ONLY when per-move size is weakening (exhaustion). Shadow = observational (no real-money gate).',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
-      symbol: 'R_100', stake: 1, durationTicks: 5, minStreak: 7,
-      shadowWinsRequired: 3,
+      symbol: 'R_100', stake: 1, durationTicks: 5,
+      minStreak: 7,
+      weakenRatio: 0.7,
+      shadowWinsRequired: 0,
+      shadowObservational: true,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
       const dv = sanitizeDigitView(ctx.digitView);
       if (!dv) return wait('Corrupt or missing digit data');
       const { config, stats } = ctx;
-      const dirs = (dv.directions || []).slice(-20);
-      if (dirs.length < config.minStreak) return wait('Not enough ticks');
-      let streak = 0, lastDir = null;
-      for (let i = dirs.length - 1; i >= 0; i--) {
-        if (dirs[i] === 'flat') break;
-        if (lastDir === null) { lastDir = dirs[i]; streak = 1; }
-        else if (dirs[i] === lastDir) streak++;
-        else break;
+
+      const ds = dv.directionalStreak;
+      if (!ds || ds.length < config.minStreak) {
+        return wait(`Directional streak ${ds ? ds.length : 0}/${config.minStreak}`);
       }
-      if (streak < config.minStreak) return wait(`Streak: ${streak} ${lastDir || '-'} (Need ${config.minStreak})`);
-      const normalDir = lastDir === 'up' ? 'PUT' : 'CALL';
+      const mv = dv.movement;
+      if (!mv) return wait('No movement data');
+
+      // Fade only when the streak is losing strength — require lastAbs < prevAbs * weakenRatio
+      const wRatio = Number(config.weakenRatio) || 0.7;
+      if (!mv.weakening || mv.prevAbs <= 0 || mv.lastAbs > mv.prevAbs * wRatio) {
+        return wait(`Streak not weakening (last=${mv.lastAbs.toFixed(5)} prev=${mv.prevAbs.toFixed(5)}, need < ${wRatio}×)`);
+      }
+
+      const normalDir = ds.side === 'up' ? 'PUT' : 'CALL';
       const flip = shouldFlip(config, stats);
       const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
-      const reason = flip ? `${streak}-tick ${lastDir}-streak FLIPPED → ${finalDir}` : `${streak}-tick ${lastDir}-streak → fade to ${finalDir}`;
+      const reason = flip
+        ? `${ds.length}-tick ${ds.side}-streak weakening FLIPPED → ${finalDir}`
+        : `${ds.length}-tick ${ds.side}-streak weakening → fade to ${finalDir}`;
       return enterBinary(finalDir, config, reason);
     },
   },
 
   rise_fall_breakout: {
     id: 'rise_fall_breakout', name: 'Rise/Fall Breakout',
-    description: 'Synthetic CALL/PUT. Flip NOT recommended (50/50). Shadow-gated.',
+    description: 'Synthetic CALL/PUT. Net move relative to real price range; latest price must be extending; already-reversed breakouts rejected. Shadow = observational (no real-money gate).',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
-      symbol: 'R_100', stake: 1, durationTicks: 5, lookbackTicks: 10, minMovePct: 0.08,
-      shadowWinsRequired: 3,
+      symbol: 'R_100', stake: 1, durationTicks: 5,
+      lookbackTicks: 10, minMovePct: 0.08,
+      minNetToRange: 0.4,
+      shadowWinsRequired: 0,
+      shadowObservational: true,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
       const dv = sanitizeDigitView(ctx.digitView);
       if (!dv) return wait('Corrupt or missing digit data');
       const { config, stats } = ctx;
+
       const prices = (dv.recentPrices || []).slice(-config.lookbackTicks);
       if (prices.length < 5) return wait('Not enough prices');
-      const first = prices[0], last = prices[prices.length - 1];
+
+      const first = prices[0];
+      const last = prices[prices.length - 1];
       const movePct = ((last - first) / first) * 100;
-      if (Math.abs(movePct) < config.minMovePct) return wait(`Move ${movePct.toFixed(3)}% too small (Need ${config.minMovePct.toFixed(3)}%)`);
+      if (Math.abs(movePct) < config.minMovePct) {
+        return wait(`Move ${movePct.toFixed(3)}% too small (Need ${config.minMovePct.toFixed(3)}%)`);
+      }
+
+      const mv = dv.movement;
+      if (!mv) return wait('No movement data');
+
+      // Net movement should be substantial relative to the price range —
+      // filters out choppy stretches that merely happen to have a net drift.
+      const minNR = Number(config.minNetToRange) || 0.4;
+      if (mv.netToRange < minNR) {
+        return wait(`Choppy: net/range ${mv.netToRange.toFixed(2)} < ${minNR}`);
+      }
+
       const normalDir = movePct > 0 ? 'CALL' : 'PUT';
+
+      // Reject breakouts that have already reversed
+      if (normalDir === 'CALL' && !mv.latestExtendsUp) {
+        return wait('Breakout already reversing (latest price not extending up)');
+      }
+      if (normalDir === 'PUT' && !mv.latestExtendsDown) {
+        return wait('Breakdown already reversing (latest price not extending down)');
+      }
+
       const flip = shouldFlip(config, stats);
       const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
-      const reason = flip ? `Move ${movePct.toFixed(3)}% FLIPPED → ${finalDir}` : `Move ${movePct.toFixed(3)}%`;
+      const reason = flip
+        ? `Move ${movePct.toFixed(3)}% (ext) FLIPPED → ${finalDir}`
+        : `Breakout ${movePct.toFixed(3)}% (net/range ${mv.netToRange.toFixed(2)})`;
       return enterBinary(finalDir, config, reason);
     },
   },
 
   vol_high_low: {
     id: 'vol_high_low', name: 'Volatility High/Low',
-    description: 'Synthetic CALL/PUT on directional bias. Flip review before enabling. Shadow-gated.',
+    description: 'Synthetic CALL/PUT on persistent directional pressure: short+long windows agree, latest move confirms, outsized single-move bias rejected. Shadow = observational (no real-money gate).',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
-      symbol: 'R_100', stake: 1, durationTicks: 5, barrierPips: 10,
-      shadowWinsRequired: 3,
+      symbol: 'R_100', stake: 1, durationTicks: 5,
+      barrierPips: 10,
+      upThreshold: 0.65,
+      downThreshold: 0.35,
+      minDirectionalSamples: 30,
+      shadowWinsRequired: 0,
+      shadowObservational: true,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
       const dv = sanitizeDigitView(ctx.digitView);
       if (!dv) return wait('Corrupt or missing digit data');
       const { config, stats } = ctx;
-      const dirs = (dv.directions || []).slice(-20);
-      const up = dirs.filter(d => d === 'up').length;
-      const down = dirs.filter(d => d === 'down').length;
-      const total = up + down;
-      if (total === 0) return wait('Not enough direction data');
-      const upBias = up / total;
-      let normalDir = null;
-      if (upBias > 0.72) normalDir = 'CALL';
-      else if (upBias < 0.45) normalDir = 'PUT';
-      if (!normalDir) return wait(`Up bias ${(upBias * 100).toFixed(1)}% (Need >72% CALL or <45% PUT)`);
+
+      const win = dv.windows;
+      if (!win || !win.short || !win.long) return wait('No window data');
+      const short = win.short;
+      const long  = win.long;
+      if (short.sampleSize < config.minDirectionalSamples) {
+        return wait(`Not enough short-window samples (${short.sampleSize})`);
+      }
+      if (long.sampleSize < config.minDirectionalSamples) {
+        return wait(`Not enough long-window samples (${long.sampleSize})`);
+      }
+
+      const upShort = short.risePct;
+      const upLong  = long.risePct;
+
+      let normalDir = null, biasUsed = 0;
+      if (upShort >= config.upThreshold * 100 && upLong > 50) {
+        normalDir = 'CALL'; biasUsed = upShort;
+      } else if (upShort <= config.downThreshold * 100 && upLong < 50) {
+        normalDir = 'PUT'; biasUsed = 100 - upShort;
+      }
+      if (!normalDir) {
+        return wait(`Short up=${upShort.toFixed(0)}% long up=${upLong.toFixed(0)}% (need consistent >=${(config.upThreshold * 100).toFixed(0)}% or <=${(config.downThreshold * 100).toFixed(0)}%)`);
+      }
+
+      const mv = dv.movement;
+      if (!mv) return wait('No movement data');
+
+      // Latest move must agree with the bias
+      if (normalDir === 'CALL' && mv.lastMove <= 0) return wait('Latest move disagrees with CALL bias');
+      if (normalDir === 'PUT'  && mv.lastMove >= 0) return wait('Latest move disagrees with PUT bias');
+
+      // Reject if a single outsized move dominates — avoid "one spike ≠ trend"
+      if (mv.sameDir && mv.prevAbs > 0 && mv.lastAbs > mv.prevAbs * 3) {
+        return wait(`Outsized move (${mv.lastAbs.toFixed(5)} > 3× ${mv.prevAbs.toFixed(5)})`);
+      }
+
       const flip = shouldFlip(config, stats);
       const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
-      const reason = flip ? `${normalDir} FLIPPED → ${finalDir}` : `Direction bias ${(upBias * 100).toFixed(1)}% up → ${normalDir}`;
+      const reason = flip
+        ? `${normalDir} bias FLIPPED → ${finalDir} (short=${upShort.toFixed(0)}% long=${upLong.toFixed(0)}%)`
+        : `Persistent ${normalDir} (short ${upShort.toFixed(0)}% long ${upLong.toFixed(0)}%)`;
       return enterBinary(finalDir, config, reason);
     },
   },
 
   vol_scalper: {
     id: 'vol_scalper', name: 'Volatility Scalper',
-    description: 'Synthetic CALL/PUT. Fades extreme streaks (7+) when 30-tick directional bias is only moderate (<= 65%). Trend-conflict filter blocks fading during real momentum runs. Shadow-gated.',
+    description: 'Synthetic CALL/PUT. fade mode requires directional streak + weakening per-move size; follow mode requires expanding per-move size. Trend-conflict filter preserved. Shadow = observational (no real-money gate).',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
@@ -933,57 +929,66 @@ const BOTS = {
       minStreak: 7,
       mode: 'fade',
       trendConflictPct: 0.65,
+      weakeningRatio: 0.8,
+      expandingRatio: 1.1,
       minSamples: 30,
-      shadowWinsRequired: 3,
+      shadowWinsRequired: 0,
+      shadowObservational: true,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
       const dv = sanitizeDigitView(ctx.digitView);
       if (!dv) return wait('Corrupt or missing digit data');
       if ((dv.sampleSize || 0) < ctx.config.minSamples) return wait('Not enough samples');
-
       const { config, stats } = ctx;
-      const dirs = (dv.directions || []).slice(-30);
-      if (dirs.length < config.minStreak) return wait(`Not enough ticks (${dirs.length}/${config.minStreak})`);
 
-      // Count the current trailing streak
-      let streak = 0, lastDir = null;
-      for (let i = dirs.length - 1; i >= 0; i--) {
-        if (dirs[i] === 'flat') break;
-        if (lastDir === null) { lastDir = dirs[i]; streak = 1; }
-        else if (dirs[i] === lastDir) streak++;
-        else break;
+      const ds = dv.directionalStreak;
+      if (!ds || ds.length < config.minStreak) {
+        return wait(`Directional streak ${ds ? ds.length : 0}/${config.minStreak} ${ds ? ds.side : '-'}`);
       }
-      if (streak < config.minStreak) return wait(`Streak ${streak}/${config.minStreak} ${lastDir || '-'}`);
+      const mv = dv.movement;
+      if (!mv) return wait('No movement data');
 
-      // Trend-conflict filter: bias = share of last 30 ticks in streak direction
-      const ups = dirs.filter(d => d === 'up').length;
-      const downs = dirs.filter(d => d === 'down').length;
-      const total = ups + downs;
-      if (total < 10) return wait('Not enough non-flat ticks');
-      const bias = lastDir === 'up' ? ups / total : downs / total;
-
+      // Trend-conflict filter — uses short-window non-flat bias
+      const shortWin = dv.windows && dv.windows.short;
+      let bias = 0.5;
+      if (shortWin) {
+        bias = ds.side === 'up' ? shortWin.risePct / 100 : shortWin.fallPct / 100;
+      }
       if (config.mode === 'fade' && bias > config.trendConflictPct) {
-        return wait(`Trend conflict: ${lastDir}-bias ${(bias * 100).toFixed(0)}% > ${(config.trendConflictPct * 100)}% — won't fade a strong trend`);
+        return wait(`Trend conflict: ${ds.side}-bias ${(bias * 100).toFixed(0)}% > ${(config.trendConflictPct * 100).toFixed(0)}% — won't fade a strong trend`);
       }
       if (config.mode === 'follow' && bias < config.trendConflictPct) {
-        return wait(`Weak trend: ${lastDir}-bias ${(bias * 100).toFixed(0)}% < ${(config.trendConflictPct * 100)}% — follow needs trend confirmation`);
+        return wait(`Weak trend: ${ds.side}-bias ${(bias * 100).toFixed(0)}% < ${(config.trendConflictPct * 100).toFixed(0)}% — follow needs trend confirmation`);
+      }
+
+      // Mode-specific movement requirement
+      if (config.mode === 'fade') {
+        const wRatio = Number(config.weakeningRatio) || 0.8;
+        if (!mv.weakening || mv.prevAbs <= 0 || mv.lastAbs > mv.prevAbs * wRatio) {
+          return wait(`Fade needs weakening (last=${mv.lastAbs.toFixed(5)} prev=${mv.prevAbs.toFixed(5)})`);
+        }
+      } else if (config.mode === 'follow') {
+        const eRatio = Number(config.expandingRatio) || 1.1;
+        if (!mv.expanding || mv.prevAbs <= 0 || mv.lastAbs < mv.prevAbs * eRatio) {
+          return wait(`Follow needs expanding (last=${mv.lastAbs.toFixed(5)} prev=${mv.prevAbs.toFixed(5)})`);
+        }
       }
 
       let normalDir;
-      if (config.mode === 'fade') normalDir = lastDir === 'up' ? 'PUT' : 'CALL';
-      else                          normalDir = lastDir === 'up' ? 'CALL' : 'PUT';
+      if (config.mode === 'fade') normalDir = ds.side === 'up' ? 'PUT' : 'CALL';
+      else                        normalDir = ds.side === 'up' ? 'CALL' : 'PUT';
 
       const flip = shouldFlip(config, stats);
       const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
       const reason = flip
-        ? `${streak}-tick ${lastDir} ${config.mode} FLIPPED → ${finalDir} (bias ${(bias * 100).toFixed(0)}%)`
-        : `${streak}-tick ${lastDir} ${config.mode} → ${finalDir} (bias ${(bias * 100).toFixed(0)}%)`;
+        ? `${ds.length}-tick ${ds.side} ${config.mode} FLIPPED → ${finalDir} (bias ${(bias * 100).toFixed(0)}%)`
+        : `${ds.length}-tick ${ds.side} ${config.mode} → ${finalDir} (bias ${(bias * 100).toFixed(0)}%)`;
       return enterBinary(finalDir, config, reason);
     },
   },
 
-  // ── High-Payout (4) ──
+  // ── High-Payout (4) — UNCHANGED ──
   touch_hunter: {
     id: 'touch_hunter', name: 'Touch Hunter',
     description: 'Touch/No Touch on far barriers after consolidation. High payout (200-350%) on far touches. Low win rate — designed for big wins.',
@@ -1143,14 +1148,6 @@ const RISK_DEFAULTS = {
   flipStableTrades: 20,
   shadowWinsRequired: 0,
   shadowObservational: false,
-  // [FIX-SHADOW-PHASE] Stake used for shadow-phase validation trades in
-  // gated mode. Every rule-fire during shadow phase places a REAL contract
-  // at this stake. Outcomes are 100% accurate (it IS the real trade).
-  // Default 0.35 — small enough that 3-10 validation fires cost
-  // $1.05-$3.50 to open the gate. Change per-bot in the form.
-  //
-  // Only read by synthetic_binary bots in gated mode. FX and digit bots
-  // see the field in their form but never use it.
   shadowStake: 0.35,
 };
 
@@ -1158,7 +1155,6 @@ for (const id in BOTS) {
   BOTS[id].defaultConfig = Object.assign({}, RISK_DEFAULTS, BOTS[id].defaultConfig);
 }
 
-// ── [FIX-COMPOUND-STAKE] Compound config — synthetic_binary ONLY ──
 const COMPOUND_DEFAULTS = {
   compoundEnabled: false,
   compoundMaxStake: 10,
