@@ -1,56 +1,18 @@
 // core/intelligence/digit/analyzer.js
 // Tracks the last digit of every tick. Computes:
-//   • Digit frequency (0-9)
+//   • Digit frequency (0-9) over full history and over short/long windows
 //   • Even/Odd percentages and streaks
-//   • Rise/Fall percentages (higher/lower than previous tick)
-//   • Current digit + arrow direction
-//   • Over/Under edge
-//   • [FIX-3] Z-scores for every statistic (statistical significance layer)
+//   • Rise/Fall percentages (higher/lower than previous tick) — DIRECTIONAL ONLY
+//     (flats excluded from the denominator; flatPct reported separately)
+//   • Current digit + arrow direction (ARROW IS NOW PRICE-BASED, NOT DIGIT-BASED)
+//   • Over/Under edge (aligned to Deriv contract semantics: OVER N = digit > N;
+//     UNDER N = digit < N)
+//   • Z-scores for every statistic (statistical significance layer, unchanged)
+//   • Directional (price) streak — tracked separately from parity streaks
+//   • Movement metrics — net move, last vs. prev move, expanding/weakening,
+//     breakout extension, range and net-to-range ratio
+//
 // Emits 'digitUpdate' per tick, 'digitSignal' when edge exceeds threshold.
-// Also tracks recentPrices and directions for breakout bots.
-//
-// [FIX-1] Digit extraction was hardcoded to .toFixed(5). For 2-decimal
-//         instruments (R_10/R_25/R_50/R_75/R_100 and other synthetics),
-//         toFixed(5) pads with trailing zeros — the "last digit" was
-//         ALWAYS 0. This corrupted every digit reading: evenPct=100,
-//         oddPct=0, digit 5 at 0%, etc. Betting MATCH on the "cold"
-//         digit lost 100% of the time; betting DIFF won 100% of the
-//         time. Both were artifacts of the bug, not real edge.
-//         Now uses per-symbol precision (getDigitPrecision).
-//
-// [FIX-2] Added degenerate-distribution detection. If a 100+ sample
-//         window has <3 unique digits, log a warning. This would have
-//         caught the above bug in production.
-//
-// [FIX-3] **Statistical significance layer.**
-//         The digit bots used fixed percentage thresholds (e.g., "even
-//         >= 62%", "digit 5 <= 3%", "over 8 <= 5%"). On a fair RNG
-//         these require 5–7σ events — essentially unreachable. Result:
-//         every digit bot fired 0 trades over 87+ cycles.
-//
-//         This file now computes Z-scores for every statistic the bots
-//         already use:
-//             z = (observed - expected) / σ
-//         where σ depends on the sample size n and the Bernoulli
-//         probability of the event.
-//
-//         Bots can compare against a configurable zThreshold (default
-//         1.5 → ~7% fire rate) instead of an arbitrary percentage.
-//         At N=200 with zThreshold=1.5:
-//             • even/odd fires when even% ≥ 55.3%
-//             • target digit fires when digit% ≤ 6.8% (cold) or ≥ 13.2% (hot)
-//             • over/under fires when threshold% ≤ 6.8% or ≥ 13.2%
-//         These are statistically meaningful AND reachable in practice.
-//
-//         Also adds streak metrics derived from log2(n) so the streak-
-//         fade bot can adapt its threshold to the window size instead
-//         of using a fixed `minStreak: 8`.
-//
-//         Z-scores are computed at every tick from the last
-//         `DEFAULT_Z_WINDOW` (200) ticks. Bots can call
-//         `getZView(symbol, customWindow)` for a different window.
-//         Full-history percentages (`evenPct`, `digitFreqPct`, etc.)
-//         are still exposed unchanged for the UI.
 
 'use strict';
 
@@ -64,71 +26,38 @@ const SIGNAL_MIN_EDGE = 0.08;
 const DEGENERATE_CHECK_SAMPLES = 100;
 const DEGENERATE_MIN_UNIQUE = 3;
 
-// [FIX-3] Default window for z-score computation. Bots get this via
-// view.zStats; a different window requires `getZView(symbol, N)`.
 const DEFAULT_Z_WINDOW = 200;
-// [FIX-3] Minimum samples below which z-scores are meaningless.
 const Z_MIN_SAMPLES = 30;
+
+// Window sizes for short/long measurement views.
+const SHORT_WINDOW = 30;
+const LONG_WINDOW = 100;
 
 function normalizeSymbol(sym) {
   return String(sym || '').replace(/^frx/i, '').replace(/[/\-_]/g, '').toUpperCase();
 }
 
-/**
- * How many decimals to round the price to BEFORE extracting the last digit.
- * Must match the actual quote precision of each instrument — otherwise
- * toFixed() pads with trailing zeros and every tick yields digit 0.
- *
- * Deriv volatility indices (R_10, R_25, R_50, R_75, R_100) are quoted at
- * 2 decimals. 1HZ* synthetics also 2 decimals. FX pairs are 5 (JPY: 3).
- * Metals/crypto vary.
- */
 function getDigitPrecision(symbol) {
   const clean = normalizeSymbol(symbol);
   const map = {
-    // FX majors — 5 decimals
     EURUSD: 5, GBPUSD: 5, AUDUSD: 5, NZDUSD: 5, USDCHF: 5, USDCAD: 5,
     EURGBP: 5, EURAUD: 5, EURNZD: 5, GBPAUD: 5, GBPNZD: 5, AUDNZD: 5,
     AUDCAD: 5, AUDCHF: 5, NZDCAD: 5, NZDCHF: 5, CADCHF: 5,
-    // JPY pairs — 3 decimals
     USDJPY: 3, EURJPY: 3, GBPJPY: 3, AUDJPY: 3, NZDJPY: 3, CADJPY: 3, CHFJPY: 3,
-    // Metals — varies
     XAUUSD: 2, XAGUSD: 3,
-    // Crypto — varies
     BTCUSD: 2, ETHUSD: 2,
-    // Volatility indices — 2 decimals (this was the bug)
     R_10: 2, R_25: 2, R_50: 2, R_75: 2, R_100: 2,
     '1HZ10V': 2, '1HZ25V': 2, '1HZ50V': 2, '1HZ75V': 2, '1HZ100V': 2,
     '1HZ150V': 2, '1HZ250V': 2,
-    // Jump / step indices — 2 decimals
     JD10: 2, JD25: 2, JD50: 2, JD75: 2, JD100: 2,
     STPRNG: 2, 'STPRNG100': 2,
   };
-  // Default to 2 — safest for synthetics, which is where digit trading runs.
-  // If a new symbol is added that needs >2, add it to the map.
   return map[clean] != null ? map[clean] : 2;
 }
 
 // ============================================================
-// [FIX-3] Z-score computation
+//  Statistical layer — unchanged (already correct)
 // ============================================================
-/**
- * Compute statistical z-scores for a sliding window of digit data.
- *
- * All z-scores follow the form: (observed - expected) / stdDev
- *
- * Sign convention:
- *   evenZ > 0  → more EVEN than expected
- *   oddZ  > 0  → more ODD than expected (oddZ = -evenZ)
- *   digitZ[i] > 0 → digit i appears MORE often than expected (hot)
- *   digitZ[i] < 0 → digit i appears LESS often than expected (cold)
- *   overZ[th]  > 0 → more digits > th than expected
- *   underZ[th] > 0 → more digits < th than expected
- *   riseZ > 0  → more UP ticks than expected
- *   fallZ > 0  → more DOWN ticks than expected (fallZ = -riseZ)
- *
- * Returns null if windowSize < Z_MIN_SAMPLES.
- */
 function computeZStats(digits, directions, windowSize) {
   if (!Array.isArray(digits) || digits.length < Z_MIN_SAMPLES) return null;
 
@@ -136,47 +65,36 @@ function computeZStats(digits, directions, windowSize) {
   const arr = digits.slice(-n);
   const dirArr = Array.isArray(directions) ? directions.slice(-n) : [];
 
-  // ---------- Digit frequencies ----------
   const freq = new Array(10).fill(0);
-  for (const d of arr) {
-    if (d >= 0 && d <= 9) freq[d]++;
-  }
+  for (const d of arr) if (d >= 0 && d <= 9) freq[d]++;
 
-  // ---------- Per-digit z-scores ----------
-  // Expected count per digit: n * 0.1; std: sqrt(n * 0.1 * 0.9)
   const expDigit = n * 0.1;
   const stdDigit = Math.sqrt(n * 0.1 * 0.9);
   const digitZ = freq.map(f => stdDigit > 0 ? (f - expDigit) / stdDigit : 0);
 
-  // ---------- Even/Odd z-score ----------
   const evenCount = freq[0] + freq[2] + freq[4] + freq[6] + freq[8];
-  const oddCount = freq[1] + freq[3] + freq[5] + freq[7] + freq[9];
+  const oddCount  = freq[1] + freq[3] + freq[5] + freq[7] + freq[9];
   const expEven = n * 0.5;
   const stdEven = Math.sqrt(n * 0.25);
   const evenZ = stdEven > 0 ? (evenCount - expEven) / stdEven : 0;
 
-  // ---------- Over/Under z-scores (thresholds 1..8) ----------
-  // OVER th  = digits > th (count in th+1..9); p = (9-th)/10
-  // UNDER th = digits < th (count in 0..th-1);  p = th/10
   const overZ = {};
   const underZ = {};
   for (let th = 1; th <= 8; th++) {
-    const cntOver = freq.slice(th + 1).reduce((a, b) => a + b, 0);
+    const cntOver = freq.slice(th + 1).reduce((a, b) => a + b, 0);   // digit > th
     const pOver = (9 - th) / 10;
     const expOver = n * pOver;
     const stdOver = Math.sqrt(n * pOver * (1 - pOver));
     overZ[th] = stdOver > 0 ? (cntOver - expOver) / stdOver : 0;
 
-    const cntUnder = freq.slice(0, th).reduce((a, b) => a + b, 0);
+    const cntUnder = freq.slice(0, th).reduce((a, b) => a + b, 0);    // digit < th
     const pUnder = th / 10;
     const expUnder = n * pUnder;
     const stdUnder = Math.sqrt(n * pUnder * (1 - pUnder));
     underZ[th] = stdUnder > 0 ? (cntUnder - expUnder) / stdUnder : 0;
   }
 
-  // ---------- Rise/Fall z-score (excluding flat) ----------
-  let riseCount = 0;
-  let fallCount = 0;
+  let riseCount = 0, fallCount = 0;
   for (const d of dirArr) {
     if (d === 'up') riseCount++;
     else if (d === 'down') fallCount++;
@@ -186,8 +104,6 @@ function computeZStats(digits, directions, windowSize) {
   const stdRise = Math.sqrt(dirTotal * 0.25);
   const riseZ = stdRise > 0 ? (riseCount - expRise) / stdRise : 0;
 
-  // ---------- Streaks ----------
-  // currentStreak — length of the TRAILING same-parity run
   let currentStreak = 0;
   let currentStreakParity = null;
   for (let i = arr.length - 1; i >= 0; i--) {
@@ -197,7 +113,6 @@ function computeZStats(digits, directions, windowSize) {
     currentStreak++;
   }
 
-  // maxRecentStreak — longest same-parity run ANYWHERE in window
   let maxRecentStreak = 0;
   let runLen = 0;
   let runParity = null;
@@ -207,32 +122,111 @@ function computeZStats(digits, directions, windowSize) {
     else { runLen = 1; runParity = p; }
     if (runLen > maxRecentStreak) maxRecentStreak = runLen;
   }
-
-  // expectedMaxStreak — expected longest run of heads/tails in n flips
-  // Empirically ~log2(n) + 0.33. For n=200 → 7.9; n=500 → 9.3; n=1000 → 10.3.
   const expectedMaxStreak = Math.log2(n) + 0.33;
 
   return {
     windowSize: n,
-    // Per-feature z-scores
-    digitZ,
-    evenZ,
-    oddZ: -evenZ,
-    overZ,
-    underZ,
-    riseZ,
-    fallZ: -riseZ,
-    // Streak metrics
-    currentStreak,
-    currentStreakParity,
-    maxRecentStreak,
-    expectedMaxStreak,
-    // Raw counts for reference (bot can double-check)
-    evenCount,
-    oddCount,
-    riseCount,
-    fallCount,
-    dirTotal,
+    digitZ, evenZ, oddZ: -evenZ, overZ, underZ,
+    riseZ, fallZ: -riseZ,
+    currentStreak, currentStreakParity, maxRecentStreak, expectedMaxStreak,
+    evenCount, oddCount, riseCount, fallCount, dirTotal,
+  };
+}
+
+// ============================================================
+//  Window metrics — short/long directional + parity + digit freq
+//  Rise/Fall percentages use a NON-FLAT denominator.
+// ============================================================
+function computeWindowMetrics(digits, directions, n) {
+  const dSlice = digits.slice(-n);
+  const dirSlice = directions.slice(-n);
+  const total = dSlice.length || 1;
+
+  const freq = new Array(10).fill(0);
+  for (const x of dSlice) if (x >= 0 && x <= 9) freq[x]++;
+
+  let up = 0, down = 0;
+  for (const x of dirSlice) {
+    if (x === 'up') up++;
+    else if (x === 'down') down++;
+  }
+  const dirTotal = up + down;
+  const even = freq[0] + freq[2] + freq[4] + freq[6] + freq[8];
+  const odd  = freq[1] + freq[3] + freq[5] + freq[7] + freq[9];
+
+  return {
+    sampleSize: total,
+    digitFreqPct: freq.map(f => Number(((f / total) * 100).toFixed(2))),
+    // Directional (non-flat denominator)
+    risePct: dirTotal > 0 ? Number(((up / dirTotal) * 100).toFixed(2)) : 0,
+    fallPct: dirTotal > 0 ? Number(((down / dirTotal) * 100).toFixed(2)) : 0,
+    // Parity (full window denominator — every tick has a digit)
+    evenPct: Number(((even / total) * 100).toFixed(2)),
+    oddPct:  Number(((odd  / total) * 100).toFixed(2)),
+    riseCount: up,
+    fallCount: down,
+    flatCount: total - dirTotal,
+  };
+}
+
+// ============================================================
+//  Directional (price) streak — SEPARATE from parity streaks
+// ============================================================
+function computeDirectionalStreak(directions) {
+  if (!Array.isArray(directions) || directions.length === 0) {
+    return { side: null, length: 0 };
+  }
+  let side = null;
+  let length = 0;
+  for (let i = directions.length - 1; i >= 0; i--) {
+    const d = directions[i];
+    if (d === 'flat') break;
+    if (side === null) side = d;
+    if (d === side) length++;
+    else break;
+  }
+  return { side, length };
+}
+
+// ============================================================
+//  Movement strength — from prices, not digits
+// ============================================================
+function computeMovement(prices, window = LONG_WINDOW) {
+  if (!Array.isArray(prices) || prices.length < 3) return null;
+
+  const last  = prices[prices.length - 1];
+  const prev  = prices[prices.length - 2];
+  const prev2 = prices[prices.length - 3];
+
+  const lastMove = last - prev;
+  const prevMove = prev - prev2;
+  const lastAbs  = Math.abs(lastMove);
+  const prevAbs  = Math.abs(prevMove);
+  const sameDir  = (lastMove > 0 && prevMove > 0) || (lastMove < 0 && prevMove < 0);
+  const expanding = sameDir && prevAbs > 0 && lastAbs > prevAbs;
+  const weakening = sameDir && lastAbs < prevAbs;
+
+  const win = prices.slice(-window);
+  const hi  = Math.max(...win);
+  const lo  = Math.min(...win);
+  const mid = (hi + lo) / 2;
+  const netMove = last - win[0];
+  const rangePct = mid > 0 ? ((hi - lo) / mid) * 100 : 0;
+  const range = hi - lo;
+  const netToRange = range > 0 ? Math.abs(netMove) / range : 0;
+
+  // "latestExtends" = the latest move is directional AND at the window extreme
+  const eps = 1e-12;
+  const latestExtendsUp   = lastMove > 0 && last >= hi - eps;
+  const latestExtendsDown = lastMove < 0 && last <= lo + eps;
+
+  return {
+    lastMove, prevMove, lastAbs, prevAbs,
+    sameDir, expanding, weakening,
+    netMove, rangePct, netToRange,
+    latestExtendsUp, latestExtendsDown,
+    windowSize: win.length,
+    high: hi, low: lo, mid,
   };
 }
 
@@ -241,8 +235,8 @@ class DigitAnalyzer extends EventEmitter {
     super();
     this._state = new Map();
     this._lastSignal = new Map();
-    this._lastWarnedPrecision = new Map();   // per-symbol, throttle precision log
-    this._lastWarnedDegenerate = new Map();  // per-symbol, throttle corrupt-data log
+    this._lastWarnedPrecision = new Map();
+    this._lastWarnedDegenerate = new Map();
     this._listening = false;
   }
 
@@ -260,13 +254,11 @@ class DigitAnalyzer extends EventEmitter {
     const mid = Number(tick.mid ?? (tick.bid + tick.ask) / 2);
     if (!Number.isFinite(mid) || mid <= 0) return;
 
-    // [FIX-1] Use per-symbol precision instead of hardcoded 5.
     const precision = getDigitPrecision(symbol);
     const formatted = mid.toFixed(precision);
     const digit = parseInt(formatted[formatted.length - 1], 10);
     if (!Number.isFinite(digit)) return;
 
-    // Log precision per symbol once (first tick only, per process).
     if (!this._lastWarnedPrecision.has(symbol)) {
       this._lastWarnedPrecision.set(symbol, true);
       logger.info(`[DigitAnalyzer] ${symbol} → precision=${precision} (mid=${mid} → digit=${digit})`);
@@ -295,7 +287,6 @@ class DigitAnalyzer extends EventEmitter {
     s.lastPrice = mid;
     s.lastUpdate = Date.now();
 
-    // [FIX-2] Degenerate detection — throttle to once per 60s per symbol
     if (s.digits.length >= DEGENERATE_CHECK_SAMPLES) {
       const last = s.digits.slice(-DEGENERATE_CHECK_SAMPLES);
       const unique = new Set(last).size;
@@ -341,19 +332,23 @@ class DigitAnalyzer extends EventEmitter {
       else if (d === 'down') fallCount++;
       else flatCount++;
     }
+    // Non-flat directional denominator (fixes the flat-tick bias)
+    const dirTotal = riseCount + fallCount;
 
+    // ── FIX: arrow compares PRICES, not digits ──
     let arrow = 'flat';
-    if (digits.length >= 2) {
-      const prev = digits[digits.length - 2];
-      const cur = digits[digits.length - 1];
-      if (cur > prev) arrow = 'up';
-      else if (cur < prev) arrow = 'down';
+    if (s.prices.length >= 2) {
+      const prevP = s.prices[s.prices.length - 2];
+      const curP  = s.prices[s.prices.length - 1];
+      if (curP > prevP) arrow = 'up';
+      else if (curP < prevP) arrow = 'down';
     }
 
+    // Parity streak (unchanged semantics)
     let evenStreak = 0, oddStreak = 0, currentParity = null;
     for (let i = digits.length - 1; i >= 0; i--) {
       const p = digits[i] % 2 === 0 ? 'even' : 'odd';
-      if (currentParity === null) { currentParity = p; }
+      if (currentParity === null) currentParity = p;
       if (p !== currentParity) break;
       if (p === 'even') evenStreak++; else oddStreak++;
     }
@@ -362,27 +357,38 @@ class DigitAnalyzer extends EventEmitter {
       symbol,
       currentDigit: digits[digits.length - 1],
       previousDigit: digits.length >= 2 ? digits[digits.length - 2] : null,
-      arrow,
+      arrow,                          // NOW from prices
       price: currentPrice,
-      precision,                       // expose so consumers can verify
+      precision,
       sampleSize: total,
 
       digitFreq: freq,
       digitFreqPct: freq.map(f => Number(((f / total) * 100).toFixed(2))),
 
       evenPct: Number(((evenCount / total) * 100).toFixed(2)),
-      oddPct: Number(((oddCount / total) * 100).toFixed(2)),
+      oddPct: Number(((oddCount  / total) * 100).toFixed(2)),
 
-      risePct: Number(((riseCount / total) * 100).toFixed(2)),
-      fallPct: Number(((fallCount / total) * 100).toFixed(2)),
+      // Directional (non-flat). flatPct kept on the FULL denominator.
+      risePct: dirTotal > 0 ? Number(((riseCount / dirTotal) * 100).toFixed(2)) : 0,
+      fallPct: dirTotal > 0 ? Number(((fallCount / dirTotal) * 100).toFixed(2)) : 0,
       flatPct: Number(((flatCount / total) * 100).toFixed(2)),
 
       currentParity,
       evenStreak,
       oddStreak,
 
-      // [FIX-3] Z-scores computed from last DEFAULT_Z_WINDOW ticks.
-      // null if fewer than Z_MIN_SAMPLES accumulated.
+      // Directional streak — price-based, separate from parity
+      directionalStreak: computeDirectionalStreak(directions),
+
+      // Movement strength — from prices
+      movement: computeMovement(s.prices, LONG_WINDOW),
+
+      // Short and long window aggregates
+      windows: {
+        short: computeWindowMetrics(digits, directions, SHORT_WINDOW),
+        long:  computeWindowMetrics(digits, directions, LONG_WINDOW),
+      },
+
       zStats: computeZStats(digits, directions, DEFAULT_Z_WINDOW),
 
       recentDigits: digits.slice(-30),
@@ -402,6 +408,7 @@ class DigitAnalyzer extends EventEmitter {
       evenOdd = { side: 'ODD', probability: view.oddPct / 100, edge: view.oddPct - 50 };
     }
 
+    // Directional — uses the non-flat view.risePct / view.fallPct directly.
     let riseFall = null;
     if (view.risePct >= 50 + SIGNAL_MIN_EDGE * 100) {
       riseFall = { side: 'RISE', probability: view.risePct / 100, edge: view.risePct - 50 };
@@ -409,12 +416,15 @@ class DigitAnalyzer extends EventEmitter {
       riseFall = { side: 'FALL', probability: view.fallPct / 100, edge: view.fallPct - 50 };
     }
 
+    // Over/Under — Deriv contract semantics:
+    //   OVER  N wins on digit > N  → freq.slice(N + 1)
+    //   UNDER N wins on digit < N  → freq.slice(0, N)
     let overUnder = null;
     let bestEdge = 0;
     for (let threshold = 1; threshold <= 8; threshold++) {
-      const overCount = view.digitFreq.slice(threshold + 1).reduce((a, b) => a + b, 0);
-      const underCount = view.digitFreq.slice(0, threshold + 1).reduce((a, b) => a + b, 0);
-      const overPct = (overCount / view.sampleSize) * 100;
+      const overCount  = view.digitFreq.slice(threshold + 1).reduce((a, b) => a + b, 0);
+      const underCount = view.digitFreq.slice(0, threshold).reduce((a, b) => a + b, 0);
+      const overPct  = (overCount  / view.sampleSize) * 100;
       const underPct = (underCount / view.sampleSize) * 100;
 
       if (overPct > 50 + SIGNAL_MIN_EDGE * 100 && overPct - 50 > bestEdge) {
@@ -432,9 +442,7 @@ class DigitAnalyzer extends EventEmitter {
     return {
       symbol,
       timestamp: new Date().toISOString(),
-      evenOdd,
-      riseFall,
-      overUnder,
+      evenOdd, riseFall, overUnder,
       sampleSize: view.sampleSize,
     };
   }
@@ -447,8 +455,6 @@ class DigitAnalyzer extends EventEmitter {
     return this._computeView(s, symbol, s.lastPrice, precision);
   }
 
-  // [FIX-3] Z-score view from a custom window size. Returns null if
-  // fewer than Z_MIN_SAMPLES ticks are available.
   getZView(symbol, windowSize = DEFAULT_Z_WINDOW) {
     const clean = normalizeSymbol(symbol);
     const s = this._state.get(clean);
@@ -475,6 +481,11 @@ class DigitAnalyzer extends EventEmitter {
 const instance = new DigitAnalyzer();
 module.exports = instance;
 module.exports.getDigitPrecision = getDigitPrecision;
-module.exports.computeZStats = computeZStats;    // [FIX-3] exposed for tests
+module.exports.computeZStats = computeZStats;
+module.exports.computeWindowMetrics = computeWindowMetrics;
+module.exports.computeDirectionalStreak = computeDirectionalStreak;
+module.exports.computeMovement = computeMovement;
 module.exports.DEFAULT_Z_WINDOW = DEFAULT_Z_WINDOW;
 module.exports.Z_MIN_SAMPLES = Z_MIN_SAMPLES;
+module.exports.SHORT_WINDOW = SHORT_WINDOW;
+module.exports.LONG_WINDOW = LONG_WINDOW;
