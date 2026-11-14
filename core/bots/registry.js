@@ -1,5 +1,46 @@
 // core/bots/registry.js
-// (all header comments preserved from original)
+// 21 bots. Multi-signal, adaptive, risk-enforced.
+//
+// [FIX-VOLHL] vol_high_low was emitting ONETOUCH/NOTOUCH without a barrier
+//   parameter, which Deriv rejects with `InvalidBarrierSingle`. The bot
+//   never placed a single trade. Now uses CALL/PUT based on directional
+//   bias (same signal, valid contract type, no barrier needed).
+//
+// [FIX-DIGIT-DYN] Digit bots use statistical significance (z-scores)
+//   instead of fixed percentage thresholds.
+//
+// [FIX-UNDER-BARRIER] DIGITUNDER contracts correctly send barrier=1.
+//
+// [FIX-SHADOW-CFG] shadowWinsRequired on the five synthetic binary bots.
+//
+// [FIX-SHADOW-MODES] Three shadow modes per bot:
+//     wins=0, obs=false → OFF
+//     wins=0, obs=true  → OBSERVATIONAL (mirror real trade result)
+//     wins>0            → GATED (real-money gate — high-payout only)
+//
+// [FIX-HIGH-PAYOUT] Four high-payout bots: touch_hunter, vanilla_trend,
+//   turbo_breakout, accumulator_scalper.
+//
+// [FIX-BINARY-IMPROVED-MATH] Five synthetic_binary bots rewritten to use
+//   the analyzer's corrected measurements:
+//     • Rise/Fall % on the NON-FLAT denominator
+//     • directionalStreak (price-based, separate from parity)
+//     • movement (netMove, lastMove, prevMove, expanding, weakening,
+//       netToRange, latestExtendsUp/Down)
+//     • windows.short / windows.long
+//   Each bot retains its identity, flip handling, and contract class.
+//   Shadow is always observational (no real-money gate) for binary.
+//
+// [FIX-BINARY-LOSS-STOP] Binary bots no longer auto-stop after 3
+//   consecutive losses. A 50/50 binary contract hits a 3-loss streak
+//   every ~8 trades — auto-stopping there kills the bot in normal
+//   variance. botStopLoss (money) remains the real safeguard.
+//
+// [FIX-PRECISION-DIGIT] Digit bots rewritten for higher hit rate.
+//
+// [FIX-VOL-SCALPER-PRECISION] vol_scalper redesigned — fade requires
+//   weakening momentum, follow requires expanding momentum.
+
 'use strict';
 
 const { EMA, BollingerBands } = require('../strategy/engine');
@@ -697,7 +738,7 @@ const BOTS = {
     },
   },
 
-  // ── Synthetic Binary (5) — [IMPROVED MATHEMATICS] ──
+  // ── Synthetic Binary (5) — IMPROVED MATHEMATICS ──
 
   rise_fall_momentum: {
     id: 'rise_fall_momentum', name: 'Rise/Fall Momentum',
@@ -719,7 +760,7 @@ const BOTS = {
       if (dv.sampleSize < ctx.config.minSamples) return wait('Not enough samples');
       const { config, stats } = ctx;
 
-      // risePct / fallPct now use a non-flat directional denominator.
+      // risePct / fallPct use the non-flat directional denominator.
       const risePct = dv.risePct / 100;
       const fallPct = dv.fallPct / 100;
 
@@ -781,7 +822,7 @@ const BOTS = {
       const mv = dv.movement;
       if (!mv) return wait('No movement data');
 
-      // Fade only when the streak is losing strength — require lastAbs < prevAbs * weakenRatio
+      // Fade only when the streak is losing strength
       const wRatio = Number(config.weakenRatio) || 0.7;
       if (!mv.weakening || mv.prevAbs <= 0 || mv.lastAbs > mv.prevAbs * wRatio) {
         return wait(`Streak not weakening (last=${mv.lastAbs.toFixed(5)} prev=${mv.prevAbs.toFixed(5)}, need < ${wRatio}×)`);
@@ -828,8 +869,7 @@ const BOTS = {
       const mv = dv.movement;
       if (!mv) return wait('No movement data');
 
-      // Net movement should be substantial relative to the price range —
-      // filters out choppy stretches that merely happen to have a net drift.
+      // Net movement must be substantial relative to the price range.
       const minNR = Number(config.minNetToRange) || 0.4;
       if (mv.netToRange < minNR) {
         return wait(`Choppy: net/range ${mv.netToRange.toFixed(2)} < ${minNR}`);
@@ -901,11 +941,11 @@ const BOTS = {
       const mv = dv.movement;
       if (!mv) return wait('No movement data');
 
-      // Latest move must agree with the bias
+      // Latest move must agree with bias
       if (normalDir === 'CALL' && mv.lastMove <= 0) return wait('Latest move disagrees with CALL bias');
       if (normalDir === 'PUT'  && mv.lastMove >= 0) return wait('Latest move disagrees with PUT bias');
 
-      // Reject if a single outsized move dominates — avoid "one spike ≠ trend"
+      // Reject outsized single move
       if (mv.sameDir && mv.prevAbs > 0 && mv.lastAbs > mv.prevAbs * 3) {
         return wait(`Outsized move (${mv.lastAbs.toFixed(5)} > 3× ${mv.prevAbs.toFixed(5)})`);
       }
@@ -1155,6 +1195,7 @@ for (const id in BOTS) {
   BOTS[id].defaultConfig = Object.assign({}, RISK_DEFAULTS, BOTS[id].defaultConfig);
 }
 
+// ── Compound config — synthetic_binary ONLY ──
 const COMPOUND_DEFAULTS = {
   compoundEnabled: false,
   compoundMaxStake: 10,
@@ -1184,6 +1225,16 @@ BOTS.turbo_breakout.defaultConfig.botTakeProfit = 0;
 BOTS.turbo_breakout.defaultConfig.botStopLoss = 0;
 
 BOTS.accumulator_scalper.defaultConfig.stopAfterLosses = 5;
+
+// [FIX-BINARY-LOSS-STOP] Binary bots stop from money loss, not from
+// consecutive-loss count. A 50/50 binary contract hits a 3-loss streak
+// every ~8 trades — auto-stopping there kills the bot in normal variance.
+// botStopLoss (money) remains the real safeguard.
+BOTS.rise_fall_momentum.defaultConfig.stopAfterLosses = 0;
+BOTS.rise_fall_streak.defaultConfig.stopAfterLosses   = 0;
+BOTS.rise_fall_breakout.defaultConfig.stopAfterLosses = 0;
+BOTS.vol_high_low.defaultConfig.stopAfterLosses       = 0;
+BOTS.vol_scalper.defaultConfig.stopAfterLosses        = 0;
 
 function getBot(id) { return BOTS[id] || null; }
 function listBots() { return Object.values(BOTS); }
