@@ -25,6 +25,18 @@ function toCents(n) {
   return Math.round(Number(n) * 100);
 }
 
+// Convert a contract's { duration, unit } to an expected lifetime in ms.
+function durationToMs(duration, unit) {
+  const d = Number(duration);
+  if (!Number.isFinite(d) || d <= 0) return null;
+  const u = unit || 't';
+  if (u === 't') return d * 2000;      // 2s per tick (Deriv default)
+  if (u === 's') return d * 1000;
+  if (u === 'm') return d * 60_000;
+  if (u === 'h') return d * 3_600_000;
+  return null;
+}
+
 const SESSION_RANGES = [
   { code: 'ASIAN',             start: 0,  end: 7  },
   { code: 'LONDON',            start: 7,  end: 12 },
@@ -52,21 +64,22 @@ const OPEN_POSITION_BACKOFF_MS = 60_000;
 const RECONCILE_POSITION_GRACE_MS = 2500;
 const RECONCILE_POSITION_LOOKBACK_MS = 60_000;
 
-// Settlement-aware re-entry guards (replaces the old blind 15s cooldown).
 const MIN_REENTRY_MS = 3_000;
 const POST_CLOSE_BUFFER_MS = 1_000;
 
-// Short-TTL positions cache — prevents duplicated getOpenTrades() calls
-// inside a single cycle without ever skipping the pre-order freshness check.
 const POSITIONS_CACHE_TTL_MS = 1_500;
 
-// [FIX-HANG-WATCHDOG] A cycle stuck for this long is presumed hung.
-// The watchdog force-clears `_running` and emits `botWatchdogReset`.
+// [FIX-PENDING-CONTRACTS] Grace period after expected settlement for the
+// close event to arrive. Deriv removes the contract from open-trades
+// BEFORE firing trade.closed — this window is exactly what let the bot
+// fire twice. Pending map tracks every placed contract until we receive
+// its close event.
+const PENDING_SETTLEMENT_GRACE_MS = 30_000;
+const PENDING_HARD_PRUNE_MS       = 90_000;
+
 const WATCHDOG_INTERVAL_MS = 5_000;
 const WATCHDOG_STALE_THRESHOLD_MS = 30_000;
 
-// [FIX-STALE-FEED] Warn if no new tick for this long. Below it, short-
-// circuit is normal. Above it, feed is stalled.
 const STALE_FEED_WARN_MS = 30_000;
 const SLOW_FEED_WARN_MS  = 10_000;
 
@@ -109,6 +122,7 @@ class BotRunner extends EventEmitter {
       compoundResets: 0,
       watchdogResets: 0,
       autoStops: 0,
+      pendingPrunedTimeouts: 0,
     };
   }
 
@@ -149,6 +163,7 @@ class BotRunner extends EventEmitter {
       _stalenessWarnAt: 0,
       _watchdog: null,
       _entryFailureBackoffUntil: 0,
+      _pendingContracts: new Map(),
       shadow,
       compound,
       _trailingPeaks: new Map(),
@@ -167,15 +182,10 @@ class BotRunner extends EventEmitter {
       },
     };
 
-    // Faster cadence for non-FX — the per-cycle tick short-circuit prevents
-    // busy-spinning while keeping signal→evaluation latency near one tick.
     const intervalMs = bot.assetClass === 'fx' ? 15000 : 1000;
     instance.timer = setInterval(() => { this._runCycle(instance).catch(() => {}); }, intervalMs);
     if (typeof instance.timer.unref === 'function') instance.timer.unref();
 
-    // [FIX-HANG-WATCHDOG] If any async cycle gets stuck (broker hang, DNS,
-    // unhandled reject chain), _running stays true forever and the bot
-    // "disappears" from working. Force-clear after 30s and log loudly.
     instance._watchdog = setInterval(() => {
       if (!instance._running || !instance._runningSince) return;
       const stuck = Date.now() - instance._runningSince;
@@ -196,6 +206,19 @@ class BotRunner extends EventEmitter {
       });
     }, WATCHDOG_INTERVAL_MS);
     if (typeof instance._watchdog.unref === 'function') instance._watchdog.unref();
+
+    // [FIX-SHADOW-REINTRODUCE] Warn (not block) if gated shadow is turned on
+    // for a low-payout binary contract. User's choice is respected.
+    if (mode === 'gated' && bot.contractClass === 'binary') {
+      const g = shadow ? shadow.currentGate : 0;
+      const sStake = Number(finalConfig.shadowStake) || 0.35;
+      logger.warn(
+        `[BotRunner] ${instance.instanceId}: GATED shadow on binary bot (${bot.id}) — ` +
+        `~0.88× payout means each $${sStake.toFixed(2)} validation fire is real money at EV-negative odds. ` +
+        `Expected cost to open gate (${g} wins): ~$${(sStake * g * 2).toFixed(2)}. ` +
+        `Set shadowWinsRequired=0 or shadowObservational=true to disable.`
+      );
+    }
 
     this._instances.set(instanceId, instance);
     logger.info(
@@ -236,20 +259,14 @@ class BotRunner extends EventEmitter {
     };
   }
 
-  // [FIX-SHADOW-LOWPAYOUT] Binary contracts (~0.88× payout) cannot sustain
-  // real-money shadow validation. Forced into 'observational' mode
-  // regardless of the legacy shadowWinsRequired flag.
+  // [FIX-SHADOW-REINTRODUCE] User config is authoritative.
+  //   wins > 0                                → GATED
+  //   wins = 0, shadowObservational = true    → OBSERVATIONAL
+  //   both off                                → OFF (default for all bots)
+  // No forced downgrade. Binary warning is emitted at startup (see start()).
   _shadowModeForConfig(config, bot) {
     if (!bot || bot.assetClass !== 'synthetic_binary') return 'off';
     if (config._edgeTest) return 'off';
-
-    if (bot.contractClass === 'binary') {
-      const obs = !!config.shadowObservational;
-      const wins = Number(config.shadowWinsRequired) || 0;
-      if (wins > 0 || obs) return 'observational';
-      return 'off';
-    }
-
     const wins = Number(config.shadowWinsRequired) || 0;
     if (wins > 0) return 'gated';
     if (!!config.shadowObservational) return 'observational';
@@ -279,6 +296,7 @@ class BotRunner extends EventEmitter {
       if (lock.instanceId === instanceId) this._symbolLocks.delete(sym);
     }
     if (instance._trailingPeaks) instance._trailingPeaks.clear();
+    if (instance._pendingContracts) instance._pendingContracts.clear();
     this._instances.delete(instanceId);
     logger.info(`[BotRunner] Stopped ${instance.name} (${instanceId})` +
       (instance._stopReason ? ` — ${instance._stopReason}` : ''));
@@ -301,6 +319,9 @@ class BotRunner extends EventEmitter {
     if (!instance) return { success: false, error: 'Instance not found' };
     if (instance.status !== 'RUNNING') return { success: false, error: 'Bot is not running' };
     if (instance._running) return { success: false, error: 'A cycle is already in progress — try again in a moment' };
+    if (instance._pendingContracts && instance._pendingContracts.size > 0) {
+      return { success: false, error: `Cannot force — ${instance._pendingContracts.size} pending contract(s) still settling` };
+    }
     if (instance._lastEntryTime && Date.now() - instance._lastEntryTime < MIN_REENTRY_MS) {
       return { success: false, error: `Recent entry — wait ${Math.ceil((MIN_REENTRY_MS - (Date.now() - instance._lastEntryTime)) / 1000)}s before forcing another` };
     }
@@ -356,6 +377,7 @@ class BotRunner extends EventEmitter {
       health: {
         watchdogResets: this._metrics.watchdogResets,
         autoStops: this._metrics.autoStops,
+        pendingPrunedTimeouts: this._metrics.pendingPrunedTimeouts,
       },
       openPositionRejections: this._metrics.openPositionRejections,
       runningInstances: this._instances.size,
@@ -363,9 +385,6 @@ class BotRunner extends EventEmitter {
     };
   }
 
-  // ─────────────────────────────────────────────────────────────
-  //  Positions cache — shared across a single cycle, short TTL.
-  // ─────────────────────────────────────────────────────────────
   async _getPositions(forceFresh = false) {
     const now = Date.now();
     if (!forceFresh && this._positionsCache.data && (now - this._positionsCache.at) < this._positionsCache.ttl) {
@@ -393,8 +412,54 @@ class BotRunner extends EventEmitter {
   }
 
   // ─────────────────────────────────────────────────────────────
-  //  Compound stake
+  //  [FIX-PENDING-CONTRACTS]
+  //  Authoritative, memory-local registry of every placed contract that
+  //  we have NOT yet seen the close event for. Prevents double-fire during
+  //  the Deriv window where a contract is settled server-side but removed
+  //  from getOpenTrades() before trade.closed reaches us.
   // ─────────────────────────────────────────────────────────────
+  _registerPendingContract(instance, info) {
+    if (!instance._pendingContracts) instance._pendingContracts = new Map();
+    const durationMs = durationToMs(info.duration, info.durationUnit) || 10_000;
+    const placedAt = Date.now();
+    const expectedAt = placedAt + durationMs + PENDING_SETTLEMENT_GRACE_MS;
+    const hardPruneAt = expectedAt + PENDING_HARD_PRUNE_MS;
+    instance._pendingContracts.set(String(info.contractId), {
+      contractId: String(info.contractId),
+      symbol: info.symbol,
+      phase: info.phase,
+      durationMs,
+      placedAt,
+      expectedAt,
+      hardPruneAt,
+    });
+    logger.info(
+      `[BotRunner] ${instance.instanceId}: PENDING registered ${info.contractId} ` +
+      `(${info.phase}, ${Math.round(durationMs / 1000)}s + grace, hard-prune in ${Math.round((hardPruneAt - placedAt) / 1000)}s)`
+    );
+  }
+
+  _clearPendingContract(instance, contractId) {
+    if (!instance || !instance._pendingContracts) return;
+    instance._pendingContracts.delete(String(contractId));
+  }
+
+  _prunePendingContracts(instance) {
+    if (!instance._pendingContracts || instance._pendingContracts.size === 0) return;
+    const now = Date.now();
+    for (const [cid, p] of instance._pendingContracts) {
+      if (now > p.hardPruneAt) {
+        logger.warn(
+          `[BotRunner] ${instance.instanceId}: PENDING ${cid} HARD-PRUNED — close event never arrived ` +
+          `(placed ${Math.round((now - p.placedAt) / 1000)}s ago). This trade's result is LOST from stats. ` +
+          `Check broker event delivery.`
+        );
+        instance._pendingContracts.delete(cid);
+        this._metrics.pendingPrunedTimeouts++;
+      }
+    }
+  }
+
   _getEffectiveStake(instance, tradeParams) {
     if (instance.compound && instance.compound.enabled) {
       return round2(instance.compound.currentStake);
@@ -738,9 +803,6 @@ class BotRunner extends EventEmitter {
     if (s.flipHistory.length > FLIP_HISTORY_MAX) s.flipHistory = s.flipHistory.slice(-FLIP_HISTORY_MAX);
   }
 
-  // [FIX-AUTOSTOP-VISIBILITY] Explicit auto-stop with a caller-provided
-  // reason. Emits an event the UI can surface, so the bot doesn't silently
-  // "disappear" — the user sees WHY it stopped.
   _autoStop(instance, reason) {
     instance._stopReason = reason;
     this._metrics.autoStops++;
@@ -757,10 +819,6 @@ class BotRunner extends EventEmitter {
     this.stop(instance.instanceId, { autoStopReason: reason });
   }
 
-  // [FIX-EXIT-VISIBILITY] Live progress toward each exit threshold.
-  // The summary exposes this so the UI can show "2/3 losses, 40% to SL,"
-  // etc. — the bot's own rules are checked every cycle, this makes it
-  // VISIBLE.
   _buildExitStatus(instance) {
     const s = instance.stats;
     const tp = Number(instance.config.botTakeProfit) || 0;
@@ -770,10 +828,16 @@ class BotRunner extends EventEmitter {
     const trailFloor = trailPct > 0 && s.peakPnl > 0
       ? Number((s.peakPnl * (1 - trailPct / 100)).toFixed(2))
       : null;
+    const pendingCount = instance._pendingContracts ? instance._pendingContracts.size : 0;
+    const pendingOldestMs = pendingCount > 0
+      ? Date.now() - Math.min(...Array.from(instance._pendingContracts.values()).map(p => p.placedAt))
+      : null;
     return {
       pnl: Number(s.pnl.toFixed(2)),
       peakPnl: Number(s.peakPnl.toFixed(2)),
       consecutiveLosses: s.consecutiveLosses,
+      pendingContracts: pendingCount,
+      oldestPendingMs: pendingOldestMs,
       tp: {
         target: tp,
         progressPct: tp > 0 && s.pnl > 0 ? Number(((s.pnl / tp) * 100).toFixed(1)) : 0,
@@ -817,6 +881,7 @@ class BotRunner extends EventEmitter {
       catch (trErr) { logger.warn(`[BotRunner] ${instance.instanceId}: trailing check failed: ${trErr.message}`); }
 
       this._cleanupExpiredLocks();
+      this._prunePendingContracts(instance);
 
       if (instance._entryFailureBackoffUntil && Date.now() < instance._entryFailureBackoffUntil) {
         const remaining = Math.ceil((instance._entryFailureBackoffUntil - Date.now()) / 1000);
@@ -833,7 +898,18 @@ class BotRunner extends EventEmitter {
         return;
       }
 
-      // ── Exit checks — run every cycle, before anything heavy ──
+      // [FIX-PENDING-CONTRACTS] Hard block if any contract is still awaiting
+      // its close event. This is the definitive fix for double-fire during
+      // the Deriv settlement race — it does NOT depend on getOpenTrades().
+      if (instance._pendingContracts && instance._pendingContracts.size > 0) {
+        const now = Date.now();
+        const oldest = Math.min(...Array.from(instance._pendingContracts.values()).map(p => p.placedAt));
+        const oldestAgeSec = Math.floor((now - oldest) / 1000);
+        instance.lastReason = `Awaiting settlement: ${instance._pendingContracts.size} pending contract(s), oldest ${oldestAgeSec}s`;
+        return;
+      }
+
+      // ── Exit checks ──
       const maxLosses = Number(instance.config.stopAfterLosses) || 0;
       if (maxLosses > 0 && instance.stats.consecutiveLosses >= maxLosses) {
         this._autoStop(instance, `Consecutive losses ${instance.stats.consecutiveLosses}/${maxLosses}`);
@@ -930,7 +1006,6 @@ class BotRunner extends EventEmitter {
         ctx.digitView = digitView;
       }
 
-      // ── Tick short-circuit — but now with staleness detection ──
       if (bot.assetClass !== 'fx' && !HIGH_PAYOUT_CLASSES.has(bot.contractClass)) {
         if (ctx.digitView && ctx.digitView.sampleSize &&
             ctx.digitView.sampleSize === instance._lastEvaluatedSampleSize) {
@@ -1103,11 +1178,8 @@ class BotRunner extends EventEmitter {
           ticks: Number(tradeParams.duration),
           unit: tradeParams.durationUnit || null,
           at: (() => {
-            const dur = Number(tradeParams.duration);
-            const unit = tradeParams.durationUnit || 't';
-            if (!Number.isFinite(dur) || dur <= 0) return null;
-            const msPer = unit === 't' ? 2000 : unit === 's' ? 1000 : unit === 'm' ? 60000 : unit === 'h' ? 3600000 : 0;
-            return msPer ? new Date(Date.now() + dur * msPer).toISOString() : null;
+            const ms = durationToMs(tradeParams.duration, tradeParams.durationUnit);
+            return ms ? new Date(Date.now() + ms).toISOString() : null;
           })(),
         } : null,
         pattern: pred && pred.pattern ? { bias: pred.pattern.bias, confidence: pred.pattern.confidence, patterns: pred.pattern.patterns } : null,
@@ -1121,27 +1193,25 @@ class BotRunner extends EventEmitter {
 
     const dv = ctx && ctx.digitView;
     const expiry = tradeParams ? (() => {
+      const ms = durationToMs(tradeParams.duration, tradeParams.durationUnit);
       const dur = Number(tradeParams.duration);
       const unit = tradeParams.durationUnit || 't';
       if (!Number.isFinite(dur) || dur <= 0) return null;
-      const msPer = unit === 't' ? 2000 : unit === 's' ? 1000 : unit === 'm' ? 60000 : unit === 'h' ? 3600000 : 0;
       return {
         ticks: unit === 't' ? dur : null,
         unit,
-        at: msPer ? new Date(Date.now() + dur * msPer).toISOString() : null,
+        at: ms ? new Date(Date.now() + ms).toISOString() : null,
       };
     })() : null;
 
     return {
       botId: instance.botId, instanceId: instance.instanceId,
       reasons: reasons || [], edgeTest: isEdgeTest, session, flip: flipLabel, phaseStats,
-      // Backward-compatible snapshot (still consumed by existing dashboards).
       digitView: dv ? {
         sampleSize: dv.sampleSize, precision: dv.precision,
         evenPct: dv.evenPct, oddPct: dv.oddPct, risePct: dv.risePct, fallPct: dv.fallPct,
         evenStreak: dv.evenStreak, oddStreak: dv.oddStreak,
       } : null,
-      // Complete measurement record — which calculation wins/loses daily.
       measurementSnapshot: dv ? {
         arrow: dv.arrow,
         directionalStreak: dv.directionalStreak,
@@ -1336,6 +1406,18 @@ class BotRunner extends EventEmitter {
       if (isShadowPhase) this._metrics.shadowPlaced++;
       this._invalidatePositions();
 
+      // [FIX-PENDING-CONTRACTS] Register pending BEFORE persist so we never
+      // lose track even if the BotRun write fails.
+      if (tradeParams.duration != null && Number(tradeParams.duration) > 0) {
+        this._registerPendingContract(instance, {
+          contractId: String(result.contractId),
+          symbol: lockSymbol,
+          phase: isShadowPhase ? 'shadow' : 'real',
+          duration: tradeParams.duration,
+          durationUnit: tradeParams.durationUnit || 't',
+        });
+      }
+
       await this._persistBotRun(
         instance, result, tradeParams, direction, stakeCheck, reasons, entryThesis,
         currentRegime, currentSession, isShadowPhase
@@ -1382,6 +1464,16 @@ class BotRunner extends EventEmitter {
           if (isShadowPhase) this._metrics.shadowPlaced++;
           this._invalidatePositions();
 
+          if (tradeParams.duration != null && Number(tradeParams.duration) > 0) {
+            this._registerPendingContract(instance, {
+              contractId: String(recovered.id),
+              symbol: lockSymbol,
+              phase: isShadowPhase ? 'shadow' : 'real',
+              duration: tradeParams.duration,
+              durationUnit: tradeParams.durationUnit || 't',
+            });
+          }
+
           const broker = getBroker('deriv_cfd');
           if (broker._subscribeOpenContract) broker._subscribeOpenContract(recovered.id).catch(() => {});
 
@@ -1423,9 +1515,22 @@ class BotRunner extends EventEmitter {
     try {
       const contractId = String(data && data.contractId || '');
       if (!contractId) return;
+
+      // [FIX-PENDING-CONTRACTS] Always clear pending when a close event
+      // arrives — regardless of whether BotRun was persisted. This is the
+      // authoritative cleanup that unblocks the bot.
+      let closedInstance = null;
+      for (const inst of this._instances.values()) {
+        if (inst._pendingContracts && inst._pendingContracts.has(contractId)) {
+          inst._pendingContracts.delete(contractId);
+          closedInstance = inst;
+        }
+      }
+
       const run = await BotRun.findOne({ contractId, status: 'OPEN' });
       if (!run) {
-        logger.warn(`[BotRunner] _onTradeClosed: no OPEN BotRun for contract ${contractId} (entry persist may have failed)`);
+        logger.warn(`[BotRunner] _onTradeClosed: no OPEN BotRun for contract ${contractId} (entry persist may have failed)` +
+          (closedInstance ? ` — pending cleared on ${closedInstance.instanceId}` : ''));
         return;
       }
 
@@ -1593,6 +1698,8 @@ class BotRunner extends EventEmitter {
       lastResetAt: instance.compound.lastResetAt,
     } : null;
 
+    const pendingIds = instance._pendingContracts ? Array.from(instance._pendingContracts.keys()) : [];
+
     return {
       instanceId: instance.instanceId, botId: instance.botId, name: instance.name,
       assetClass: instance.assetClass, contractClass: instance.contractClass,
@@ -1600,6 +1707,7 @@ class BotRunner extends EventEmitter {
       lastRunAt: instance.lastRunAt, lastReason: instance.lastReason, config: instance.config,
       lastCycleAt: instance._lastCycleAt ? new Date(instance._lastCycleAt).toISOString() : null,
       stopReason: instance._stopReason || null,
+      pendingContractIds: pendingIds,
       exitStatus: this._buildExitStatus(instance),
       stats: statsForSummary,
       shadow: shadowForSummary,
