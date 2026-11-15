@@ -1,45 +1,21 @@
 // core/bots/registry.js
 // 21 bots. Multi-signal, adaptive, risk-enforced.
 //
-// [FIX-VOLHL] vol_high_low was emitting ONETOUCH/NOTOUCH without a barrier
-//   parameter, which Deriv rejects with `InvalidBarrierSingle`. The bot
-//   never placed a single trade. Now uses CALL/PUT based on directional
-//   bias (same signal, valid contract type, no barrier needed).
+// [FIX-BINARY-IMPROVED-MATH] Five synthetic_binary bots use the analyzer's
+//   corrected measurements (non-flat risePct/fallPct, directionalStreak,
+//   movement, windows.short/long).
 //
-// [FIX-DIGIT-DYN] Digit bots use statistical significance (z-scores)
-//   instead of fixed percentage thresholds.
+// [FIX-BINARY-LOSS-STOP] Binary bots stop from botStopLoss (money), not
+//   from consecutive-loss count.
 //
-// [FIX-UNDER-BARRIER] DIGITUNDER contracts correctly send barrier=1.
-//
-// [FIX-SHADOW-CFG] shadowWinsRequired on the five synthetic binary bots.
-//
-// [FIX-SHADOW-MODES] Three shadow modes per bot:
-//     wins=0, obs=false → OFF
-//     wins=0, obs=true  → OBSERVATIONAL (mirror real trade result)
-//     wins>0            → GATED (real-money gate — high-payout only)
-//
-// [FIX-HIGH-PAYOUT] Four high-payout bots: touch_hunter, vanilla_trend,
-//   turbo_breakout, accumulator_scalper.
-//
-// [FIX-BINARY-IMPROVED-MATH] Five synthetic_binary bots rewritten to use
-//   the analyzer's corrected measurements:
-//     • Rise/Fall % on the NON-FLAT denominator
-//     • directionalStreak (price-based, separate from parity)
-//     • movement (netMove, lastMove, prevMove, expanding, weakening,
-//       netToRange, latestExtendsUp/Down)
-//     • windows.short / windows.long
-//   Each bot retains its identity, flip handling, and contract class.
-//   Shadow is always observational (no real-money gate) for binary.
-//
-// [FIX-BINARY-LOSS-STOP] Binary bots no longer auto-stop after 3
-//   consecutive losses. A 50/50 binary contract hits a 3-loss streak
-//   every ~8 trades — auto-stopping there kills the bot in normal
-//   variance. botStopLoss (money) remains the real safeguard.
-//
-// [FIX-PRECISION-DIGIT] Digit bots rewritten for higher hit rate.
-//
-// [FIX-VOL-SCALPER-PRECISION] vol_scalper redesigned — fade requires
-//   weakening momentum, follow requires expanding momentum.
+// [FIX-SHADOW-REINTRODUCE] All 5 binary bots now default to shadow OFF:
+//     shadowWinsRequired: 0
+//     shadowObservational: false
+//   User can enable either in the bot form:
+//     • shadowWinsRequired > 0 → GATED (real $shadowStake fires before gate)
+//     • shadowObservational: true (wins=0) → OBSERVATIONAL (free, mirrored)
+//     • both off → fully OFF (default)
+//   Runner respects config; no forced downgrade.
 
 'use strict';
 
@@ -738,11 +714,11 @@ const BOTS = {
     },
   },
 
-  // ── Synthetic Binary (5) — IMPROVED MATHEMATICS ──
+  // ── Synthetic Binary (5) — IMPROVED MATH + shadow defaults OFF ──
 
   rise_fall_momentum: {
     id: 'rise_fall_momentum', name: 'Rise/Fall Momentum',
-    description: 'Synthetic CALL/PUT. Directional bias (non-flat denominator) + momentum confirmation. Rejects sharply weakened momentum. Shadow = observational (no real-money gate).',
+    description: 'Synthetic CALL/PUT. Directional bias (non-flat denominator) + momentum confirmation. Rejects sharply weakened momentum.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
@@ -751,7 +727,7 @@ const BOTS = {
       minSamples: 100,
       weakeningThreshold: 0.5,
       shadowWinsRequired: 0,
-      shadowObservational: true,
+      shadowObservational: false,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
@@ -760,7 +736,6 @@ const BOTS = {
       if (dv.sampleSize < ctx.config.minSamples) return wait('Not enough samples');
       const { config, stats } = ctx;
 
-      // risePct / fallPct use the non-flat directional denominator.
       const risePct = dv.risePct / 100;
       const fallPct = dv.fallPct / 100;
 
@@ -778,12 +753,10 @@ const BOTS = {
       const latestAgrees = (expectedDirection === 'up' && mv.lastMove > 0) ||
                            (expectedDirection === 'down' && mv.lastMove < 0);
 
-      // Reject if the streak has sharply weakened (last move < prev * weakeningThreshold)
       const wThresh = Number(config.weakeningThreshold) || 0.5;
       if (mv.sameDir && mv.prevAbs > 0 && mv.lastAbs < mv.prevAbs * wThresh) {
         return wait(`Momentum weakening (last=${mv.lastAbs.toFixed(5)} < ${mv.prevAbs.toFixed(5)}×${wThresh})`);
       }
-      // Reject if the latest move is against bias AND larger than the prior move
       if (!latestAgrees && mv.prevAbs > 0 && mv.lastAbs > mv.prevAbs * 1.5) {
         return wait('Recent adverse move exceeds prior (momentum reversed)');
       }
@@ -799,7 +772,7 @@ const BOTS = {
 
   rise_fall_streak: {
     id: 'rise_fall_streak', name: 'Rise/Fall Streak Fade',
-    description: 'Synthetic CALL/PUT. Fades directional streaks ONLY when per-move size is weakening (exhaustion). Shadow = observational (no real-money gate).',
+    description: 'Synthetic CALL/PUT. Fades directional streaks ONLY when per-move size is weakening (exhaustion).',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
@@ -807,7 +780,7 @@ const BOTS = {
       minStreak: 7,
       weakenRatio: 0.7,
       shadowWinsRequired: 0,
-      shadowObservational: true,
+      shadowObservational: false,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
@@ -822,7 +795,6 @@ const BOTS = {
       const mv = dv.movement;
       if (!mv) return wait('No movement data');
 
-      // Fade only when the streak is losing strength
       const wRatio = Number(config.weakenRatio) || 0.7;
       if (!mv.weakening || mv.prevAbs <= 0 || mv.lastAbs > mv.prevAbs * wRatio) {
         return wait(`Streak not weakening (last=${mv.lastAbs.toFixed(5)} prev=${mv.prevAbs.toFixed(5)}, need < ${wRatio}×)`);
@@ -840,7 +812,7 @@ const BOTS = {
 
   rise_fall_breakout: {
     id: 'rise_fall_breakout', name: 'Rise/Fall Breakout',
-    description: 'Synthetic CALL/PUT. Net move relative to real price range; latest price must be extending; already-reversed breakouts rejected. Shadow = observational (no real-money gate).',
+    description: 'Synthetic CALL/PUT. Net move relative to real price range; latest price must be extending; already-reversed breakouts rejected.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
@@ -848,7 +820,7 @@ const BOTS = {
       lookbackTicks: 10, minMovePct: 0.08,
       minNetToRange: 0.4,
       shadowWinsRequired: 0,
-      shadowObservational: true,
+      shadowObservational: false,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
@@ -869,7 +841,6 @@ const BOTS = {
       const mv = dv.movement;
       if (!mv) return wait('No movement data');
 
-      // Net movement must be substantial relative to the price range.
       const minNR = Number(config.minNetToRange) || 0.4;
       if (mv.netToRange < minNR) {
         return wait(`Choppy: net/range ${mv.netToRange.toFixed(2)} < ${minNR}`);
@@ -877,7 +848,6 @@ const BOTS = {
 
       const normalDir = movePct > 0 ? 'CALL' : 'PUT';
 
-      // Reject breakouts that have already reversed
       if (normalDir === 'CALL' && !mv.latestExtendsUp) {
         return wait('Breakout already reversing (latest price not extending up)');
       }
@@ -896,7 +866,7 @@ const BOTS = {
 
   vol_high_low: {
     id: 'vol_high_low', name: 'Volatility High/Low',
-    description: 'Synthetic CALL/PUT on persistent directional pressure: short+long windows agree, latest move confirms, outsized single-move bias rejected. Shadow = observational (no real-money gate).',
+    description: 'Synthetic CALL/PUT on persistent directional pressure: short+long windows agree, latest move confirms, outsized single-move bias rejected.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
@@ -906,7 +876,7 @@ const BOTS = {
       downThreshold: 0.35,
       minDirectionalSamples: 30,
       shadowWinsRequired: 0,
-      shadowObservational: true,
+      shadowObservational: false,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
@@ -941,11 +911,9 @@ const BOTS = {
       const mv = dv.movement;
       if (!mv) return wait('No movement data');
 
-      // Latest move must agree with bias
       if (normalDir === 'CALL' && mv.lastMove <= 0) return wait('Latest move disagrees with CALL bias');
       if (normalDir === 'PUT'  && mv.lastMove >= 0) return wait('Latest move disagrees with PUT bias');
 
-      // Reject outsized single move
       if (mv.sameDir && mv.prevAbs > 0 && mv.lastAbs > mv.prevAbs * 3) {
         return wait(`Outsized move (${mv.lastAbs.toFixed(5)} > 3× ${mv.prevAbs.toFixed(5)})`);
       }
@@ -961,7 +929,7 @@ const BOTS = {
 
   vol_scalper: {
     id: 'vol_scalper', name: 'Volatility Scalper',
-    description: 'Synthetic CALL/PUT. fade mode requires directional streak + weakening per-move size; follow mode requires expanding per-move size. Trend-conflict filter preserved. Shadow = observational (no real-money gate).',
+    description: 'Synthetic CALL/PUT. fade mode requires directional streak + weakening per-move size; follow mode requires expanding per-move size. Trend-conflict filter preserved.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
@@ -973,7 +941,7 @@ const BOTS = {
       expandingRatio: 1.1,
       minSamples: 30,
       shadowWinsRequired: 0,
-      shadowObservational: true,
+      shadowObservational: false,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
@@ -989,7 +957,6 @@ const BOTS = {
       const mv = dv.movement;
       if (!mv) return wait('No movement data');
 
-      // Trend-conflict filter — uses short-window non-flat bias
       const shortWin = dv.windows && dv.windows.short;
       let bias = 0.5;
       if (shortWin) {
@@ -1002,7 +969,6 @@ const BOTS = {
         return wait(`Weak trend: ${ds.side}-bias ${(bias * 100).toFixed(0)}% < ${(config.trendConflictPct * 100).toFixed(0)}% — follow needs trend confirmation`);
       }
 
-      // Mode-specific movement requirement
       if (config.mode === 'fade') {
         const wRatio = Number(config.weakeningRatio) || 0.8;
         if (!mv.weakening || mv.prevAbs <= 0 || mv.lastAbs > mv.prevAbs * wRatio) {
