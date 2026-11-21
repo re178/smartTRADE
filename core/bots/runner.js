@@ -71,9 +71,7 @@ const POSITIONS_CACHE_TTL_MS = 1_500;
 
 // [FIX-PENDING-CONTRACTS] Grace period after expected settlement for the
 // close event to arrive. Deriv removes the contract from open-trades
-// BEFORE firing trade.closed — this window is exactly what let the bot
-// fire twice. Pending map tracks every placed contract until we receive
-// its close event.
+// BEFORE firing trade.closed — this window is what let the bot fire twice.
 const PENDING_SETTLEMENT_GRACE_MS = 30_000;
 const PENDING_HARD_PRUNE_MS       = 90_000;
 
@@ -89,14 +87,16 @@ const BUY_CONTRACT_TYPES = new Set([
 ]);
 const SELL_CONTRACT_TYPES = new Set([
   'MULTDOWN', 'PUT', 'DIGITODD', 'DIGITUNDER', 'DIGITDIFF', 'NOTOUCH',
-  'VANILLALONGPUT', 'TURBOSHORT',
+  'VANILLALONGPUT', 'TURBOSSHORT',
 ]);
 
 const SHADOW_STALL_TIMEOUT_MS = 30_000;
 const SHADOW_SEQUENCE_MAX = 20;
 
 const HIGH_PAYOUT_CLASSES = new Set(['touch', 'vanilla', 'turbo', 'accumulator']);
-const TRAIL_ELIGIBLE_CLASSES = new Set(['vanilla', 'turbo']);
+// [FIX-ACCU-TRAILING] Accumulator added so trailing exits apply. Enables
+// the accumulator bot's trailingEnabled config to actually take effect.
+const TRAIL_ELIGIBLE_CLASSES = new Set(['vanilla', 'turbo', 'accumulator']);
 
 class BotRunner extends EventEmitter {
   constructor() {
@@ -207,8 +207,6 @@ class BotRunner extends EventEmitter {
     }, WATCHDOG_INTERVAL_MS);
     if (typeof instance._watchdog.unref === 'function') instance._watchdog.unref();
 
-    // [FIX-SHADOW-REINTRODUCE] Warn (not block) if gated shadow is turned on
-    // for a low-payout binary contract. User's choice is respected.
     if (mode === 'gated' && bot.contractClass === 'binary') {
       const g = shadow ? shadow.currentGate : 0;
       const sStake = Number(finalConfig.shadowStake) || 0.35;
@@ -259,11 +257,10 @@ class BotRunner extends EventEmitter {
     };
   }
 
-  // [FIX-SHADOW-REINTRODUCE] User config is authoritative.
+  // User config is authoritative:
   //   wins > 0                                → GATED
   //   wins = 0, shadowObservational = true    → OBSERVATIONAL
   //   both off                                → OFF (default for all bots)
-  // No forced downgrade. Binary warning is emitted at startup (see start()).
   _shadowModeForConfig(config, bot) {
     if (!bot || bot.assetClass !== 'synthetic_binary') return 'off';
     if (config._edgeTest) return 'off';
@@ -413,10 +410,6 @@ class BotRunner extends EventEmitter {
 
   // ─────────────────────────────────────────────────────────────
   //  [FIX-PENDING-CONTRACTS]
-  //  Authoritative, memory-local registry of every placed contract that
-  //  we have NOT yet seen the close event for. Prevents double-fire during
-  //  the Deriv window where a contract is settled server-side but removed
-  //  from getOpenTrades() before trade.closed reaches us.
   // ─────────────────────────────────────────────────────────────
   _registerPendingContract(instance, info) {
     if (!instance._pendingContracts) instance._pendingContracts = new Map();
@@ -898,9 +891,6 @@ class BotRunner extends EventEmitter {
         return;
       }
 
-      // [FIX-PENDING-CONTRACTS] Hard block if any contract is still awaiting
-      // its close event. This is the definitive fix for double-fire during
-      // the Deriv settlement race — it does NOT depend on getOpenTrades().
       if (instance._pendingContracts && instance._pendingContracts.size > 0) {
         const now = Date.now();
         const oldest = Math.min(...Array.from(instance._pendingContracts.values()).map(p => p.placedAt));
@@ -909,7 +899,6 @@ class BotRunner extends EventEmitter {
         return;
       }
 
-      // ── Exit checks ──
       const maxLosses = Number(instance.config.stopAfterLosses) || 0;
       if (maxLosses > 0 && instance.stats.consecutiveLosses >= maxLosses) {
         this._autoStop(instance, `Consecutive losses ${instance.stats.consecutiveLosses}/${maxLosses}`);
@@ -1406,8 +1395,6 @@ class BotRunner extends EventEmitter {
       if (isShadowPhase) this._metrics.shadowPlaced++;
       this._invalidatePositions();
 
-      // [FIX-PENDING-CONTRACTS] Register pending BEFORE persist so we never
-      // lose track even if the BotRun write fails.
       if (tradeParams.duration != null && Number(tradeParams.duration) > 0) {
         this._registerPendingContract(instance, {
           contractId: String(result.contractId),
@@ -1516,9 +1503,6 @@ class BotRunner extends EventEmitter {
       const contractId = String(data && data.contractId || '');
       if (!contractId) return;
 
-      // [FIX-PENDING-CONTRACTS] Always clear pending when a close event
-      // arrives — regardless of whether BotRun was persisted. This is the
-      // authoritative cleanup that unblocks the bot.
       let closedInstance = null;
       for (const inst of this._instances.values()) {
         if (inst._pendingContracts && inst._pendingContracts.has(contractId)) {
