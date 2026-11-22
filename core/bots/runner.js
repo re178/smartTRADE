@@ -87,16 +87,14 @@ const BUY_CONTRACT_TYPES = new Set([
 ]);
 const SELL_CONTRACT_TYPES = new Set([
   'MULTDOWN', 'PUT', 'DIGITODD', 'DIGITUNDER', 'DIGITDIFF', 'NOTOUCH',
-  'VANILLALONGPUT', 'TURBOSSHORT',
+  'VANILLALONGPUT', 'TURBOSHORT',
 ]);
 
 const SHADOW_STALL_TIMEOUT_MS = 30_000;
 const SHADOW_SEQUENCE_MAX = 20;
 
 const HIGH_PAYOUT_CLASSES = new Set(['touch', 'vanilla', 'turbo', 'accumulator']);
-// [FIX-ACCU-TRAILING] Accumulator added so trailing exits apply. Enables
-// the accumulator bot's trailingEnabled config to actually take effect.
-const TRAIL_ELIGIBLE_CLASSES = new Set(['vanilla', 'turbo', 'accumulator']);
+const TRAIL_ELIGIBLE_CLASSES = new Set(['vanilla', 'turbo']);
 
 class BotRunner extends EventEmitter {
   constructor() {
