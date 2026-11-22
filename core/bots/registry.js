@@ -11,16 +11,12 @@
 //   OFF. User can enable gated (shadowWinsRequired > 0) or observational
 //   (shadowObservational: true) in the bot form.
 //
-// [FIX-ACCUMULATOR-7-MEASURES] accumulator_scalper rewritten with:
-//     1. Multi-window range check (short 20t + long 100t)
-//     2. Vol expansion rejection (short > long × 1.3)
-//     3. Tick-level trend rejection (netToRange > 0.50)
-//     4. Long-window directional bias rejection (bias > 62%)
-//     5. Outsized last-move rejection (lastMove > 0.10% of price)
-//     6. Directional streak rejection (streak >= 3)
-//     7. Adaptive growth rate (2/3/5% based on realized vol)
-//   Plus: configurable M5 regime check (checkRegime, default true),
-//   trailing exit activation (trailingEnabled, activate $0.40, retrace 40%).
+// [FIX-ACCU-REGIME-TOGGLE] accumulator_scalper gains a checkRegime
+//   checkbox (default true). When true, the M5 regime gate runs as
+//   before. When false, the M5 regime gate is skipped — the 20-tick
+//   range filter still runs. Everything else in the bot is unchanged
+//   from the previous version (single 20-tick range check, fixed 3%
+//   growth rate, no additional filters).
 
 'use strict';
 
@@ -999,7 +995,7 @@ const BOTS = {
     },
   },
 
-  // ── High-Payout (4) — UNCHANGED except accumulator ──
+  // ── High-Payout (4) — UNCHANGED except accumulator (regime toggle added) ──
   touch_hunter: {
     id: 'touch_hunter', name: 'Touch Hunter',
     description: 'Touch/No Touch on far barriers after consolidation. High payout (200-350%) on far touches. Low win rate — designed for big wins.',
@@ -1075,7 +1071,7 @@ const BOTS = {
     baseRate: 0.30,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationMinutes: 15,
-      barrierAtrOffset: 1.5, requireBreakoutPattern: true, minAtrRatio: 1.3,
+      barrierAtrOffset: 0.5, requireBreakoutPattern: true, minAtrRatio: 1.3,
       trailingEnabled: true, trailingActivateAfterUSD: 2.0, trailingRetracePct: 25,
       turboTakeProfit: null,
       shadowWinsRequired: 0,
@@ -1106,158 +1102,46 @@ const BOTS = {
     },
   },
 
-  // ── Accumulator — FULL 7-MEASURE REWRITE ──
+  // ── Accumulator — previous version + checkRegime toggle ──
   accumulator_scalper: {
     id: 'accumulator_scalper', name: 'Accumulator Scalper',
-    description: 'Multi-window Accumulator. Short+long windows must both be quiet, no directional streak, no vol expansion, no outsized tick. Growth rate adapts to realized vol (2/3/5%). Trailing exit locks in gains. M5 regime check is toggleable via checkRegime (default ON).',
+    description: 'Accumulator on tight ranges. 3%/tick compounding, take-profit at 2x stake. Regime check toggleable via checkRegime (default ON).',
     assetClass: 'synthetic_binary', contractClass: 'accumulator',
     baseRate: 0.30,
     defaultConfig: {
       symbol: 'R_100', stake: 1,
-
-      // Duration & take-profit
-      durationTicks: 30,
-      accumulatorTakeProfit: 0.4,
-
-      // ── Range gates ──
-      rangeLookbackTicks: 20,
-      maxRangePct: 0.08,             // short window (20 ticks)
-      maxLongRangePct: 0.15,         // long window (100 ticks)
-      maxLastMovePct: 0.10,          // reject if last tick > 0.10% of price
-
-      // ── Directional rejection ──
-      maxDirectionalStreak: 3,       // reject streak >= 3
-      maxBias: 0.60,                 // short-window rise% or fall% cap
-      maxLongBias: 0.62,             // long-window rise% or fall% cap
-
-      // ── Vol expansion rejection ──
-      volExpansionRatio: 1.3,        // reject if short range > long range × 1.3
-
-      // ── Tick-level trend via netToRange ──
-      maxNetToRange: 0.50,           // reject if |net|/(hi-lo) > 0.50 over 100 ticks
-
-      // ── M5 regime check (toggleable) ──
-      checkRegime: true,             // when false, relies on tick filters only
-
-      // ── Adaptive growth rate ──
-      baseGrowthRate: 3,             // fallback if thresholds don't match
-      lowVolThreshold: 0.03,         // shortRangePct < this → highGrowthRate
-      mediumVolThreshold: 0.06,      // shortRangePct > this → lowGrowthRate
-      highGrowthRate: 5,             // very quiet → 5%
-      lowGrowthRate: 2,              // elevated → 2%
-
-      // ── Trailing exit ──
-      trailingEnabled: true,
-      trailingActivateAfterUSD: 0.4,
-      trailingRetracePct: 40,
-
-      // ── Shadow ──
+      growthRatePct: 3, durationTicks: 30,
+      accumulatorTakeProfit: 2,
+      maxRangePct: 0.08, rangeLookbackTicks: 20,
+      checkRegime: true,
       shadowWinsRequired: 0,
-      shadowObservational: false,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
       const { state, digitView, config } = ctx;
-
-      // Require digitView always. Require state only if checkRegime is on.
-      if (!digitView) return wait('No digit data');
-      if (config.checkRegime && !state) {
-        return wait('No market state (regime check enabled — uncheck checkRegime to skip M5)');
-      }
-
-      // ── 1. Short-window range (last 20 ticks) ──
-      const prices = (digitView.recentPrices || []).slice(-config.rangeLookbackTicks);
-      if (prices.length < config.rangeLookbackTicks) {
-        return wait(`Not enough prices (${prices.length}/${config.rangeLookbackTicks})`);
-      }
+      if (!state && !digitView) return wait('No market state');
+      const prices = digitView && Array.isArray(digitView.recentPrices) ? digitView.recentPrices.slice(-config.rangeLookbackTicks) : null;
+      if (!prices || prices.length < 10) return wait(`Not enough recent prices for range check (${prices ? prices.length : 0})`);
       const highs = Math.max(...prices);
       const lows = Math.min(...prices);
-      const mid = (highs + lows) / 2;
-      if (!Number.isFinite(mid) || mid <= 0) return wait('Invalid price data');
-      const shortRangePct = ((highs - lows) / mid) * 100;
+      const mids = (highs + lows) / 2;
+      if (!Number.isFinite(mids) || mids <= 0) return wait('Invalid price data');
+      const rangePct = ((highs - lows) / mids) * 100;
+      if (rangePct > config.maxRangePct) return wait(`Range ${rangePct.toFixed(3)}% > ${config.maxRangePct}% (high=${highs.toFixed(2)}, low=${lows.toFixed(2)})`);
 
-      // ── 2. Long-window range (last 100 ticks via movement) ──
-      const mv = digitView.movement;
-      if (!mv || !mv.windowSize || mv.windowSize < 30) {
-        return wait('Not enough movement data');
-      }
-      const longRangePct = mv.rangePct;
-
-      if (shortRangePct > config.maxRangePct) {
-        return wait(`Short range ${shortRangePct.toFixed(3)}% > ${config.maxRangePct}%`);
-      }
-      if (longRangePct > config.maxLongRangePct) {
-        return wait(`Long range ${longRangePct.toFixed(3)}% > ${config.maxLongRangePct}%`);
-      }
-
-      // ── 3. Vol expansion rejection ──
-      if (longRangePct > 0 && shortRangePct > longRangePct * config.volExpansionRatio) {
-        return wait(`Vol expanding (short ${shortRangePct.toFixed(3)}% > long ${longRangePct.toFixed(3)}% × ${config.volExpansionRatio})`);
-      }
-
-      // ── 4. Tick-level trend: net move / range ──
-      if (mv.netToRange > config.maxNetToRange) {
-        return wait(`Tick-trend: net/range ${mv.netToRange.toFixed(2)} > ${config.maxNetToRange}`);
-      }
-
-      // ── 5. Long-window directional bias ──
-      const longWin = digitView.windows && digitView.windows.long;
-      if (longWin) {
-        const longBias = Math.max(longWin.risePct, longWin.fallPct) / 100;
-        if (longBias > config.maxLongBias) {
-          return wait(`Long-window bias ${(longBias * 100).toFixed(0)}% > ${(config.maxLongBias * 100).toFixed(0)}% (trending)`);
-        }
-      }
-
-      // ── 6. Outsized last move rejection ──
-      if (mv.lastAbs > 0 && mv.mid > 0) {
-        const lastMovePct = (mv.lastAbs / mv.mid) * 100;
-        if (lastMovePct > config.maxLastMovePct) {
-          return wait(`Last move ${lastMovePct.toFixed(3)}% > ${config.maxLastMovePct}% (spike)`);
-        }
-      }
-
-      // ── 7. Directional streak rejection ──
-      const ds = digitView.directionalStreak;
-      if (ds && ds.length >= config.maxDirectionalStreak) {
-        return wait(`Directional streak ${ds.length} ${ds.side} — too trending`);
-      }
-
-      // ── 8. Short-window directional bias ──
-      const shortWin = digitView.windows && digitView.windows.short;
-      if (shortWin) {
-        const shortBias = Math.max(shortWin.risePct, shortWin.fallPct) / 100;
-        if (shortBias > config.maxBias) {
-          return wait(`Short-window bias ${(shortBias * 100).toFixed(0)}% > ${(config.maxBias * 100).toFixed(0)}%`);
-        }
-      }
-
-      // ── 9. M5 regime check (toggleable, default ON) ──
-      let regimeLabel = 'SKIPPED';
-      if (config.checkRegime) {
+      // [FIX-ACCU-REGIME-TOGGLE] Only check M5 regime when config.checkRegime !== false
+      if (config.checkRegime !== false) {
         const regime = state && state.regime && state.regime.code;
         if (regime && regime !== 'RANGING' && regime !== 'WEAK_TREND') {
-          return wait(`Regime ${regime} (need RANGING or WEAK_TREND)`);
+          return wait(`Regime ${regime} (need RANGING or low-vol)`);
         }
-        regimeLabel = regime || '?';
       }
 
-      // ── 10. Adaptive growth rate ──
-      let growthRatePct;
-      if (shortRangePct < config.lowVolThreshold) {
-        growthRatePct = config.highGrowthRate;
-      } else if (shortRangePct > config.mediumVolThreshold) {
-        growthRatePct = config.lowGrowthRate;
-      } else {
-        growthRatePct = config.baseGrowthRate;
-      }
-
-      const growthRate = growthRatePct / 100;
+      const growthRate = (Number(config.growthRatePct) || 3) / 100;
       const ticks = Number(config.durationTicks) || 30;
+      const maxMultiplier = Math.pow(1 + growthRate, ticks);
       const tp = config.accumulatorTakeProfit != null ? `$${config.accumulatorTakeProfit}` : 'none';
-      const reason = `ACCU ${growthRatePct}%/tick × ${ticks}t TP=${tp} ` +
-        `(short=${shortRangePct.toFixed(3)}% long=${longRangePct.toFixed(3)}% ` +
-        `net/r=${mv.netToRange.toFixed(2)} regime=${regimeLabel})`;
+      const reason = `ACCU ${(growthRate * 100).toFixed(1)}%/tick × ${ticks}t TP=${tp} (range=${rangePct.toFixed(3)}%, max ${maxMultiplier.toFixed(1)}× stake)`;
       return enterAccumulator(growthRate, config, reason);
     },
   },
