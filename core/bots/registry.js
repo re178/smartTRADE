@@ -11,12 +11,22 @@
 //   OFF. User can enable gated (shadowWinsRequired > 0) or observational
 //   (shadowObservational: true) in the bot form.
 //
+// [FIX-PREDICTION-MODE] User-selectable prediction hypothesis per bot.
+//   5 rise/fall bots: predictionMode 'auto'|'continue'|'reverse'.
+//     'auto'     → bot's designed hypothesis (unchanged)
+//     'continue' → bet WITH the measured signal
+//     'reverse'  → bet AGAINST the measured signal
+//   matches_differs: preferredSide 'auto'|'match'|'diff'.
+//     'auto'  → use existing mode (diff_hot | match_cold)
+//     'match' → always bet DIGITMATCH (requires target COLD)
+//     'diff'  → always bet DIGITDIFF  (requires target HOT)
+//   flipEnabled still applies AFTER predictionMode. Both enabled = net
+//   no-change, visible via [FLIP→X] in the reason string.
+//
 // [FIX-ACCU-REGIME-TOGGLE] accumulator_scalper gains a checkRegime
 //   checkbox (default true). When true, the M5 regime gate runs as
 //   before. When false, the M5 regime gate is skipped — the 20-tick
-//   range filter still runs. Everything else in the bot is unchanged
-//   from the previous version (single 20-tick range check, fixed 3%
-//   growth rate, no additional filters).
+//   range filter still runs.
 
 'use strict';
 
@@ -523,7 +533,7 @@ const BOTS = {
     },
   },
 
-  // ── Synthetic Digit (5) — UNCHANGED ──
+  // ── Synthetic Digit (5) — UNCHANGED except matches_differs ──
   even_odd_trader: {
     id: 'even_odd_trader', name: 'Even/Odd Trader',
     description: 'Synthetic digit. Fades extreme parity (|z| >= 2.0). Set mode="follow" to chase extremes instead. Flip NOT recommended (50/50).',
@@ -601,15 +611,17 @@ const BOTS = {
     },
   },
 
+  // matches_differs_trader — added preferredSide
   matches_differs_trader: {
     id: 'matches_differs_trader', name: 'Matches/Differs Trader',
-    description: 'Synthetic digit. Fires DIGITDIFF when target digit is statistically HOT (z >= 2.0). ~90% base WR. Set mode="match_cold" for the high-payout MATCH path. Flip is MATHEMATICALLY VALID.',
+    description: 'Synthetic digit. Fires DIGITDIFF when target digit is statistically HOT (z >= 2.0). ~90% base WR. preferredSide="match" forces MATCH on cold target; preferredSide="diff" forces DIFF on hot target; "auto" uses mode. Flip is MATHEMATICALLY VALID.',
     assetClass: 'synthetic_digit', contractClass: 'digit',
     baseRate: 0.10,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5, targetDigit: 5,
       minSamples: 150, zThreshold: 2.0,
       mode: 'diff_hot',
+      preferredSide: 'auto',
       flipEnabled: true, flipBelowPct: 80, flipMinTrades: 20, flipStableTrades: 20,
     },
     evaluate(ctx) {
@@ -621,17 +633,36 @@ const BOTS = {
       const zThreshold = Number(ctx.config.zThreshold) || 2.0;
       const target = Number(ctx.config.targetDigit) || 5;
       const mode = ctx.config.mode || 'diff_hot';
+      const preferredSide = ctx.config.preferredSide || 'auto';
       const targetZ = zs.digitZ[target];
 
       let normalDir, reason;
-      if (mode === 'diff_hot') {
-        if (targetZ < zThreshold) return wait(`digit ${target} z=${targetZ.toFixed(2)} (need >= +${zThreshold} for DIFF_HOT, N=${zs.windowSize})`);
-        normalDir = 'DIGITDIFF';
-        reason = `digit ${target} HOT z=${targetZ.toFixed(2)} → DIGITDIFF`;
-      } else {
-        if (targetZ > -zThreshold) return wait(`digit ${target} z=${targetZ.toFixed(2)} (need <= -${zThreshold} for MATCH_COLD, N=${zs.windowSize})`);
+
+      if (preferredSide === 'match') {
+        // Force MATCH. Fire only when target is COLD (preserves z-score evidence requirement).
+        if (targetZ > -zThreshold) {
+          return wait(`digit ${target} z=${targetZ.toFixed(2)} (preferredSide=match; need <= -${zThreshold}, N=${zs.windowSize})`);
+        }
         normalDir = 'DIGITMATCH';
-        reason = `digit ${target} COLD z=${targetZ.toFixed(2)} → DIGITMATCH`;
+        reason = `digit ${target} COLD z=${targetZ.toFixed(2)} → DIGITMATCH (preferred)`;
+      } else if (preferredSide === 'diff') {
+        // Force DIFF. Fire only when target is HOT.
+        if (targetZ < zThreshold) {
+          return wait(`digit ${target} z=${targetZ.toFixed(2)} (preferredSide=diff; need >= +${zThreshold}, N=${zs.windowSize})`);
+        }
+        normalDir = 'DIGITDIFF';
+        reason = `digit ${target} HOT z=${targetZ.toFixed(2)} → DIGITDIFF (preferred)`;
+      } else {
+        // 'auto' — use existing mode (unchanged from previous file)
+        if (mode === 'diff_hot') {
+          if (targetZ < zThreshold) return wait(`digit ${target} z=${targetZ.toFixed(2)} (need >= +${zThreshold} for DIFF_HOT, N=${zs.windowSize})`);
+          normalDir = 'DIGITDIFF';
+          reason = `digit ${target} HOT z=${targetZ.toFixed(2)} → DIGITDIFF`;
+        } else {
+          if (targetZ > -zThreshold) return wait(`digit ${target} z=${targetZ.toFixed(2)} (need <= -${zThreshold} for MATCH_COLD, N=${zs.windowSize})`);
+          normalDir = 'DIGITMATCH';
+          reason = `digit ${target} COLD z=${targetZ.toFixed(2)} → DIGITMATCH`;
+        }
       }
 
       const flip = shouldFlip(ctx.config, ctx.stats);
@@ -715,11 +746,11 @@ const BOTS = {
     },
   },
 
-  // ── Synthetic Binary (5) — IMPROVED MATH + shadow defaults OFF ──
+  // ── Synthetic Binary (5) — predictionMode added to all 5 ──
 
   rise_fall_momentum: {
     id: 'rise_fall_momentum', name: 'Rise/Fall Momentum',
-    description: 'Synthetic CALL/PUT. Directional bias (non-flat denominator) + momentum confirmation. Rejects sharply weakened momentum.',
+    description: 'Synthetic CALL/PUT. Directional bias + momentum confirmation. predictionMode: auto/continue = bet with bias; reverse = bet against bias.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
@@ -727,6 +758,7 @@ const BOTS = {
       minBias: 0.62,
       minSamples: 100,
       weakeningThreshold: 0.5,
+      predictionMode: 'auto',
       shadowWinsRequired: 0,
       shadowObservational: false,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
@@ -740,17 +772,17 @@ const BOTS = {
       const risePct = dv.risePct / 100;
       const fallPct = dv.fallPct / 100;
 
-      let normalDir = null, biasUsed = 0;
-      if (risePct >= config.minBias) { normalDir = 'CALL'; biasUsed = risePct; }
-      else if (fallPct >= config.minBias) { normalDir = 'PUT'; biasUsed = fallPct; }
-      if (!normalDir) {
+      let signalDir = null, biasUsed = 0;
+      if (risePct >= config.minBias) { signalDir = 'CALL'; biasUsed = risePct; }
+      else if (fallPct >= config.minBias) { signalDir = 'PUT'; biasUsed = fallPct; }
+      if (!signalDir) {
         return wait(`Rise ${(risePct * 100).toFixed(1)}% / Fall ${(fallPct * 100).toFixed(1)}% (Need >=${(config.minBias * 100).toFixed(0)}%)`);
       }
 
       const mv = dv.movement;
       if (!mv) return wait('No movement data');
 
-      const expectedDirection = normalDir === 'CALL' ? 'up' : 'down';
+      const expectedDirection = signalDir === 'CALL' ? 'up' : 'down';
       const latestAgrees = (expectedDirection === 'up' && mv.lastMove > 0) ||
                            (expectedDirection === 'down' && mv.lastMove < 0);
 
@@ -762,24 +794,35 @@ const BOTS = {
         return wait('Recent adverse move exceeds prior (momentum reversed)');
       }
 
+      // predictionMode: auto/continue = with bias, reverse = against bias
+      const pm = config.predictionMode || 'auto';
+      let betDir = signalDir;
+      let modeNote = '';
+      if (pm === 'reverse') {
+        betDir = signalDir === 'CALL' ? 'PUT' : 'CALL';
+        modeNote = ` [reverse→${betDir}]`;
+      } else if (pm === 'continue') {
+        modeNote = ' [continue]';
+      }
+
       const flip = shouldFlip(config, stats);
-      const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
-      const reason = flip
-        ? `${normalDir} (${(biasUsed * 100).toFixed(1)}%) FLIPPED → ${finalDir}`
-        : `Bias ${(biasUsed * 100).toFixed(1)}% + momentum confirmed`;
+      const finalDir = flip ? (betDir === 'CALL' ? 'PUT' : 'CALL') : betDir;
+      const flipNote = flip ? ` [FLIP→${finalDir}]` : '';
+      const reason = `${signalDir} bias ${(biasUsed * 100).toFixed(1)}% + momentum confirmed${modeNote}${flipNote}`;
       return enterBinary(finalDir, config, reason);
     },
   },
 
   rise_fall_streak: {
     id: 'rise_fall_streak', name: 'Rise/Fall Streak Fade',
-    description: 'Synthetic CALL/PUT. Fades directional streaks ONLY when per-move size is weakening (exhaustion).',
+    description: 'Synthetic CALL/PUT. Fades directional streaks ONLY when per-move size is weakening (exhaustion). predictionMode: auto/reverse = fade the streak; continue = bet with the streak.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5,
       minStreak: 7,
       weakenRatio: 0.7,
+      predictionMode: 'auto',
       shadowWinsRequired: 0,
       shadowObservational: false,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
@@ -801,25 +844,38 @@ const BOTS = {
         return wait(`Streak not weakening (last=${mv.lastAbs.toFixed(5)} prev=${mv.prevAbs.toFixed(5)}, need < ${wRatio}×)`);
       }
 
-      const normalDir = ds.side === 'up' ? 'PUT' : 'CALL';
+      // Signal direction (with the streak)
+      const signalDir = ds.side === 'up' ? 'CALL' : 'PUT';
+
+      // predictionMode: auto/reverse = fade (against streak), continue = with streak
+      const pm = config.predictionMode || 'auto';
+      let betDir, modeNote;
+      if (pm === 'continue') {
+        betDir = signalDir;
+        modeNote = ' [continue→with-streak]';
+      } else {
+        betDir = signalDir === 'CALL' ? 'PUT' : 'CALL';
+        modeNote = pm === 'reverse' ? ' [reverse→fade]' : ' [auto→fade]';
+      }
+
       const flip = shouldFlip(config, stats);
-      const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
-      const reason = flip
-        ? `${ds.length}-tick ${ds.side}-streak weakening FLIPPED → ${finalDir}`
-        : `${ds.length}-tick ${ds.side}-streak weakening → fade to ${finalDir}`;
+      const finalDir = flip ? (betDir === 'CALL' ? 'PUT' : 'CALL') : betDir;
+      const flipNote = flip ? ` [FLIP→${finalDir}]` : '';
+      const reason = `${ds.length}-tick ${ds.side}-streak weakening${modeNote}${flipNote}`;
       return enterBinary(finalDir, config, reason);
     },
   },
 
   rise_fall_breakout: {
     id: 'rise_fall_breakout', name: 'Rise/Fall Breakout',
-    description: 'Synthetic CALL/PUT. Net move relative to real price range; latest price must be extending; already-reversed breakouts rejected.',
+    description: 'Synthetic CALL/PUT. Net move vs. range; latest price must be extending; already-reversed breakouts rejected. predictionMode: auto/continue = with breakout; reverse = against.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
       symbol: 'R_100', stake: 1, durationTicks: 5,
       lookbackTicks: 10, minMovePct: 0.08,
       minNetToRange: 0.4,
+      predictionMode: 'auto',
       shadowWinsRequired: 0,
       shadowObservational: false,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
@@ -847,27 +903,39 @@ const BOTS = {
         return wait(`Choppy: net/range ${mv.netToRange.toFixed(2)} < ${minNR}`);
       }
 
-      const normalDir = movePct > 0 ? 'CALL' : 'PUT';
+      // Signal = breakout direction
+      const signalDir = movePct > 0 ? 'CALL' : 'PUT';
 
-      if (normalDir === 'CALL' && !mv.latestExtendsUp) {
+      // Extension check (against breakout direction — rejects already-reversed)
+      if (signalDir === 'CALL' && !mv.latestExtendsUp) {
         return wait('Breakout already reversing (latest price not extending up)');
       }
-      if (normalDir === 'PUT' && !mv.latestExtendsDown) {
+      if (signalDir === 'PUT' && !mv.latestExtendsDown) {
         return wait('Breakdown already reversing (latest price not extending down)');
       }
 
+      // predictionMode: auto/continue = with breakout, reverse = against
+      const pm = config.predictionMode || 'auto';
+      let betDir = signalDir;
+      let modeNote = '';
+      if (pm === 'reverse') {
+        betDir = signalDir === 'CALL' ? 'PUT' : 'CALL';
+        modeNote = ` [reverse→${betDir}]`;
+      } else if (pm === 'continue') {
+        modeNote = ' [continue]';
+      }
+
       const flip = shouldFlip(config, stats);
-      const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
-      const reason = flip
-        ? `Move ${movePct.toFixed(3)}% (ext) FLIPPED → ${finalDir}`
-        : `Breakout ${movePct.toFixed(3)}% (net/range ${mv.netToRange.toFixed(2)})`;
+      const finalDir = flip ? (betDir === 'CALL' ? 'PUT' : 'CALL') : betDir;
+      const flipNote = flip ? ` [FLIP→${finalDir}]` : '';
+      const reason = `Breakout ${movePct.toFixed(3)}% (net/range ${mv.netToRange.toFixed(2)})${modeNote}${flipNote}`;
       return enterBinary(finalDir, config, reason);
     },
   },
 
   vol_high_low: {
     id: 'vol_high_low', name: 'Volatility High/Low',
-    description: 'Synthetic CALL/PUT on persistent directional pressure: short+long windows agree, latest move confirms, outsized single-move bias rejected.',
+    description: 'Synthetic CALL/PUT on persistent directional pressure. predictionMode: auto/continue = with bias; reverse = against.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
@@ -876,6 +944,7 @@ const BOTS = {
       upThreshold: 0.65,
       downThreshold: 0.35,
       minDirectionalSamples: 30,
+      predictionMode: 'auto',
       shadowWinsRequired: 0,
       shadowObservational: false,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
@@ -899,38 +968,48 @@ const BOTS = {
       const upShort = short.risePct;
       const upLong  = long.risePct;
 
-      let normalDir = null, biasUsed = 0;
+      let signalDir = null, biasUsed = 0;
       if (upShort >= config.upThreshold * 100 && upLong > 50) {
-        normalDir = 'CALL'; biasUsed = upShort;
+        signalDir = 'CALL'; biasUsed = upShort;
       } else if (upShort <= config.downThreshold * 100 && upLong < 50) {
-        normalDir = 'PUT'; biasUsed = 100 - upShort;
+        signalDir = 'PUT'; biasUsed = 100 - upShort;
       }
-      if (!normalDir) {
+      if (!signalDir) {
         return wait(`Short up=${upShort.toFixed(0)}% long up=${upLong.toFixed(0)}% (need consistent >=${(config.upThreshold * 100).toFixed(0)}% or <=${(config.downThreshold * 100).toFixed(0)}%)`);
       }
 
       const mv = dv.movement;
       if (!mv) return wait('No movement data');
 
-      if (normalDir === 'CALL' && mv.lastMove <= 0) return wait('Latest move disagrees with CALL bias');
-      if (normalDir === 'PUT'  && mv.lastMove >= 0) return wait('Latest move disagrees with PUT bias');
+      if (signalDir === 'CALL' && mv.lastMove <= 0) return wait('Latest move disagrees with CALL bias');
+      if (signalDir === 'PUT'  && mv.lastMove >= 0) return wait('Latest move disagrees with PUT bias');
 
       if (mv.sameDir && mv.prevAbs > 0 && mv.lastAbs > mv.prevAbs * 3) {
         return wait(`Outsized move (${mv.lastAbs.toFixed(5)} > 3× ${mv.prevAbs.toFixed(5)})`);
       }
 
+      // predictionMode
+      const pm = config.predictionMode || 'auto';
+      let betDir = signalDir;
+      let modeNote = '';
+      if (pm === 'reverse') {
+        betDir = signalDir === 'CALL' ? 'PUT' : 'CALL';
+        modeNote = ` [reverse→${betDir}]`;
+      } else if (pm === 'continue') {
+        modeNote = ' [continue]';
+      }
+
       const flip = shouldFlip(config, stats);
-      const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
-      const reason = flip
-        ? `${normalDir} bias FLIPPED → ${finalDir} (short=${upShort.toFixed(0)}% long=${upLong.toFixed(0)}%)`
-        : `Persistent ${normalDir} (short ${upShort.toFixed(0)}% long ${upLong.toFixed(0)}%)`;
+      const finalDir = flip ? (betDir === 'CALL' ? 'PUT' : 'CALL') : betDir;
+      const flipNote = flip ? ` [FLIP→${finalDir}]` : '';
+      const reason = `Persistent ${signalDir} (short ${upShort.toFixed(0)}% long ${upLong.toFixed(0)}%)${modeNote}${flipNote}`;
       return enterBinary(finalDir, config, reason);
     },
   },
 
   vol_scalper: {
     id: 'vol_scalper', name: 'Volatility Scalper',
-    description: 'Synthetic CALL/PUT. fade mode requires directional streak + weakening per-move size; follow mode requires expanding per-move size. Trend-conflict filter preserved.',
+    description: 'Synthetic CALL/PUT. predictionMode: auto = use mode; continue = follow; reverse = fade. Weakens/expands gates and trend-conflict filter follow effectiveMode.',
     assetClass: 'synthetic_binary', contractClass: 'binary',
     baseRate: 0.50,
     defaultConfig: {
@@ -941,6 +1020,7 @@ const BOTS = {
       weakeningRatio: 0.8,
       expandingRatio: 1.1,
       minSamples: 30,
+      predictionMode: 'auto',
       shadowWinsRequired: 0,
       shadowObservational: false,
       flipEnabled: false, flipBelowPct: 48, flipMinTrades: 20, flipStableTrades: 20,
@@ -958,44 +1038,54 @@ const BOTS = {
       const mv = dv.movement;
       if (!mv) return wait('No movement data');
 
+      // Resolve effective mode: predictionMode overrides config.mode when set
+      const pm = config.predictionMode || 'auto';
+      let effectiveMode, modeSource;
+      if (pm === 'continue') { effectiveMode = 'follow'; modeSource = 'continue'; }
+      else if (pm === 'reverse') { effectiveMode = 'fade'; modeSource = 'reverse'; }
+      else { effectiveMode = config.mode || 'fade'; modeSource = 'auto'; }
+
+      // Trend-conflict filter (uses effectiveMode's gate)
       const shortWin = dv.windows && dv.windows.short;
       let bias = 0.5;
       if (shortWin) {
         bias = ds.side === 'up' ? shortWin.risePct / 100 : shortWin.fallPct / 100;
       }
-      if (config.mode === 'fade' && bias > config.trendConflictPct) {
+      if (effectiveMode === 'fade' && bias > config.trendConflictPct) {
         return wait(`Trend conflict: ${ds.side}-bias ${(bias * 100).toFixed(0)}% > ${(config.trendConflictPct * 100).toFixed(0)}% — won't fade a strong trend`);
       }
-      if (config.mode === 'follow' && bias < config.trendConflictPct) {
+      if (effectiveMode === 'follow' && bias < config.trendConflictPct) {
         return wait(`Weak trend: ${ds.side}-bias ${(bias * 100).toFixed(0)}% < ${(config.trendConflictPct * 100).toFixed(0)}% — follow needs trend confirmation`);
       }
 
-      if (config.mode === 'fade') {
+      // Mode-specific movement gate
+      if (effectiveMode === 'fade') {
         const wRatio = Number(config.weakeningRatio) || 0.8;
         if (!mv.weakening || mv.prevAbs <= 0 || mv.lastAbs > mv.prevAbs * wRatio) {
           return wait(`Fade needs weakening (last=${mv.lastAbs.toFixed(5)} prev=${mv.prevAbs.toFixed(5)})`);
         }
-      } else if (config.mode === 'follow') {
+      } else {
         const eRatio = Number(config.expandingRatio) || 1.1;
         if (!mv.expanding || mv.prevAbs <= 0 || mv.lastAbs < mv.prevAbs * eRatio) {
           return wait(`Follow needs expanding (last=${mv.lastAbs.toFixed(5)} prev=${mv.prevAbs.toFixed(5)})`);
         }
       }
 
-      let normalDir;
-      if (config.mode === 'fade') normalDir = ds.side === 'up' ? 'PUT' : 'CALL';
-      else                        normalDir = ds.side === 'up' ? 'CALL' : 'PUT';
+      // Signal + bet direction
+      const signalDir = ds.side === 'up' ? 'CALL' : 'PUT';
+      const betDir = effectiveMode === 'fade'
+        ? (signalDir === 'CALL' ? 'PUT' : 'CALL')
+        : signalDir;
 
       const flip = shouldFlip(config, stats);
-      const finalDir = flip ? (normalDir === 'CALL' ? 'PUT' : 'CALL') : normalDir;
-      const reason = flip
-        ? `${ds.length}-tick ${ds.side} ${config.mode} FLIPPED → ${finalDir} (bias ${(bias * 100).toFixed(0)}%)`
-        : `${ds.length}-tick ${ds.side} ${config.mode} → ${finalDir} (bias ${(bias * 100).toFixed(0)}%)`;
+      const finalDir = flip ? (betDir === 'CALL' ? 'PUT' : 'CALL') : betDir;
+      const flipNote = flip ? ` [FLIP→${finalDir}]` : '';
+      const reason = `${ds.length}-tick ${ds.side} ${effectiveMode}(${modeSource}) → ${finalDir} (bias ${(bias * 100).toFixed(0)}%)${flipNote}`;
       return enterBinary(finalDir, config, reason);
     },
   },
 
-  // ── High-Payout (4) — UNCHANGED except accumulator (regime toggle added) ──
+  // ── High-Payout (4) — UNCHANGED except accumulator (regime toggle) ──
   touch_hunter: {
     id: 'touch_hunter', name: 'Touch Hunter',
     description: 'Touch/No Touch on far barriers after consolidation. High payout (200-350%) on far touches. Low win rate — designed for big wins.',
@@ -1102,7 +1192,6 @@ const BOTS = {
     },
   },
 
-  // ── Accumulator — previous version + checkRegime toggle ──
   accumulator_scalper: {
     id: 'accumulator_scalper', name: 'Accumulator Scalper',
     description: 'Accumulator on tight ranges. 3%/tick compounding, take-profit at 2x stake. Regime check toggleable via checkRegime (default ON).',
@@ -1129,7 +1218,6 @@ const BOTS = {
       const rangePct = ((highs - lows) / mids) * 100;
       if (rangePct > config.maxRangePct) return wait(`Range ${rangePct.toFixed(3)}% > ${config.maxRangePct}% (high=${highs.toFixed(2)}, low=${lows.toFixed(2)})`);
 
-      // [FIX-ACCU-REGIME-TOGGLE] Only check M5 regime when config.checkRegime !== false
       if (config.checkRegime !== false) {
         const regime = state && state.regime && state.regime.code;
         if (regime && regime !== 'RANGING' && regime !== 'WEAK_TREND') {
@@ -1171,7 +1259,6 @@ for (const id in BOTS) {
   BOTS[id].defaultConfig = Object.assign({}, RISK_DEFAULTS, BOTS[id].defaultConfig);
 }
 
-// ── Compound config — synthetic_binary ONLY ──
 const COMPOUND_DEFAULTS = {
   compoundEnabled: false,
   compoundMaxStake: 10,
@@ -1202,8 +1289,6 @@ BOTS.turbo_breakout.defaultConfig.botStopLoss = 0;
 
 BOTS.accumulator_scalper.defaultConfig.stopAfterLosses = 5;
 
-// [FIX-BINARY-LOSS-STOP] Binary bots stop from money loss, not from
-// consecutive-loss count. botStopLoss remains the real safeguard.
 BOTS.rise_fall_momentum.defaultConfig.stopAfterLosses = 0;
 BOTS.rise_fall_streak.defaultConfig.stopAfterLosses   = 0;
 BOTS.rise_fall_breakout.defaultConfig.stopAfterLosses = 0;
